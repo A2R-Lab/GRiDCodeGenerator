@@ -30,7 +30,11 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
-                            gen_crba_device, gen_crba_kernel, gen_crba_host
+                            gen_crba_device, gen_crba_kernel, gen_crba_host, \
+                            gen_fdsva, gen_fdsva_inner_temp_mem_size, gen_fdsva_inner_function_call, gen_fdsva_inner, gen_fdsva_device_temp_mem_size, \
+                            gen_fdsva_device, gen_fdsva_kernel, gen_fdsva_host, \
+                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
+                            gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -78,6 +82,8 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines(["const int NUM_JOINTS = " + str(self.robot.get_num_pos()) + ";", \
                                  "const int ID_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int CRBA_SHARED_MEM_COUNT = " + str(self.gen_crba_inner_temp_mem_size() + XI_size) + ";", \
+                                 "const int FDSVA_SHARED_MEM_COUNT = " + str(self.gen_fdsva_inner_temp_mem_size() + XI_size) + ";", \
+                                 "const int FDSVA_SO_SHARED_MEM_COUNT = " + str(self.gen_fdsva_so_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int MINV_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_direct_minv_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int FD_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_forward_dynamics_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int ID_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_inverse_dynamics_gradient_inner_temp_mem_size() + XI_size) + ";", \
@@ -97,10 +103,14 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines(["template <typename T>", \
                                  "struct gridData {", \
                                  "    // GPU INPUTS", \
+                                 "    T *d_id_dq_dqd;", \
+                                 "    T *d_q_qd_qdd_u;", \
                                  "    T *d_q_qd_u;", \
                                  "    T *d_q_qd;", \
                                  "    T *d_q;", \
                                  "    // CPU INPUTS", \
+                                 "    T *h_id_dq_dqd;", \
+                                 "    T *h_q_qd_qdd_u;", \
                                  "    T *h_q_qd_u;", \
                                  "    T *h_q_qd;", \
                                  "    T *h_q;", \
@@ -111,6 +121,9 @@ class GRiDCodeGenerator:
                                  "    T *d_qdd;", \
                                  "    T *d_dc_du;", \
                                  "    T *d_df_du;", \
+                                 "    T *d_fddq_fddqd_fddt;", \
+                                 "    T *d_fdoutput;", \
+                                 "    T *d_df2;", \
                                  "    // CPU OUTPUTS", \
                                  "    T *h_c;", \
                                  "    T *h_M;", \
@@ -118,15 +131,20 @@ class GRiDCodeGenerator:
                                  "    T *h_qdd;", \
                                  "    T *h_dc_du;", \
                                  "    T *h_df_du;", \
+                                 "    T *h_fddq_fddqd_fddt;", \
+                                 "    T *h_fdoutput;", \
+                                 "    T *h_df2;", \
                                  "};"])
 
     def gen_init_gridData(self):
         code_lines = ["gridData<T> *hd_data = (gridData<T> *)malloc(sizeof(gridData<T>));"
                       "// first the input variables on the GPU", \
+                    #   "gpuErrchk(cudaMalloc((void**)&hd_data->d_id_dq_dqd, 2*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_q_qd_u, 3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_q_qd, 2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_q, NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "// and the CPU", \
+                    #   "hd_data->h_id_dq_dqd, 2*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T);", \
                       "hd_data->h_q_qd_u = (T *)malloc(3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_q_qd = (T *)malloc(2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_q = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -137,6 +155,9 @@ class GRiDCodeGenerator:
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_dc_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_M, NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "gpuErrchk(cudaMalloc((void**)&hd_data->d_fddq_fddqd_fddt, 3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "gpuErrchk(cudaMalloc((void**)&hd_data->d_fdoutput,3*NUM_JOINTS*3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "gpuErrchk(cudaMalloc((void**)&hd_data->d_df2,3*NUM_JOINTS*3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "// and the CPU", \
                       "hd_data->h_c = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_Minv = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -144,6 +165,9 @@ class GRiDCodeGenerator:
                       "hd_data->h_dc_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_df_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_M = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "hd_data->h_fddq_fddqd_fddt = (T *)malloc(3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "hd_data->h_fdoutput = (T *)malloc(3*NUM_JOINTS*3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "hd_data->h_df2 = (T *)malloc(3*NUM_JOINTS*3*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "return hd_data;"]
         # generate as templated or not function
         self.gen_add_func_doc("Allocated device and host memory for all computations",
@@ -316,6 +340,8 @@ class GRiDCodeGenerator:
         self.gen_forward_dynamics_gradient(use_thread_group)
         self.gen_crba(use_thread_group)
         self.gen_aba(use_thread_group)
+        self.gen_fdsva(use_thread_group)
+        self.gen_fdsva_so(use_thread_group)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
         self.gen_add_end_control_flow()
