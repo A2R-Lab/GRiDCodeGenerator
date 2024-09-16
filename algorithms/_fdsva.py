@@ -1,4 +1,6 @@
 import numpy as np
+import copy 
+
 
 def gen_fdsva_inner(self, use_thread_group = False): 
 	# construct the boilerplate and function definition
@@ -7,13 +9,11 @@ def gen_fdsva_inner(self, use_thread_group = False):
                 "s_qd is the vector of joint velocities", \
                 "s_qdd is the vector of joint accelerations", \
                 "s_tau is the vector of joint torques", \
-                "s_id_dq is the first order of inverse dyanmics WRT q", \
-                "s_id_dqd is the first order of inverse dyanmics WRT qd", \
                 "s_temp is the pointer to the shared memory needed of size: " + \
                             str(self.gen_fdsva_inner_temp_mem_size()), \
                 "gravity is the gravity constant"]
     func_def_start = "void fdsva_inner("
-    func_def_middle = "T *s_fddq_fddqd_fddt, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau,  T *s_id_dq,  T *s_id_dqd, "
+    func_def_middle = "T *s_fddq_fddqd_fddt, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau, "
     func_def_end = "T *s_temp, const T gravity) {"
     func_notes = ["Assumes works with IDSVA"]
     if use_thread_group:
@@ -26,150 +26,234 @@ def gen_fdsva_inner(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    #
-    # Initial Debug Prints if Requested
-    #
-    if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
-        self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
-        self.gen_add_code_line("printf(\"qd\\n\"); printMat<T,1," + str(n) + ">(s_qd,1);")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*i],6);}")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"I[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*(i+" + str(n) + ")],6);}")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-
     # n = len(qd)
     n = self.robot.get_num_pos()
-    n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
+    # n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
 
-    # fddq = np.zeros((n,n))
-    # fddqd = np.zeros((n,n))
-    # fddt = np.zeros((n,n))
-
-    # fddq_offset = 0
-    # self.gen_add_code_line("T * fddq = &s_fddq_fddqd_fddt[" + str(fddq_offset) + "];")
-    # fddqd_offset = fddq_offset + n*n
-    # self.gen_add_code_line("T *fddqd = &s_fddq_fddqd_fddt[" + str(fddqd_offset) + "];")
-    # fddt_offset = fddqd_offset + n*n
-    # self.gen_add_code_line("T * fddt = &s_fddq_fddqd_fddt[" + str(fddt_offset) + "];")
-
-    M_offset = 0
-    self.gen_add_code_line("T * Minv = &s_temp[" + str(M_offset) + "];")
+    # M_offset = 0
+    # self.gen_add_code_line("T * s_Minv = &s_temp[" + str(M_offset) + "];")
 
     # Minv = np.linalg.inv(id_M)
     #import M from crba // figure out how to generaize for any M 
-    M =  [[ 0.6936, -0.1445,  0.7274,  0.0169,  0.0306, -0.0125, -0.0009],
-        [-0.1445,  3.6172, -0.1306, -1.1012,  0.0269,  0.0464,  0.0002],
-        [ 0.7274, -0.1306,  0.8871, -0.0052,  0.0324, -0.0133, -0.0015],
-        [0.0169, -1.1012, -0.0052,  0.8882, -0.0199, -0.0613,  0.0006],
-        [ 0.0306, 0.0269,  0.0324, -0.0199,  0.0209, -0,    0.0042],
-        [-0.0125,  0.0464, -0.0133, -0.0613, -0,     0.0213,  0  ],
-        [-0.0009,  0.0002, -0.0015,  0.0006,  0.0042,  0,      0.005 ]]
+    # M =  [[ 0.6936, -0.1445,  0.7274,  0.0169,  0.0306, -0.0125, -0.0009],
+    #     [-0.1445,  3.6172, -0.1306, -1.1012,  0.0269,  0.0464,  0.0002],
+    #     [ 0.7274, -0.1306,  0.8871, -0.0052,  0.0324, -0.0133, -0.0015],
+    #     [0.0169, -1.1012, -0.0052,  0.8882, -0.0199, -0.0613,  0.0006],
+    #     [ 0.0306, 0.0269,  0.0324, -0.0199,  0.0209, -0,    0.0042],
+    #     [-0.0125,  0.0464, -0.0133, -0.0613, -0,     0.0213,  0  ],
+    #     [-0.0009,  0.0002, -0.0015,  0.0006,  0.0042,  0,      0.005 ]]
     #inverse the matrix 
-    Minv = np.linalg.inv(M)
-    for row in range(len(Minv)):
-        for col in range(len(Minv[row])):
-            self.gen_add_code_line("Minv[" + str(len(Minv)*row + col) + "] = " +str(Minv[row][col]) + ";")
+    # Minv = np.linalg.inv(M)
+    # for row in range(len(Minv)):
+    #     for col in range(len(Minv[row])):
+    #         self.gen_add_code_line("s_Minv[" + str(len(Minv)*row + col) + "] = " +str(Minv[row][col]) + ";")
     
-    self.gen_add_code_line(" ")
+    # self.gen_add_code_line(" ")
+
+    self.gen_add_code_line("__shared__ T s_Minv["+ str(n*n) +"];")
+    self.gen_add_code_line("__shared__ T s_qdd1[" + str(n) + "];")
+    self.gen_add_code_line("__shared__ T s_vaf[" + str(n*12) + "];")
+    self.gen_add_code_line("__shared__ T s_dc_du[" + str(n*n*2) + "];")
+    # self.gen_add_code_line("__shared__ T s_df_du[" + str(n*n*3) + "];")
+    
+    
+    self.gen_add_code_line("direct_minv_inner<T>(s_Minv, s_q, s_XImats, s_temp);")
+
+    # for row_m in range(n):
+    #     for col_m in range(n):
+    #         if row_m > col_m:
+    #             self.gen_add_code_line("s_Minv["+ str(row_m + col_m*n) + "] = s_Minv["+ str(row_m*n + col_m) + "];")
+
+    # self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
+    # self.gen_add_code_line("s_fddq_fddqd_fddt[ 98 + ind] = s_Minv[ind] ;")
+    # self.gen_add_end_control_flow()
+    # self.gen_add_sync(use_thread_group)
+
+
+    # iddqd_offset = n*n + iddq_offset
+    # self.gen_add_code_line("T * iddq = &s_temp[" + str(iddq_offset) + "];")
     
     # fddq = iddq
-    self.gen_add_code_line("T * fddq = &s_id_dq[0];")
+
+    # iddq_offset = n*n + M_offset
+    # self.gen_add_code_line("T * iddq = &s_temp[" + str(iddq_offset) + "];")
+    # fddq_offset = n*n + M_offset
+    # self.gen_add_code_line("T * fddq = &s_temp[" + str(fddq_offset) + "];")
+   
+    
+    # fddq =  [[  0,      3.9818,   3.0601,   0.9813,  -1.749,    0.5841,   0    ],
+    #         [  0,     -64.0731,   0.0253,  29.2773,  -1.9972,   0.3182,  0    ],
+    #         [  0,       3.8337,   4.3914,   1.9117,  -1.9424,   0.6518,   0    ],
+    #         [  0,       8.0833,  -0.8577,  -1.948,    1.0627,  -0.0681,  -0    ],
+    #         [  0,      -0.2113,   0.0042,   0.0931,  -0.364,    0.2447,  -0    ],
+    #         [  0,       0.1874,   0.0013,  -0.5526,   0.1069,  -0.2258,   0    ],
+    #         [  0,      -0.0033,  -0.03,    -0.0098,   0.0761,  -0.0631,  -0   ]]
+
+    self.gen_add_code_line("inverse_dynamics_inner<T>(s_temp, s_vaf, s_q, s_qd, s_XImats, &s_temp[7], gravity);")
+    self.gen_add_code_line("forward_dynamics_finish<T>(s_qdd1, s_tau, s_temp, s_Minv);")
+    self.gen_add_code_line("inverse_dynamics_inner_vaf<T>(s_vaf, s_q, s_qd, s_qdd1, s_XImats, s_temp, gravity);")
+    self.gen_add_code_line("inverse_dynamics_gradient_inner<T>(s_dc_du, s_q, s_qd, s_vaf, s_XImats, s_temp, gravity);")
+
+    self.gen_add_code_line("T * di_dq = &s_dc_du[0];")
+    self.gen_add_code_line("T * di_dqd = &s_dc_du[49];")
+
+    for row_m in range(n):
+        for col_m in range(n):
+            if row_m > col_m:
+                self.gen_add_code_line("s_Minv["+ str(row_m + col_m*n) + "] = s_Minv["+ str(row_m*n + col_m) + "];")
+
+    self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
+    self.gen_add_code_line("s_fddq_fddqd_fddt[ 98 + ind] = s_Minv[ind] ;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    
+
+    # iddq =  [[  0,      3.9799,   5.022,   3.9703,  1.0418,    0.2037,   -0    ],
+    #         [  0,     23.898,   0.1634,  -11.9321,  -1.9972,   0.3182,  0    ],
+    #         [  0,       3.8337,   4.3914,   1.9117,  -1.9424,   0.6518,   0    ],
+    #         [  0,       8.0833,  -0.8577,  -1.948,    1.0627,  -0.0681,  -0    ],
+    #         [  0,      -0.2113,   0.0042,   0.0931,  -0.364,    0.2447,  -0    ],
+    #         [  0,       0.1874,   0.0013,  -0.5526,   0.1069,  -0.2258,   0    ],
+    #         [  0,      -0.0033,  -0.03,    -0.0098,   0.0761,  -0.0631,  -0   ]]
+    # for row in range(len(fddq)):
+    #     for col in range(len(fddq[row])):
+    #         self.gen_add_code_line("fddq[" + str(len(fddq)*col + row) + "] = " +str(fddq[row][col]) + ";")
+    
+    # self.gen_add_code_line(" ")
+
+    # fddq = (-1)*Minv@iddq
+    # n = len(Minv) 
+    for i in range(n):
+        self.gen_add_parallel_loop("ind",str(n),use_thread_group)
+        self.gen_add_code_line("int jid = " + str(i) + ";")
+        self.gen_add_code_line("int row = ind % " + str(n) + ";")
+        self.gen_add_code_line("int col = ind / " + str(n) + ";")
+
+        # self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &fddq[" + str(n) + "*col + row]);")
+        self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(n) + "*jid + ind] = dot_prod<T,7,7,1>(&s_Minv[row], &di_dq[" + str(n) + "*jid + col]);")
+        #s_fddq_fddqd_fddt[7*jid + ind] = dot_prod<T,7,7,1>(&Minv[row], &fddq[7*jid + col]);
+    
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
     # fddqd = iddqd
-    self.gen_add_code_line("T * fddqd = &s_id_dqd[0];")
+    # iddqd_offset = n*n + M_offset
+    # self.gen_add_code_line("T * fddqd = &s_temp[" + str(iddqd_offset) + "];")
+    # self.gen_add_code_line("T * fddqd = &temp[0];")
+
+    # fddqd_offset = n*n + iddqd_offset
+    # self.gen_add_code_line("T * fddq = &temp[" + str(fddqd_offset) + "];")
+
+
+
+    # fddqd =  [[  0,      0,   0,   0,  0,    0,   0    ],
+    #         [  0,     0,   0,  0,  0,   0,  0    ],
+    #         [  0,       0,   0,   0,  0,   0,   0    ],
+    #         [  0,       0,  0,  0,    0,  0,  0    ],
+    #         [  0,      0,   0,  0,   0,    0,  0    ],
+    #         [  0,       0,   0,  0,   0,    0,   0    ],
+    #         [  0,      0,  0,    0,   0,    0,  0   ]]
+    # for row in range(len(fddqd)):
+    #     for col in range(len(fddqd[row])):
+    #         self.gen_add_code_line("fddqd[" + str(len(fddqd)*col + row) + "] = " +str(fddqd[row][col]) + ";")
+    
+    # self.gen_add_code_line(" ")
+    for i in range(n):
+
+        # self.gen_add_code_line("M = &s_temp[" + str(M_offset) + "];")
+
+        # fddqd = (-1)*Minv@fddqd
+        self.gen_add_parallel_loop("ind",str(n),use_thread_group)
+        self.gen_add_code_line("int jid = " + str(i) + ";")
+        self.gen_add_code_line("int row = ind % " + str(n) + ";")
+        self.gen_add_code_line("int col = ind / " + str(n) + ";")
+
+        # self.gen_add_code_line("s_fddq_fddqd_fddt[ 49 + " + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &fddqd[" + str(n) + "*row + col]);")
+        # self.gen_add_code_line("s_fddq_fddqd_fddt[49 + ind] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &fddqd[" + str(n) + "*row + col]);")
+        self.gen_add_code_line("s_fddq_fddqd_fddt[49 + " + str(n) + "*jid + ind] = dot_prod<T," + str(n) + "," + str(n) + ",1>(&s_Minv[row], &di_dqd[" + str(n) + "*jid + col]);")
+
+   
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
     #placeholder to store fddt
-    self.gen_add_code_line("T * fddt= &s_id_dqd[0];")
-    self.gen_add_code_line(" ")
-    
-    fddq =  [[  0,      3.9818,   3.0601,   0.9813,  -1.749,    0.5841,   0    ],
-            [  0,     -64.0731,   0.0253,  29.2773,  -1.9972,   0.3182,  0    ],
-            [  0,       3.8337,   4.3914,   1.9117,  -1.9424,   0.6518,   0    ],
-            [  0,       8.0833,  -0.8577,  -1.948,    1.0627,  -0.0681,  -0    ],
-            [  0,      -0.2113,   0.0042,   0.0931,  -0.364,    0.2447,  -0    ],
-            [  0,       0.1874,   0.0013,  -0.5526,   0.1069,  -0.2258,   0    ],
-            [  0,      -0.0033,  -0.03,    -0.0098,   0.0761,  -0.0631,  -0   ]]
-    for row in range(len(fddq)):
-        for col in range(len(fddq[row])):
-            self.gen_add_code_line("fddq[" + str(len(fddq)*col + row) + "] = " +str(fddq[row][col]) + ";")
-    
+    # self.gen_add_code_line("T * fddt= &temp[0];")
     self.gen_add_code_line(" ")
 
-    fddqd =  [[  0,      0,   0,   0,  0,    0,   0    ],
-            [  0,     0,   0,  0,  0,   0,  0    ],
-            [  0,       0,   0,   0,  0,   0,   0    ],
-            [  0,       0,  0,  0,    0,  0,  0    ],
-            [  0,      0,   0,  0,   0,    0,  0    ],
-            [  0,       0,   0,  0,   0,    0,   0    ],
-            [  0,      0,  0,    0,   0,    0,  0   ]]
-    for row in range(len(fddqd)):
-        for col in range(len(fddqd[row])):
-            self.gen_add_code_line("fddqd[" + str(len(fddqd)*col + row) + "] = " +str(fddqd[row][col]) + ";")
     
-    self.gen_add_code_line(" ")
-
-    # self.gen_add_code_line("M = &s_temp[" + str(M_offset) + "];")
 
 
+    # # fddq = (-1)*Minv@fddq
+    # n = len(Minv) 
+    # self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
+    # self.gen_add_code_line("int row = ind / " + str(n) + ";")
+    # self.gen_add_code_line("int col = ind % " + str(n) + ";")
 
-    # fddq = (-1)*Minv@fddq
-    n = len(Minv) 
-    self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
-    self.gen_add_code_line("int row = ind / " + str(n) + ";")
-    self.gen_add_code_line("int col = ind % " + str(n) + ";")
-
-    self.gen_add_code_line("fddq[" + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &s_id_dq[" + str(n) + "*col + row]);")
+    # self.gen_add_code_line("fddq[" + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &s_id_dq[" + str(n) + "*col + row]);")
    
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    # self.gen_add_end_control_flow()
+    # self.gen_add_sync(use_thread_group)
 
 
-    # fddqd = (-1)*Minv@fddqd
-    self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
-    self.gen_add_code_line("int row = ind / " + str(n) + ";")
-    self.gen_add_code_line("int col = ind % " + str(n) + ";")
+    # # fddqd = (-1)*Minv@fddqd
+    # self.gen_add_parallel_loop("ind",str(n*n),use_thread_group)
+    # self.gen_add_code_line("int row = ind / " + str(n) + ";")
+    # self.gen_add_code_line("int col = ind % " + str(n) + ";")
 
-    self.gen_add_code_line("fddqd[" + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &s_id_dqd[" + str(n) + "*row + col]);")
+    # self.gen_add_code_line("fddqd[" + str(n) + "*row + col] = dot_prod<T,7,7,1>(&Minv[" + str(n) + "*row + col], &s_id_dqd[" + str(n) + "*row + col]);")
    
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    # self.gen_add_end_control_flow()
+    # self.gen_add_sync(use_thread_group)
 
 
     # fddt = Minv 
-    self.gen_add_parallel_loop("ind",str(n*n*3),use_thread_group)
-    self.gen_add_code_line("int row = ind / " + str(n) + ";")
-    self.gen_add_code_line("int col = ind % " + str(n) + ";")
+    # self.gen_add_parallel_loop("ind",str(n*n*3),use_thread_group)
+    # self.gen_add_code_line("int row = ind / " + str(n) + ";")
+    # self.gen_add_code_line("int col = ind % " + str(n) + ";")
 
-    self.gen_add_code_line("fddt[" + str(n) + "*row + col] = Minv["+ str(n) + "*row + col];")
+    # self.gen_add_code_line("fddt[" + str(n) + "*row + col] = Minv["+ str(n) + "*row + col];")
+   
+    # self.gen_add_end_control_flow()
+    # self.gen_add_sync(use_thread_group)
+
+    # mult fddq and fddqd w -1
+    self.gen_add_parallel_loop("ind",str(n*n*2),use_thread_group)
+    # self.gen_add_code_line("int row = ind / " + str(n) + ";")
+    # self.gen_add_code_line("int col = ind % " + str(n) + ";")
+
+    # self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(n) + "*row + col] *= (-1);")
+    self.gen_add_code_line("s_fddq_fddqd_fddt[ind] *= (-1);")
    
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
+    
+    # self.gen_add_code_line("if(threadIdx.x == 0 && blockIdx.x == 0){")
+    # self.gen_add_code_line("printf(\"s_fddq_fddqd_fddt[0] = \");")
+    # self.gen_add_code_line("printMat<T,7,7>(&s_fddq_fddqd_fddt[0],7);")
 
-    self.gen_add_parallel_loop("ind",str(n*n*3),use_thread_group)
-    self.gen_add_code_line("int row = ind / " + str(n) + ";")
-    self.gen_add_code_line("int col = ind % " + str(n) + ";")
+    # self.gen_add_code_line("printf(\"s_fddq_fddqd_fddt[49] = \");")
+    # self.gen_add_code_line("printMat<T,7,7>(&s_fddq_fddqd_fddt[49],7);")
 
-    self.gen_add_code_line("fddq[" + str(n) + "*row + col] *= (-1);")
-    self.gen_add_code_line("fddqd[" + str(n) + "*row + col] *= (-1);")
-   
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    # self.gen_add_code_line("printf(\"s_fddq_fddqd_fddt[98] = \");")
+    # self.gen_add_code_line("printMat<T,7,7>(&s_fddq_fddqd_fddt[98],7);")
+    # self.gen_add_code_line("}")
 
-    fddq_offset = 0
-    self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddq_offset) + "] = *fddq;")
-    fddqd_offset = fddq_offset + n*n
-    self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddqd_offset) + "] = *fddqd;")
-    fddt_offset = fddqd_offset + n*n
-    self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddt_offset) + "] = *fddt;")
+
+    # fddq_offset = 0
+    # self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddq_offset) + "] = *fddq;")
+    # fddqd_offset = fddq_offset + n*n
+    # self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddqd_offset) + "] = *fddqd;")
+    # fddt_offset = fddqd_offset + n*n
+    # self.gen_add_code_line("s_fddq_fddqd_fddt[" + str(fddt_offset) + "] = *fddt;")
 
     self.gen_add_end_function()
 
     
-
-    
 def gen_fdsva_inner_temp_mem_size(self):
     n = self.robot.get_num_pos()
-    return 140 * n
+    minv_temp = self.gen_direct_minv_inner_temp_mem_size()
+    id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    return max(minv_temp,id_du_temp)
     
 def gen_fdsva_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -178,15 +262,13 @@ def gen_fdsva_inner_function_call(self, use_thread_group = False, updated_var_na
         s_qd_name = "s_qd", \
         s_qdd_name = "s_qdd", \
         s_tau_name = "s_tau", \
-        s_id_dq_name = "s_id_dq", \
-        s_id_dqd_name = "s_id_dqd", \
         s_temp_name = "s_temp", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    fdsva_code_start = "fdsva_inner<T>(" + var_names["s_fddq_fddqd_fddt_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", " + var_names["s_tau_name"] + ", " + var_names["s_id_dq_name"] + ", " + var_names["s_id_dqd_name"] + ", "
+    fdsva_code_start = "fdsva_inner<T>(" + var_names["s_fddq_fddqd_fddt_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", " + var_names["s_tau_name"] + ", " 
     fdsva_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
@@ -206,13 +288,11 @@ def gen_fdsva_device(self, use_thread_group = False):
                    "s_qd is the vector of joint velocities", \
                    "s_qdd is the vector of joint accelerations", \
                    "s_tau is the vector of joint torques", \
-                   "s_id_dq is the first order of inverse dyanmics WRT q", \
-                   "s_id_dqd is the first order of inverse dyanmics WRT qd", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "gravity is the gravity constant"]
     func_notes = []
     func_def_start = "void fdsva_device("
-    func_def_middle = "const T *s_q, const T *s_qd, const T *s_qdd, const T *s_tau, const T *s_id_dq, const T *s_id_dqd,"
+    func_def_middle = "const T *s_q, const T *s_qd, const T *s_qdd, const T *s_tau,"
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
@@ -242,13 +322,12 @@ def gen_fdsva_kernel(self, use_thread_group = False, single_call_timing = False)
     # define function def and params
     func_params = ["d_q_qd_qdd_tau is the vector of joint positions, velocities, accelerations", \
                     "stride_q_qd_qdd is the stride between each q, qd, qdd", \
-                    "d_id_dq_dqd is the first order of inverse dyanmics WRT q and qd", \
                     "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                     "d_tau is the vector of joint torques", \
                     "gravity is the gravity constant", \
                     "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void fdsva_kernel(T *d_fddq_fddqd_fddt, const T *d_q_qd_qdd_tau, const int stride_q_qd_qdd, const T *d_id_dq_dqd, "
+    func_def_start = "void fdsva_kernel(T *d_fddq_fddqd_fddt, const T *d_q_qd_qdd_tau, const int stride_q_qd_qdd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -264,7 +343,7 @@ def gen_fdsva_kernel(self, use_thread_group = False, single_call_timing = False)
     # add shared memory variables
     shared_mem_vars = ["__shared__ T s_fddq_fddqd_fddt[3*" + str(n*n) + "];", \
                         "__shared__ T s_q_qd_qdd_tau[4*" + str(n) + "]; T *s_q = s_q_qd_qdd_tau; T *s_qd = &s_q_qd_qdd_tau[" + str(n) + "]; T *s_qdd = &s_q_qd_qdd_tau[2 * " + str(n) + "]; T *s_tau = &s_q_qd_qdd_tau[3 * " + str(n) + "];",\
-                        "__shared__ T s_id_dq_dqd[2* " + str(n*n) + "]; T *s_id_dq = s_id_dq_dqd; T *s_id_dqd = &s_id_dq_dqd[" + str(n*n) + "];"]
+                        ]
     self.gen_add_code_lines(shared_mem_vars)
     shared_mem_size = self.gen_fdsva_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
@@ -323,7 +402,7 @@ def gen_fdsva_host(self, mode = 0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
 
-    func_call_start = "fdsva_kernel<T><<<block_dimms,thread_dimms,FDSVA_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_fddq_fddqd_fddt,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_id_dq_dqd,"
+    func_call_start = "fdsva_kernel<T><<<block_dimms,thread_dimms,FDSVA_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_fddq_fddqd_fddt,hd_data->d_q_qd_u,stride_q_qd_qdd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd_qdd = 3*NUM_JOINTS;")
     if single_call_timing:
