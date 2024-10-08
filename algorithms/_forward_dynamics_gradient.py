@@ -1,11 +1,11 @@
 def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     minv_temp = self.gen_direct_minv_inner_temp_mem_size()
     id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return max(minv_temp,id_du_temp) if not use_qdd_Minv_input else id_du_temp
 
 def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, use_qdd_Minv_input = False, s_df_du_name = "s_df_du"):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     if not use_qdd_Minv_input:
         #
         # TODO: there is a slightly faster way as s_v does not change -- thus no recompute needed
@@ -57,7 +57,8 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
     self.gen_add_end_control_flow()
 
 def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd_Minv_input = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
 
     # construct the boilerplate and function definition
     func_params = ["s_df_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
@@ -85,7 +86,7 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    self.gen_add_code_lines(["__shared__ T s_vaf[" + str(18*n) + "];",
+    self.gen_add_code_lines(["__shared__ T s_vaf[" + str(18*NJ) + "];",
                              "__shared__ T s_dc_du[" + str(n*2*n) + "];"])
     if not use_qdd_Minv_input:
         self.gen_add_code_lines(["__shared__ T s_Minv[" + str(n*n) + "];",
@@ -99,13 +100,14 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_end_function()
 
 def gen_forward_dynamics_gradient_kernel_max_temp_mem_size(self):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     base_size = 2*n + n*2*n + n*2*n + 18*n + n + n*n + n
     temp_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
 def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd_Minv_input = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
     # define function def and params
     func_params = ["d_df_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
@@ -134,13 +136,13 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q_qd[2*" + str(n) + "]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];", \
+    shared_mem_vars = [f"__shared__ T s_q_qd[{2*n+self.robot.floating_base}]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];", \
                        "__shared__ T s_dc_du[" + str(n*2*n) + "];",
-                       "__shared__ T s_vaf[" + str(18*n) + "];",
+                       "__shared__ T s_vaf[" + str(18*NJ) + "];",
                        "__shared__ T s_qdd[" + str(n) + "];",
                        "__shared__ T s_Minv[" + str(n*n) + "];"]
     if not use_qdd_Minv_input:
-        shared_mem_vars[0] = "__shared__ T s_q_qd_u[3*" + str(n) + "]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[" + str(2*n) + "];"
+        shared_mem_vars[0] = f"__shared__ T s_q_qd_u[{3*n+self.robot.floating_base}]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];"
     self.gen_add_code_lines(shared_mem_vars)
     shared_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
@@ -150,9 +152,9 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n),use_thread_group,"qdd",str(n),str(n),"Minv",str(n*n),str(n*n))
+            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),str(n),"Minv",str(n*n),str(n*n))
         else:
-            self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -163,9 +165,9 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n),"Minv",str(n*n))
+            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),"Minv",str(n*n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n),use_thread_group)
+            self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)

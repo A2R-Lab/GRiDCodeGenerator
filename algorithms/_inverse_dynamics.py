@@ -119,8 +119,9 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                 self.gen_add_parallel_loop("row",str(6),use_thread_group)
                 jid = str(inds[0])
             self.gen_add_code_lines(["int jid6 = 6*" + jid + ";", \
-                                     "s_vaf[jid6 + row] = static_cast<T>(0);", \
-                                     "s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;"])
+                                        "s_vaf[jid6 + row] = static_cast<T>(0);",])
+            if not self.robot.floating_base or not use_qdd_input: self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;")
+            else: self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity + s_qdd[row];")
             # then add in qd and qdd
             if S_ind_cpp == '-1': # floating base returns -1, and has 6x6 identity matrix
                 qd_qdd_code = "s_vaf[jid6 + row] = s_qd[row];" 

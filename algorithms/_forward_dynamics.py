@@ -19,7 +19,7 @@ def gen_forward_dynamics_finish_function_call(self, use_thread_group = False, up
     self.gen_add_code_line(code)
 
 def gen_forward_dynamics_finish(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_qdd is a pointer to memory for the final result", \
                    "s_u is the vector of joint input torques", \
@@ -70,7 +70,8 @@ def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, upd
     self.gen_add_code_line(fd_code)
 
 def gen_forward_dynamics_inner(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
     # construct the boilerplate and function definition
     func_params = ["s_qdd is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
@@ -94,7 +95,7 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     self.gen_add_code_line(func_def, True)
     updated_var_names = dict(s_Minv_name = "s_temp", s_temp_name = "&s_temp[" + str(n*n) + "]")
     self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names)
-    updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + 19*n) + "]")
+    updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
     self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
     
     if self.DEBUG_MODE:
@@ -112,7 +113,7 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_forward_dynamics_device(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_qdd is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
@@ -141,7 +142,7 @@ def gen_forward_dynamics_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     # define function def and params
     func_params = ["d_qdd is a pointer to memory for the final result", \
                    "d_q_qd_u is the vector of joint positions, velocities, and input torques", \
@@ -161,7 +162,7 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q_qd_u[" + str(3*n) + "]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[" + str(2*n) + "];", \
+    shared_mem_vars = ["__shared__ T s_q_qd_u[" + str(3*n+self.robot.floating_base) + "]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n+self.robot.floating_base) + "]; T *s_u = &s_q_qd_u[" + str(2*n+self.robot.floating_base) + "];", \
                        "__shared__ T s_qdd[" + str(n) + "];"]
     self.gen_add_code_lines(shared_mem_vars)
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
@@ -182,7 +183,7 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n))
+        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base))
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
