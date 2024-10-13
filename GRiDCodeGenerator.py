@@ -34,7 +34,11 @@ class GRiDCodeGenerator:
                             gen_end_effector_positions_device_temp_mem_size, gen_end_effector_positions_device, gen_end_effector_positions_kernel, \
                             gen_end_effector_positions_host, gen_end_effector_positions_gradient_inner_temp_mem_size, gen_end_effector_positions_gradient_inner_function_call, \
                             gen_end_effector_positions_gradient_inner, gen_end_effector_positions_gradient_device, \
-                            gen_end_effector_positions_gradient_kernel, gen_end_effector_positions_gradient_host, gen_eepos_and_gradient
+                            gen_end_effector_positions_gradient_kernel, gen_end_effector_positions_gradient_host, gen_eepos_and_gradient, \
+                            gen_aba, gen_aba_inner, gen_aba_host, \
+                            gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
+                            gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
+                            gen_crba_device, gen_crba_kernel, gen_crba_host
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -87,6 +91,8 @@ class GRiDCodeGenerator:
                                  "const int FD_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_forward_dynamics_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int ID_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_inverse_dynamics_gradient_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int FD_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size) + ";", \
+                                 "const int ABA_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_aba_inner_temp_mem_size() + XI_size) + ";", \
+                                 "const int CRBA_SHARED_MEM_COUNT = " + str(self.gen_crba_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int ID_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_inverse_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int FD_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_forward_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_positions_inner_temp_mem_size()) + XHom_size) + ";", \
@@ -114,6 +120,7 @@ class GRiDCodeGenerator:
                                  "    T *d_c;", \
                                  "    T *d_Minv;", \
                                  "    T *d_qdd;", \
+                                 "    T *d_M;", \
                                  "    T *d_dc_du;", \
                                  "    T *d_df_du;", \
                                  "    T *d_eePos;", \
@@ -122,6 +129,7 @@ class GRiDCodeGenerator:
                                  "    T *h_c;", \
                                  "    T *h_Minv;", \
                                  "    T *h_qdd;", \
+                                 "    T *h_M;", \
                                  "    T *h_dc_du;", \
                                  "    T *h_df_du;", \
                                  "    T *h_eePos;", \
@@ -142,6 +150,7 @@ class GRiDCodeGenerator:
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_c, NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_Minv, NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_qdd, NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "gpuErrchk(cudaMalloc((void**)&hd_data->d_M, NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_dc_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
@@ -149,6 +158,7 @@ class GRiDCodeGenerator:
                       "// and the CPU", \
                       "hd_data->h_c = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_Minv = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "hd_data->h_M = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_qdd = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_dc_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_df_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -348,7 +358,11 @@ class GRiDCodeGenerator:
         self.gen_forward_dynamics(use_thread_group)
         self.gen_inverse_dynamics_gradient(use_thread_group)
         self.gen_forward_dynamics_gradient(use_thread_group)
-        if self.robot.floating_base: print('eepos, and debug mode are still under development for floating base')
+        print('crba is still under development')
+        if self.robot.floating_base: print('eepos, aba, crba, and debug mode are still under development for floating base')
+        else:
+            self.gen_aba(use_thread_group)
+            self.gen_crba(use_thread_group)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
         self.gen_add_end_control_flow()
