@@ -239,12 +239,14 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 else:
                     jid = inds[0]
                     parent_ind_cpp = self.robot.get_parent_id(jid)
+                self.gen_add_code_line(f"int dof_id = {jid}+5;")
                 self.gen_add_code_line(f"int du_offset = dq_flag ? {Offset_dv_dq} + {6*n}*{jid} : {Offset_dv_dqd} + {6*n}*{jid};")
                 self.gen_add_code_line(f"int parent_du_offset = dq_flag ? {Offset_dv_dq} + {6*n}*{parent_ind_cpp} : {Offset_dv_dqd} + {6*n}*{parent_ind_cpp};")
                 self.gen_add_code_line("s_temp[du_offset + 6*col + row] = dot_prod<T,6,6,1>(&s_XImats[36 * " + str(jid) + " + row]," + \
                                         " &s_temp[6*col + parent_du_offset]);")
                 # then add in S or Mx(Xv)
                 self.gen_add_code_line(f"if (col == {jid} + 5)" + ' {', True)
+                if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
                 self.gen_add_code_line(f"s_temp[du_offset + 6*col + row] += !dq_flag * (row == {S_ind_cpp})" + \
                                         f" + dq_flag * s_temp[{Offset_MxXv} + ({jid}+5)*6 + row];")
                 self.gen_add_end_control_flow()
