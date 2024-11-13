@@ -81,10 +81,11 @@ class GRiDCodeGenerator:
         n = self.robot.get_num_pos()
         XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
         XHom_size = self.gen_get_Xhom_size()
-        dva_cols_per_partial = self.robot.get_total_ancestor_count() + n
+        dva_cols_per_partial = self.robot.get_total_ancestor_count() + self.robot.get_num_joints()
         max_threads_in_comp_loop = 6*2*dva_cols_per_partial
         suggested_threads = 32 * int(np.ceil(max_threads_in_comp_loop/32.0))
         self.gen_add_code_lines(["const int NUM_JOINTS = " + str(self.robot.get_num_pos()) + ";", \
+                                 "const int NUM_VEL = " + str(self.robot.get_num_vel()) + ";", \
                                  "const int NUM_EES = " + str(self.robot.get_total_leaf_nodes()) + ";", \
                                  "const int ID_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int MINV_DYNAMIC_SHARED_MEM_COUNT = " + str(self.gen_direct_minv_inner_temp_mem_size() + XI_size) + ";", \
@@ -358,7 +359,6 @@ class GRiDCodeGenerator:
         self.gen_forward_dynamics(use_thread_group)
         self.gen_inverse_dynamics_gradient(use_thread_group)
         self.gen_forward_dynamics_gradient(use_thread_group)
-        print('crba is still under development')
         if self.robot.floating_base: print('eepos, aba, crba, and debug mode are still under development for floating base')
         else:
             self.gen_aba(use_thread_group)
