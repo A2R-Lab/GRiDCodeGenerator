@@ -32,6 +32,93 @@ def gen_mx_func_call_for_cpp(self, inds = None, PEQ_FLAG = False, SCALE_FLAG = F
     code_end = ");"
     self.gen_add_code_line(code_start + code_middle + code_end)
 
+def gen_crm_mul(self):
+    """
+    This function generates the code for the 
+    motion cross product matrix multiplication function.
+    It multiplies a cross product matrix by a vector.
+    It returns the result of the entry at the index.
+    """
+    self.gen_add_func_doc("Compute the motion cross product multiplication of a 6-vector, v_crm, with a second 6-vector v", [], \
+                          ['index is the index of the result vector to compute', \
+                            'v_crm is the 6-vector to take the cross product matrix of', \
+                           'v is the 6-vector to multiply with v_crm'])
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("T crm_mul(int index, T *v_crm, T *v) {", True)
+    self.gen_add_code_line("T result;")
+    self.gen_add_code_line('if (index == 0) result = -v_crm[2] * v[1] + v_crm[1] * v[2];')
+    self.gen_add_code_line('if (index == 1) result = v_crm[2] * v[0] - v_crm[0] * v[2];')
+    self.gen_add_code_line('if (index == 2) result = -v_crm[1] * v[0] + v_crm[0] * v[1];')
+    self.gen_add_code_line('if (index == 3) result = -v_crm[5] * v[1] + v_crm[4] * v[2] - v_crm[2] * v[4] + v_crm[1] * v[5];')
+    self.gen_add_code_line('if (index == 4) result = v_crm[5] * v[0] - v_crm[3] * v[2] + v_crm[2] * v[3] - v_crm[0] * v[5];')
+    self.gen_add_code_line('if (index == 5) result = -v_crm[4] * v[0] + v_crm[3] * v[1] - v_crm[1] * v[3] + v_crm[0] * v[4];')
+    self.gen_add_code_line('return result;')
+    self.gen_add_end_function()
+
+
+def gen_crm(self):
+    """
+    This function generates the code for 
+    the spatial motion cross product 
+    operation function. It computes the
+    motion cross product operation of a vector.
+    """
+    self.gen_add_func_doc("Compute the motion cross product matrix of a 6-vector, v Returns the entry at the index.", \
+                          ['The force cross product matrix is just the negative transpose of this matrix'], \
+                          ['index is the index of the result matirx to compute', \
+                           'v is the 6-vector to take the cross product matrix of'])
+    
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("T crm(int index, T *v) {", True)
+    self.gen_add_code_line("T result;")
+    self.gen_add_code_lines(['if (index == 0) result = static_cast<T>(0);',
+                             'if (index == 1) result = v[2];',
+                             'if (index == 2) result = -v[1];',
+                             'if (index == 3) result = static_cast<T>(0);',
+                             'if (index == 4) result = v[5];',
+                             'if (index == 5) result = -v[4];',
+                             
+                             'if (index == 6) result = -v[2];',
+                             'if (index == 7) result = static_cast<T>(0);',
+                             'if (index == 8) result = v[0];',
+                             'if (index == 9) result = -v[5];',
+                             'if (index == 10) result = static_cast<T>(0);',
+                             'if (index == 11) result = v[3];',
+                             
+                             'if (index == 12) result = v[1];',
+                             'if (index == 13) result = -v[0];',
+                             'if (index == 14) result = static_cast<T>(0);',
+                             'if (index == 15) result = v[4];',
+                             'if (index == 16) result = -v[3];',
+                             'if (index == 17) result = static_cast<T>(0);'
+
+                             'if (index == 18) result = static_cast<T>(0);',
+                             'if (index == 19) result = static_cast<T>(0);',
+                             'if (index == 20) result = static_cast<T>(0);',
+                             'if (index == 21) result = static_cast<T>(0);',
+                             'if (index == 22) result = v[2];',
+                             'if (index == 23) result = -v[1];',
+
+                             'if (index == 24) result = static_cast<T>(0);',
+                             'if (index == 25) result = static_cast<T>(0);',
+                             'if (index == 26) result = static_cast<T>(0);',
+                             'if (index == 27) result = -v[2];',
+                             'if (index == 28) result = static_cast<T>(0);',
+                             'if (index == 29) result = v[0];',
+                             
+                             'if (index == 30) result = static_cast<T>(0);',
+                             'if (index == 31) result = static_cast<T>(0);',
+                             'if (index == 32) result = static_cast<T>(0);',
+                             'if (index == 33) result = v[1];',
+                             'if (index == 34) result = -v[0];',
+                             'if (index == 35) result = static_cast<T>(0);'])
+
+    self.gen_add_code_line("return result;")
+    self.gen_add_end_function()
+
+
 def gen_spatial_algebra_helpers(self):
     # First function -- add dot product code with and without const
     for i in range(4):
@@ -300,3 +387,67 @@ def gen_spatial_algebra_helpers(self):
     self.gen_add_code_line("dest[34] = -1*v[0];")
     self.gen_add_code_line("dest[35] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
+
+
+    # ICRF
+    """
+    Generates the function that computes
+    the inverse force cross product matrix.
+    icrf is defined such that v crf f = f icrf v.
+    """
+    self.gen_add_func_doc("Compute the inverse force cross product matrix of a 6-vector, v Returns the entry at the index.", \
+                          ['ICRF is the operation defined such that v crf f = f icrf v'], \
+                          ['index is the index of the result matirx to compute', \
+                           'v is the 6-vector to take the cross product matrix of'])
+    
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("T icrf(int index, T *v) {", True)
+    self.gen_add_code_line("T result;")
+    self.gen_add_code_lines(['if (index == 0) result = static_cast<T>(0);',
+                             'if (index == 1) result = v[2];',
+                             'if (index == 2) result = -v[1];',
+                             'if (index == 3) result = static_cast<T>(0);',
+                             'if (index == 4) result = v[5];',
+                             'if (index == 5) result = -v[4];',
+                             
+                             'if (index == 6) result = -v[2];',
+                             'if (index == 7) result = static_cast<T>(0);',
+                             'if (index == 8) result = v[0];',
+                             'if (index == 9) result = -v[5];',
+                             'if (index == 10) result = static_cast<T>(0);',
+                             'if (index == 11) result = v[3];',
+                             
+                             'if (index == 12) result = v[1];',
+                             'if (index == 13) result = -v[0];',
+                             'if (index == 14) result = static_cast<T>(0);',
+                             'if (index == 15) result = v[4];',
+                             'if (index == 16) result = -v[3];',
+                             'if (index == 17) result = static_cast<T>(0);'
+
+                             'if (index == 18) result = static_cast<T>(0);',
+                             'if (index == 19) result = v[5];',
+                             'if (index == 20) result = -v[4];',
+                             'if (index == 21) result = static_cast<T>(0);',
+                             'if (index == 22) result = static_cast<T>(0);',
+                             'if (index == 23) result = static_cast<T>(0);',
+
+                             'if (index == 24) result = -v[5];',
+                             'if (index == 25) result = static_cast<T>(0);',
+                             'if (index == 26) result = v[3];',
+                             'if (index == 27) result = static_cast<T>(0);',
+                             'if (index == 28) result = static_cast<T>(0);',
+                             'if (index == 29) result = static_cast<T>(0);',
+                             
+                             'if (index == 30) result = v[4];',
+                             'if (index == 31) result = -v[3];',
+                             'if (index == 32) result = static_cast<T>(0);',
+                             'if (index == 33) result = static_cast<T>(0);',
+                             'if (index == 34) result = static_cast<T>(0);',
+                             'if (index == 35) result = static_cast<T>(0);'])
+
+    self.gen_add_code_line("return -result;")
+    self.gen_add_end_function()
+
+    
+                            

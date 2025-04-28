@@ -243,6 +243,11 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
         self.gen_add_code_line("printf(\"Single Call FD_DU %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
 
+def gen_forward_dynamics_gradient_device_function_call(self, compute_Minv=False):
+    if compute_Minv:
+        self.gen_add_code_line("forward_dynamics_gradient_device<T>(s_df_du, s_q, s_qd, s_u, s_Minv, d_robotModel, gravity);")
+    else: self.gen_add_code_line("forward_dynamics_gradient_device(s_df_du, s_q, s_qd, s_u, d_robotModel, gravity);")
+
 def gen_forward_dynamics_gradient(self, use_thread_group = False):
     # first device wrappers
     self.gen_forward_dynamics_gradient_device(use_thread_group,False)

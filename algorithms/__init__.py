@@ -6,3 +6,5 @@ from ._forward_dynamics_gradient import *
 from ._eepos_and_gradient import *
 from ._aba import *
 from ._crba import *
+from ._idsva_so import *
+from ._fdsva_so import *
