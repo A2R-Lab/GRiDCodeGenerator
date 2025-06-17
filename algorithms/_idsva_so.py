@@ -66,7 +66,7 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
 
 
     # MEMORY LAYOUT (s_temp):
-        # Xup(36 * NJ)/Xdown(36*NJ)/
+        # Xdown(36*NJ)/
             # vJ(6 * NJ)/f(6*NJ)/ICT_S(6*NJ) & 
             # v(6 * NJ)/psid_Sd(6*NJ) & 
             # Sd(6 * NJ) & 
@@ -89,7 +89,7 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
         # crf_psid (36 * NJ)/D4 (36*NJ)
         # icrf_f (36 * NJ)/D1 (36*NJ)
         # D2 (36*NJ)
-        # t - t1/t2/t3/t4/t5/t6/t7/t8/t9 [(len(jids_a) * 36]/p1 & p2 & p3 & p4 & p5 & p6 ([len(jids_a) * 6]*6)
+        # Xup(36*NJ)/t - t1/t2/t3/t4/t5/t6/t7/t8/t9 [(len(jids_a) * 36]/p1 & p2 & p3 & p4 & p5 & p6 ([len(jids_a) * 6]*6)
 
 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
@@ -97,10 +97,10 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     vars = [
         '// Relevant Tensors in the order they appear',
         'T *I = s_XImats + XIMAT_SIZE*NUM_JOINTS;', # Inertia Matrices (6x6 for each joint)
-        f'T *Xup = s_temp;', # Spatial Transforms from parent to child (6x6 for each joint)
-        'T *IC = Xup + XIMAT_SIZE*NUM_JOINTS;', # Centroidal Inertia (6x6 for each joint)
+        f'T *Xup = s_temp + 11*XIMAT_SIZE*NUM_JOINTS;', # Spatial Transforms from parent to child (6x6 for each joint)
+        'T *IC = s_temp + XIMAT_SIZE*NUM_JOINTS;', # Centroidal Inertia (6x6 for each joint)
         # Xup, I_Xup done being used
-        'T *Xdown = Xup;\n', # Spatial Transforms from child to parent (6x6 for each joint)
+        'T *Xdown = s_temp;\n', # Spatial Transforms from child to parent (6x6 for each joint)
         'T *S = IC + XIMAT_SIZE*NUM_JOINTS;', # Transformed Joint Subspace Tensors (6x1 for each joint)
         # Xdown done being used
         'T *vJ = Xdown;', # Non-propogated Joint Spatial velocities (6x1 for each joint),
@@ -222,17 +222,20 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line("// Compute Xdown - child to parent transformation matrices")
     self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_JOINTS',use_thread_group)
-    self.gen_add_code_line('T temp = Xup[i]; // Xup and Xdown are in the same memory')
-    self.gen_add_code_line('int sub_idx = i % XIMAT_SIZE;')
+    self.gen_add_code_line('size_t idx = i % XIMAT_SIZE;')
+    self.gen_add_code_line('size_t sub_idx = idx % 18;')
     # TODO fix magic numbers
-    self.gen_add_code_line('if (sub_idx % 18 == 1 || sub_idx % 18 == 4 || sub_idx % 18 == 8 || sub_idx % 18 == 11) {', True)
+    self.gen_add_code_line('if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {', True)
     self.gen_add_code_line(f'Xdown[i] = Xup[i+5];')
-    self.gen_add_code_line(f'Xdown[i+5] = temp;')
+    self.gen_add_code_line(f'Xdown[i+5] = Xup[i];')
     self.gen_add_end_control_flow()
-    self.gen_add_code_line('else if (sub_idx % 18 == 2 || sub_idx % 18 == 5) {', True)
+    self.gen_add_code_line('else if (idx % 18 == 2 || idx % 18 == 5) {', True)
     self.gen_add_code_line(f'Xdown[i] = Xup[i+10];')
-    self.gen_add_code_line('Xdown[i+10] = temp;')
+    self.gen_add_code_line('Xdown[i+10] = Xup[i];')
     self.gen_add_end_control_flow()
+    self.gen_add_code_line('else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 &&')
+    self.gen_add_code_line('            sub_idx != 12 && sub_idx != 15)', True)
+    self.gen_add_code_line(f'Xdown[i] = Xup[i];')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 

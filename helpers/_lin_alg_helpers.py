@@ -116,5 +116,5 @@ def gen_outer_product(self):
     self.gen_add_code_line("void outerProduct(T *a, T *b, T *dest, int aLength, int bLength, int idx) {", True)
     self.gen_add_code_line("int row = idx / bLength;")
     self.gen_add_code_line("int col = idx % bLength;")
-    self.gen_add_code_line("if (row < aLength && col < bLength) dest[col * bLength + row] = a[row] * b[col];")
+    self.gen_add_code_line("if (row < aLength && col < bLength) dest[col * aLength + row] = a[row] * b[col];")
     self.gen_add_end_function()
