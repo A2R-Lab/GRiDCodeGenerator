@@ -732,19 +732,168 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     # Initial Debug Prints if Requested
     #
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
-        self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,4,4>(&s_Xhom[16*i],4);}")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"dX[%d]\\n\",i); printMat<T,4,4>(&s_dXhom[16*i],4);}")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"d2X[%d]\\n\",i); printMat<T,4,4>(&s_d2Xhom[16*i],4);}")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        debug_code_lines = ["printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);", \
+                            "for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,4,4>(&s_Xhom[16*i],4);}"
+                            "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX[%d]\\n\",i); printMat<T,4,4>(&s_dXhom[16*i],4);}"]
+        self.gen_add_debug_print_code_lines(debug_code_lines,use_thread_group)
+
     #
+    # For each chain we need to (in parallel) multiply the (d)Xmats
+    # 
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// For each branch/gradient in parallel chain up the transform")
+    self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
+    self.gen_add_code_line("// Keep all gradients (and the value) as we need them for the hessian")
+    self.gen_add_code_line("T *s_eeTemp = &s_temp[0]; T *s_deeTemp = &s_temp[" + str(2*16*num_ees) + "];")
+    for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
+        # if serial chain manipulator then this is easy
+        if self.robot.is_serial_chain():
+            self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
+            if bfs_level == 0:
+                self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
+                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int eeIndStart = 16*" + str(all_ees[0]) + ";")
+                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[eeIndStart + rc];")
+                self.gen_add_code_line("s_deeTemp[ind] = (djid == " + str(all_ees[0]) + ") ? s_dXhom[eeIndStart + rc] : s_Xhom[eeIndStart + rc];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
+                                  "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
+                    self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+            else:
+                self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
+                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
+                # get the parents we need at this level working backwards from all_ees
+                parent = all_ees[0]
+                for i in range(bfs_level):
+                    parent = self.robot.get_parent_id(parent)
+                # need to swap dst and start each time
+                even = bfs_level % 2
+                tempDstOffset = 16*n*(even)
+                tempSrcOffset = 16*n*(not even)
+                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == " + str(parent) + ") ? s_dXhom : s_Xhom);")
+                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom_dXhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
+                                  "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
+                    self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+        else:
+            # if first loop then just set to transform at the leaf
+            if bfs_level == 0:
+                self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
+                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+                select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
+                # make sure to zero out all things not in the chain
+                jidChainCode = []
+                for eejid in all_ees:
+                    jidChain = sorted(self.robot.get_ancestors_by_id(eejid))
+                    jidChain.append(eejid)
+                    code = self.gen_var_in_list("djid", [str(jid) for jid in jidChain])
+                    jidChainCode.append(code)
+                select_var_vals.append(("bool", "inChain", jidChainCode))
+                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
+                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
+                self.gen_add_code_line("s_deeTemp[ind] = inChain * ((djid == eeInd) ? s_dXhom[16*eeInd + rc] : s_Xhom[16*eeInd + rc]);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
+                                  "for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
+            else:
+                self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
+                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
+                # get the parents we need at this level working backwards from all_ees
+                curr_parents = all_ees
+                for i in range(bfs_level):
+                    curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
+                # need to swap dst and start each time
+                even = bfs_level % 2
+                tempDstOffset_ee = 16*num_ees*(even)
+                tempSrcOffset_ee = 16*num_ees*(not even)
+                tempDstOffset_dee = 16*n*num_ees*(even)
+                tempSrcOffset_dee = 16*n*num_ees*(not even)
+                # get parents for this level
+                select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
+                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
+                if (-1 in curr_parents):
+                    self.gen_add_code_line("if(parent_jid == -1){continue;}")
+                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);")
+                self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == parent_jid) ? s_dXhom : s_Xhom);")
+                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset_dee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom_dXhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset_dee) + " + colInd]);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
+                                  "for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
     #
-    # TODO Finish this and then add other functions (device, kernel, host)!
-    #
-    #
+    # For each chain we now need to (in parallel) form the d2Xmats
+    # 
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// For each hessian term in parallel chain up the transform")
+    self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
+    self.gen_add_code_line("T *s_d2eeTemp = &s_deeTemp[" + str(2*16*num_ees*n) + "];")
+    for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
+        # if serial chain manipulator then this is easy
+        if self.robot.is_serial_chain():
+            self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
+            if bfs_level == 0:
+                self.gen_add_code_line("// First set the leaf transforms")
+                self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
+                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int eeIndStart = 16*" + str(all_ees[0]) + ";")
+                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(all_ees[0]) + ")) ? s_d2Xhom : (" + \
+                                                                "((djid_i == " + str(all_ees[0]) + ") || (djid_j == " + str(all_ees[0]) + ")) ? s_dXhom : s_Xhom);")
+                self.gen_add_code_line("s_d2eeTemp[ind] = s_Xhom_dXhom_d2Xhom[eeIndStart + rc];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n*n) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}"]
+                    self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+            else:
+                self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
+                self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
+                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int row = rc % 4; int colInd = ind - row;")
+                # get the parents we need at this level working backwards from all_ees
+                parent = all_ees[0]
+                for i in range(bfs_level):
+                    parent = self.robot.get_parent_id(parent)
+                # need to swap dst and start each time
+                even = bfs_level % 2
+                tempDstOffset = 16*n*n*(even)
+                tempSrcOffset = 16*n*n*(not even)
+                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(parent) + ")) ? s_d2Xhom : (" + \
+                                                                "((djid_i == " + str(parent) + ") || (djid_j == " + str(parent) + ")) ? s_dXhom : s_Xhom);")
+                self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom_dXhom_d2Xhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                if self.DEBUG_MODE:
+                    code_lines = ["for (int i = 0; i < " + str(n*n) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}"]
+                    self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+        else:
+            if bfs_level == 0:
+                pass
+            else:
+                pass
+
+        # Then extract the end-effector position with the given offset(s)
+        # TODO handle different offsets for different branches
+
+        ####### TODO Test Serial-Chain
+        ####### TODO FINISH THE Non-Serial-Chain
+        ####### TODO to the extract ee-pos stuff!
+
 
 def gen_eepos_and_gradient(self, use_thread_group = False):
     # first generate the inner helpers

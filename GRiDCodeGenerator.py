@@ -30,11 +30,11 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_gradient_inner_temp_mem_size, gen_forward_dynamics_gradient_kernel_max_temp_mem_size, \
                             gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_kernel, \
                             gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, \
-                            gen_end_effector_positions_inner_temp_mem_size, gen_end_effector_positions_inner_function_call, gen_end_effector_positions_inner, \
-                            gen_end_effector_positions_device_temp_mem_size, gen_end_effector_positions_device, gen_end_effector_positions_kernel, \
-                            gen_end_effector_positions_host, gen_end_effector_positions_gradient_inner_temp_mem_size, gen_end_effector_positions_gradient_inner_function_call, \
-                            gen_end_effector_positions_gradient_inner, gen_end_effector_positions_gradient_device, \
-                            gen_end_effector_positions_gradient_kernel, gen_end_effector_positions_gradient_host, gen_eepos_and_gradient, \
+                            gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
+                            gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
+                            gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
+                            gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, \
+                            gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_gradient, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
@@ -96,8 +96,8 @@ class GRiDCodeGenerator:
                                  "const int CRBA_SHARED_MEM_COUNT = " + str(self.gen_crba_inner_temp_mem_size() + XI_size) + ";", \
                                  "const int ID_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_inverse_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int FD_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_forward_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
-                                 "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_positions_inner_temp_mem_size()) + XHom_size) + ";", \
-                                 "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_positions_gradient_inner_temp_mem_size()) + 2*XHom_size) + ";", \
+                                 "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_inner_temp_mem_size()) + XHom_size) + ";", \
+                                 "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + 2*XHom_size) + ";", \
                                  "const int SUGGESTED_THREADS = " + str(min(suggested_threads, 512)) + ";"]) # max of 512 to avoid exceeding available registers
         # then the structs
         # first add the struct
@@ -314,15 +314,15 @@ class GRiDCodeGenerator:
             "    __global__ forward_dynamics_gradient_kernel<T>(T *d_df_du, const T *d_q_qd, const T *d_qdd, const T *d_Minv, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   forward_dynamics_gradient<T,USE_QDD_MINV_FLAG=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_positions_inner<T>(T *s_eePos, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp)", \
-            "    __device__ end_effector_positions_device<T>(T *s_eePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_positions_kernel<T>(T *d_eePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
-            "    __host__   end_effector_positions<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __device__ end_effector_pose_inner<T>(T *s_eePos, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_device<T>(T *s_eePos, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_kernel<T>(T *d_eePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __host__   end_effector_pose<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_positions_gradient_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
-            "    __device__ end_effector_positions_gradient_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_positions_gradient_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
-            "    __host__   end_effector_positions_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __device__ end_effector_pose_gradient_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_gradient_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __host__   end_effector_pose_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "","Suggested Type T is float",\
             "","Additional helper functions and ALGORITHM_inner functions which take in __shared__ memory temp variables exist -- see function descriptions in the file",\
             "","By default device and kernels need to be launched with dynamic shared mem of size <FUNC_CODE>_DYNAMIC_SHARED_MEM_COUNT where <FUNC_CODE> = [ID, MINV, FD, ID_DU, FD_DU]"]
