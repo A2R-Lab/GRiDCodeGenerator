@@ -34,7 +34,11 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
                             gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, \
+<<<<<<< HEAD
                             gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_gradient, \
+=======
+                            gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_derivatives, \
+>>>>>>> 0851bfd10f4020c676568689b8498b38f8866f70
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
@@ -352,15 +356,16 @@ class GRiDCodeGenerator:
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,False)
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,True)
             # then generate kinematic algorithms
-            self.gen_eepos_and_gradient()
+            self.gen_eepos_and_derivatives()
+        else:
+            print('eepos, aba, crba, and debug mode are still under development for floating base')
         # then generate the dynamics algorithms
         self.gen_inverse_dynamics(use_thread_group)
         self.gen_direct_minv(use_thread_group)
         self.gen_forward_dynamics(use_thread_group)
         self.gen_inverse_dynamics_gradient(use_thread_group)
         self.gen_forward_dynamics_gradient(use_thread_group)
-        if self.robot.floating_base: print('eepos, aba, crba, and debug mode are still under development for floating base')
-        else:
+        if not self.robot.floating_base:
             self.gen_aba(use_thread_group)
             self.gen_crba(use_thread_group)
         # then finally the master init and close the namespace

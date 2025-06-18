@@ -736,7 +736,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                             "for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,4,4>(&s_Xhom[16*i],4);}"
                             "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX[%d]\\n\",i); printMat<T,4,4>(&s_dXhom[16*i],4);}"]
         self.gen_add_debug_print_code_lines(debug_code_lines,use_thread_group)
-
     #
     # For each chain we need to (in parallel) multiply the (d)Xmats
     # 
@@ -895,7 +894,186 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
         ####### TODO to the extract ee-pos stuff!
 
 
-def gen_eepos_and_gradient(self, use_thread_group = False):
+    # self.gen_add_code_line("T *s_eeTemp = &s_temp[0]; T *s_deeTemp = &s_temp[" + str(2*16*num_ees*n) + "];")
+    # for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
+    #     # if serial chain manipulator then this is easy
+    #     if self.robot.is_serial_chain():
+    #         self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
+    #         if bfs_level == 0:
+    #             self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
+    #             self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+    #             self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int eeIndStart = 16*" + str(all_ees[0]) + ";")
+    #             self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[eeIndStart + rc];")
+    #             self.gen_add_code_line("s_deeTemp[ind] = (djid == " + str(all_ees[0]) + ") ? s_dXhom[eeIndStart + rc] : s_Xhom[eeIndStart + rc];")
+    #             self.gen_add_end_control_flow()
+    #             self.gen_add_sync(use_thread_group)
+    #         else:
+    #             self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
+    #             self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+    #             self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
+    #             # get the parents we need at this level working backwards from all_ees
+    #             parent = all_ees[0]
+    #             for i in range(bfs_level):
+    #                 parent = self.robot.get_parent_id(parent)
+    #             # need to swap dst and start each time
+    #             even = bfs_level % 2
+    #             tempDstOffset = 16*n*(even)
+    #             tempSrcOffset = 16*n*(not even)
+    #             self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+    #                                    "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
+    #             self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == " + str(parent) + ") ? s_dXhom : s_Xhom);")
+    #             self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+    #                                    "(&s_Xhom_dXhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+    #             self.gen_add_end_control_flow()
+    #             self.gen_add_sync(use_thread_group)
+    #     else:
+    #         # if first loop then just set to transform at the leaf
+    #         if bfs_level == 0:
+    #             self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
+    #             self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+    #             self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+    #             select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
+    #             # make sure to zero out all things not in the chain
+    #             jidChainCode = []
+    #             for eejid in all_ees:
+    #                 jidChain = sorted(self.robot.get_ancestors_by_id(eejid))
+    #                 jidChain.append(eejid)
+    #                 code = self.gen_var_in_list("djid", [str(jid) for jid in jidChain])
+    #                 jidChainCode.append(code)
+    #             select_var_vals.append(("bool", "inChain", jidChainCode))
+    #             self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
+    #             self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
+    #             self.gen_add_code_line("s_deeTemp[ind] = inChain * ((djid == eeInd) ? s_dXhom[16*eeInd + rc] : s_Xhom[16*eeInd + rc]);")
+    #             self.gen_add_end_control_flow()
+    #             self.gen_add_sync(use_thread_group)
+    #         else:
+    #             self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
+    #             self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+    #             self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+    #             self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
+    #             # get the parents we need at this level working backwards from all_ees
+    #             curr_parents = all_ees
+    #             for i in range(bfs_level):
+    #                 curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
+    #             # need to swap dst and start each time
+    #             even = bfs_level % 2
+    #             tempDstOffset = 16*n*num_ees*(even)
+    #             tempSrcOffset = 16*n*num_ees*(not even)
+    #             # get parents for this level
+    #             select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
+    #             self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
+    #             if (-1 in curr_parents):
+    #                 self.gen_add_code_line("if(parent_jid == -1){continue;}")
+    #             self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+    #                                    "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
+    #             self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == parent_jid) ? s_dXhom : s_Xhom);")
+    #             self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+    #                                    "(&s_Xhom_dXhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+    #             self.gen_add_end_control_flow()
+    #             self.gen_add_sync(use_thread_group)
+   
+    self.gen_add_code_line("// Then the second dervatives (and save to temp)")
+
+    # for dind_i in range(n): # can be done in parallel
+    #     for dind_j in range(n): # can be done in parallel
+    #         currId = jid
+    #         d2Xmat_hom_arr[:,:,dind_i,dind_j] = np.eye(4)
+    #         while(currId != -1):
+    #             if (currId == dind_i) or (currId == dind_j):
+    #                 if dind_i == dind_j: # use second derivative
+    #                     d2currX = self.robot.get_d2Xmat_hom_Func_by_id(currId)(q[currId])
+    #                     d2Xmat_hom_arr[:,:,dind_i,dind_j] = np.matmul(d2currX,d2Xmat_hom_arr[:,:,dind_i,dind_j])
+    #                 else: # use first derivative values
+    #                     dcurrX = self.robot.get_dXmat_hom_Func_by_id(currId)(q[currId])
+    #                     d2Xmat_hom_arr[:,:,dind_i,dind_j] = np.matmul(dcurrX,d2Xmat_hom_arr[:,:,dind_i,dind_j])
+    #             else: # use normal transform
+    #                 currX = self.robot.get_Xmat_hom_Func_by_id(currId)(q[currId])
+    #                 d2Xmat_hom_arr[:,:,dind_i,dind_j] = np.matmul(currX,d2Xmat_hom_arr[:,:,dind_i,dind_j])
+    #             currId = self.robot.get_parent_id(currId)
+
+    #
+    #
+    # TODO MODIFY CODE ABOVE AND MAKE SURE IT MATCHES PSUEDOCODE ABOVE
+    #
+    #
+
+    self.gen_add_code_line("// Finally extract the final poses")
+
+    #
+    #
+    # TODO MAKE CODE FOR PSUEDOCODE BELOW (Chcek the gradietn for some examples)
+    #
+    #
+
+    # d2eePos = np.zeros((6,n,n))
+    # for dind_i in range(n): # can be done in parallel
+    #     for dind_j in range(n): # can be done in parallel
+
+    #         # point to the correct transforms
+    #         Xmat_hom = dXmat_hom_arr[:,:,n]
+    #         dXmat_hom_i = dXmat_hom_arr[:,:,dind_i]
+    #         dXmat_hom_j = dXmat_hom_arr[:,:,dind_j]
+    #         d2Xmat_hom = d2Xmat_hom_arr[:,:,dind_i,dind_j]
+
+    #         # Note: if not in branch then 0
+    #         if (dind_i not in jidChain) or (dind_j not in jidChain):
+    #             d2eePos[:,dind_i,dind_j] = np.zeros((6,))
+            
+    #         else:
+    #             # xyz position is easy
+    #             d2eePos_xyz1 = d2Xmat_hom * offsets[0].transpose()
+
+    #             # roll pitch yaw is a bit more difficult
+    #             # note: d/dz of arctan2(y(z),x(z)) = [-x'(z)y(z)+x(z)y'(z)]/[(x(z)^2 + y(z)^2)]
+    #             def darctan2(y,x,y_prime,x_prime):
+    #                 return (-x_prime*y + x*y_prime)/(x*x + y*y)
+    #             # then another chain / quotient rule
+    #             def quotient_rule(top,bottom,dtop,dbottom):
+    #                 return (bottom*dtop - top*dbottom) / (bottom*bottom)
+    #             def d2arctan2(y,x,y_prime_i,x_prime_i,y_prime_j,x_prime_j,y_prime_prime,x_prime_prime,i,j):
+    #                 top = -x_prime_i*y + x*y_prime_i
+    #                 dtop = -x_prime_prime*y + x*y_prime_prime
+    #                 if (i != j):
+    #                     dtop = dtop + (-x_prime_i*y_prime_j + x_prime_j*y_prime_i)
+    #                 bottom = x*x + y*y
+    #                 dbottom = 2*x*x_prime_j + 2*y*y_prime_j
+    #                 return quotient_rule(top,bottom,dtop,dbottom)
+    #             # in other words for each atan2 we are plugging in Xmat_hom and dXmat_hom at 
+    #             # those indicies into the spots as specified by that equation.
+    #             # also note that d/dz of sqrt(f(z)) = f'(z)/2sqrt(f(z))
+    #             d2eePos_roll = d2arctan2(Xmat_hom[2,1],Xmat_hom[2,2],dXmat_hom_i[2,1],dXmat_hom_i[2,2], \
+    #                             dXmat_hom_j[2,1],dXmat_hom_j[2,2],d2Xmat_hom[2,1],d2Xmat_hom[2,2],dind_i,dind_j)
+
+    #             pitch_sqrt_term = np.sqrt(Xmat_hom[2,2]*Xmat_hom[2,2] + Xmat_hom[2,1]*Xmat_hom[2,1])
+    #             dpitch_sqrt_term_i_top = Xmat_hom[2,2]*dXmat_hom_i[2,2] + Xmat_hom[2,1]*dXmat_hom_i[2,1]
+    #             dpitch_sqrt_term_i = dpitch_sqrt_term_i_top/pitch_sqrt_term # note canceled out the 2 in the numer and denom
+    #             dpitch_sqrt_term_j_top = Xmat_hom[2,2]*dXmat_hom_j[2,2] + Xmat_hom[2,1]*dXmat_hom_j[2,1]
+    #             dpitch_sqrt_term_j = dpitch_sqrt_term_j_top/pitch_sqrt_term # note canceled out the 2 in the numer and denom
+    #             # d2pitch_sqrt_term is quotient rule of dpitch_sqrt_term_i
+    #             # top = dpitch_sqrt_term_i, bottom = pitch_sqrt_term, dtop = dpitch_sqrt_term_i_top_dj, dbottom = dpitch_sqrt_term_j
+    #             dpitch_sqrt_term_i_top_dj = dXmat_hom_j[2,2]*dXmat_hom_i[2,2] + Xmat_hom[2,2]*d2Xmat_hom[2,2] + \
+    #                                         dXmat_hom_j[2,1]*dXmat_hom_i[2,1] + Xmat_hom[2,1]*d2Xmat_hom[2,1]
+    #             d2pitch_sqrt_term = quotient_rule(dpitch_sqrt_term_i,pitch_sqrt_term,dpitch_sqrt_term_i_top_dj,dpitch_sqrt_term_j)
+    #             d2eePos_pitch = d2arctan2(-Xmat_hom[2,0],pitch_sqrt_term,-dXmat_hom_i[2,0],dpitch_sqrt_term_i, \
+    #                              -dXmat_hom_j[2,0],dpitch_sqrt_term_j,-d2Xmat_hom[2,0],d2pitch_sqrt_term,dind_i,dind_j)
+    #             d2eePos_yaw = d2arctan2(Xmat_hom[1,0],Xmat_hom[0,0],dXmat_hom_i[1,0],dXmat_hom_i[0,0], \
+    #                             dXmat_hom_j[1,0],dXmat_hom_j[0,0],d2Xmat_hom[1,0],d2Xmat_hom[0,0],dind_i,dind_j)
+    #             d2eePos_rpy = np.matrix([[d2eePos_roll,d2eePos_pitch,d2eePos_yaw]])
+
+    #             # then stack it up!
+    #             d2eePos_col = np.vstack((d2eePos_xyz1[:3,:],d2eePos_rpy.transpose()))
+    #             d2eePos[:,dind_i,dind_j] = d2eePos_col.reshape((6,))
+
+    # d2eePos_arr.append(d2eePos)
+    
+
+#
+#
+# TODO add the device / kernel / host code
+#
+#
+
+def gen_eepos_and_derivatives(self, use_thread_group = False):
     # first generate the inner helpers
     self.gen_end_effector_pose_inner(use_thread_group)
     # then generate the device wrappers
@@ -908,7 +1086,7 @@ def gen_eepos_and_gradient(self, use_thread_group = False):
     self.gen_end_effector_pose_host(1)
     self.gen_end_effector_pose_host(2)
 
-    # then for the gradients first generate the inner helpers
+    # then for the gradient first generate the inner helpers
     self.gen_end_effector_pose_gradient_inner(use_thread_group)
     # then generate the device wrappers
     self.gen_end_effector_pose_gradient_device(use_thread_group)
@@ -919,3 +1097,15 @@ def gen_eepos_and_gradient(self, use_thread_group = False):
     self.gen_end_effector_pose_gradient_host(0)
     self.gen_end_effector_pose_gradient_host(1)
     self.gen_end_effector_pose_gradient_host(2)
+
+    # then for the hessian first generate the inner helpers
+    self.gen_end_effector_pose_gradient_hessian_inner(use_thread_group)
+    # # then generate the device wrappers
+    # self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
+    # # then generate the kernels
+    # self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
+    # self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
+    # # then the host launch wrappers
+    # self.gen_end_effector_pose_gradient_hessian_host(0)
+    # self.gen_end_effector_pose_gradient_hessian_host(1)
+    # self.gen_end_effector_pose_gradient_hessian_host(2)
