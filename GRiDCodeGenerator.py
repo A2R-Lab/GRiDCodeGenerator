@@ -34,11 +34,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
                             gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, \
-<<<<<<< HEAD
-                            gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_gradient, \
-=======
                             gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_derivatives, \
->>>>>>> 0851bfd10f4020c676568689b8498b38f8866f70
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
