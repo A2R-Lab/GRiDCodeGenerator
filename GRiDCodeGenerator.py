@@ -33,8 +33,10 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
-                            gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, \
-                            gen_end_effector_pose_gradient_kernel, gen_end_effector_pose_gradient_host, gen_eepos_and_derivatives, \
+                            gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, gen_end_effector_pose_gradient_kernel, \
+                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
+                            gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, \
+                            gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
@@ -126,6 +128,7 @@ class GRiDCodeGenerator:
                                  "    T *d_df_du;", \
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
+                                 "    T *d_d2eePos;", \
                                  "    // CPU OUTPUTS", \
                                  "    T *h_c;", \
                                  "    T *h_Minv;", \
@@ -135,6 +138,7 @@ class GRiDCodeGenerator:
                                  "    T *h_df_du;", \
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
+                                 "    T *h_d2eePos;", \
                                  "};"])
 
     def gen_init_gridData(self):
@@ -156,6 +160,7 @@ class GRiDCodeGenerator:
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "// and the CPU", \
                       "hd_data->h_c = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_Minv = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -165,6 +170,7 @@ class GRiDCodeGenerator:
                       "hd_data->h_df_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "return hd_data;"]
         # generate as templated or not function
         self.gen_add_func_doc("Allocated device and host memory for all computations",
@@ -323,6 +329,12 @@ class GRiDCodeGenerator:
             "    __device__ end_effector_pose_gradient_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
             "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "",\
+            "    __device__ end_effector_pose_gradient_hessian_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_gradient_hessian_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_gradient_hessian_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __host__   end_effector_pose_gradient_hessian<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "",\
             "","Suggested Type T is float",\
             "","Additional helper functions and ALGORITHM_inner functions which take in __shared__ memory temp variables exist -- see function descriptions in the file",\
             "","By default device and kernels need to be launched with dynamic shared mem of size <FUNC_CODE>_DYNAMIC_SHARED_MEM_COUNT where <FUNC_CODE> = [ID, MINV, FD, ID_DU, FD_DU]"]
@@ -352,7 +364,7 @@ class GRiDCodeGenerator:
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,False)
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,True)
             # then generate kinematic algorithms
-            self.gen_eepos_and_derivatives()
+            self.gen_eepose_and_derivatives()
         else:
             print('eepos, aba, crba, and debug mode are still under development for floating base')
         # then generate the dynamics algorithms

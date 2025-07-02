@@ -518,7 +518,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False):
 def gen_end_effector_pose_gradient_device_temp_mem_size(self):
     n = self.robot.get_num_pos()
     wrapper_size = self.gen_topology_helpers_size() + 2*self.gen_get_Xhom_size() # for Xhom and dXhom
-    return self.gen_end_effector_pose_inner_temp_mem_size() + wrapper_size
+    return self.gen_end_effector_pose_gradient_inner_temp_mem_size() + wrapper_size
 
 def gen_end_effector_pose_gradient_device(self, use_thread_group = False):
     n = self.robot.get_num_pos()
@@ -675,13 +675,14 @@ def gen_end_effector_pose_gradient_host(self, mode = 0):
 def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
-    return num_ees*(16*(n+1) + 16*n*n)
+    return 2*num_ees*(16*(n+1) + 16*n*n)
 
 def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
         s_dXhom_name = "s_dXmatsHom", \
         s_d2Xhom_name = "s_d2XmatsHom", \
+        s_deePos_name = "s_deePos", \
         s_d2eePos_name = "s_d2eePos", \
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
@@ -690,7 +691,7 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_gradient_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_gradient_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", " + var_names["s_d2Xhom_name"] + ", "
     code_end =  var_names["s_temp_name"] + ");"
     # account for thread group
@@ -706,8 +707,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     all_ees = self.robot.get_leaf_nodes()
     num_ees = len(all_ees)
     # construct the boilerplate and function definition
-    func_params = ["s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
-                   "s_d2eePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
+    func_params = ["s_d2eePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
+                   "s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
                    "s_q is the vector of joint positions", \
                    "s_Xhom is the pointer to the homogenous transformation matricies ", \
                    "s_dXhom is the pointer to the 1st derivative of the homogenous transformation matricies ", \
@@ -716,7 +717,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                             str(self.gen_end_effector_pose_gradient_inner_temp_mem_size())]
     func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
-    func_def_middle = "T *s_deePos, T *s_d2eePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, "
+    func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, "
     func_def_end = "T *s_temp) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
@@ -950,8 +951,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("int ind = ind6 / 6; int outputInd = ind6 % 6;")
     self.gen_add_code_line("int curr_ee = ind / " + str(n*n) + "; int djid_ij = ind % " + str(n*n) + "; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + ";")
     self.gen_add_code_line("int ee_offset = 16 * curr_ee; int dee_offset = ee_offset * " + str(n) + "; int d2ee_offset = dee_offset * " + str(n) + ";")
-    self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[ee_offset]; T *s_d2Xmat_hom_ij = &s_d2eeTemp[d2ee_offset + 16 * djid_i * " + str(n) + " + 16 * djid_j]")
-    self.gen_add_code_line("T *s_dXmat_hom_i = &s_deeTemp[dee_offset + 16 * djid_i], T *s_dXmat_hom_j = &s_deeTemp[dee_offset + 16 * djid_j]")
+    self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[ee_offset]; T *s_d2Xmat_hom_ij = &s_d2eeTemp[d2ee_offset + 16 * djid_i * " + str(n) + " + 16 * djid_j];")
+    self.gen_add_code_line("T *s_dXmat_hom_i = &s_deeTemp[dee_offset + 16 * djid_i]; T *s_dXmat_hom_j = &s_deeTemp[dee_offset + 16 * djid_j];")
     self.gen_add_code_line("T *s_deePos_i = &s_deePos[6*djid_i]; T *s_d2eePos_ij = &s_d2eePos[6*(" + str(n) + "*djid_i + djid_j)];")
     # # make sure to zero out all things not in the chain
     # jidChainCode_i = []
@@ -987,11 +988,11 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//          dbottom = 2*x*x_prime_j + 2*y*y_prime_j")
     self.gen_add_code_line("else {", add_indent_after=True)
     self.gen_add_code_line("T pitchSqrtTerm = sqrt(s_Xmat_hom[10]*s_Xmat_hom[10] + s_Xmat_hom[6]*s_Xmat_hom[6]);") 
-    self.gen_add_code_line("T dpitchSqrtTerm_i = (s_Xmat_hom[10]*s_dXmat_hom_i[10] + s_Xmat_hom[6]*s_dXmat_hom_i[6])/sqrtTerm;")
-    self.gen_add_code_line("T dpitchSqrtTerm_j = (s_Xmat_hom[10]*s_dXmat_hom_i[10] + s_Xmat_hom[10]*s_dXmat_hom_i[10])/sqrtTerm;")
+    self.gen_add_code_line("T dpitchSqrtTerm_i = (s_Xmat_hom[10]*s_dXmat_hom_i[10] + s_Xmat_hom[6]*s_dXmat_hom_i[6])/pitchSqrtTerm;")
+    self.gen_add_code_line("T dpitchSqrtTerm_j = (s_Xmat_hom[10]*s_dXmat_hom_i[10] + s_Xmat_hom[10]*s_dXmat_hom_i[10])/pitchSqrtTerm;")
     self.gen_add_code_line("T dpitchSqrtTerm_i_top_dj = s_dXmat_hom_j[10]*s_dXmat_hom_i[10] + s_Xmat_hom[10]*s_d2Xmat_hom_ij[10] + ")
     self.gen_add_code_line("                            s_dXmat_hom_j[6]*s_dXmat_hom_i[6] + s_Xmat_hom[6]*s_d2Xmat_hom_ij[6];")
-    self.gen_add_code_line("T d2pitchSqrtTerm_ij = (pitchSqrtTerm*dpitchSqrtTerm_i_top_dj - dpitch_sqrt_term_i*dpitchSqrtTerm_j) / (pitchSqrtTerm*pitchSqrtTerm);")
+    self.gen_add_code_line("T d2pitchSqrtTerm_ij = (pitchSqrtTerm*dpitchSqrtTerm_i_top_dj - dpitchSqrtTerm_i*dpitchSqrtTerm_j) / (pitchSqrtTerm*pitchSqrtTerm);")
     select_var_vals = [("T", "y",           ["s_Xmat_hom[6]",       "-s_Xmat_hom[2]",      "s_Xmat_hom[1]"]), \
                        ("T", "x",           ["s_Xmat_hom[10]",      "pitchSqrtTerm",       "s_Xmat_hom[0]"]), \
                        ("T", "y_prime_i",   ["s_dXmat_hom_i[6]",    "-s_dXmat_hom_i[2]",   "s_dXmat_hom_i[1]"]), \
@@ -1001,27 +1002,179 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                        ("T", "y_dprime_ij", ["s_d2Xmat_hom_ij[6]",  "-s_d2Xmat_hom_ij[2]", "s_d2Xmat_hom_ij[1]"]), \
                        ("T", "x_dprime_ij", ["s_d2Xmat_hom_ij[10]", "d2pitchSqrtTerm_ij",  "s_d2Xmat_hom_ij[0]"])]
     self.gen_add_multi_threaded_select("outputInd", "==", [str(i) for i in range(3,6)], select_var_vals)
-    self.gen_add_code_line("T top = -x_prime*y + x*y_prime;     T bottom = x*x + y*y;")
-    self.gen_add_code_line("T dtop = x_dprime_ij*y + x*y_dprime_ij + (djid_i != djid_j)*(-x_prime_i*y_prime_j + x_prime_j*y_prime_i)")
-    self.gen_add_code_line("T dbottom = 2*x*x_prime_j + 2*y*y_prime_j")
+    self.gen_add_code_line("T top = -x_prime_i*y + x*y_prime_i;     T bottom = x*x + y*y;")
+    self.gen_add_code_line("T dtop = x_dprime_ij*y + x*y_dprime_ij + (djid_i != djid_j)*(-x_prime_i*y_prime_j + x_prime_j*y_prime_i);")
+    self.gen_add_code_line("T dbottom = 2*x*x_prime_j + 2*y*y_prime_j;")
     self.gen_add_code_line("if (djid_j == 0){s_deePos_i[outputInd] = top/bottom;}")
     self.gen_add_code_line("s_d2eePos_ij[outputInd] = (bottom*dtop - top*dbottom) / (bottom*bottom);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
 
-#
-#
-# TODO add the device / kernel / host code
-#
-#
+def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
+    n = self.robot.get_num_pos()
+    wrapper_size = self.gen_topology_helpers_size() + 2*self.gen_get_Xhom_size() # for Xhom and dXhom
+    return self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + wrapper_size
 
-#
-#
-# TODO all testing
-#
-#
+def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False):
+    n = self.robot.get_num_pos()
+    num_ees = self.robot.get_total_leaf_nodes()
+    # construct the boilerplate and function definition
+    func_params = ["s_d2eePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
+                   "s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
+                   "s_q is the vector of joint positions", \
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
+    func_notes = []
+    func_def_start = "void end_effector_pose_gradient_device("
+    func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
+    func_def_end = "const robotModel<T> *d_robotModel) {"
+    if use_thread_group:
+        func_def_start += "cgrps::thread_group tgrp, "
+        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
+    func_def = func_def_start + func_def_middle + func_def_end
+    # then generate the code
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+                          func_notes,func_params,None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    # add the shared memory variables
+    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    # then load/update XI and run the algo
+    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+    self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+    self.gen_add_end_function()
 
-def gen_eepos_and_derivatives(self, use_thread_group = False):
+def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False, single_call_timing = False):
+    n = self.robot.get_num_pos()
+    num_ees = self.robot.get_total_leaf_nodes()
+    # define function def and params
+    func_params = ["d_d2eePos is the vector of end effector positions gradients", \
+                   "d_deePos is the vector of end effector positions gradients", \
+                   "d_q is the vector of joint positions", \
+                   "stride_q is the stide between each q", \
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_notes = []
+    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_deePos, const T *d_q, const int stride_q, "
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    # then generate the code
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+                          func_notes,func_params,None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line(func_def, True)
+    # add shared memory variables
+    shared_mem_vars = ["__shared__ T s_q[" + str(n) + "];", \
+                       "__shared__ T s_d2eePos[" + str(6*n*n*num_ees) + "];", \
+                       "__shared__ T s_deePos[" + str(6*n*num_ees) + "];"]
+    self.gen_add_code_lines(shared_mem_vars)
+    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    if use_thread_group:
+        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    if not single_call_timing:
+        # load to shared mem and loop over blocks to compute all requested comps
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        # compute
+        self.gen_add_code_line("// compute")
+        # then load/update X and run the algo
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+        self.gen_add_sync(use_thread_group)
+        # save to global
+        self.gen_kernel_save_result("d2eePos",str(6*n*n*num_ees),str(6*n*n*num_ees),use_thread_group)
+        self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
+        self.gen_add_end_control_flow()
+    else:
+        #repurpose NUM_TIMESTEPS for number of timing reps
+        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        # then compute in loop for timing
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        # then load/update X and run the algo
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+        self.gen_add_end_control_flow()
+        # save to global
+        self.gen_kernel_save_result_single_timing("d2eePos",str(6*n*n*num_ees),use_thread_group)
+        self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
+    self.gen_add_end_function()
+
+def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
+    # default is to do the full kernel call -- options are for single timing or compute only kernel wrapper
+    single_call_timing = True if mode == 1 else False
+    compute_only = True if mode == 2 else False
+
+    # define function def and params
+    func_params = ["hd_data is the packaged input and output pointers", \
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+    func_notes = []
+    func_def_start = "void end_effector_pose_gradient_hessian(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    # then generate the code
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+                          func_notes,func_params,None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_deePos,hd_data->d_q,stride_q,"
+    func_call_end = "d_robotModel,num_timesteps);"
+    if single_call_timing:
+        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+    if not compute_only:
+        # start code with memory transfer
+        self.gen_add_code_lines(["// start code with memory transfer", \
+                                 "int stride_q;", \
+                                 "if (USE_COMPRESSED_MEM) {stride_q = NUM_JOINTS; " + \
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" + \
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
+                                 "else {stride_q = 3*NUM_JOINTS; " + \
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" + \
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
+                                 "gpuErrchk(cudaDeviceSynchronize());"])
+    else:
+        self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
+    # then compute but adjust for compressed mem and qdd usage
+    self.gen_add_code_line("// then call the kernel")
+    func_call = func_call_start + func_call_end
+    # add in compressed mem adjusts
+    func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q","hd_data->d_q_qd_u") + "}"
+    # compule into a set of code
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchk(cudaDeviceSynchronize());"]
+    # wrap function call in timing (if needed)
+    if single_call_timing:
+        func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        # then transfer memory back
+        self.gen_add_code_lines(["// finally transfer the result back", \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_deePos,hd_data->d_deePos,6*NUM_EES*NUM_JOINTS*" + \
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_d2eePos,hd_data->d_d2eePos,6*NUM_EES*NUM_JOINTS*NUM_JOINTS*" + \
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchk(cudaDeviceSynchronize());"])
+    # finally report out timing if requested
+    if single_call_timing:
+        self.gen_add_code_line("printf(\"Single Call DEEPOS %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+    self.gen_add_end_function()
+
+def gen_eepose_and_derivatives(self, use_thread_group = False):
     # first generate the inner helpers
     self.gen_end_effector_pose_inner(use_thread_group)
     # then generate the device wrappers
@@ -1048,12 +1201,12 @@ def gen_eepos_and_derivatives(self, use_thread_group = False):
 
     # then for the hessian first generate the inner helpers
     self.gen_end_effector_pose_gradient_hessian_inner(use_thread_group)
-    # # then generate the device wrappers
-    # self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
-    # # then generate the kernels
-    # self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
-    # self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
-    # # then the host launch wrappers
-    # self.gen_end_effector_pose_gradient_hessian_host(0)
-    # self.gen_end_effector_pose_gradient_hessian_host(1)
-    # self.gen_end_effector_pose_gradient_hessian_host(2)
+    # then generate the device wrappers
+    self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
+    # then generate the kernels
+    self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
+    self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
+    # then the host launch wrappers
+    self.gen_end_effector_pose_gradient_hessian_host(0)
+    self.gen_end_effector_pose_gradient_hessian_host(1)
+    self.gen_end_effector_pose_gradient_hessian_host(2)
