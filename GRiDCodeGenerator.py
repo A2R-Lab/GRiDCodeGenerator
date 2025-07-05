@@ -361,8 +361,9 @@ class GRiDCodeGenerator:
         if not self.robot.floating_base: 
             if include_homogenous_transforms:
                 # once with and once without the gradients
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,False)
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,True)
+                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
+                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
+                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
             # then generate kinematic algorithms
             self.gen_eepose_and_derivatives()
         else:

@@ -259,7 +259,7 @@ def gen_end_effector_pose_host(self, mode = 0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     # then generate the code
-    self.gen_add_func_doc("Compute the End Effector Positions",\
+    self.gen_add_func_doc("Compute the End Effector Pose",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
     self.gen_add_code_line("__host__")
@@ -355,7 +355,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False):
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
     # now generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
@@ -536,7 +536,7 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False):
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
@@ -565,7 +565,7 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
@@ -625,7 +625,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
     self.gen_add_code_line("__host__")
@@ -691,7 +691,7 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_gradient_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_gradient_hessian_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", " + var_names["s_d2Xhom_name"] + ", "
     code_end =  var_names["s_temp_name"] + ");"
     # account for thread group
@@ -725,7 +725,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
     # now generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
@@ -855,7 +855,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("// First set the leaf transforms")
                 self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
                 self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int eeIndStart = 16*" + str(all_ees[0]) + ";")
-                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(all_ees[0]) + ")) ? s_d2Xhom : (" + \
+                self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(all_ees[0]) + ")) ? s_d2Xhom : (" + \
                                                                 "((djid_i == " + str(all_ees[0]) + ") || (djid_j == " + str(all_ees[0]) + ")) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind] = s_Xhom_dXhom_d2Xhom[eeIndStart + rc];")
                 self.gen_add_end_control_flow()
@@ -875,7 +875,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 even = bfs_level % 2
                 tempDstOffset = 16*n*n*(even)
                 tempSrcOffset = 16*n*n*(not even)
-                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(parent) + ")) ? s_d2Xhom : (" + \
+                self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(parent) + ")) ? s_d2Xhom : (" + \
                                                                 "((djid_i == " + str(parent) + ") || (djid_j == " + str(parent) + ")) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom_d2Xhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
@@ -904,7 +904,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 select_var_vals.append(("bool", "inChain_j", jidChainCode_j))
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*n*(i+1)) for i in range(num_ees)], select_var_vals)
                 self.gen_add_code_line("bool inChain = inChain_i || inChain_j;")
-                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(all_ees[0]) + ")) ? s_d2Xhom : (" + \
+                self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(all_ees[0]) + ")) ? s_d2Xhom : (" + \
                                                                 "((djid_i == " + str(all_ees[0]) + ") || (djid_j == " + str(all_ees[0]) + ")) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind] = inChain * s_Xhom_dXhom_d2Xhom[16*eeInd + rc];")
                 self.gen_add_end_control_flow()
@@ -930,7 +930,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
                 if (-1 in curr_parents):
                     self.gen_add_code_line("if(parent_jid == -1){continue;}")
-                self.gen_add_code_line("T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == parent_jid)) ? s_d2Xhom : (" + \
+                self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == parent_jid)) ? s_d2Xhom : (" + \
                                                                 "((djid_i == parent_jid) || (djid_j == parent_jid)) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom_d2Xhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
@@ -1009,10 +1009,11 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("s_d2eePos_ij[outputInd] = (bottom*dtop - top*dbottom) / (bottom*bottom);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
+    self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
     n = self.robot.get_num_pos()
-    wrapper_size = self.gen_topology_helpers_size() + 2*self.gen_get_Xhom_size() # for Xhom and dXhom
+    wrapper_size = self.gen_topology_helpers_size() + 3*self.gen_get_Xhom_size() # for Xhom and dXhom and d2Xhom
     return self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + wrapper_size
 
 def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False):
@@ -1024,7 +1025,7 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
                    "s_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_device("
+    func_def_start = "void end_effector_pose_gradient_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel) {"
     if use_thread_group:
@@ -1032,16 +1033,16 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
     # then load/update XI and run the algo
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
     self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
@@ -1056,13 +1057,13 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_deePos, const T *d_q, const int stride_q, "
+    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_d2eePos, T *d_deePos, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
@@ -1073,7 +1074,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
                        "__shared__ T s_deePos[" + str(6*n*num_ees) + "];"]
     self.gen_add_code_lines(shared_mem_vars)
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -1083,7 +1084,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
         # compute
         self.gen_add_code_line("// compute")
         # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
         # save to global
@@ -1097,7 +1098,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
         self.gen_add_end_control_flow()
         # save to global
@@ -1125,13 +1126,13 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     # then generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Position with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_deePos,hd_data->d_q,stride_q,"
+    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
