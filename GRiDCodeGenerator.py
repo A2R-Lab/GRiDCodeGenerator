@@ -103,8 +103,8 @@ class GRiDCodeGenerator:
                                  "const int FD_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_forward_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_positions_inner_temp_mem_size()) + XHom_size) + ";", \
                                  "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_positions_gradient_inner_temp_mem_size()) + 2*XHom_size) + ";", \
-                                 f"const int IDSVA_SO_SHARED_MEM_COUNT = {self.gen_idsva_so_inner_temp_mem_size()};", \
-                                 f'const int FDSVA_SO_SHARED_MEM_COUNT = {self.gen_fdsva_so_inner_temp_mem_size()};', \
+                                 f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = 0;", \
+                                 f'const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size};', \
                                  "const int SUGGESTED_THREADS = " + str(min(suggested_threads, 512)) + ";"]) # max of 512 to avoid exceeding available registers
         # then the structs
         # first add the struct

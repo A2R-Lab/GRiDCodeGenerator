@@ -1054,7 +1054,7 @@ def gen_idsva_so_host(self, mode = 0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "idsva_so_kernel<T><<<block_dimms,thread_dimms,ID_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_idsva_so," + \
+    func_call_start = "idsva_so_kernel<T><<<block_dimms,thread_dimms>>>(hd_data->d_idsva_so," + \
         "hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
