@@ -17,6 +17,7 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
         updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]")
         self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
         self.gen_forward_dynamics_finish_function_call(use_thread_group, updated_var_names)
+        self.gen_add_sync(use_thread_group)
         self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = False, use_qdd_input = True)
     # else just compute vaf
     else:
@@ -242,6 +243,11 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call FD_DU %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
+
+def gen_forward_dynamics_gradient_device_function_call(self, compute_Minv=False):
+    if compute_Minv:
+        self.gen_add_code_line("forward_dynamics_gradient_device<T>(s_df_du, s_q, s_qd, s_u, s_Minv, d_robotModel, gravity);")
+    else: self.gen_add_code_line("forward_dynamics_gradient_device(s_df_du, s_q, s_qd, s_u, d_robotModel, gravity);")
 
 def gen_forward_dynamics_gradient(self, use_thread_group = False):
     # first device wrappers
