@@ -26,7 +26,8 @@ def gen_forward_dynamics_finish(self, use_thread_group = False):
                    "s_c is the bias vector", \
                    "s_Minv is the inverse mass matrix"]
     func_def = "void forward_dynamics_finish(T *s_qdd, const T *s_u, const T *s_c, const T *s_Minv) {"
-    func_notes = ["Assumes s_Minv and s_c are already computed"]
+    func_notes = ["Assumes s_Minv and s_c are already computed", 
+                  "Does not internally sync the thread group, so it should be called after all threads have finished computing their values"]
     if use_thread_group:
         func_def = func_def.replace("(","(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -83,7 +84,8 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     func_def_start = "void forward_dynamics_inner(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "T *s_temp, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
-    func_notes = ["Assumes s_XImats is updated already for the current s_q"]
+    func_notes = ["Assumes s_XImats is updated already for the current s_q",
+                  "Does not internally sync the thread group, so it should be called after all threads have finished computing their values"]
     if use_thread_group:
         func_def_start = func_def_start.replace("(","(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
