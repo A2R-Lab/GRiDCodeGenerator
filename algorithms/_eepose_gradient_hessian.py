@@ -773,15 +773,21 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     parent = self.robot.get_parent_id(parent)
                 # need to swap dst and start each time
                 even = bfs_level % 2
-                tempDstOffset = 16*n*(even)
-                tempSrcOffset = 16*n*(not even)
-                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                tempDstOffset_ee = 16*num_ees*(even)
+                tempSrcOffset_ee = 16*num_ees*(not even)
+                tempDstOffset_dee = 16*n*num_ees*(even)
+                tempSrcOffset_dee = 16*n*num_ees*(not even)
+                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == " + str(parent) + ") ? s_dXhom : s_Xhom);")
-                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset_dee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom_dXhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset_dee) + " + colInd]);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
+                # make sure to save the offsets for next operations
+                if bfs_level == n_bfs_levels - 1:
+                    self.gen_add_code_line("int eeTemp_Offset = " + str(tempDstOffset_ee) + ";")
+                    self.gen_add_code_line("int deeTemp_Offset = " + str(tempDstOffset_dee) + ";")
                 if self.DEBUG_MODE:
                     code_lines = ["for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
                                   "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
@@ -834,8 +840,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == parent_jid) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset_dee) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset_dee) + " + colInd]);")
+                self.gen_add_code_line("// if last loop then save the temp offsets")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
+                # make sure to save the offsets for next operations
+                if bfs_level == n_bfs_levels - 1:
+                    self.gen_add_code_line("int eeTemp_Offset = " + str(tempDstOffset_ee) + ";")
+                    self.gen_add_code_line("int deeTemp_Offset = " + str(tempDstOffset_dee) + ";")
                 if self.DEBUG_MODE:
                     code_lines = ["for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
                                   "for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
@@ -847,6 +858,9 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
     self.gen_add_code_line("//")
     self.gen_add_code_line("T *s_d2eeTemp = &s_deeTemp[" + str(2*16*num_ees*n) + "];")
+    self.gen_add_code_line("// set eeTemp and deeTemp to the right offsets")
+    self.gen_add_code_line("s_eeTemp = &s_eeTemp[eeTemp_Offset];")
+    self.gen_add_code_line("s_deeTemp = &s_deeTemp[deeTemp_Offset];")
     for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
         # if serial chain manipulator then this is easy
         if self.robot.is_serial_chain():
@@ -939,6 +953,9 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 if self.DEBUG_MODE:
                     code_lines = ["for (int i = 0; i < " + str(n*n*num_ees) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_d2eeTemp[16*i],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+    if self.DEBUG_MODE:
+        code_lines = ["for (int i = 0; i < " + str(n*n*num_ees) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_d2eeTemp[16*i],4);}"]
+        self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
 
     # Then extract the end-effector position with the given offset(s)
     # TODO handle different offsets for different branches
@@ -953,7 +970,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("int ee_offset = 16 * curr_ee; int dee_offset = ee_offset * " + str(n) + "; int d2ee_offset = dee_offset * " + str(n) + ";")
     self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[ee_offset]; T *s_d2Xmat_hom_ij = &s_d2eeTemp[d2ee_offset + 16 * djid_i * " + str(n) + " + 16 * djid_j];")
     self.gen_add_code_line("T *s_dXmat_hom_i = &s_deeTemp[dee_offset + 16 * djid_i]; T *s_dXmat_hom_j = &s_deeTemp[dee_offset + 16 * djid_j];")
-    self.gen_add_code_line("T *s_deePos_i = &s_deePos[6*djid_i]; T *s_d2eePos_ij = &s_d2eePos[6*(" + str(n) + "*djid_i + djid_j)];")
+    self.gen_add_code_line("T *s_deePos_i = &s_deePos[6*djid_i]; int d2eePosOffset_ij = djid_i * " + str(n) + " + djid_j; int d2eePosOffset_ind = " + str(n*n) + ";")
     # # make sure to zero out all things not in the chain
     # jidChainCode_i = []
     # jidChainCode_j = []
@@ -974,7 +991,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// xyz is easy")
     self.gen_add_code_line("if (outputInd < 3){", add_indent_after=True)
     self.gen_add_code_line("if (djid_j == 0){s_deePos_i[outputInd] = s_dXmat_hom_i[12 + outputInd];}")
-    self.gen_add_code_line("s_d2eePos_ij[outputInd] = s_d2Xmat_hom_ij[12 + outputInd];")
+    self.gen_add_code_line("s_d2eePos[outputInd*d2eePosOffset_ind + d2eePosOffset_ij] = s_d2Xmat_hom_ij[12 + outputInd];")
     self.gen_add_end_control_flow()
 
     # roll pitch yaw is a bit more difficult
@@ -1005,8 +1022,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("T top = -x_prime_i*y + x*y_prime_i;     T bottom = x*x + y*y;")
     self.gen_add_code_line("T dtop = x_dprime_ij*y + x*y_dprime_ij + (djid_i != djid_j)*(-x_prime_i*y_prime_j + x_prime_j*y_prime_i);")
     self.gen_add_code_line("T dbottom = 2*x*x_prime_j + 2*y*y_prime_j;")
-    self.gen_add_code_line("if (djid_j == 0){s_deePos_i[outputInd] = top/bottom;}")
-    self.gen_add_code_line("s_d2eePos_ij[outputInd] = (bottom*dtop - top*dbottom) / (bottom*bottom);")
+    self.gen_add_code_line("if (djid_j == 0){s_d2eePos[outputInd*d2eePosOffset_ind + d2eePosOffset_ij] = top/bottom;}")
+    self.gen_add_code_line("else{s_d2eePos[outputInd*d2eePosOffset_ind + d2eePosOffset_ij] = (bottom*dtop - top*dbottom) / (bottom*bottom);}")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()

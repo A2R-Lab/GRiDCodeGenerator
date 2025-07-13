@@ -6,7 +6,7 @@ class GRiDCodeGenerator:
                          gen_add_func_doc, gen_add_serial_ops, gen_add_parallel_loop, gen_add_sync, gen_var_in_list, \
                          gen_var_not_in_list, gen_add_multi_threaded_select, gen_kernel_load_inputs, gen_kernel_save_result, \
                          gen_kernel_load_inputs_single_timing, gen_kernel_save_result_single_timing, \
-                         gen_static_array_ind_2d, gen_static_array_ind_3d, \
+                         gen_static_array_ind_2d, gen_static_array_ind_3d, gen_add_debug_print_code_lines, \
                          gen_mx_func_call_for_cpp, gen_spatial_algebra_helpers, \
                          gen_get_XI_size, gen_init_XImats, gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
