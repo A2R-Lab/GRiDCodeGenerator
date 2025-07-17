@@ -755,12 +755,12 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
                 self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
                 self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int eeIndStart = 16*" + str(all_ees[0]) + ";")
-                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[eeIndStart + rc];")
+                self.gen_add_code_line("if(djid == 0){s_eeTemp[ind] = s_Xhom[eeIndStart + rc];}")
                 self.gen_add_code_line("s_deeTemp[ind] = (djid == " + str(all_ees[0]) + ") ? s_dXhom[eeIndStart + rc] : s_Xhom[eeIndStart + rc];")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
+                    code_lines = ["printf(\"X_chain0\\n\"); printMat<T,4,4>(s_eeTemp,4);", \
                                   "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
             else:
@@ -777,8 +777,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 tempSrcOffset_ee = 16*num_ees*(not even)
                 tempDstOffset_dee = 16*n*num_ees*(even)
                 tempSrcOffset_dee = 16*n*num_ees*(not even)
-                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);")
+                self.gen_add_code_line("if(djid == 0){s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);}")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == " + str(parent) + ") ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset_dee) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset_dee) + " + colInd]);")
@@ -789,8 +789,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     self.gen_add_code_line("int eeTemp_Offset = " + str(tempDstOffset_ee) + ";")
                     self.gen_add_code_line("int deeTemp_Offset = " + str(tempDstOffset_dee) + ";")
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
-                                  "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
+                    code_lines = ["printf(\"X_chain_iter[%d]\\n\"," + str(bfs_level) + "); printMat<T,4,4>(&s_eeTemp[" + str(tempDstOffset_ee) + "],4);", \
+                                  "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain_iter[%d][%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i+" + str(tempDstOffset_dee) + "],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
         else:
             # if first loop then just set to transform at the leaf
@@ -808,7 +808,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     jidChainCode.append(code)
                 select_var_vals.append(("bool", "inChain", jidChainCode))
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
-                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
+                self.gen_add_code_line("if(djid == 0){s_eeTemp[ind] = s_Xhom[16*eeInd + rc];}")
                 self.gen_add_code_line("s_deeTemp[ind] = inChain * ((djid == eeInd) ? s_dXhom[16*eeInd + rc] : s_Xhom[16*eeInd + rc]);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
@@ -835,8 +835,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
                 if (-1 in curr_parents):
                     self.gen_add_code_line("if(parent_jid == -1){continue;}")
-                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);")
+                self.gen_add_code_line("if(djid == 0){s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);}")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = ((djid == parent_jid) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset_dee) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset_dee) + " + colInd]);")
@@ -848,8 +848,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     self.gen_add_code_line("int eeTemp_Offset = " + str(tempDstOffset_ee) + ";")
                     self.gen_add_code_line("int deeTemp_Offset = " + str(tempDstOffset_dee) + ";")
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}", \
-                                  "for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
+                    code_lines = ["printf(\"X_chain_iter[%d]\\n\"," + str(bfs_level) + "); printMat<T,4,4>(&s_eeTemp[" + str(tempDstOffset_ee) + "],4);", \
+                                  "for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain_iter[%d][%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i+" + str(tempDstOffset_dee) + "],4);}"]
     #
     # For each chain we now need to (in parallel) form the d2Xmats
     # 
@@ -875,7 +875,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n*n) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}"]
+                    code_lines = ["for (int ind = 0; ind < " + str(n*n) + "; ind++){int i = ind / " + str(n) + "; int j = ind % " + str(n) + "; printf(\"d2X_chain[0][%d][%d]\\n\",i,j); printMat<T,4,4>(&s_d2eeTemp[16*ind],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
@@ -892,11 +892,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == " + str(parent) + ")) ? s_d2Xhom : (" + \
                                                                 "((djid_i == " + str(parent) + ") || (djid_j == " + str(parent) + ")) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom_d2Xhom[16*" + str(parent) + " + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                                       "(&s_Xhom_dXhom_d2Xhom[16*" + str(parent) + " + row], &s_d2eeTemp[" + str(tempSrcOffset) + " + colInd]);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
+                if bfs_level == n_bfs_levels - 1:
+                    self.gen_add_code_line("int d2eeTemp_Offset = " + str(tempDstOffset) + ";")
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n*n) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}"]
+                    code_lines = ["for (int ind = 0; ind < " + str(n*n) + "; ind++){int i = ind / " + str(n) + "; int j = ind % " + str(n) + "; printf(\"d2X_chain_iter[%d][%d][%d]\\n\"," + str(bfs_level) + ",i,j); printMat<T,4,4>(&s_d2eeTemp[16*ind + " + str(tempDstOffset) + "],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
         else:
             if bfs_level == 0:
@@ -947,15 +949,14 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = ((djid_i == djid_j) && (djid_i == parent_jid)) ? s_d2Xhom : (" + \
                                                                 "((djid_i == parent_jid) || (djid_j == parent_jid)) ? s_dXhom : s_Xhom);")
                 self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom_d2Xhom[16*parent_jid + row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                                       "(&s_Xhom_dXhom_d2Xhom[16*parent_jid + row], &s_d2eeTemp[" + str(tempSrcOffset) + " + colInd]);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
+                if bfs_level == n_bfs_levels - 1:
+                    self.gen_add_code_line("int d2eeTemp_Offset = " + str(tempDstOffset) + ";")
                 if self.DEBUG_MODE:
-                    code_lines = ["for (int i = 0; i < " + str(n*n*num_ees) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_d2eeTemp[16*i],4);}"]
+                    code_lines = ["for (int ind = 0; ind < " + str(n*n) + "; ind++){int i = ind / " + str(n) + "; int j = ind % " + str(n) + "; printf(\"d2X_chain_iter[%d][%d][%d]\\n\"," + str(bfs_level) + ",i,j); printMat<T,4,4>(&s_d2eeTemp[16*ind + " + str(tempDstOffset) + "],4);}"]
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
-    if self.DEBUG_MODE:
-        code_lines = ["for (int i = 0; i < " + str(n*n*num_ees) + "; i++){printf(\"d2X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_d2eeTemp[16*i],4);}"]
-        self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
 
     # Then extract the end-effector position with the given offset(s)
     # TODO handle different offsets for different branches
@@ -963,6 +964,11 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// Finally Extract the eePos from the Tansforms")
     self.gen_add_code_line("// TODO: ADD OFFSETS")
     self.gen_add_code_line("//")
+    self.gen_add_code_line("// set d2eeTemp to the right offsets")
+    self.gen_add_code_line("s_d2eeTemp = &s_d2eeTemp[d2eeTemp_Offset];")
+    if self.DEBUG_MODE:
+        code_lines = ["for (int ind = 0; ind < " + str(n*n) + "; ind++){int i = ind / " + str(n) + "; int j = ind % " + str(n) + "; printf(\"d2X_chain[%d][%d]\\n\",i,j); printMat<T,4,4>(&s_d2eeTemp[16*ind],4);}"]
+        self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
     self.gen_add_code_line("// For all n*n*num_ee in parallel")
     self.gen_add_parallel_loop("ind6",str(6*n*n*num_ees),use_thread_group)
     self.gen_add_code_line("int ind = ind6 / 6; int outputInd = ind6 % 6;")
