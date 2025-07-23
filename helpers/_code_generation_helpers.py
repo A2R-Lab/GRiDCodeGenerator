@@ -66,6 +66,21 @@ def gen_add_sync(self, use_thread_group = False):
     else:
         self.gen_add_code_line("__syncthreads();")
 
+def gen_add_debug_print_code_line(self, print_code_string, use_thread_group = False):
+    self.gen_add_sync(use_thread_group)
+    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_code_line(print_code_string)
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+def gen_add_debug_print_code_lines(self, print_code_string_arr, use_thread_group = False):
+    self.gen_add_sync(use_thread_group)
+    self.gen_add_serial_ops(use_thread_group)
+    for code_string in print_code_string_arr:
+        self.gen_add_code_line(code_string)
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
 def gen_var_in_list(self, var_name, option_list):
     if len(option_list) == 1:
         return "(" + var_name + " == " + option_list[0] + ")"

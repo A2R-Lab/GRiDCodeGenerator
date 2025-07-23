@@ -2,7 +2,7 @@ import sympy as sp
 
 def gen_get_XI_size(self, include_base_inertia = False, include_homogenous_transforms = False):
     n = self.robot.get_num_joints()
-    return 36*2*n + (36 if include_base_inertia else 0) + (2*16*n if include_homogenous_transforms else 0)
+    return 36*2*n + (36 if include_base_inertia else 0) + (3*16*n if include_homogenous_transforms else 0)
 
 def gen_get_Xhom_size(self):
     n = self.robot.get_num_pos()
@@ -59,6 +59,7 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
         baseXI_size = self.gen_get_XI_size(include_base_inertia)
         Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id()
         dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
+        d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
         Xhom_size = self.gen_get_Xhom_size()
         for ind in range(len(Xmats_hom)):
             self.gen_add_code_line("// Xhom[" + str(ind) + "]")
@@ -68,7 +69,7 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
                     if not val.is_constant(): # initialize to 0
                         val = 0
                     str_val = str(val)
-                    cpp_ind = baseXI_size+ self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
+                    cpp_ind = baseXI_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
                     self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
         # and the gradients
         for ind in range(len(dXmats_hom)):
@@ -80,6 +81,17 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
                         val = 0
                     str_val = str(val)
                     cpp_ind = baseXI_size + Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
+                    self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
+        # and the 2nd derivatives
+        for ind in range(len(d2Xmats_hom)):
+            self.gen_add_code_line("// d2Xhom[" + str(ind) + "]")
+            for col in range(4):
+                for row in range(4):
+                    val = d2Xmats_hom[ind][row,col]
+                    if not val.is_constant(): # initialize to 0
+                        val = 0
+                    str_val = str(val)
+                    cpp_ind = baseXI_size + 2*Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
                     self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
     # allocate and transfer data to the GPU, free CPU memory and return the pointer to the memory
     self.gen_add_code_line("T *d_XImats; gpuErrchk(cudaMalloc((void**)&d_XImats," + str(XI_size) + "*sizeof(T)));")
@@ -238,10 +250,11 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
         if (include_homogenous_transforms):
             Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id()
             dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
+            d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
             baseXI_size = self.gen_get_XI_size(include_base_inertia)
             Xhom_size = self.gen_get_Xhom_size()
             self.gen_add_code_line("// X_hom[" + str(ind) + "]")
-            for col in range(4): # TL and BR are identical so only update TL and BL serially
+            for col in range(4):
                 for row in range(4):
                     val = Xmats_hom[ind][row,col]
                     if not val.is_constant():
@@ -257,7 +270,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
             # and gradients
             self.gen_add_code_line("// dX_hom[" + str(ind) + "]")
-            for col in range(4): # TL and BR are identical so only update TL and BL serially
+            for col in range(4):
                 for row in range(4):
                     val = dXmats_hom[ind][row,col]
                     if not val.is_constant():
@@ -271,11 +284,27 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
                         # then output the code
                         cpp_ind = str(baseXI_size + Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
+            # and 2nd derivatives
+            self.gen_add_code_line("// d2X_hom[" + str(ind) + "]")
+            for col in range(4):
+                for row in range(4):
+                    val = d2Xmats_hom[ind][row,col]
+                    if not val.is_constant():
+                        # parse the symbolic value into the appropriate array access
+                        str_val = str(val)
+                        # first check for sin/cos (revolute)
+                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
+                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
+                        # then just the variable (prismatic)
+                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        # then output the code
+                        cpp_ind = str(baseXI_size + 2*Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
+                        self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
 
     # end the serial section
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    # then copy the TL to BR in parallel across all X
+    # then copy the TL to BR in parallel across all 6x6 X
     self.gen_add_parallel_loop("kcr",str(9*self.robot.get_num_joints()),use_thread_group)
     self.gen_add_code_line("int k = kcr / 9; int cr = kcr % 9; int c = cr / 3; int r = cr % 3;")
     self.gen_add_code_line("int srcInd = k*36 + c*6 + r; int dstInd = srcInd + 21; // 3 more rows and cols")
@@ -285,10 +314,11 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
     # add the function end
     self.gen_add_end_function()
 
-def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = False, updated_var_names = None, include_gradients = False):
+def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = False, updated_var_names = None, include_gradients = False, include_hessians = False):
     var_names = dict( \
         s_XmatsHom_name = "s_XmatsHom", \
         s_dXmatsHom_name = "s_dXmatsHom", \
+        s_d2XmatsHom_name = "s_d2XmatsHom", \
         d_robotModel_name = "d_robotModel", \
         s_q_name = "s_q", \
         s_temp_name = "s_temp", \
@@ -302,28 +332,35 @@ def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = Fals
     n = self.robot.get_num_pos()
     if include_gradients:
         code_start += var_names["s_dXmatsHom_name"] + ", "
+    if include_hessians:
+        code_start += var_names["s_d2XmatsHom_name"] + ", "
     if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         code_start += var_names["s_topology_helpers_name"] + ", "
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
 
-def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = None, include_gradients = False):
+def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = None, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
     Xhom_size = 16*n
     if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         self.gen_add_code_line("__shared__ int s_topology_helpers[" + str(self.gen_topology_helpers_size()) + "];")
     if temp_mem_size is None: # use dynamic shared mem
-        if include_gradients:
+        if include_hessians:
+            self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_dXmatsHom = &s_XHomTemp[" + str(Xhom_size) + "]; T *s_d2XmatsHom = &s_dXmatsHom[" + str(Xhom_size) + "]; T *s_temp = &s_d2XmatsHom[" + str(Xhom_size) + "];")
+        elif include_gradients:
             self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_dXmatsHom = &s_XHomTemp[" + str(Xhom_size) + "]; T *s_temp = &s_dXmatsHom[" + str(Xhom_size) + "];")
         else:
             self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_temp = &s_XHomTemp[" + str(Xhom_size) + "];")
     else: # use specified static shared mem
         self.gen_add_code_line("__shared__ T s_XmatsHom[" + str(Xhom_size) + "];")
-        self.gen_add_code_line("__shared__ T s_dXmatsHom[" + str(Xhom_size) + "];")
+        if include_gradients:
+            self.gen_add_code_line("__shared__ T s_dXmatsHom[" + str(Xhom_size) + "];")
+        if include_hessians:
+            self.gen_add_code_line("__shared__ T s_d2XmatsHom[" + str(Xhom_size) + "];")
         self.gen_add_code_line("__shared__ T s_temp[" + str(temp_mem_size) + "];")
 
-def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_base_inertia = False, include_gradients = False):
+def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
     Xhom_size = 16*n
     baseXI_size = self.gen_get_XI_size(include_base_inertia)
@@ -340,6 +377,9 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     if include_gradients:
         func_params.insert(1,"s_dXmatsHom is the (shared) memory destination location for the dXmatsHom")
         func_def_middle += "T *s_dXmatsHom, "
+    if include_hessians:
+        func_params.insert(1,"s_d2XmatsHom is the (shared) memory destination location for the d2XmatsHom")
+        func_def_middle += "T *s_d2XmatsHom, "
     if use_thread_group:
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
         func_def_start += "cgrps::thread_group tgrp, "
@@ -365,6 +405,8 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
         if include_gradients:
             self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
+        if include_hessians:
+            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + 2*Xhom_size) + "];")
         self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
@@ -381,6 +423,8 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
         self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size) + "]," + str(Xhom_size) + ");")
         if include_gradients:
             self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_dXmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "]," + str(Xhom_size) + ");")
+        if include_hessians:
+            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_d2XmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size + 2*Xhom_size) + "]," + str(Xhom_size) + ");")
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_topology_helpers,d_robotModel->d_topology_helpers," + str(self.gen_topology_helpers_size()) + "*sizeof(int));")
         self.gen_add_code_line("cgrps::wait(tgrp);")
@@ -388,7 +432,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     self.gen_add_serial_ops(use_thread_group)
     for ind in range(n):
         self.gen_add_code_line("// X_hom[" + str(ind) + "]")
-        for col in range(4): # TL and BR are identical so only update TL and BL serially
+        for col in range(4):
             for row in range(4):
                 val = Xmats_hom[ind][row,col]
                 if not val.is_constant():
@@ -406,7 +450,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
         dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
         for ind in range(n):
             self.gen_add_code_line("// dX_hom[" + str(ind) + "]")
-            for col in range(4): # TL and BR are identical so only update TL and BL serially
+            for col in range(4):
                 for row in range(4):
                     val = dXmats_hom[ind][row,col]
                     if not val.is_constant():
@@ -420,10 +464,27 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_dXmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
+    if include_hessians:
+        d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
+        for ind in range(n):
+            self.gen_add_code_line("// d2X_hom[" + str(ind) + "]")
+            for col in range(4):
+                for row in range(4):
+                    val = d2Xmats_hom[ind][row,col]
+                    if not val.is_constant():
+                        # parse the symbolic value into the appropriate array access
+                        str_val = str(val)
+                        # first check for sin/cos (revolute)
+                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
+                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
+                        # then just the variable (prismatic)
+                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        # then output the code
+                        cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
+                        self.gen_add_code_line("s_d2XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     # end the serial section
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    # add the function end
     self.gen_add_end_function()
 
 def gen_topology_helpers_size(self):
