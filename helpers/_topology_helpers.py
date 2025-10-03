@@ -712,3 +712,52 @@ def gen_init_robotModel(self):
                              "gpuErrchk(cudaMemcpy(d_robotModel,&h_robotModel,sizeof(robotModel<T>),cudaMemcpyHostToDevice));"])
     self.gen_add_code_line("return d_robotModel;")
     self.gen_add_end_function()
+
+def gen_joint_limits_size(self):
+    n = self.robot.get_num_pos()
+    return 2 * n
+
+def gen_init_joint_limits(self):
+    n = self.robot.get_num_pos()
+
+    limits_q_order = []
+    for j in self.robot.get_joints_ordered_by_id():
+        jt = j.get_type() if hasattr(j, "get_type") else j.jtype
+        if jt == "revolute":
+            lims = j.get_joint_limits() if hasattr(j, "get_joint_limits") else getattr(j, "joint_limits", [])
+            if lims and len(lims) >= 2:
+                lo, hi = lims[0], lims[1]
+            else:
+                lo, hi = -float("inf"), float("inf")
+            if lo is None: lo = -float("inf")
+            if hi is None: hi =  float("inf")
+            limits_q_order.append((lo, hi))
+
+    self.gen_add_func_doc(
+        "Initializes joint limits (lower/upper) in GPU memory",
+        ["Memory order is lower[0..n-1], upper[0..n-1]"],
+        [],
+        "A device pointer to the joint limits array"
+    )
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("T* init_joint_limits() {", True)
+
+    total_size = self.gen_joint_limits_size()
+    self.gen_add_code_line(f"T *h_joint_limits = (T*)malloc({total_size}*sizeof(T));")
+
+    for i, (lo, hi) in enumerate(limits_q_order):
+        lo_str = ("-std::numeric_limits<T>::infinity()" if (lo is None or lo == -float('inf'))
+                  else f"static_cast<T>({lo})")
+        hi_str = (" std::numeric_limits<T>::infinity()" if (hi is None or hi ==  float('inf'))
+                  else f"static_cast<T>({hi})")
+        self.gen_add_code_line(f"h_joint_limits[{i}] = {lo_str};")
+        self.gen_add_code_line(f"h_joint_limits[{i + n}] = {hi_str};")
+
+    self.gen_add_code_line("T *d_joint_limits;")
+    self.gen_add_code_line(f"gpuErrchk(cudaMalloc((void**)&d_joint_limits, {total_size}*sizeof(T)));")
+    self.gen_add_code_line(f"gpuErrchk(cudaMemcpy(d_joint_limits, h_joint_limits, {total_size}*sizeof(T), cudaMemcpyHostToDevice));")
+    self.gen_add_code_line("free(h_joint_limits);")
+    self.gen_add_code_line("return d_joint_limits;")
+    self.gen_add_end_function()
+
