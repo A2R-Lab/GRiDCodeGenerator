@@ -243,8 +243,8 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Transform S')
     self.gen_add_parallel_loop('i','6*NUM_JOINTS',use_thread_group)
-    self.gen_add_code_line('int joint = i / 6;')
-    self.gen_add_code_line(f'S[i] = Xdown[joint*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
+    self.gen_add_code_line('int jid = i / 6;')
+    self.gen_add_code_line(f'S[i] = Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
