@@ -80,7 +80,7 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
     self.gen_add_code_line("//")
     parent = -1
-    for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
+    for bfs_level in range(n_bfs_levels + (0 if fixed_target_name == "" else 1)): # at most bfs levels of parents to chain (unless with fixed target can be one larger)
         # if serial chain manipulator then this is easy
         if self.robot.is_serial_chain():
             self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
