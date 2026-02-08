@@ -13,7 +13,7 @@ class GRiDCodeGenerator:
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
                          gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
-                         gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_outer_product
+                         gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_outer_product, custom_is_constant
 
     # then import all of the algorithms
     from .algorithms import gen_inverse_dynamics_inner_temp_mem_size, gen_inverse_dynamics_inner_function_call, \
@@ -87,7 +87,7 @@ class GRiDCodeGenerator:
         # first add constants
         n = self.robot.get_num_pos()
         XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
-        XHom_size = self.gen_get_Xhom_size()
+        XHom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
         dva_cols_per_partial = self.robot.get_total_ancestor_count() + self.robot.get_num_joints()
         max_threads_in_comp_loop = 6*2*dva_cols_per_partial
         suggested_threads = 32 * int(np.ceil(max_threads_in_comp_loop/32.0))
@@ -104,8 +104,8 @@ class GRiDCodeGenerator:
                                  "const int ID_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_inverse_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int FD_DU_MAX_SHARED_MEM_COUNT = " + str(int(self.gen_forward_dynamics_gradient_kernel_max_temp_mem_size()) + XI_size) + ";", \
                                  "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_inner_temp_mem_size()) + XHom_size) + ";", \
-                                 "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + 2*XHom_size) + ";", \
-                                 "const int D2EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()) + 3*XHom_size) + ";", \
+                                 "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + XHom_size + dXhom_size) + ";", \
+                                 "const int D2EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(int(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()) + XHom_size + dXhom_size + d2Xhom_size) + ";", \
                                  f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = 0;", \
                                  f'const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size};', \
                                  "const int SUGGESTED_THREADS = " + str(min(suggested_threads, 512)) + ";"]) # max of 512 to avoid exceeding available registers
@@ -306,7 +306,8 @@ class GRiDCodeGenerator:
             self.gen_add_end_function()
 
     # finally generate all of the code
-    def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False):
+    def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = ""):
+        self.include_fixed_kinematic_targets = fixed_target_name != ""
         # first generate the file info
         file_notes = [ "Interface is:", \
             "    __host__   robotModel<T> *d_robotModel = init_robotModel<T>()", \
@@ -377,6 +378,8 @@ class GRiDCodeGenerator:
             "","Suggested Type T is float",\
             "","Additional helper functions and ALGORITHM_inner functions which take in __shared__ memory temp variables exist -- see function descriptions in the file",\
             "","By default device and kernels need to be launched with dynamic shared mem of size <FUNC_CODE>_DYNAMIC_SHARED_MEM_COUNT where <FUNC_CODE> = [ID, MINV, FD, ID_DU, FD_DU]"]
+        if self.include_fixed_kinematic_targets:
+            file_notes += ["", "Additional EEPose Functions Included for Fixed Kinematic Target: " + fixed_target_name,""]
         self.gen_add_func_doc("This instance of grid.cuh is optimized for the urdf: " + self.robot.name,file_notes)
         # then all of the includes (and namespaces and defines)
         self.gen_add_includes(use_thread_group)
@@ -398,7 +401,7 @@ class GRiDCodeGenerator:
         self.gen_outer_product()
         # then generate the robot specific transformation and inertia matricies
         self.gen_init_topology_helpers()
-        self.gen_init_XImats(include_base_inertia,include_homogenous_transforms)
+        self.gen_init_XImats(include_base_inertia, include_homogenous_transforms)
         self.gen_init_robotModel()
         self.gen_init_gridData()
         self.gen_joint_limits_size()
@@ -411,7 +414,7 @@ class GRiDCodeGenerator:
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
             # then generate kinematic algorithms
-            self.gen_eepose_and_derivatives()
+            self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name)
         else:
             print('eepos, aba, crba, second order dynamics, and debug mode are still under development for floating base')
         # then generate the dynamics algorithms
