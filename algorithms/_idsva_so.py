@@ -186,12 +186,12 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             self.gen_add_parallel_loop('i', str(36*len(inds)), use_thread_group)
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid = "jid"
+                    jid_cpp = "jid"
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*36) for idx, jid in enumerate(inds)], select_var_vals)
             else:
-                jid = inds[0]
-                parent_ind_cpp = self.robot.get_parent_id(jid)
-            self.gen_add_code_line('int X_idx = jid*XIMAT_SIZE;')
+                jid_cpp = str(inds[0])
+                parent_ind_cpp = self.robot.get_parent_id(inds[0])
+            self.gen_add_code_line(f'int X_idx = {jid_cpp}*XIMAT_SIZE;')
             if bfs_level == 0: self.gen_add_code_line(f'Xup[X_idx + i % XIMAT_SIZE] = s_XImats[X_idx + i % XIMAT_SIZE]; // Parent is base')
             else: self.gen_add_code_line(f'matmul<T>(i % 36, &Xup[{parent_ind_cpp} * XIMAT_SIZE], &s_XImats[X_idx], &Xup[X_idx], XIMAT_SIZE, 0);')
             self.gen_add_end_control_flow()
@@ -277,14 +277,14 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             self.gen_add_parallel_loop('i', str(6*len(inds)), use_thread_group)
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid = "jid"
+                    jid_cpp = "jid"
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*6) for idx, jid in enumerate(inds)], select_var_vals)
             else:
-                jid = inds[0]
-                parent_ind_cpp = self.robot.get_parent_id(jid)
+                jid_cpp = str(inds[0])
+                parent_ind_cpp = self.robot.get_parent_id(inds[0])
             self.gen_add_code_line(f'int idx = i % 6;')
-            if bfs_level == 0: self.gen_add_code_line(f'v[jid*6 + idx] = vJ[jid*6 + idx]; // Parent is base')
-            else: self.gen_add_code_line(f'v[jid*6 + idx] = v[{parent_ind_cpp}*6 + idx] + vJ[jid*6 + idx];')
+            if bfs_level == 0: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = vJ[{jid_cpp}*6 + idx]; // Parent is base')
+            else: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = v[{parent_ind_cpp}*6 + idx] + vJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -333,14 +333,14 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             self.gen_add_parallel_loop('i', str(6*len(inds)), use_thread_group)
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid = "jid"
+                    jid_cpp = "jid"
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*6) for idx, jid in enumerate(inds)], select_var_vals)
             else:
-                jid = inds[0]
-                parent_ind_cpp = self.robot.get_parent_id(jid)
+                jid_cpp = str(inds[0])
+                parent_ind_cpp = self.robot.get_parent_id(inds[0])
             self.gen_add_code_line(f'int idx = i % 6;')
-            if bfs_level == 0: self.gen_add_code_line(f"a[jid*6+ idx] = aJ[jid*6 + idx] + gravity * (idx == 5); // Base joint's parent is the world")
-            else: self.gen_add_code_line(f'a[jid*6 + idx] = a[{parent_ind_cpp}*6 + idx] + aJ[jid*6 + idx];')
+            if bfs_level == 0: self.gen_add_code_line(f"a[{jid_cpp}*6+ idx] = aJ[{jid_cpp}*6 + idx] + gravity * (idx == 5); // Base joint's parent is the world")
+            else: self.gen_add_code_line(f'a[{jid_cpp}*6 + idx] = a[{parent_ind_cpp}*6 + idx] + aJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
         
@@ -434,15 +434,15 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             self.gen_add_parallel_loop('i', str((36*2 + 6)*len(inds)), use_thread_group)
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid = "jid"
+                    jid_cpp = "jid"
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*(36*2 + 6)) for idx, jid in enumerate(inds)], select_var_vals)
             else:
-                jid = inds[0]
-                parent_ind_cpp = self.robot.get_parent_id(jid)
+                jid_cpp = str(inds[0])
+                parent_ind_cpp = self.robot.get_parent_id(inds[0])
             self.gen_add_code_line(f'int idx = i % (36*2 + 6);')
-            self.gen_add_code_line(f'if (idx < 36) IC[{parent_ind_cpp}*36 + idx] += IC[jid*36 + idx];')
-            self.gen_add_code_line(f'else if (idx < 36*2) BC[{parent_ind_cpp}*36 + idx - 36] += BC[jid*36 + idx - 36];')
-            self.gen_add_code_line(f'else f[{parent_ind_cpp}*6 + idx - 36*2] += f[jid*6 + idx - 36*2];')
+            self.gen_add_code_line(f'if (idx < 36) IC[{parent_ind_cpp}*36 + idx] += IC[{jid_cpp}*36 + idx];')
+            self.gen_add_code_line(f'else if (idx < 36*2) BC[{parent_ind_cpp}*36 + idx - 36] += BC[{jid_cpp}*36 + idx - 36];')
+            self.gen_add_code_line(f'else f[{parent_ind_cpp}*6 + idx - 36*2] += f[{jid_cpp}*6 + idx - 36*2];')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 

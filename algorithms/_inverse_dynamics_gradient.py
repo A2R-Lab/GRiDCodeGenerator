@@ -168,6 +168,35 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+    has_linear_axis = any(
+        self.robot.get_S_by_id(jid).tolist().index(1) >= 3 for jid in range(n)
+    )
+    if has_linear_axis:
+        # For prismatic axes, the force derivative term needs the force cross-product
+        # column. The motion and force columns coincide for the revolute axes covered
+        # by the original path, but differ for linear axes.
+        self.gen_add_parallel_loop("dof_id", str(n), use_thread_group)
+        self.gen_add_code_line("int S_ind = s_topology_helpers[9 + dof_id];")
+        self.gen_add_code_line("if (S_ind >= 3) {", True)
+        self.gen_add_code_line(f"T *dst = &s_temp[{Offset_Mxf} + 6*dof_id];")
+        self.gen_add_code_line(f"const T *src = &s_vaf[{12*NJ} + 6*dof_id];")
+        self.gen_add_code_line("for (int row = 0; row < 6; ++row) dst[row] = static_cast<T>(0);")
+        self.gen_add_code_line("if (S_ind == 3) {", True)
+        self.gen_add_code_line("dst[1] = src[5];")
+        self.gen_add_code_line("dst[2] = -src[4];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else if (S_ind == 4) {", True)
+        self.gen_add_code_line("dst[0] = -src[5];")
+        self.gen_add_code_line("dst[2] = src[3];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        self.gen_add_code_line("dst[0] = src[4];")
+        self.gen_add_code_line("dst[1] = -src[3];")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
     if self.DEBUG_MODE:
         self.gen_add_sync(use_thread_group)
         self.gen_add_serial_ops(use_thread_group)
