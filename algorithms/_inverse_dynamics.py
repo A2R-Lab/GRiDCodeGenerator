@@ -96,6 +96,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
 
         if bfs_level == 0: 
             self.gen_add_code_line("// s_v, s_a where parent is base")
@@ -126,9 +127,9 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             if S_ind_cpp == '-1': # floating base returns -1, and has 6x6 identity matrix
                 qd_qdd_code = "s_vaf[jid6 + row] = s_qd[row];" 
             else:
-                qd_qdd_code = "if (row == " + S_ind_cpp + "){s_vaf[jid6 + " + S_ind_cpp + "] += s_qd[" + jid + "];}"
+                qd_qdd_code = "if (row == " + S_ind_cpp + "){s_vaf[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qd[" + jid + "];}"
             if use_qdd_input:
-                qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += s_qdd[" + jid + "];}")
+                qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qdd[" + jid + "];}")
             self.gen_add_code_line(qd_qdd_code)
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
@@ -163,9 +164,9 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                 jid = str(inds[0])
             self.gen_add_code_line("int vaOffset = !vFlag * " + str(6*n) + "; int jid6 = 6 * " + jid + ";")
             if self.robot.floating_base: # 6-dof offset on qd for non-fb joints, 0 idx offset => + 5
-                if jid != 'jid': qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (vFlag * s_qd[" + str(int(jid) + 5) + "]);"
-                else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (vFlag * s_qd[" + jid + " + 5]);"
-            else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (vFlag * s_qd[" + jid + "]);"
+                if jid != 'jid': qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + str(int(jid) + 5) + "]);"
+                else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + jid + " + 5]);"
+            else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + jid + "]);"
             if use_qdd_input:
                 if self.robot.floating_base: 
                     if jid != 'jid': qd_qdd_val_code = qd_qdd_val_code.replace(");", " + !vFlag * s_qdd[" + str(int(jid) + 5) + "]);")
@@ -198,14 +199,14 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                 self.gen_add_multi_threaded_select("ind", "==", [str(i) for i in range(len(inds))], select_var_vals)
                 dst_name = "&s_vaf[" + str(6*n) + " + 6*jid]"
                 src_name = "&s_vaf[6*jid]"
-                if self.robot.floating_base: scale_name = "s_qd[jid + 5]" # dof offset for fb
-                else: scale_name = "s_qd[jid]"
+                if self.robot.floating_base: scale_name = "(" + S_sign_cpp + ") * s_qd[jid + 5]" # dof offset for fb
+                else: scale_name = "(" + S_sign_cpp + ") * s_qd[jid]"
             else:
                 jid = inds[0]
                 dst_name = "&s_vaf[" + str(6*n + 6*jid) + "]"
                 src_name = "&s_vaf[" + str(6*jid) + "]"
-                if self.robot.floating_base: scale_name = "s_qd[" + str(jid + 5) + "]" # dof offset due to fb
-                else: scale_name = "s_qd[" + str(jid) + "]"
+                if self.robot.floating_base: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid + 5) + "]" # dof offset due to fb
+                else: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid) + "]"
             updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = dst_name, s_src_name = src_name, s_scale_name = scale_name)
             self.gen_mx_func_call_for_cpp(inds, PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
             self.gen_add_end_control_flow()
@@ -306,16 +307,18 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
     if compute_c:
         # then extract all c in parallel
         _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp()
         self.gen_add_code_line("//")
         self.gen_add_code_line("// s_c extracted in parallel (S*f)")
         self.gen_add_code_line("//")
         self.gen_add_parallel_loop("dof_id",str(self.robot.get_num_vel()),use_thread_group) # one component for each dof
         if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id') 
+        if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
         if self.robot.floating_base:
             if '+' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace(']', ' - 5]') # offset back to the beginning of the S_inds
             self.gen_add_code_line("int fb_offset = (dof_id > 5) * (6 * (dof_id - 5)); // First 6 DOF belong to floating base")
             self.gen_add_code_line("s_c[dof_id] = s_vaf[" + str(12*n) + " + fb_offset + " + S_ind_cpp + "];")
-        else: self.gen_add_code_line("s_c[dof_id] = s_vaf[" + str(12*n) + " + 6*dof_id + " + S_ind_cpp + "];")
+        else: self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + 6*dof_id + " + S_ind_cpp + "];")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()

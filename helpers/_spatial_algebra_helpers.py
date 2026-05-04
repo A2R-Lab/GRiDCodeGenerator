@@ -10,7 +10,7 @@ def gen_mx_func_call_for_cpp(self, inds = None, PEQ_FLAG = False, SCALE_FLAG = F
 
     # check for all the same mxFunc
     if IDENTICAL_S_FLAG_INDS:
-        S_ind = str(self.robot.get_S_by_id(inds[0]).tolist().index(1))
+        S_ind = str(self.robot.get_S_index_by_id(inds[0]))
     else:
         S_ind = "X"
     # find which function type

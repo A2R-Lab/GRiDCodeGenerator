@@ -618,7 +618,7 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
 
         if self.robot.floating_base:
             if 0 in inds: S_ind = '-1'
-            else: S_ind = str(self.robot.get_S_by_id(inds[0]).tolist().index(1))
+            else: S_ind = str(self.robot.get_S_index_by_id(inds[0]))
     
     # else branch based on type of robot
     else:
@@ -633,15 +633,17 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
             dva_col_offset_for_jid_p1 = "(" + var_names["jid_name"] + "+1)*(" + var_names["jid_name"] + "+2)/2"
             df_col_that_is_jid = var_names["jid_name"]
             if not IDENTICAL_S_FLAG_INDS:
-                S_ind = "s_topology_helpers[jid]"
+                S_id = "s_topology_helpers[jid]"
+                S_ind = "((" + S_id + ") > 0 ? (" + S_id + ") - 1 : -(" + S_id + ") - 1)"
     
         # generic robot
         else:
             parent_ind = var_names["s_topology_helpers_name"] + "[" + var_names["jid_name"] + "]"
             if not IDENTICAL_S_FLAG_INDS: # this set of inds can be optimized if all S are the same
                 if OFFSET:
-                    S_ind = var_names["s_topology_helpers_name"] + "[" + str(n) + " + " + var_names["jid_name"] +  "]"
-                else: S_ind = var_names["s_topology_helpers_name"] + "[" + str(NJ) + " + " + var_names["jid_name"] +  "]"
+                    S_id = var_names["s_topology_helpers_name"] + "[" + str(n) + " + " + var_names["jid_name"] +  "]"
+                else: S_id = var_names["s_topology_helpers_name"] + "[" + str(NJ) + " + " + var_names["jid_name"] +  "]"
+                S_ind = "((" + S_id + ") > 0 ? (" + S_id + ") - 1 : -(" + S_id + ") - 1)"
             if not IDENTICAL_S_FLAG_GLOBAL: # ofset is based on any S different at all
                 if OFFSET: ancestor_offset = 2*n
                 else: ancestor_offset = NJ+n
@@ -673,12 +675,35 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
             df_col_that_is_jid = var_names["s_topology_helpers_name"] + "[" + str(ancestor_offset) + " + " + var_names["jid_name"] + "]"
 
     if IDENTICAL_S_FLAG_INDS: # always true for one ind
-        S_ind = str(self.robot.get_S_by_id(inds[0]).tolist().index(1))
+        S_ind = str(self.robot.get_S_index_by_id(inds[0]))
 
     if NO_GRAD_FLAG:
         return parent_ind, S_ind
     else:
         return parent_ind, S_ind, dva_col_offset_for_jid, df_col_offset_for_jid, dva_col_offset_for_parent, df_col_offset_for_parent, dva_col_offset_for_jid_p1, df_col_that_is_jid
+
+def gen_topology_S_sign_for_cpp(self, inds = None, updated_var_names = None, OFFSET = True):
+    var_names = dict(jid_name = "jid", s_topology_helpers_name = "s_topology_helpers")
+    if updated_var_names is not None:
+        for key,value in updated_var_names.items():
+            var_names[key] = value
+    n = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
+    if inds == None:
+        inds = list(range(n))
+
+    if self.robot.are_Ss_identical(inds):
+        return str(self.robot.get_S_sign_by_id(inds[0]))
+
+    if self.robot.is_serial_chain():
+        S_id = var_names["s_topology_helpers_name"] + "[" + var_names["jid_name"] + "]"
+        return "((" + S_id + ") > 0 ? 1 : -1)"
+
+    if OFFSET:
+        S_id = var_names["s_topology_helpers_name"] + "[" + str(n) + " + " + var_names["jid_name"] + "]"
+    else:
+        S_id = var_names["s_topology_helpers_name"] + "[" + str(NJ) + " + " + var_names["jid_name"] + "]"
+    return "((" + S_id + ") > 0 ? 1 : -1)"
 
 def gen_insert_helpers_function_call(self, updated_var_names = None):
     n = self.robot.get_num_pos()
@@ -776,4 +801,3 @@ def gen_init_joint_limits(self):
     self.gen_add_code_line("free(h_joint_limits);")
     self.gen_add_code_line("return d_joint_limits;")
     self.gen_add_end_function()
-

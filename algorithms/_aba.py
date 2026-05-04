@@ -48,6 +48,7 @@ def gen_aba_inner(self, use_thread_group = False):
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
 
         if bfs_level == 0:
             self.gen_add_code_line("// s_v where parent is base")
@@ -69,7 +70,7 @@ def gen_aba_inner(self, use_thread_group = False):
             self.gen_add_code_lines(["int jid6 = 6*jid;", \
                                      "s_va[jid6 + row] = static_cast<T>(0);"])
             # add in qd
-            self.gen_add_code_line("if (row == " + S_ind_cpp + "){s_va[jid6 + " + S_ind_cpp + "] += s_qd[" + jid + "];}")
+            self.gen_add_code_line("if (row == " + S_ind_cpp + "){s_va[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qd[" + jid + "];}")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -99,7 +100,7 @@ def gen_aba_inner(self, use_thread_group = False):
                 jid = str(inds[0])
                 self.gen_add_code_line("int jid = " + jid + ";")
             self.gen_add_code_line("int jid6 = 6 * jid;")
-            self.gen_add_code_line("T qd_val = (row == " + S_ind_cpp + ") * (s_qd[" + jid + "]);")
+            self.gen_add_code_line("T qd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (s_qd[" + jid + "]);")
             self.gen_add_code_line("s_va[jid6 + row] = dot_prod<T,6,6,1>(&s_XImats[6*jid6 + row], &s_va[6*" + parent_ind_cpp + "]) + qd_val;")
             
 
@@ -120,7 +121,9 @@ def gen_aba_inner(self, use_thread_group = False):
     self.gen_add_parallel_loop("ind", str(n), use_thread_group)
     self.gen_add_code_line("int jid = ind;")
     self.gen_add_code_line("int jid6 = 6 * jid;")
-    self.gen_add_code_line("mx2_scaled<T>(&s_temp[72 * " + str(n) + "+jid6], &s_va[jid6], s_qd[jid]);")
+    _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp()
+    self.gen_mx_func_call_for_cpp(list(range(n)), updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = "&s_temp[72 * " + str(n) + " + jid6]", s_src_name = "&s_va[jid6]", s_scale_name = "(" + S_sign_cpp + ") * s_qd[jid]"), PEQ_FLAG = False, SCALE_FLAG = True)
     self.gen_add_end_control_flow()
     
     # add debug if requested
@@ -182,6 +185,7 @@ def gen_aba_inner(self, use_thread_group = False):
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
         self.gen_add_code_line("// Backward pass where bfs_level is " + str(bfs_level))
         self.gen_add_code_line("//     joints are: " + ", ".join(joint_names))
         self.gen_add_code_line("//     links are: " + ", ".join(link_names))
@@ -198,7 +202,7 @@ def gen_aba_inner(self, use_thread_group = False):
             self.gen_add_code_line("int jid = " + jid + ";")
         self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
 
-        self.gen_add_code_line("s_temp[84*"+str(n)+"+jid6+row] = s_temp[36*jid+row+6*("+ S_ind_cpp+")];")
+        self.gen_add_code_line("s_temp[84*"+str(n)+"+jid6+row] = (" + S_sign_cpp + ") * s_temp[36*jid+row+6*("+ S_ind_cpp+")];")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 
@@ -213,9 +217,9 @@ def gen_aba_inner(self, use_thread_group = False):
             jid = str(inds[0])
             self.gen_add_code_line("int jid = " + jid + ";")
         self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
-        self.gen_add_code_line("s_temp[96 * "+ str(n) +" + jid] = s_temp[84 * " + str(n) + " + jid6 + " + S_ind_cpp + "];")
+        self.gen_add_code_line("s_temp[96 * "+ str(n) +" + jid] = (" + S_sign_cpp + ") * s_temp[84 * " + str(n) + " + jid6 + " + S_ind_cpp + "];")
         
-        self.gen_add_code_line("T tempval = s_temp[78 * " + str(n) + " + jid6 + " + S_ind_cpp +"];") 
+        self.gen_add_code_line("T tempval = (" + S_sign_cpp + ") * s_temp[78 * " + str(n) + " + jid6 + " + S_ind_cpp +"];") 
         self.gen_add_code_line("s_temp[97 * " + str(n) + " + jid] = s_tau[jid] - tempval;")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
@@ -327,6 +331,7 @@ def gen_aba_inner(self, use_thread_group = False):
     for bfs_level in range(n_bfs_levels):
         inds = self.robot.get_ids_by_bfs_level(bfs_level)
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         # calculate a where parent is base
@@ -400,7 +405,7 @@ def gen_aba_inner(self, use_thread_group = False):
             jid = str(inds[0])
             self.gen_add_code_line("int jid = " + jid + ";")
         self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
-        self.gen_add_code_line("T qdd_val = (row == " + S_ind_cpp + ") * (s_qdd[jid]);")
+        self.gen_add_code_line("T qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (s_qdd[jid]);")
         self.gen_add_code_line("s_va[6*"+str(n)+"+jid6+row] += qdd_val;")
 
         self.gen_add_end_control_flow()

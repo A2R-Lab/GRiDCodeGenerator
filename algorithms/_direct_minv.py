@@ -89,6 +89,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
         ind_subtree_inds = []
         subree_counts = []
         for ind in inds:
@@ -137,9 +138,9 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 jid = str(inds[0]) 
                 jid6 = str(6*inds[0])
                 self.gen_add_parallel_loop("row",str(6),use_thread_group)
-            self.gen_add_code_line("s_temp[" + str(UOffset) + " + " + jid6 + " + row] = s_temp[" + str(IAOffset) + " + 6*" + jid6 + " + 6*" + S_ind_cpp + " + row];")
+            self.gen_add_code_line("s_temp[" + str(UOffset) + " + " + jid6 + " + row] = (" + S_sign_cpp + ") * s_temp[" + str(IAOffset) + " + 6*" + jid6 + " + 6*" + S_ind_cpp + " + row];")
             self.gen_add_code_line("if(row == " + S_ind_cpp + "){", True)
-            self.gen_add_code_line("s_temp[" + str(DinvOffset) + " + " + jid + "] = static_cast<T>(1)/s_temp[" + str(UOffset) + " + " + jid6 + " + " + S_ind_cpp + "];")
+            self.gen_add_code_line("s_temp[" + str(DinvOffset) + " + " + jid + "] = static_cast<T>(1)/((" + S_sign_cpp + ") * s_temp[" + str(UOffset) + " + " + jid6 + " + " + S_ind_cpp + "]);")
             # need offset due to floating base matrix in upper left
             if self.robot.floating_base: self.gen_add_code_line(f's_Minv[{str(n + 1)} * ({jid} + 5)]' + " = s_temp[" + str(DinvOffset) + " + " + jid + "];")
             else: self.gen_add_code_line("s_Minv[" + str(n + 1) + " * " + jid + "] = s_temp[" + str(DinvOffset) + " + " + jid + "];")
@@ -204,7 +205,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                     jid_subtreeN = str(subId*n)
 
             self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + \
-                                                    "s_temp[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
+                                                    "(" + S_sign_cpp + ") * s_temp[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
             if bfs_level != 0:
                 self.gen_add_code_line("for(int row = 0; row < 6; row++) {", True)
                 self.gen_add_code_line("s_temp[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + row] += " + \
@@ -376,8 +377,10 @@ def gen_direct_minv_inner(self, use_thread_group = False):
   
         if self.robot.floating_base and jid == 0: 
             SInd = '-1'
+            SSign = '1'
         else:
-            SInd = str(self.robot.get_S_by_id(jid).tolist().index(1))
+            SInd = str(self.robot.get_S_index_by_id(jid))
+            SSign = str(self.robot.get_S_sign_by_id(jid))
 
         # Minv[i,i:] -= Dinv*U^T*Xmat*F[parent,:,i:] across cols i...N
         # F[i,:,i:] = S^T * Minv[i,i:] + Xmat*F[parent,:,i:] across cols i...N
@@ -417,7 +420,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                                    "s_temp[" + str(DinvOffset + jid) + "] * " + \
                                    "dot_prod<T,6,1,1>(s_Fcol,&s_temp[" + str(UOffset + 6*jid) + "]);")
             if jid < n-1: # skip redundant comp on last loop
-                self.gen_add_code_line("s_Fcol[" + SInd + "] += s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "];")
+                self.gen_add_code_line("s_Fcol[" + SInd + "] += (" + SSign + ") * s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "];")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -439,7 +442,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             if self.robot.floating_base: self.gen_add_code_line(f"s_temp[ind] = s_Minv[row + {n} * col];") # update F[0]
             else:
                 self.gen_add_code_line("s_temp[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = (row == " + SInd + ") * " + \
-                                            "s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
+                                            "(" + SSign + ") * s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 

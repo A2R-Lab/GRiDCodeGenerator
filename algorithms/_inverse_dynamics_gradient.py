@@ -128,6 +128,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     self.gen_add_code_line("int row = ind % 6; int col = ind / 6; int jid = col % " + str(NJ) + "; int jid6 = 6*jid;")
     # get the parent (note that in some cases we have more efficient ways of computing this so add some special cases)
     parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True, OFFSET=False)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp(OFFSET=False)
     self.gen_add_code_line("bool parentIsBase = " + parent_ind_cpp + " == -1;")
     # then get the offsets
     self.gen_add_code_lines(["bool comp1 = col < " + str(NJ) + "; bool comp3 = col >= " + str(2*NJ) + ";",
@@ -163,35 +164,48 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                        "&s_vaf[0]", "&s_vaf[" + str(12*NJ) + "]"])]
     self.gen_add_multi_threaded_select("selector", "==", [str(i) for i in range(4)], select_var_vals)
     if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
-    updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = "&s_temp[dstOffset + dof_id6]", s_src_name = "&src[jid6]")
-    self.gen_mx_func_call_for_cpp(PEQ_FLAG = False, SCALE_FLAG = False, updated_var_names = updated_var_names)
+    if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
+    updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = "&s_temp[dstOffset + dof_id6]", s_src_name = "&src[jid6]", s_scale_name = S_sign_cpp)
+    self.gen_mx_func_call_for_cpp(PEQ_FLAG = False, SCALE_FLAG = True, updated_var_names = updated_var_names)
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
     has_linear_axis = any(
-        self.robot.get_S_by_id(jid).tolist().index(1) >= 3 for jid in range(n)
+        self.robot.get_S_index_by_id(jid) >= 3 for jid in range(n)
     )
     if has_linear_axis:
         # For prismatic axes, the force derivative term needs the force cross-product
         # column. The motion and force columns coincide for the revolute axes covered
         # by the original path, but differ for linear axes.
         self.gen_add_parallel_loop("dof_id", str(n), use_thread_group)
-        self.gen_add_code_line("int S_ind = s_topology_helpers[9 + dof_id];")
+        _, S_ind_dof_cpp = self.gen_topology_helpers_pointers_for_cpp(
+            list(range(n)),
+            updated_var_names=dict(jid_name="dof_id"),
+            NO_GRAD_FLAG=True,
+            OFFSET=False,
+        )
+        S_sign_dof_cpp = self.gen_topology_S_sign_for_cpp(
+            list(range(n)),
+            updated_var_names=dict(jid_name="dof_id"),
+            OFFSET=False,
+        )
+        self.gen_add_code_line("int S_ind = " + S_ind_dof_cpp + ";")
+        self.gen_add_code_line("T S_sign = static_cast<T>(" + S_sign_dof_cpp + ");")
         self.gen_add_code_line("if (S_ind >= 3) {", True)
         self.gen_add_code_line(f"T *dst = &s_temp[{Offset_Mxf} + 6*dof_id];")
         self.gen_add_code_line(f"const T *src = &s_vaf[{12*NJ} + 6*dof_id];")
         self.gen_add_code_line("for (int row = 0; row < 6; ++row) dst[row] = static_cast<T>(0);")
         self.gen_add_code_line("if (S_ind == 3) {", True)
-        self.gen_add_code_line("dst[1] = src[5];")
-        self.gen_add_code_line("dst[2] = -src[4];")
+        self.gen_add_code_line("dst[1] = S_sign * src[5];")
+        self.gen_add_code_line("dst[2] = -S_sign * src[4];")
         self.gen_add_end_control_flow()
         self.gen_add_code_line("else if (S_ind == 4) {", True)
-        self.gen_add_code_line("dst[0] = -src[5];")
-        self.gen_add_code_line("dst[2] = src[3];")
+        self.gen_add_code_line("dst[0] = -S_sign * src[5];")
+        self.gen_add_code_line("dst[2] = S_sign * src[3];")
         self.gen_add_end_control_flow()
         self.gen_add_code_line("else {", True)
-        self.gen_add_code_line("dst[0] = src[4];")
-        self.gen_add_code_line("dst[1] = -src[3];")
+        self.gen_add_code_line("dst[0] = S_sign * src[4];")
+        self.gen_add_code_line("dst[1] = -S_sign * src[3];")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
@@ -225,6 +239,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         _, S_ind_cpp, dva_col_offset_for_jid_cpp, _, dva_col_offset_for_parent_cpp, _, _, _ = self.gen_topology_helpers_pointers_for_cpp(inds, OFFSET=False)
+        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds, OFFSET=False)
         self.gen_add_code_line("// dv/du where bfs_level is " + str(bfs_level))
         self.gen_add_code_line("//     joints are: " + ", ".join(joint_names))
         self.gen_add_code_line("//     links are: " + ", ".join(link_names))
@@ -248,7 +263,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                     self.gen_add_code_line("int row = ind % 6; int dq_flag = (ind / 6) == 0;")
                 self.gen_add_code_line("int du_offset = dq_flag ? " + str(Offset_dv_dq) + " : " + str(Offset_dv_dqd) + ";")
                 self.gen_add_code_line("s_temp[du_offset + 6*" + dva_col_offset_for_jid_cpp + " + row] = " + \
-                                    "(!dq_flag && row == " + S_ind_cpp + ") * static_cast<T>(1);") 
+                                    "(!dq_flag && row == " + S_ind_cpp + ") * static_cast<T>(" + S_sign_cpp + ");") 
             self.gen_add_end_control_flow()
 
         # dv/du = X dv_parent/du + {MxXv or S for col ind}
@@ -276,8 +291,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 # then add in S or Mx(Xv)
                 self.gen_add_code_line(f"if (col == {jid} + 5)" + ' {', True)
                 if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
+                if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
                 self.gen_add_code_line(f"s_temp[du_offset + 6*col + row] += !dq_flag * (row == {S_ind_cpp})" + \
-                                        f" + dq_flag * s_temp[{Offset_MxXv} + ({jid}+5)*6 + row];")
+                                        f" * ({S_sign_cpp}) + dq_flag * s_temp[{Offset_MxXv} + ({jid}+5)*6 + row];")
                 self.gen_add_end_control_flow()
             else:
                 self.gen_add_parallel_loop("ind",str(6*2*(bfs_level)*len(inds)),use_thread_group)
@@ -304,7 +320,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 # do the non-branching if/else
                 self.gen_add_code_line("s_temp[du_col_offset + 6*" + dva_col_offset_for_jid_cpp + " + 6 + row] = ")
                 self.gen_add_code_line("    dq_flag * s_temp[" + str(Offset_MxXv) + " + 6*" + jid + " + row] + " + \
-                                        "(!dq_flag && row == " + S_ind_cpp + ") * static_cast<T>(1);")
+                                        "(!dq_flag && row == " + S_ind_cpp + ") * static_cast<T>(" + S_sign_cpp + ");")
                 # all cols add if bfs_level is 1 so skip the if statement
                 if bfs_level > 1:
                     self.gen_add_end_control_flow()
@@ -333,6 +349,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     self.gen_add_code_line("// start da/du by setting = MxS(dv/du)*qd + {MxXa, Mxv} for all n in parallel")
     self.gen_add_code_line("// start with da/du = MxS(dv/du)*qd")
     _ , S_ind_cpp , _ , _ , _ , _ , dva_col_offset_for_jidp1_cpp, _ = self.gen_topology_helpers_pointers_for_cpp(list(range(n)), OFFSET=False)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp(OFFSET=False)
     add_col_for_jid = "(" + dva_col_offset_for_jidp1_cpp + " - 1)"
     if self.robot.floating_base: 
         # set da/du = 0
@@ -346,8 +363,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line(f"int dof_id = (col / {n}) % {n}; int jid = dof_id < 6 ? 0 : dof_id - 5;") # dof_id being applied with S, to jid
         self.gen_add_code_line(f"bool dq_flag = col < {n*n}; int dqd_offset = !dq_flag * {6*dva_cols_per_partial};")
         if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
+        if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
         updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = f"&s_temp[{Offset_da_dq} + jid*{6*n} + dof*6 + dqd_offset]", \
-                                 s_src_name = f"&s_temp[{Offset_dv_dq} + jid*{6*n} + dof*6 + dqd_offset]", s_scale_name = "s_qd[dof_id]")
+                                 s_src_name = f"&s_temp[{Offset_dv_dq} + jid*{6*n} + dof*6 + dqd_offset]", s_scale_name = "(" + S_sign_cpp + ") * s_qd[dof_id]")
         # call the mx func
         self.gen_mx_func_call_for_cpp(PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
         # then add to the add col
@@ -362,7 +380,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         select_var_vals = [("int", "jid", [str(jid) for jid in range(NJ)])]
         self.gen_add_multi_threaded_select("col_du", "<", [str(running_sum_dva_cols_per_jid[jid+1]) for jid in range(NJ)], select_var_vals)
         updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = "&s_temp[" + str(Offset_da_dq) + " + 6*col]", \
-                                s_src_name = "&s_temp[" + str(Offset_dv_dq) + " + 6*col]", s_scale_name = "s_qd[jid]")
+                                s_src_name = "&s_temp[" + str(Offset_dv_dq) + " + 6*col]", s_scale_name = "(" + S_sign_cpp + ") * s_qd[jid]")
         # call the mx func
         self.gen_mx_func_call_for_cpp(PEQ_FLAG = False, SCALE_FLAG = True, updated_var_names = updated_var_names)
         # then add to the add col
@@ -738,6 +756,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     # extract dc/du
     self.gen_add_code_line("// Finally dc[i]/du = S[i]^T*df[i]/du")
     _, S_ind_cpp, _, df_col_offset_for_jid_cpp, _, _, _, _ = self.gen_topology_helpers_pointers_for_cpp(list(range(n)), OFFSET=False)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp(OFFSET=False)
     # Note that for a serial chain this is straightforward (all df are size n) but otherwise gets complicated
     if self.robot.is_serial_chain() or self.robot.floating_base:
         self.gen_add_parallel_loop("ind",str(2*n*n),use_thread_group)
@@ -753,7 +772,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_lines(["int Offset_src = dq_flag * " + str(Offset_df_dq) + " + !dq_flag * " + str(Offset_df_dqd) + \
                                         " + 6 * " + str(n) + " * jid + 6 * jid_du + " + S_ind_cpp + ";",
                                     "int Offset_dst = !dq_flag * " + str(n*n) + " + " + str(n) + " * jid_du + jid;"])
-            self.gen_add_code_line("s_dc_du[Offset_dst] = s_temp[Offset_src];")
+            self.gen_add_code_line("s_dc_du[Offset_dst] = (" + S_sign_cpp + ") * s_temp[Offset_src];")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 
@@ -782,9 +801,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                     jid_du_check_for_jid = self.gen_var_in_list("jid",[str(i) for i in non_zero_inds])
                 self.gen_add_code_line("flag = " + jid_du_check_for_jid + ";")
                 # compute the val and pointer updates accordingly
-                self.gen_add_code_line("s_dc_du[Offset_dst] = flag*s_temp[Offset_src]; Offset_src += flag*6; Offset_dst += " + str(n) + ";")
+                self.gen_add_code_line("s_dc_du[Offset_dst] = flag * (" + S_sign_cpp + ") * s_temp[Offset_src]; Offset_src += flag*6; Offset_dst += " + str(n) + ";")
             else: # else everyone updates and updates their pointer
-                self.gen_add_code_line("s_dc_du[Offset_dst] = s_temp[Offset_src]; Offset_src += 6; Offset_dst += " + str(n) + ";")
+                self.gen_add_code_line("s_dc_du[Offset_dst] = (" + S_sign_cpp + ") * s_temp[Offset_src]; Offset_src += 6; Offset_dst += " + str(n) + ";")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 

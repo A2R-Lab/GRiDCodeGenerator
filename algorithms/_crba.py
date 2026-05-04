@@ -31,7 +31,7 @@ def gen_crba_inner(self, use_thread_group = False):
     
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
-    has_linear_axis = any(self.robot.get_S_by_id(jid).tolist().index(1) >= 3 for jid in range(n))
+    has_linear_axis = any(self.robot.get_S_index_by_id(jid) >= 3 for jid in range(n))
     imat_offset = n if has_linear_axis else 7
 
     #construct the boilerplate and function definition
@@ -167,6 +167,7 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_code_line("// Calculation of M[ind, ind] ")
     self.gen_add_code_line("//")
     _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp()
     
     self.gen_add_parallel_loop("jid",str(n),use_thread_group)
 
@@ -183,7 +184,7 @@ def gen_crba_inner(self, use_thread_group = False):
     # initialize fh as (XS)^T
     self.gen_add_parallel_loop('i',str(n*6),use_thread_group)
     self.gen_add_code_line('int jid = i / 6; int ind = i % 6;')
-    self.gen_add_code_line(f's_fh[i] = s_XImats[{ImatOffset} + 36*jid + 6*{S_ind_cpp} + ind];')
+    self.gen_add_code_line(f's_fh[i] = ({S_sign_cpp}) * s_XImats[{ImatOffset} + 36*jid + 6*{S_ind_cpp} + ind];')
     self.gen_add_end_control_flow()
 
     # M[jid, parent_id] = dot product between (S_lambda^T * X_lambda^t) * IS
@@ -220,8 +221,16 @@ def gen_crba_inner(self, use_thread_group = False):
 
     self.gen_add_code_line('int parent_ind = jid_parents[i];')
     if has_linear_axis:
-        self.gen_add_code_line("int S_ind = s_topology_helpers[9 + jid] >= 3 ? s_topology_helpers[9 + parent_ind] : s_topology_helpers[9 + jid];")
-        self.gen_add_code_line(f"s_M[jid*{n} + parent_ind] = s_fh[jid*6 + S_ind];")
+        _, parent_S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(
+            list(range(n)),
+            updated_var_names=dict(jid_name="parent_ind"),
+            NO_GRAD_FLAG=True,
+        )
+        parent_S_sign_cpp = self.gen_topology_S_sign_for_cpp(
+            list(range(n)),
+            updated_var_names=dict(jid_name="parent_ind"),
+        )
+        self.gen_add_code_line(f"s_M[jid*{n} + parent_ind] = ({parent_S_sign_cpp}) * s_fh[jid*6 + {parent_S_ind_cpp}];")
     else:
         self.gen_add_code_line(f"s_M[jid*{n} + parent_ind] = s_fh[jid*6 + {S_ind_cpp}];")
     self.gen_add_code_line(f"s_M[parent_ind*{n} + jid] = s_M[jid*{n} + parent_ind];") # M symmetric
