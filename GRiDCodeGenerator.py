@@ -67,6 +67,7 @@ class GRiDCodeGenerator:
         # first all of the includes
         self.gen_add_code_line("")
         self.gen_add_code_line("#include <assert.h>")
+        self.gen_add_code_line("#include <stdint.h>")
         self.gen_add_code_line("#include <stdio.h>")
         self.gen_add_code_line("#include <stdlib.h>")
         self.gen_add_code_line("#include <time.h>")
@@ -306,7 +307,7 @@ class GRiDCodeGenerator:
             self.gen_add_end_function()
 
     # finally generate all of the code
-    def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = ""):
+    def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None):
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         # first generate the file info
         file_notes = [ "Interface is:", \
@@ -432,6 +433,8 @@ class GRiDCodeGenerator:
         self.gen_init_close_grid()
         self.gen_add_end_control_flow()
         # then output to a file
-        file = open(self.file_namespace + ".cuh","w")
+        if output_path is None:
+            output_path = self.file_namespace + ".cuh"
+        file = open(output_path, "w")
         file.write(self.code_str)
         file.close()
