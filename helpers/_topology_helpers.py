@@ -633,7 +633,7 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
             dva_col_offset_for_jid_p1 = "(" + var_names["jid_name"] + "+1)*(" + var_names["jid_name"] + "+2)/2"
             df_col_that_is_jid = var_names["jid_name"]
             if not IDENTICAL_S_FLAG_INDS:
-                S_id = "s_topology_helpers[jid]"
+                S_id = var_names["s_topology_helpers_name"] + "[" + var_names["jid_name"] + "]"
                 S_ind = "((" + S_id + ") > 0 ? (" + S_id + ") - 1 : -(" + S_id + ") - 1)"
     
         # generic robot
@@ -691,6 +691,9 @@ def gen_topology_S_sign_for_cpp(self, inds = None, updated_var_names = None, OFF
     NJ = self.robot.get_num_joints()
     if inds == None:
         inds = list(range(n))
+
+    if self.robot.floating_base and len(inds) == 1 and inds[0] != 0:
+        return str(self.robot.get_S_sign_by_id(inds[0]))
 
     if self.robot.are_Ss_identical(inds):
         return str(self.robot.get_S_sign_by_id(inds[0]))

@@ -135,8 +135,13 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                              "int XIOffset  =  comp1 * " + str(36*NJ) + " + 6*jid6 + row; // rowCol of I (comp1) or X (comp 2 and 3)",
                              "int vaOffset  = comp1 * jid6 + !comp1 * 6*" + parent_ind_cpp + " + comp3 * " + str(6*NJ) + "; // v_i (comp1) or va_parent (comp 2 and 3)",
                              "int dstOffset = comp1 * " + str(Offset_Iv) + " + !comp1 * " + str(Offset_FxvI) + " + comp3 * " + str(6*NJ) + " + jid6 + row; // rowCol of dst"])
-    self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ? comp3 * s_XImats[XIOffset + 30] * gravity : ",
-                             "                                               dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
+    if self.robot.floating_base:
+        self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ?",
+                                 "                           (comp3 ? (row < 3 ? static_cast<T>(0) : s_XImats[6*jid6 + 6*row + 5] * gravity) : static_cast<T>(0)) :",
+                                 "                           dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
+    else:
+        self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ? comp3 * s_XImats[XIOffset + 30] * gravity : ",
+                                 "                                               dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -252,7 +257,8 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 self.gen_add_code_line("bool dq_flag = ind < " + str(6*n) + ";")
                 self.gen_add_code_line("int row = ind % 6; int col = (!dq_flag * " + str(-n) + ") + (ind / 6);")
                 self.gen_add_code_line("int du_offset = dq_flag ? " + str(Offset_dv_dq) + " : " + str(Offset_dv_dqd) + ";")
-                self.gen_add_code_line("s_temp[du_offset + 6*col + row] = !dq_flag * (row == col);")
+                self.gen_add_code_line("int fb_col = row < 3 ? row + 3 : row - 3;")
+                self.gen_add_code_line("s_temp[du_offset + 6*col + row] = !dq_flag * (fb_col == col);")
             else:
                 self.gen_add_parallel_loop("ind",str(6*2*len(inds)),use_thread_group)
                 if len(inds) > 1:

@@ -121,15 +121,24 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                 jid = str(inds[0])
             self.gen_add_code_lines(["int jid6 = 6*" + jid + ";", \
                                         "s_vaf[jid6 + row] = static_cast<T>(0);",])
-            if not self.robot.floating_base or not use_qdd_input: self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;")
-            else: self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity + s_qdd[row];")
+            if self.robot.floating_base:
+                root_gravity_code = "(row < 3 ? static_cast<T>(0) : s_XImats[6*jid6 + 6*row + 5] * gravity)"
+                if not use_qdd_input:
+                    self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + ";")
+                else:
+                    self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + " + s_qdd[row];")
+            else:
+                self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;")
             # then add in qd and qdd
-            if S_ind_cpp == '-1': # floating base returns -1, and has 6x6 identity matrix
-                qd_qdd_code = "s_vaf[jid6 + row] = s_qd[row];" 
+            if S_ind_cpp == '-1': # floating base uses the root motion subspace, not raw row-wise copies
+                qd_qdd_code = "int fb_col = row < 3 ? row + 3 : row - 3; s_vaf[jid6 + row] = s_qd[fb_col];"
             else:
                 qd_qdd_code = "if (row == " + S_ind_cpp + "){s_vaf[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qd[" + jid + "];}"
             if use_qdd_input:
-                qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qdd[" + jid + "];}")
+                if S_ind_cpp == '-1':
+                    qd_qdd_code += " s_vaf[" + str(n*6) + " + jid6 + row] += s_qdd[fb_col];"
+                else:
+                    qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qdd[" + jid + "];}")
             self.gen_add_code_line(qd_qdd_code)
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
