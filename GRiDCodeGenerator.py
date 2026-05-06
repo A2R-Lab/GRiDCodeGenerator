@@ -46,7 +46,7 @@ class GRiDCodeGenerator:
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
                             gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
                             gen_idsva_so_device, gen_idsva_so_kernel, gen_idsva_so_host, gen_idsva_so, \
-                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
+                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
 
     # finally import the test code
@@ -234,10 +234,11 @@ class GRiDCodeGenerator:
 
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
         fdsva_so_inner_temp_count = 4*nv**3
-        fdsva_so_shared_temp_count = max(idsva_so_inner_temp_count, fdsva_so_inner_temp_count)
+        fdsva_so_fd_gradient_inline_temp_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
+        fdsva_so_shared_temp_count = max(idsva_so_inner_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         fdsva_so_full_t_count = fdsva_so_base_t_count + 8*nv**3 + fdsva_so_shared_temp_count
         fdsva_so_global_t_count = fdsva_so_base_t_count + fdsva_so_shared_temp_count
-        fdsva_so_workspace_temp_t_count = fdsva_so_base_t_count + idsva_so_inner_temp_count
+        fdsva_so_workspace_temp_t_count = fdsva_so_base_t_count + max(idsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         self.fdsva_so_use_global_tensors = py_arena_bytes(fdsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
         self.fdsva_so_use_workspace_temp = (
             self.fdsva_so_use_global_tensors and

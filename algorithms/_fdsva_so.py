@@ -38,8 +38,8 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Second Derivatives of Forward Dynamics')
     self.gen_add_code_line('T *d2a_dqdq = s_df2;')
-    self.gen_add_code_line('T *d2a_dvdv = &s_df2[' + str(n*n*n) + '];')
-    self.gen_add_code_line('T *d2a_dvdq = &s_df2[' + str(2*n*n*n) + '];')
+    self.gen_add_code_line('T *d2a_dvdq = &s_df2[' + str(n*n*n) + '];')
+    self.gen_add_code_line('T *d2a_dvdv = &s_df2[' + str(2*n*n*n) + '];')
     self.gen_add_code_line('T *d2a_dtdq = &s_df2[' + str(3*n*n*n) + '];')
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Temporary Variables')
@@ -75,10 +75,10 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     self.gen_add_code_line('// Multiply by -Minv to finish algorithm')
     self.gen_add_parallel_loop("ind",str(4*n**3),use_thread_group)
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
-    self.gen_add_code_line(f'if (ind < {n**3}) d2a_dqdq[i*{n*n} + j + k*{n}] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_dq[j + k*{n}]);')
-    self.gen_add_code_line(f'else if (ind < {2*n**3}) d2a_dvdq[i*{n*n} + j + k*{n}] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_cross[j + k*{n}]);')
-    self.gen_add_code_line(f'else if (ind < {3*n**3}) d2a_dvdv[i*{n*n} + j + k*{n}] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &d2tau_dvdv[j + k*{n}]);')
-    self.gen_add_code_line(f'else d2a_dtdq[i*{n*n} + j + k*{n}] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_tau[j + k*{n}]);')
+    self.gen_add_code_line(f'if (ind < {n**3}) d2a_dqdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_dq[j + k*{n}]);')
+    self.gen_add_code_line(f'else if (ind < {2*n**3}) d2a_dvdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_cross[j + k*{n}]);')
+    self.gen_add_code_line(f'else if (ind < {3*n**3}) d2a_dvdv[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &d2tau_dvdv[j + k*{n}]);')
+    self.gen_add_code_line(f'else d2a_dtdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_tau[j + k*{n}]);')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -93,6 +93,53 @@ def gen_fdsva_so_device_temp_mem_size(self):
 def gen_fdsva_so_inner_temp_mem_size(self):
     n = self.robot.get_num_vel()
     return 4*n**3
+
+def gen_fdsva_so_fd_gradient_inline_temp_mem_size(self):
+    n = self.robot.get_num_vel()
+    return 18*self.robot.get_num_joints() + 2*n*n + self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+
+def gen_fdsva_so_fd_gradient_inline(self, use_thread_group = False):
+    n = self.robot.get_num_vel()
+    self.gen_add_code_line("// Compute FD gradient inline so nested device wrappers do not carve a second shared arena")
+    self.gen_add_code_line("T *s_fd_vaf = s_temp;")
+    self.gen_add_code_line(f"T *s_fd_dc_du = s_fd_vaf + {18*self.robot.get_num_joints()};")
+    self.gen_add_code_line(f"T *s_fd_temp = s_fd_dc_du + {2*n*n};")
+    self.gen_inverse_dynamics_inner_function_call(
+        use_thread_group,
+        compute_c = False,
+        use_qdd_input = True,
+        updated_var_names = dict(
+            s_vaf_name = "s_fd_vaf",
+            s_q_name = "s_q",
+            s_qd_name = "s_qd",
+            s_qdd_name = "s_qdd",
+            s_temp_name = "s_fd_temp",
+            gravity_name = "gravity",
+        ),
+    )
+    self.gen_inverse_dynamics_gradient_inner_function_call(
+        use_thread_group,
+        updated_var_names = dict(
+            s_dc_du_name = "s_fd_dc_du",
+            s_vaf_name = "s_fd_vaf",
+            s_q_name = "s_q",
+            s_qd_name = "s_qd",
+            s_temp_name = "s_fd_temp",
+            s_temp_spill_name = "nullptr",
+            temp_spill_flag_name = "false",
+            gravity_name = "gravity",
+        ),
+    )
+    self.gen_add_parallel_loop("ind", str(2*n*n), use_thread_group)
+    self.gen_add_code_line(f"int row = ind % {n}; int dc_col_offset = ind - row;")
+    self.gen_add_code_line("T val = static_cast<T>(0);")
+    self.gen_add_code_line(f"for(int col = 0; col < {n}; col++) {{", True)
+    self.gen_add_code_line(f"int index = (row <= col) * (col * {n} + row) + (row > col) * (row * {n} + col);")
+    self.gen_add_code_line("val += s_Minv[index] * s_fd_dc_du[dc_col_offset + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("s_df_du[ind] = -val;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
     
 def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -140,7 +187,11 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    shared_mem_size = max(self.gen_fdsva_so_device_temp_mem_size(), self.gen_fdsva_so_inner_temp_mem_size())
+    shared_mem_size = max(
+        self.gen_fdsva_so_device_temp_mem_size(),
+        self.gen_fdsva_so_inner_temp_mem_size(),
+        self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
+    )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
     
     # then load/update XI and run the algo
@@ -148,7 +199,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_direct_minv_inner_function_call(use_thread_group)
     self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, gravity);")
     self.gen_add_sync(use_thread_group)
-    self.gen_forward_dynamics_gradient_device_function_call()
+    self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
     self.gen_idsva_so_inner_function_call(use_thread_group)
     self.gen_fdsva_so_inner_function_call(use_thread_group)
     self.gen_add_end_function()
@@ -157,7 +208,10 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     n = self.robot.get_num_pos()
     use_global_tensors = getattr(self, "fdsva_so_use_global_tensors", n > MEMORY_THRESHOLD)
     use_workspace_temp = getattr(self, "fdsva_so_use_workspace_temp", False)
-    shared_temp_size = self.gen_idsva_so_inner_temp_mem_size()
+    shared_temp_size = max(
+        self.gen_idsva_so_inner_temp_mem_size(),
+        self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
+    )
     if not use_workspace_temp:
         shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
     # define function def and params
@@ -217,7 +271,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
-        self.gen_forward_dynamics_gradient_device_function_call()
+        self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
         self.gen_idsva_so_inner_function_call(use_thread_group)
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
@@ -240,7 +294,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
-        self.gen_forward_dynamics_gradient_device_function_call()
+        self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
         self.gen_idsva_so_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
