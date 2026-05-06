@@ -4,7 +4,10 @@ def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input =
     id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return max(minv_temp,id_du_temp) if not use_qdd_Minv_input else id_du_temp
 
-def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, use_qdd_Minv_input = False, s_df_du_name = "s_df_du"):
+def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, use_qdd_Minv_input = False,
+                                               s_df_du_name = "s_df_du",
+                                               s_temp_spill_name = "nullptr",
+                                               temp_spill_flag_name = "false"):
     n = self.robot.get_num_vel()
     if not use_qdd_Minv_input:
         #
@@ -23,7 +26,10 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
     else:
         self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = False, use_qdd_input = True)
     # then run the gradient code
-    self.gen_inverse_dynamics_gradient_inner_function_call(use_thread_group)
+    self.gen_inverse_dynamics_gradient_inner_function_call(
+        use_thread_group,
+        dict(s_temp_spill_name = s_temp_spill_name, temp_spill_flag_name = temp_spill_flag_name)
+    )
 
     if self.DEBUG_MODE:
         self.gen_add_sync(use_thread_group)
@@ -53,10 +59,6 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
     self.gen_add_code_line("for(int col = 0; col < " + str(n) + "; col++) {", True)
     self.gen_add_code_line("int index = (row <= col) * (col * " + str(n) + " + row) + (row > col) * (row * " + str(n) + " + col);")
     self.gen_add_code_line("val += s_Minv[index] * s_dc_du[dc_col_offset + col];")
-    self.gen_add_code_line("// Also save MIV as df_dtau")
-    self.gen_add_code_line("if (col < " + str(n) + "){", True)
-    self.gen_add_code_line(s_df_du_name + "[ind + " + str(n*n) + "] = s_Minv[index];")
-    self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_code_line(s_df_du_name + "[ind] = -val;")
     self.gen_add_end_control_flow()
@@ -91,13 +93,11 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    self.gen_add_code_lines(["__shared__ T s_vaf[" + str(18*NJ) + "];",
-                             "__shared__ T s_dc_du[" + str(n*2*n) + "];"])
+    extra_t_buffers = [("s_vaf", 18*n), ("s_dc_du", n*2*n)]
     if not use_qdd_Minv_input:
-        self.gen_add_code_lines(["__shared__ T s_Minv[" + str(n*n) + "];",
-                                 "__shared__ T s_qdd[" + str(n) + "];"])
-    shared_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+        extra_t_buffers += [("s_Minv", n*n), ("s_qdd", n)]
+    shared_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     # then run the computation
@@ -121,7 +121,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
                    "gravity is the gravity constant", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void forward_dynamics_gradient_kernel(T *d_df_du, const T *d_q_qd, const int stride_q_qd, "
+    func_def_start = "void forward_dynamics_gradient_kernel(T *d_df_du, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     if use_qdd_Minv_input:
         func_def_start += "const T *d_qdd, "
@@ -141,16 +141,25 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = [f"__shared__ T s_q_qd[{2*n+self.robot.floating_base}]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];", \
-                       "__shared__ T s_dc_du[" + str(n*2*n) + "];",
-                       "__shared__ T s_vaf[" + str(18*NJ) + "];",
-                       "__shared__ T s_qdd[" + str(n) + "];",
-                       "__shared__ T s_Minv[" + str(n*n) + "];"]
+    extra_t_buffers = [("s_q_qd", 2*n+self.robot.floating_base),
+                       ("s_dc_du", n*2*n),
+                       ("s_vaf", 18*n),
+                       ("s_qdd", n),
+                       ("s_Minv", n*n)]
     if not use_qdd_Minv_input:
-        shared_mem_vars[0] = f"__shared__ T s_q_qd_u[{3*n+self.robot.floating_base}]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];"
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+        extra_t_buffers[0] = ("s_q_qd_u", 3*n+self.robot.floating_base)
+    use_selective_spill = getattr(self, "fd_du_use_selective_spill", False)
+    use_global_temp = getattr(self, "fd_du_use_global_temp", False)
+    shared_mem_size = 0 if use_global_temp else (
+        max(self.gen_direct_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
+        if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
+    )
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    if use_qdd_Minv_input:
+        self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
+    else:
+        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -160,12 +169,25 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),str(n),"Minv",str(n*n),str(n*n))
         else:
             self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(n*2*n) + "];")
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        elif use_global_temp:
+            self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(n*2*n) + "];")
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_forward_dynamics_gradient_inner_python(use_thread_group,use_qdd_Minv_input,"s_temp") # use the temp mem to store s_df_du
+        self.gen_forward_dynamics_gradient_inner_python(
+            use_thread_group,
+            use_qdd_Minv_input,
+            "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
+            "s_temp_spill",
+            "GRID_FD_DU_USES_DA_DF_SPILL"
+        ) # use the temp mem to store s_df_du
         # save to global
-        self.gen_kernel_save_result("df_du",str(n*2*n),str(n*2*n),use_thread_group,"s_temp")
+        if not (use_global_temp or use_selective_spill):
+            self.gen_kernel_save_result("df_du",str(n*2*n),str(n*2*n),use_thread_group,"s_temp")
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
@@ -173,14 +195,27 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),"Minv",str(n*n))
         else:
             self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("T *d_df_du_k = d_df_du;")
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(d_workspace);")
+        elif use_global_temp:
+            self.gen_add_code_line("T *d_df_du_k = d_df_du;")
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_forward_dynamics_gradient_inner_python(use_thread_group,use_qdd_Minv_input,"s_temp") # use the temp mem to store s_df_du
+        self.gen_forward_dynamics_gradient_inner_python(
+            use_thread_group,
+            use_qdd_Minv_input,
+            "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
+            "s_temp_spill",
+            "GRID_FD_DU_USES_DA_DF_SPILL"
+        ) # use the temp mem to store s_df_du
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("df_du",str(n*2*n),use_thread_group,"s_temp")
+        if not (use_global_temp or use_selective_spill):
+            self.gen_kernel_save_result_single_timing("df_du",str(n*2*n),use_thread_group,"s_temp")
     self.gen_add_end_function()
 
 def gen_forward_dynamics_gradient_host(self, mode = 0):
@@ -195,7 +230,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void forward_dynamics_gradient(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void forward_dynamics_gradient(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -206,11 +241,12 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false>")
+    self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "forward_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,FD_DU_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_df_du,hd_data->d_q_qd_u,stride_q_qd,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_gradient requires all-data or dynamics gridData\");")
+    func_call_start = "forward_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -236,7 +272,11 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_gradient\", FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
+    self.gen_add_code_line("if (GRID_FD_DU_USES_GLOBAL_TEMP || GRID_FD_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_FD_DU_USES_GLOBAL_TEMP || GRID_FD_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \

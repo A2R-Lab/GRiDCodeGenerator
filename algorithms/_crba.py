@@ -276,7 +276,7 @@ def gen_crba_device(self, use_thread_group = False):
     self.gen_add_code_line(func_def, True)
 
     # add the shared memory variables
-    shared_mem_size = self.gen_crba_device_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None 
+    shared_mem_size = self.gen_crba_device_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
 
     # then load/update XI and run the algo
@@ -308,11 +308,9 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_M[" + str(n*n) + "];", \
-                        "__shared__ T s_q_qd[3*" + str(n) + "]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];", ]
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_crba_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = self.gen_crba_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", n*n), ("s_q_qd", 3*n)])
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -353,7 +351,7 @@ def gen_crba_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void crba(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void crba(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -364,11 +362,12 @@ def gen_crba_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "crba_kernel<T><<<block_dimms,thread_dimms,CRBA_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_M,hd_data->d_q_qd,stride_q_qd,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"crba requires all-data or dynamics gridData\");")
+    func_call_start = "crba_kernel<T><<<block_dimms,thread_dimms,CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_M,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -395,6 +394,7 @@ def gen_crba_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"crba\", CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back

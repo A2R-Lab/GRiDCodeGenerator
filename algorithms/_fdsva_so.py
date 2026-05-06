@@ -91,9 +91,8 @@ def gen_fdsva_so_device_temp_mem_size(self):
     return int(36 * NV * 10 + 30 * NV + 6 + len(jids_a)*36)
     
 def gen_fdsva_so_inner_temp_mem_size(self):
-    # TODO - should be actual amount required by inner function
-    # For now, just use device
-    return self.gen_fdsva_so_device_temp_mem_size()
+    n = self.robot.get_num_vel()
+    return 4*n**3
     
 def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -141,12 +140,8 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    # add the shared memory variables
-    self.gen_add_code_line(f"__shared__ T s_Minv[{n*n}];")
-    self.gen_add_code_line(f"__shared__ T s_qdd[{n}];")
-    self.gen_add_code_line(f"__shared__ T s_idsva_so[{n*n*n*4}];")
-    shared_mem_size = self.gen_fdsva_so_device_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = max(self.gen_fdsva_so_device_temp_mem_size(), self.gen_fdsva_so_inner_temp_mem_size())
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
     
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -160,18 +155,22 @@ def gen_fdsva_so_device(self, use_thread_group = False):
 
 def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = False):
     n = self.robot.get_num_pos()
+    use_global_tensors = getattr(self, "fdsva_so_use_global_tensors", n > MEMORY_THRESHOLD)
+    use_workspace_temp = getattr(self, "fdsva_so_use_workspace_temp", False)
+    shared_temp_size = self.gen_idsva_so_inner_temp_mem_size()
+    if not use_workspace_temp:
+        shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
     # define function def and params
     func_params = ["d_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
                     "d_q_qd_u is the vector of joint positions, velocities, torques", \
                     "stride_q_qd_u is the stride between each q, qd, qdd", \
+                    "d_workspace is the generated global spill workspace", \
+                    "d_idsva_so is the pointer to the idsva_so output tensor in global memory", \
                     "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                     "gravity is the gravity constant", \
                     "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void fdsva_so_kernel(T *d_df2, const T *d_q_qd_u, const int stride_q_qd_u, "
-    if n > MEMORY_THRESHOLD:
-        func_params.append("d_idsva_so is the pointer to the idsva_so output tensor in global memory")
-        func_def_start += "T *d_idsva_so, "
+    func_def_start = "void fdsva_so_kernel(T *d_df2, const T *d_q_qd_u, const int stride_q_qd_u, unsigned char *d_workspace, T *d_idsva_so, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -185,15 +184,16 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q_qd_u[4*" + str(n) + "]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];",\
-                        f"__shared__ T s_Minv[{n*n}];", \
-                        f"__shared__ T s_qdd[{n}];", \
-                        f"__shared__ T s_df_du[{2*n*n}];"]
-    if n <= MEMORY_THRESHOLD:
-        shared_mem_vars.append(f"__shared__ T s_idsva_so[{n*n*n*4}];")
-        shared_mem_vars.append(f"__shared__ T s_df2[" + str(4*n*n*n) + "];")
-    self.gen_add_code_lines(shared_mem_vars)
-    self.gen_XImats_helpers_temp_shared_memory_code(self.gen_idsva_so_inner_temp_mem_size())
+    extra_t_buffers = [("s_q_qd_u", 4*n), ("s_Minv", n*n), ("s_qdd", n), ("s_df_du", 2*n*n)]
+    if not use_global_tensors:
+        extra_t_buffers.append(("s_idsva_so", n*n*n*4))
+        extra_t_buffers.append(("s_df2", 4*n*n*n))
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_temp_size, extra_t_buffers = extra_t_buffers)
+    if not use_workspace_temp:
+        self.gen_add_code_line("(void)d_workspace;")
+    if not use_global_tensors:
+        self.gen_add_code_line("(void)d_idsva_so;")
+    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     fd_start = "forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, "
@@ -205,9 +205,11 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)
-        if n > MEMORY_THRESHOLD: 
+        if use_global_tensors:
             self.gen_add_code_line(f'T *s_df2 = &d_df2[k*{4*n**3}];')
             self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[k*{4*n**3}];')
+        if use_workspace_temp:
+            self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -217,10 +219,11 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_sync(use_thread_group)
         self.gen_forward_dynamics_gradient_device_function_call()
         self.gen_idsva_so_inner_function_call(use_thread_group)
-        self.gen_fdsva_so_inner_function_call(use_thread_group)
+        fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
+        self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_sync(use_thread_group)
         # save to global
-        if n <= MEMORY_THRESHOLD: self.gen_kernel_save_result("df2",f"{4*n**3}",str(4*n*n*n),use_thread_group)
+        if not use_global_tensors: self.gen_kernel_save_result("df2",f"{4*n**3}",str(4*n*n*n),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
@@ -228,19 +231,22 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        if n > MEMORY_THRESHOLD: 
-            self.gen_add_code_line(f'T *s_df2 = &d_df2[rep*{4*n**3}];')
-            self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[rep*{4*n**3}];')
+        if use_global_tensors:
+            self.gen_add_code_line('T *s_df2 = d_df2;')
+            self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')
+        if use_workspace_temp:
+            self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_forward_dynamics_gradient_device_function_call()
         self.gen_idsva_so_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
-        self.gen_fdsva_so_inner_function_call(use_thread_group)
+        fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
+        self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_end_control_flow()
         # save to global
-        if n <= MEMORY_THRESHOLD: self.gen_kernel_save_result_single_timing("df2",str(4*n*n*n),use_thread_group)
+        if not use_global_tensors: self.gen_kernel_save_result_single_timing("df2",str(4*n*n*n),use_thread_group)
     self.gen_add_end_function()
 
 def gen_fdsva_so_host(self, mode = 0):
@@ -256,7 +262,7 @@ def gen_fdsva_so_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void fdsva_so(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void fdsva_so(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -267,14 +273,13 @@ def gen_fdsva_so_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fdsva_so requires all-data or dynamics gridData\");")
 
-    func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_df2,hd_data->d_q_qd_u,stride_q_qd_qdd,"
-    if n > MEMORY_THRESHOLD:
-        func_call_start += "hd_data->d_idsva_so,"
+    func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_workspace,hd_data->d_idsva_so,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd_qdd = 3*NUM_JOINTS;")
     if single_call_timing:
@@ -294,7 +299,11 @@ def gen_fdsva_so_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*" + ("1" if single_call_timing else "num_timesteps")
+    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \

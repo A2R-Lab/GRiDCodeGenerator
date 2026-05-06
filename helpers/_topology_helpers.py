@@ -141,16 +141,18 @@ def gen_load_update_XImats_helpers_function_call(self, use_thread_group = False,
         code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
 
-def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = None, include_base_inertia = False, include_homogenous_transforms = False):
+def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_base_inertia = False,
+                                               include_homogenous_transforms = False, extra_t_buffers = None):
     n = self.robot.get_num_pos()
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        self.gen_add_code_line("__shared__ int s_topology_helpers[" + str(self.gen_topology_helpers_size()) + "];")
-    if temp_mem_size is None: # use dynamic shared mem
-        self.gen_add_code_line("extern __shared__ T s_XITemp[]; T *s_XImats = s_XITemp; T *s_temp = &s_XITemp[" + str(XI_size) + "];")
-    else: # use specified static shared mem
-        self.gen_add_code_line("__shared__ T s_XImats[" + str(XI_size) + "];")
-        self.gen_add_code_line("__shared__ T s_temp[" + str(temp_mem_size) + "];")
+    if extra_t_buffers is None:
+        extra_t_buffers = []
+    self.gen_declare_shared_arena(extra_t_buffers, temp_mem_size,
+                                  include_topology_helpers = (not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n)))),
+                                  ximat_name = "s_XImats",
+                                  ximat_size = XI_size,
+                                  temp_name = "s_temp",
+                                  topology_name = "s_topology_helpers")
 
 def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False):
     n = self.robot.get_num_joints()
@@ -356,25 +358,23 @@ def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = Fals
         code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
 
-def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = None, include_gradients = False, include_hessians = False):
+def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_gradients = False,
+                                                 include_hessians = False, extra_t_buffers = None):
     n = self.robot.get_num_pos()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        self.gen_add_code_line("__shared__ int s_topology_helpers[" + str(self.gen_topology_helpers_size()) + "];")
-    if temp_mem_size is None: # use dynamic shared mem
-        if include_hessians:
-            self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_dXmatsHom = &s_XHomTemp[" + str(Xhom_size) + "]; T *s_d2XmatsHom = &s_dXmatsHom[" + str(dXhom_size) + "]; T *s_temp = &s_d2XmatsHom[" + str(d2Xhom_size) + "];")
-        elif include_gradients:
-            self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_dXmatsHom = &s_XHomTemp[" + str(Xhom_size) + "]; T *s_temp = &s_dXmatsHom[" + str(dXhom_size) + "];")
-        else:
-            self.gen_add_code_line("extern __shared__ T s_XHomTemp[]; T *s_XmatsHom = s_XHomTemp; T *s_temp = &s_XHomTemp[" + str(Xhom_size) + "];")
-    else: # use specified static shared mem
-        self.gen_add_code_line("__shared__ T s_XmatsHom[" + str(Xhom_size) + "];")
-        if include_gradients:
-            self.gen_add_code_line("__shared__ T s_dXmatsHom[" + str(dXhom_size) + "];")
-        if include_hessians:
-            self.gen_add_code_line("__shared__ T s_d2XmatsHom[" + str(d2Xhom_size) + "];")
-        self.gen_add_code_line("__shared__ T s_temp[" + str(temp_mem_size) + "];")
+    if extra_t_buffers is None:
+        extra_t_buffers = []
+    hom_buffers = [("s_XmatsHom", Xhom_size)]
+    if include_gradients:
+        hom_buffers.append(("s_dXmatsHom", dXhom_size))
+    if include_hessians:
+        hom_buffers.append(("s_d2XmatsHom", d2Xhom_size))
+    self.gen_declare_shared_arena(extra_t_buffers + hom_buffers, temp_mem_size,
+                                  include_topology_helpers = (not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n)))),
+                                  ximat_name = "",
+                                  ximat_size = 0,
+                                  temp_name = "s_temp",
+                                  topology_name = "s_topology_helpers")
 
 def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()

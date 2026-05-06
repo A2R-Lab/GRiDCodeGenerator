@@ -1,7 +1,9 @@
 def gen_direct_minv_inner_temp_mem_size(self):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
     max_bfs_width = self.robot.get_max_bfs_width()
-    return 6*n*n+36*n+6*n+n + 36*2*max_bfs_width
+    d_inv_count = NJ + 36 if self.robot.floating_base else n
+    return 6*n*n+36*n+6*n+d_inv_count + 36*2*max_bfs_width
 
 def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -453,6 +455,26 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                                          "printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + 6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
+    if self.robot.floating_base:
+        self.gen_add_code_line("// Convert floating-base Minv from internal spatial order to public velocity order.")
+        self.gen_add_code_line("// Internal root vectors are [angular, linear]; public qd/u/qdd are [linear, angular].")
+        self.gen_add_parallel_loop("ind", str(n*n), use_thread_group)
+        self.gen_add_code_line("int row = ind % " + str(n) + "; int col = ind / " + str(n) + ";")
+        self.gen_add_code_line("T val = static_cast<T>(0);")
+        self.gen_add_code_line("if (row <= col) {", True)
+        self.gen_add_code_line("int src_row = row < 6 ? (row < 3 ? row + 3 : row - 3) : row;")
+        self.gen_add_code_line("int src_col = col < 6 ? (col < 3 ? col + 3 : col - 3) : col;")
+        self.gen_add_code_line("int read_row = src_row <= src_col ? src_row : src_col;")
+        self.gen_add_code_line("int read_col = src_row <= src_col ? src_col : src_row;")
+        self.gen_add_code_line("val = s_Minv[read_col * " + str(n) + " + read_row];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("s_temp[ind] = val;")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+        self.gen_add_parallel_loop("ind", str(n*n), use_thread_group)
+        self.gen_add_code_line("s_Minv[ind] = s_temp[ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()
 
 def gen_direct_minv_device(self, use_thread_group = False):
@@ -471,7 +493,7 @@ def gen_direct_minv_device(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
+    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -495,11 +517,8 @@ def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = 
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q[" + str(n) + "];", \
-                       "__shared__ T s_Minv[" + str(n*n) + "];"]
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_Minv", n*n)])
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -538,7 +557,7 @@ def gen_direct_minv_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void direct_minv(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void direct_minv(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                 const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -548,11 +567,12 @@ def gen_direct_minv_host(self, mode = 0):
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     # then generate the code
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "direct_minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_Minv,hd_data->d_q,stride_q,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"direct_minv requires all-data or dynamics gridData\");")
+    func_call_start = "direct_minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -578,6 +598,7 @@ def gen_direct_minv_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"direct_minv\", MINV_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back

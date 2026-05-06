@@ -959,6 +959,7 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
+    use_global_output = getattr(self, "idsva_so_use_global_output", NJ > SHARED_MEMORY_JOINT_THRESHOLD)
     # define function def and params
     func_params = ["d_idsva_so is a pointer to memory for the final result of size 4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS = " + str(4*n**3), \
                    "d_q_dq_u is the vector of joint positions, velocities, and accelerations", \
@@ -981,15 +982,17 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = [f"__shared__ T s_q_qd_u[{n*2+NUM_POS}]; T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];"]
-
-    if NJ <= SHARED_MEMORY_JOINT_THRESHOLD: shared_mem_vars.append(f"__shared__ T s_idsva_so[{4*n**3}];")
-
+    extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
+    if not use_global_output:
+        extra_t_buffers.append(("s_idsva_so", 4*n**3))
     if use_qdd_input:
-        shared_mem_vars.insert(-2,"__shared__ T s_qdd[" + str(n) + "]; ")
-    self.gen_add_code_lines(shared_mem_vars)
+        extra_t_buffers.append(("s_qdd", n))
     shared_mem_size = self.gen_idsva_so_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    if use_qdd_input:
+        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}];")
+    else:
+        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
@@ -1000,12 +1003,12 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        if NJ > SHARED_MEMORY_JOINT_THRESHOLD:
+        if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
         self.gen_idsva_so_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
-        if NJ <= SHARED_MEMORY_JOINT_THRESHOLD: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
+        if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
@@ -1017,14 +1020,14 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        if NJ > SHARED_MEMORY_JOINT_THRESHOLD:
+        if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
-            self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[rep*{4*n**3}];")
+            self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
         self.gen_idsva_so_inner_function_call(use_thread_group)
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
         # save to global
-        if NJ <= SHARED_MEMORY_JOINT_THRESHOLD: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
+        if not use_global_output: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
     self.gen_add_end_function()
 
 def gen_idsva_so_host(self, mode = 0):
@@ -1039,7 +1042,7 @@ def gen_idsva_so_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void idsva_so_host(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void idsva_so_host(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -1050,11 +1053,12 @@ def gen_idsva_so_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute IDSVA-SO (Inverse Dynamics - Spatial Vector Algebra - Second Order)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "idsva_so_kernel<T><<<block_dimms,thread_dimms>>>(hd_data->d_idsva_so," + \
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_host requires all-data or dynamics gridData\");")
+    func_call_start = "idsva_so_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
@@ -1076,6 +1080,7 @@ def gen_idsva_so_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back

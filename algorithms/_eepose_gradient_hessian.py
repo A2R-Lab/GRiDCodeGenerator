@@ -187,7 +187,7 @@ def gen_end_effector_pose_device(self, use_thread_group = False, fixed_target_na
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name) if not self.use_dynamic_shared_mem_flag else None
+    shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size)
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
@@ -216,11 +216,8 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q[" + str(n) + "];", \
-                       "__shared__ T s_eePos[" + str(6*num_ees) + "];"]
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name) if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_eePos", 6*num_ees)])
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -262,7 +259,7 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
     func_def_start = "void end_effector_pose" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + \
-                            "(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+                            "(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -273,15 +270,16 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
     # then generate the code
     self.gen_add_func_doc("Compute the End Effector Pose",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose requires all-data or kinematics gridData\");")
     func_call_start = "end_effector_pose_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + \
-                        "<T><<<block_dimms,thread_dimms,EE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_eePos,hd_data->d_q,stride_q,"
+                        "<T><<<block_dimms,thread_dimms,EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_eePos,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("<T>","_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -307,6 +305,7 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose\", EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -566,7 +565,7 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_inner_gradient_temp_mem_size(fixed_target_name) if not self.use_dynamic_shared_mem_flag else None
+    shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
@@ -595,11 +594,8 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q[" + str(n) + "];", \
-                       "__shared__ T s_deePos[" + str(6*n*num_ees) + "];"]
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name) if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, extra_t_buffers = [("s_q", n), ("s_deePos", 6*n*num_ees)])
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -640,7 +636,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void end_effector_pose_gradient" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -651,14 +647,15 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_deePos,hd_data->d_q,stride_q,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient requires all-data or kinematics gridData\");")
+    func_call_start = "end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_deePos,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("<T>","_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -684,6 +681,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient\", DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -1087,7 +1085,7 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
+    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
@@ -1117,12 +1115,9 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q[" + str(n) + "];", \
-                       "__shared__ T s_d2eePos[" + str(6*n*n*num_ees) + "];", \
-                       "__shared__ T s_deePos[" + str(6*n*num_ees) + "];"]
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
+    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True,
+                                                      extra_t_buffers = [("s_q", n), ("s_d2eePos", 6*n*n*num_ees), ("s_deePos", 6*n*num_ees)])
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -1165,7 +1160,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_hessian(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void end_effector_pose_gradient_hessian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -1176,14 +1171,15 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_q,stride_q,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient_hessian requires all-data or kinematics gridData\");")
+    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("<T>","_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -1209,6 +1205,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -1504,48 +1501,53 @@ def gen_X_warp(self, fixed_target_name = ""):
 
     self.gen_add_end_function()
 
-def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name = ""):
+def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name = "",
+                               include_pose = True, include_gradient = True, include_hessian = True):
     ee_target_names = [""]
     if fixed_target_name == "all":
         ee_target_names += [fj.name for fj in self.robot.fixed_joints]
     elif fixed_target_name != "":
         ee_target_names += [fixed_target_name]
     for target in ee_target_names:
-        # first generate the inner helpers
-        self.gen_end_effector_pose_inner(use_thread_group, fixed_target_name = target)
+        if include_pose:
+            # first generate the inner helpers
+            self.gen_end_effector_pose_inner(use_thread_group, fixed_target_name = target)
+            # then generate the device wrappers
+            self.gen_end_effector_pose_device(use_thread_group, fixed_target_name = target)
+            # then generate the kernels
+            self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = True, fixed_target_name = target)
+            self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = False, fixed_target_name = target)
+            # then the host launch wrappers
+            self.gen_end_effector_pose_host(0, fixed_target_name = target)
+            self.gen_end_effector_pose_host(1, fixed_target_name = target)
+            self.gen_end_effector_pose_host(2, fixed_target_name = target)
+
+        if include_gradient:
+            # then for the gradient first generate the inner helpers
+            self.gen_end_effector_pose_gradient_inner(use_thread_group, fixed_target_name = target)
+            # then generate the device wrappers
+            self.gen_end_effector_pose_gradient_device(use_thread_group, fixed_target_name = target)
+            # then generate the kernels
+            self.gen_end_effector_pose_gradient_kernel(use_thread_group,True, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_kernel(use_thread_group,False, fixed_target_name = target)
+            # then the host launch wrappers
+            self.gen_end_effector_pose_gradient_host(0, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_host(1, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_host(2, fixed_target_name = target)
+
+    if include_hessian:
+        # then for the hessian first generate the inner helpers
+        self.gen_end_effector_pose_gradient_hessian_inner(use_thread_group)
         # then generate the device wrappers
-        self.gen_end_effector_pose_device(use_thread_group, fixed_target_name = target)
+        self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
         # then generate the kernels
-        self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = True, fixed_target_name = target)
-        self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = False, fixed_target_name = target)
+        self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
+        self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
         # then the host launch wrappers
-        self.gen_end_effector_pose_host(0, fixed_target_name = target)
-        self.gen_end_effector_pose_host(1, fixed_target_name = target)
-        self.gen_end_effector_pose_host(2, fixed_target_name = target)
+        self.gen_end_effector_pose_gradient_hessian_host(0)
+        self.gen_end_effector_pose_gradient_hessian_host(1)
+        self.gen_end_effector_pose_gradient_hessian_host(2)
 
-        # then for the gradient first generate the inner helpers
-        self.gen_end_effector_pose_gradient_inner(use_thread_group, fixed_target_name = target)
-        # then generate the device wrappers
-        self.gen_end_effector_pose_gradient_device(use_thread_group, fixed_target_name = target)
-        # then generate the kernels
-        self.gen_end_effector_pose_gradient_kernel(use_thread_group,True, fixed_target_name = target)
-        self.gen_end_effector_pose_gradient_kernel(use_thread_group,False, fixed_target_name = target)
-        # then the host launch wrappers
-        self.gen_end_effector_pose_gradient_host(0, fixed_target_name = target)
-        self.gen_end_effector_pose_gradient_host(1, fixed_target_name = target)
-        self.gen_end_effector_pose_gradient_host(2, fixed_target_name = target)
-
-    # then for the hessian first generate the inner helpers
-    self.gen_end_effector_pose_gradient_hessian_inner(use_thread_group)
-    # then generate the device wrappers
-    self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
-    # then generate the kernels
-    self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
-    self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
-    # then the host launch wrappers
-    self.gen_end_effector_pose_gradient_hessian_host(0)
-    self.gen_end_effector_pose_gradient_hessian_host(1)
-    self.gen_end_effector_pose_gradient_hessian_host(2)
-
-    self.gen_X_single_thread(fixed_target_name = fixed_target_name)
-    self.gen_X_warp(fixed_target_name = fixed_target_name)
+    if include_pose or include_gradient or include_hessian:
+        self.gen_X_single_thread(fixed_target_name = fixed_target_name)
+        self.gen_X_warp(fixed_target_name = fixed_target_name)

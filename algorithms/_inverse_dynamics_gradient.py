@@ -1,7 +1,74 @@
 def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
-        n = self.robot.get_num_pos()
-        (dva_cols_per_partial, _, _, df_cols_per_partial, _, _, _) = self.gen_topology_sparsity_helpers_python()
-        return 66*n + 6*(4*dva_cols_per_partial + 2*df_cols_per_partial)
+        return self.gen_inverse_dynamics_gradient_temp_layout()["full_count"]
+
+def gen_inverse_dynamics_gradient_temp_layout(self):
+    n = self.robot.get_num_vel()
+    (dva_cols_per_partial, _, _, df_cols_per_partial, _, _, _) = self.gen_topology_sparsity_helpers_python()
+    offset_dv_dq = 0
+    offset_dv_dqd = offset_dv_dq + 6*dva_cols_per_partial
+    offset_da_dq = offset_dv_dqd + 6*dva_cols_per_partial
+    offset_da_dqd = offset_da_dq + 6*dva_cols_per_partial
+    offset_df_dq = offset_da_dqd + 6*dva_cols_per_partial
+    offset_df_dqd = offset_df_dq + 6*df_cols_per_partial
+    offset_fxvi = offset_df_dqd + 6*df_cols_per_partial
+    offset_mxxv = offset_fxvi + 36*n
+    offset_mxxa = offset_mxxv + 6*n
+    offset_mxv = offset_mxxa + 6*n
+    offset_mxf = offset_mxv + 6*n
+    offset_iv = offset_mxf + 6*n
+    full_count = offset_iv + 6*n
+    spill_start = offset_da_dq
+    spill_end = offset_fxvi
+    spill_count = spill_end - spill_start
+    return {
+        "dva_cols_per_partial": dva_cols_per_partial,
+        "df_cols_per_partial": df_cols_per_partial,
+        "offset_dv_dq": offset_dv_dq,
+        "offset_dv_dqd": offset_dv_dqd,
+        "offset_da_dq": offset_da_dq,
+        "offset_da_dqd": offset_da_dqd,
+        "offset_df_dq": offset_df_dq,
+        "offset_df_dqd": offset_df_dqd,
+        "offset_fxvi": offset_fxvi,
+        "offset_mxxv": offset_mxxv,
+        "offset_mxxa": offset_mxxa,
+        "offset_mxv": offset_mxv,
+        "offset_mxf": offset_mxf,
+        "offset_iv": offset_iv,
+        "full_count": full_count,
+        "spill_start": spill_start,
+        "spill_end": spill_end,
+        "spill_count": spill_count,
+        "selective_shared_count": full_count - spill_count,
+    }
+
+def _rewrite_id_du_temp_accesses_for_spill(code):
+    def replace_accesses(text, address_of):
+        token = "&s_temp[" if address_of else "s_temp["
+        out = []
+        i = 0
+        while i < len(text):
+            start = text.find(token, i)
+            if start < 0:
+                out.append(text[i:])
+                break
+            out.append(text[i:start])
+            idx_start = start + len(token)
+            depth = 1
+            j = idx_start
+            while j < len(text) and depth > 0:
+                if text[j] == "[":
+                    depth += 1
+                elif text[j] == "]":
+                    depth -= 1
+                j += 1
+            idx_expr = text[idx_start:j-1]
+            ptr_expr = "grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>(s_temp, s_temp_spill, " + idx_expr + ")"
+            out.append(ptr_expr if address_of else "(*" + ptr_expr + ")")
+            i = j
+        return "".join(out)
+
+    return replace_accesses(replace_accesses(code, True), False)
 
 def gen_inverse_dynamics_gradient_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -11,20 +78,23 @@ def gen_inverse_dynamics_gradient_inner_function_call(self, use_thread_group = F
         s_qd_name = "s_qd", \
         s_qdd_name = "s_qdd", \
         s_temp_name = "s_temp", \
+        s_temp_spill_name = "nullptr", \
+        temp_spill_flag_name = "false", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    id_du_code_start = "inverse_dynamics_gradient_inner<T>(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
+    id_du_code_start = "inverse_dynamics_gradient_inner<T, " + var_names["temp_spill_flag_name"] + ">(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
     id_du_code_middle = var_names["s_vaf_name"] + ", " + self.gen_insert_helpers_function_call()
-    id_du_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    id_du_code_end = var_names["s_temp_name"] + ", " + var_names["s_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_du_code_start = id_du_code_start.replace("(","(tgrp, ")
     id_du_code = id_du_code_start + id_du_code_middle + id_du_code_end
     self.gen_add_code_line(id_du_code)
 
 def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
+    function_start = len(self.code_str)
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
     max_bfs_levels = self.robot.get_max_bfs_level()
@@ -39,7 +109,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                             str(self.gen_inverse_dynamics_gradient_inner_temp_mem_size()), \
                    "gravity is the gravity constant"]
     func_def_start = "void inverse_dynamics_gradient_inner(T *s_dc_du, const T *s_q, const T *s_qd, const T *s_vaf, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *s_temp_spill, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q"]
     if use_thread_group:
@@ -48,7 +118,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool USE_DA_DF_SPILL = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
@@ -198,7 +268,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line("T S_sign = static_cast<T>(" + S_sign_dof_cpp + ");")
         self.gen_add_code_line("if (S_ind >= 3) {", True)
         self.gen_add_code_line(f"T *dst = &s_temp[{Offset_Mxf} + 6*dof_id];")
-        self.gen_add_code_line(f"const T *src = &s_vaf[{12*NJ} + 6*dof_id];")
+        if self.robot.floating_base:
+            self.gen_add_code_line("int jid = dof_id < 6 ? 0 : dof_id - 5;")
+            self.gen_add_code_line(f"const T *src = &s_vaf[{12*NJ} + 6*jid];")
+        else:
+            self.gen_add_code_line(f"const T *src = &s_vaf[{12*NJ} + 6*dof_id];")
         self.gen_add_code_line("for (int row = 0; row < 6; ++row) dst[row] = static_cast<T>(0);")
         self.gen_add_code_line("if (S_ind == 3) {", True)
         self.gen_add_code_line("dst[1] = S_sign * src[5];")
@@ -285,6 +359,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                     self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid = "jid"
+                    self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
+                    select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
+                    parent_ind_cpp = "parent_jid"
                     self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
                 else:
                     jid = inds[0]
@@ -441,6 +518,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 jid = "jid"
+                self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
+                select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
+                parent_ind_cpp = "parent_jid"
                 self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
             else:
                 jid = inds[0]
@@ -667,7 +747,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
                 
                 self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-                parent_jid = 'parent_jid*108'
+                parent_jid = f'parent_jid*{6*n}'
         else:
             self.gen_add_parallel_loop("ind",str(6*2*curr_cols_per_du),use_thread_group)
             self.gen_add_code_line(f"int row = ind % 6; int col = ind / 6; int col_du = col % {curr_cols_per_du};")
@@ -770,8 +850,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_line(f"bool dq_flag = ind < {n*n}; int row = ind % {n}; int col = (ind / {n}) % {n};")
             self.gen_add_code_line("int jid = row < 6 ? 0 : row - 5;")
             if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'row')
+            if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'row')
             self.gen_add_code_line(f"int srcOffset = dq_flag * {Offset_df_dq} + !dq_flag * {Offset_df_dqd} + {6*n}*jid + 6*col + {S_ind_cpp};")
-            self.gen_add_code_line(f"s_dc_du[!dq_flag * {n*n} + {n}*col + row] = s_temp[srcOffset];")
+            self.gen_add_code_line(f"s_dc_du[!dq_flag * {n*n} + {n}*col + row] = (" + S_sign_cpp + ") * s_temp[srcOffset];")
         else:
             self.gen_add_code_line("int jid = ind % " + str(n) + "; int jid_dq_qd = ind / " + str(n) + "; " + 
                                 "int jid_du = jid_dq_qd % " + str(n) + "; int dq_flag = jid_du == jid_dq_qd;")
@@ -827,9 +908,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_sync(use_thread_group)
 
     self.gen_add_end_function()
+    function_code = self.code_str[function_start:]
+    self.code_str = self.code_str[:function_start] + _rewrite_id_du_temp_accesses_for_spill(function_code)
 
 def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd_input = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "s_q is the vector of joint positions", \
@@ -853,9 +936,8 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    self.gen_add_code_line("__shared__ T s_vaf[" + str(18*n) + "];")
-    shared_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_vaf", 18*n)])
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
@@ -863,7 +945,7 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
     base_size = 2*n + n*2*n + 18*n + n
     temp_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
@@ -881,7 +963,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
                    "gravity is the gravity constant", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void inverse_dynamics_gradient_kernel(T *d_dc_du, const T *d_q_qd, const int stride_q_qd, "
+    func_def_start = "void inverse_dynamics_gradient_kernel(T *d_dc_du, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     if use_qdd_input:
         func_def_start += "const T *d_qdd, "
@@ -897,15 +979,18 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q_qd[" + str(n + NUM_POS) + "]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];", \
-                    "__shared__ T s_dc_du[" + str(n*2*n) + "];",
-                    "__shared__ T s_vaf[" + str(18*NJ) + "];"]
-
+    use_selective_spill = getattr(self, "id_du_use_selective_spill", False)
+    use_global_temp = getattr(self, "id_du_use_global_temp", False)
+    extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", 18*n)]
     if use_qdd_input:
-        shared_mem_vars.insert(-2,"__shared__ T s_qdd[" + str(n) + "]; ")
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+        extra_t_buffers.append(("s_qdd", n))
+    shared_mem_size = 0 if use_global_temp else (
+        self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
+        if use_selective_spill else self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    )
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -915,11 +1000,18 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
         else:
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        elif use_global_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(use_thread_group)
+        self.gen_inverse_dynamics_gradient_inner_function_call(
+            use_thread_group,
+            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+        )
         self.gen_add_sync(use_thread_group)
         # save to global
         self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
@@ -927,15 +1019,22 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
         if use_qdd_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n))
+            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group)
+            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(d_workspace);")
+        elif use_global_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(use_thread_group)
+        self.gen_inverse_dynamics_gradient_inner_function_call(
+            use_thread_group,
+            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+        )
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)
@@ -953,7 +1052,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void inverse_dynamics_gradient(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void inverse_dynamics_gradient(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                               const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -964,11 +1063,12 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "inverse_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,ID_DU_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_dc_du,hd_data->d_q_qd,stride_q_qd,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics_gradient requires all-data or dynamics gridData\");")
+    func_call_start = "inverse_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dc_du,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -1003,7 +1103,11 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics_gradient\", ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
+    self.gen_add_code_line("if (GRID_ID_DU_USES_GLOBAL_TEMP || GRID_ID_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_ID_DU_USES_GLOBAL_TEMP || GRID_ID_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \

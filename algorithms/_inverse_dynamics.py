@@ -123,10 +123,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                                         "s_vaf[jid6 + row] = static_cast<T>(0);",])
             if self.robot.floating_base:
                 root_gravity_code = "(row < 3 ? static_cast<T>(0) : s_XImats[6*jid6 + 6*row + 5] * gravity)"
-                if not use_qdd_input:
-                    self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + ";")
-                else:
-                    self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + " + s_qdd[row];")
+                self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + ";")
             else:
                 self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;")
             # then add in qd and qdd
@@ -325,8 +322,9 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
         if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
         if self.robot.floating_base:
             if '+' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace(']', ' - 5]') # offset back to the beginning of the S_inds
+            if '+' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace(']', ' - 5]') # offset back to the beginning of the S_inds
             self.gen_add_code_line("int fb_offset = (dof_id > 5) * (6 * (dof_id - 5)); // First 6 DOF belong to floating base")
-            self.gen_add_code_line("s_c[dof_id] = s_vaf[" + str(12*n) + " + fb_offset + " + S_ind_cpp + "];")
+            self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + fb_offset + " + S_ind_cpp + "];")
         else: self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + 6*dof_id + " + S_ind_cpp + "];")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
@@ -371,10 +369,9 @@ def gen_inverse_dynamics_device(self, use_thread_group = False, compute_c = Fals
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    if compute_c:
-        self.gen_add_code_line("__shared__ T s_vaf[" + str(18*n) + "];")
-    shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
+    extra_t_buffers = [("s_vaf", 18*n)] if compute_c else []
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_inverse_dynamics_inner_function_call(use_thread_group,compute_c,use_qdd_input)
@@ -408,14 +405,12 @@ def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = 
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_vars = ["__shared__ T s_q_qd[2*" + str(n) + "]; T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];", \
-                       "__shared__ T s_c[" + str(n) + "];",
-                       "__shared__ T s_vaf[" + str(18*n) + "];"]
+    extra_t_buffers = [("s_q_qd", 2*n), ("s_c", n), ("s_vaf", 18*n)]
     if use_qdd_input:
-        shared_mem_vars.insert(-2,"__shared__ T s_qdd[" + str(n) + "]; ")
-    self.gen_add_code_lines(shared_mem_vars)
-    shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size() if not self.use_dynamic_shared_mem_flag else None
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+        extra_t_buffers.append(("s_qdd", n))
+    shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -461,7 +456,7 @@ def gen_inverse_dynamics_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void inverse_dynamics(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void inverse_dynamics(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -472,11 +467,12 @@ def gen_inverse_dynamics_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false>")
+    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    func_call_start = "inverse_dynamics_kernel<T><<<block_dimms,thread_dimms,ID_DYNAMIC_SHARED_MEM_COUNT*sizeof(T)>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics requires all-data or dynamics gridData\");")
+    func_call_start = "inverse_dynamics_kernel<T><<<block_dimms,thread_dimms,ID_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -511,6 +507,7 @@ def gen_inverse_dynamics_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics\", ID_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -543,3 +540,22 @@ def gen_inverse_dynamics(self, use_thread_group = False):
     self.gen_inverse_dynamics_host(0)
     self.gen_inverse_dynamics_host(1)
     self.gen_inverse_dynamics_host(2)
+    self.gen_add_func_doc("Alias for inverse_dynamics using the conventional RNEA name", [], [], None)
+    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void rnea(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
+    self.gen_add_code_line("          const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {", True)
+    self.gen_add_code_line("inverse_dynamics<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);")
+    self.gen_add_end_function()
+    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void rnea_single_timing(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
+    self.gen_add_code_line("                        const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {", True)
+    self.gen_add_code_line("inverse_dynamics_single_timing<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);")
+    self.gen_add_end_function()
+    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void rnea_compute_only(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
+    self.gen_add_code_line("                       const dim3 block_dimms, const dim3 thread_dimms) {", True)
+    self.gen_add_code_line("inverse_dynamics_compute_only<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms);")
+    self.gen_add_end_function()
