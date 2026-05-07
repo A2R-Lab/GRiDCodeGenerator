@@ -24,7 +24,8 @@ def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, up
     # account for thread group and serial chains
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    if not self.robot.is_serial_chain():
+    n = self.robot.get_num_pos()
+    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         code_middle += var_names["s_topology_helpers_name"] + ", "
     self.gen_add_code_line(code_start + code_middle + code_end)
 
@@ -341,7 +342,8 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    if not self.robot.is_serial_chain():
+    n = self.robot.get_num_pos()
+    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         code_middle += var_names["s_topology_helpers_name"] + ", "
     self.gen_add_code_line(code_start + code_middle + code_end)
 
@@ -719,7 +721,8 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    if not self.robot.is_serial_chain():
+    n = self.robot.get_num_pos()
+    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         code_middle += var_names["s_topology_helpers_name"] + ", "
     self.gen_add_code_line(code_start + code_middle + code_end)
 

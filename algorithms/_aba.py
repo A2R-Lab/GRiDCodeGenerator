@@ -1,5 +1,257 @@
+def gen_aba_inner_floating(self, use_thread_group = False):
+    NJ = self.robot.get_num_joints()
+    nv = self.robot.get_num_vel()
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
+
+    IAOffset = 0
+    vcrossOffset = 36 * NJ
+    cOffset = 72 * NJ
+    pAOffset = 78 * NJ
+    UOffset = 84 * NJ
+    paOffset = 90 * NJ
+    dOffset = 96 * NJ
+    uOffset = 97 * NJ
+    tempMatOffset = 98 * NJ
+    tempVecOffset = 134 * NJ
+    fbUOffset = 140 * NJ
+    fbDOffset = fbUOffset + 36
+    fbDinvOffset = fbDOffset + 36
+    fbRhsOffset = fbDinvOffset + 36
+    fbInvTempOffset = fbRhsOffset + 6
+
+    func_params = ["s_qdd is the vector of joint accelerations", \
+                "s_va is a pointer to shared memory of size 2*6*NUM_BODIES = " + str(12*NJ), \
+                "s_q is the vector of joint positions", \
+                "s_qd is the vector of joint velocities", \
+                "s_tau is the vector of generalized forces", \
+                "s_temp is the pointer to the shared memory needed of size: " + \
+                            str(self.gen_aba_inner_temp_mem_size()), \
+                "gravity is the gravity constant"]
+    func_def_start = "void aba_inner("
+    func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
+    func_def_end = "T *s_temp, const T gravity) {"
+    func_notes = ["Assumes the XI matricies have already been updated for the given q",
+                  "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly."]
+    if use_thread_group:
+        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
+        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("Computes the Floating-Base Articulated Body Algorithm", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("#if !GRID_CUDA_FLOATING_ABA_RECURSIVE")
+    self.gen_add_code_line("// Correctness-first floating ABA path: reuse the validated floating FD composition.")
+    self.gen_forward_dynamics_inner_function_call(
+        use_thread_group,
+        updated_var_names=dict(s_qdd_name="s_qdd", s_u_name="s_tau")
+    )
+    self.gen_add_code_line("return;")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("// Recursive floating ABA root-port. Enable with GRID_CUDA_FLOATING_ABA_RECURSIVE=1 while validating.")
+
+    self.gen_add_code_line("// Initialize IA = I and clear c")
+    self.gen_add_parallel_loop("ind", str(36 * NJ + 6 * NJ), use_thread_group)
+    self.gen_add_code_line("if (ind < " + str(36 * NJ) + ") { s_temp[" + str(IAOffset) + " + ind] = s_XImats[" + str(36 * NJ) + " + ind]; }")
+    self.gen_add_code_line("else { s_temp[" + str(cOffset) + " + ind - " + str(36 * NJ) + "] = static_cast<T>(0); }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Forward Pass")
+    self.gen_add_code_line("//")
+    for bfs_level in range(n_bfs_levels):
+        inds = self.robot.get_ids_by_bfs_level(bfs_level)
+        joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
+        link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
+        self.gen_add_code_line("// forward pass where bfs_level is " + str(bfs_level))
+        self.gen_add_code_line("//     joints are: " + ", ".join(joint_names))
+        self.gen_add_code_line("//     links are: " + ", ".join(link_names))
+
+        if bfs_level == 0:
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("int fb_col = row < 3 ? row + 3 : row - 3;")
+            self.gen_add_code_line("s_va[row] = s_qd[fb_col];")
+            self.gen_add_code_line("s_temp[" + str(cOffset) + " + row] = static_cast<T>(0);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            continue
+
+        for jid in inds:
+            parent = self.robot.get_parent_id(jid)
+            S_ind = self.robot.get_S_index_by_id(jid)
+            S_sign = self.robot.get_S_sign_by_id(jid)
+            dof = jid + 5
+            jid6 = 6 * jid
+            parent6 = 6 * parent
+            self.gen_add_code_line("// v[" + str(jid) + "] = X[" + str(jid) + "]*v[" + str(parent) + "] + S*qdot")
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("T qd_val = (row == " + str(S_ind) + ") ? static_cast<T>(" + str(S_sign) + ") * s_qd[" + str(dof) + "] : static_cast<T>(0);")
+            self.gen_add_code_line("s_va[" + str(jid6) + " + row] = dot_prod<T,6,6,1>(&s_XImats[" + str(36 * jid) + " + row], &s_va[" + str(parent6) + "]) + qd_val;")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_serial_ops(use_thread_group)
+            self.gen_mx_func_call_for_cpp([jid], updated_var_names = dict(S_ind_name = str(S_ind),
+                                                                          s_dst_name = "&s_temp[" + str(cOffset + jid6) + "]",
+                                                                          s_src_name = "&s_va[" + str(jid6) + "]",
+                                                                          s_scale_name = "static_cast<T>(" + str(S_sign) + ") * s_qd[" + str(dof) + "]"),
+                                              PEQ_FLAG = False, SCALE_FLAG = True)
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("// Initialize vcross[k]")
+    self.gen_add_parallel_loop("jid", str(NJ), use_thread_group)
+    self.gen_add_code_line("int jid6 = 6 * jid;")
+    self.gen_add_code_line("vcross<T>(&s_temp[" + str(vcrossOffset) + " + 36*jid], &s_va[jid6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("// temp[k] = -vcross.T*I[k]")
+    self.gen_add_parallel_loop("ind", str(36 * NJ), use_thread_group)
+    self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid = ind / 36;")
+    self.gen_add_code_line("int jid6 = 6 * jid;")
+    self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + jid6*6 + row + col*6] = -dot_prod<T,6,1,1>(&s_temp[" + str(vcrossOffset) + " + 36*jid + row*6], &s_XImats[" + str(36 * NJ) + " + 36*jid + col*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("// pA[k] = temp[k]*v[k]")
+    self.gen_add_parallel_loop("ind", str(6 * NJ), use_thread_group)
+    self.gen_add_code_line("int row = ind % 6; int jid = ind / 6;")
+    self.gen_add_code_line("int jid6 = 6 * jid;")
+    self.gen_add_code_line("s_temp[" + str(pAOffset) + " + jid6 + row] = dot_prod<T,6,6,1>(&s_temp[" + str(tempMatOffset) + " + 6*jid6 + row], &s_va[jid6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Backward Pass")
+    self.gen_add_code_line("//")
+    for jid in range(NJ - 1, -1, -1):
+        jid6 = 6 * jid
+        parent = self.robot.get_parent_id(jid)
+        if jid == 0:
+            self.gen_add_code_line("// floating-base root: U = IA*S, D = S^T*U")
+            self.gen_add_parallel_loop("ind", "36", use_thread_group)
+            self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+            self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+            self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
+            self.gen_add_code_line("s_temp[" + str(fbUOffset) + " + ind] = s_temp[" + str(IAOffset) + " + row + 6*S_col];")
+            self.gen_add_code_line("s_temp[" + str(fbDOffset) + " + ind] = s_temp[" + str(fbUOffset) + " + S_row + 6*col];")
+            self.gen_add_code_line("s_temp[" + str(fbDinvOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(fbDOffset) + "], &s_temp[" + str(fbDinvOffset) + "], &s_temp[" + str(fbInvTempOffset) + "]);")
+            self.gen_add_parallel_loop("col", "6", use_thread_group)
+            self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+            self.gen_add_code_line("s_temp[" + str(fbRhsOffset) + " + col] = s_tau[col] - s_temp[" + str(pAOffset) + " + S_col];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            continue
+
+        S_ind = self.robot.get_S_index_by_id(jid)
+        S_sign = self.robot.get_S_sign_by_id(jid)
+        dof = jid + 5
+        self.gen_add_code_line("// scalar joint " + str(jid) + ": U, d, u")
+        self.gen_add_parallel_loop("row", "6", use_thread_group)
+        self.gen_add_code_line("s_temp[" + str(UOffset + jid6) + " + row] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(IAOffset + 36 * jid + 6 * S_ind) + " + row];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_code_line("s_temp[" + str(dOffset + jid) + "] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(UOffset + jid6 + S_ind) + "];")
+        self.gen_add_code_line("s_temp[" + str(uOffset + jid) + "] = s_tau[" + str(dof) + "] - static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(pAOffset + jid6 + S_ind) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(UOffset + jid6) + "], &s_temp[" + str(cOffset + jid6) + "]);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+        self.gen_add_code_line("// Ia = IA - U*U.T/d")
+        self.gen_add_parallel_loop("ind", "36", use_thread_group)
+        self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+        self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + row + 6*col] = s_temp[" + str(IAOffset + 36 * jid) + " + row + 6*col] - s_temp[" + str(UOffset + jid6) + " + row] * s_temp[" + str(UOffset + jid6) + " + col] / s_temp[" + str(dOffset + jid) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+        self.gen_add_code_line("// pa = pA + IA*c + U*u/d")
+        self.gen_add_parallel_loop("row", "6", use_thread_group)
+        self.gen_add_code_line("s_temp[" + str(paOffset + jid6) + " + row] = s_temp[" + str(pAOffset + jid6) + " + row] + dot_prod<T,6,6,1>(&s_temp[" + str(IAOffset + 36 * jid) + " + row], &s_temp[" + str(cOffset + jid6) + "]) + s_temp[" + str(UOffset + jid6) + " + row] * s_temp[" + str(uOffset + jid) + "] / s_temp[" + str(dOffset + jid) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+        if parent != -1:
+            parent6 = 6 * parent
+            self.gen_add_code_line("// parent updates for joint " + str(jid))
+            self.gen_add_parallel_loop("ind", "36", use_thread_group)
+            self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+            self.gen_add_code_line("s_temp[" + str(tempVecOffset) + " + row + 6*col] = dot_prod<T,6,1,1>(&s_XImats[" + str(36 * jid) + " + 6*row], &s_temp[" + str(tempMatOffset) + " + 6*col]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("ind", "42", use_thread_group)
+            self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+            self.gen_add_code_line("if (ind < 36) { s_temp[" + str(IAOffset + 36 * parent) + " + row + 6*col] += dot_prod<T,6,6,1>(&s_temp[" + str(tempVecOffset) + " + row], &s_XImats[" + str(36 * jid) + " + 6*col]); }")
+            self.gen_add_code_line("else { s_temp[" + str(pAOffset + parent6) + " + row] += dot_prod<T,6,1,1>(&s_XImats[" + str(36 * jid) + " + 6*row], &s_temp[" + str(paOffset + jid6) + "]); }")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Second Forward Pass")
+    self.gen_add_code_line("//")
+    for bfs_level in range(n_bfs_levels):
+        inds = self.robot.get_ids_by_bfs_level(bfs_level)
+        if bfs_level == 0:
+            self.gen_add_code_line("// root acceleration from gravity, then solve root qdd")
+            self.gen_add_parallel_loop("ind", "36", use_thread_group)
+            self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+            self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + ind] = s_XImats[ind];")
+            self.gen_add_code_line("s_temp[" + str(tempVecOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_temp[" + str(fbInvTempOffset) + "]);")
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_va[" + str(6 * NJ) + " + row] = s_temp[" + str(tempVecOffset) + " + row + 6*5] * gravity;")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_temp[" + str(fbRhsOffset) + " + row] -= dot_prod<T,6,1,1>(&s_temp[" + str(fbUOffset) + " + 6*row], &s_va[" + str(6 * NJ) + "]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_qdd[row] = dot_prod<T,6,6,1>(&s_temp[" + str(fbDinvOffset) + " + row], &s_temp[" + str(fbRhsOffset) + "]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("int fb_col = row < 3 ? row + 3 : row - 3;")
+            self.gen_add_code_line("s_va[" + str(6 * NJ) + " + row] += s_qdd[fb_col];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            continue
+
+        for jid in inds:
+            parent = self.robot.get_parent_id(jid)
+            S_ind = self.robot.get_S_index_by_id(jid)
+            S_sign = self.robot.get_S_sign_by_id(jid)
+            dof = jid + 5
+            jid6 = 6 * jid
+            parent6 = 6 * parent
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_va[" + str(6 * NJ + jid6) + " + row] = dot_prod<T,6,6,1>(&s_XImats[" + str(36 * jid) + " + row], &s_va[" + str(6 * NJ + parent6) + "]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_code_line("T tempval = s_temp[" + str(uOffset + jid) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(UOffset + jid6) + "], &s_va[" + str(6 * NJ + jid6) + "]);")
+            self.gen_add_code_line("s_qdd[" + str(dof) + "] = tempval / s_temp[" + str(dOffset + jid) + "];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_va[" + str(6 * NJ + jid6) + " + row] += s_temp[" + str(cOffset + jid6) + " + row];")
+            self.gen_add_code_line("if (row == " + str(S_ind) + ") { s_va[" + str(6 * NJ + jid6 + S_ind) + "] += static_cast<T>(" + str(S_sign) + ") * s_qdd[" + str(dof) + "]; }")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+
+    self.gen_add_end_function()
+
+
 def gen_aba_inner(self, use_thread_group = False): 
-    n = self.robot.get_num_pos()
+    if self.robot.floating_base:
+        return gen_aba_inner_floating(self, use_thread_group)
+    n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
 	# construct the boilerplate and function definition
     func_params = ["s_qdd is the vector of joint accelerations", \
@@ -424,7 +676,9 @@ def gen_aba_inner(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_aba_inner_temp_mem_size(self):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_joints()
+    if self.robot.floating_base:
+        return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size())
     return 140 * n
 
 def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_names = None):
@@ -449,16 +703,18 @@ def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_name
     self.gen_add_code_line(aba_code)
 
 def gen_aba_device(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_joints()
+    nv = self.robot.get_num_vel()
     # construct the boilerplate and function definition
-    func_params = ["s_q is the vector of joint positions", \
+    func_params = ["s_qdd is the vector of joint accelerations", \
+                   "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                     "s_tau is the vector of joint torques", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "gravity is the gravity constant"]
     func_notes = []
     func_def_start = "void aba_device("
-    func_def_middle = "const T *s_q, const T *s_qd, const T *s_tau, "
+    func_def_middle = "T *s_qdd, const T *s_q, const T *s_qd, const T *s_tau, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
@@ -474,7 +730,7 @@ def gen_aba_device(self, use_thread_group = False):
 
     # add the shared memory variables
     shared_mem_size = self.gen_aba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_va", 12*n), ("s_qdd", n)])
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_va", 12*n)])
     
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -482,7 +738,10 @@ def gen_aba_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    n = self.robot.get_num_joints()
+    input_count = nq + 2 * nv
     # define function def and params
     func_params = ["d_q_qd_tau is the vector of joint positions and velocities", \
                     "stride_q_qd is the stride between each q, qd", \
@@ -506,25 +765,25 @@ def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
 
     # add shared memory variables
     shared_mem_size = self.gen_aba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", n), ("s_q_qd_tau", 3*n), ("s_va", 12*n)])
-    self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(n) + "]; T *s_tau = &s_q_qd_tau[2 * " + str(n) + "];")
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", nv), ("s_q_qd_tau", input_count), ("s_va", 12*n)])
+    self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(nq + nv) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(input_count),use_thread_group)
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_aba_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
         # save to global
-        self.gen_kernel_save_result("qdd","1",str(n),use_thread_group)
+        self.gen_kernel_save_result("qdd","1",str(nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -532,7 +791,7 @@ def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
         self.gen_aba_inner_function_call(use_thread_group)
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("qdd",str(n),use_thread_group)
+        self.gen_kernel_save_result_single_timing("qdd",str(nv),use_thread_group)
     self.gen_add_end_function()
 
 def gen_aba_host(self, mode = 0):
@@ -566,7 +825,7 @@ def gen_aba_host(self, mode = 0):
 
     func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
-    self.gen_add_code_line("int stride_q_qd = 3*NUM_JOINTS;")
+    self.gen_add_code_line("int stride_q_qd = NUM_JOINTS + 2*NUM_VEL;")
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
@@ -588,7 +847,7 @@ def gen_aba_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                "gpuErrchk(cudaMemcpy(hd_data->h_qdd,hd_data->d_qdd,NUM_JOINTS*" + \
+                                "gpuErrchk(cudaMemcpy(hd_data->h_qdd,hd_data->d_qdd,NUM_VEL*" + \
                                 ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                 "gpuErrchk(cudaDeviceSynchronize());"])
     # finally report out timing if requested

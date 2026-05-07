@@ -3,6 +3,9 @@ import copy
 #np.set_printoptions(precision=4, suppress=True, linewidth = 100)
 
 def gen_crba_inner_temp_mem_size(self):
+    if self.robot.floating_base:
+        NJ = self.robot.get_num_joints()
+        return 36*NJ + 36 + 36 + 6
     n = self.robot.get_num_pos()
     return 140*n
 
@@ -28,6 +31,8 @@ def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_nam
 
 
 def gen_crba_inner(self, use_thread_group = False):
+    if self.robot.floating_base:
+        return gen_crba_inner_floating(self, use_thread_group)
     
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
@@ -242,15 +247,122 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_end_function()
 
 
+def gen_crba_inner_floating(self, use_thread_group = False):
+    NJ = self.robot.get_num_joints()
+    nv = self.robot.get_num_vel()
+    ICOffset = 0
+    alphaOffset = 36 * NJ
+    betaOffset = alphaOffset + 36
+    fhOffset = betaOffset + 36
+
+    func_params = [ "s_q is the vector of joint positions", \
+                    "s_qd is the vector of joint velocities", \
+                    "s_M is a pointer to the matrix of inertia", \
+                    "s_XI is the pointer to the transformation and inertia matricies", \
+                    "s_temp is a pointer to helper shared memory of size " + \
+                            str(self.gen_crba_inner_temp_mem_size()), \
+                    "gravity is the gravity constant"]
+    func_notes = ["Floating-base CRBA keeps composite inertias in body order and writes a public-order NUM_VEL x NUM_VEL mass matrix."]
+    func_def_start = "void crba_inner("
+    func_def_middle = "T *s_M, const T *s_q, const T *s_qd, "
+    func_def_end = "T *s_temp, const T gravity) {"
+    if use_thread_group:
+        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
+        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("Compute the Floating-Base Composite Rigid Body Algorithm", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+
+    self.gen_add_code_line("// Initialize IC = I and clear H")
+    self.gen_add_parallel_loop("ind", str(36 * NJ + nv * nv), use_thread_group)
+    self.gen_add_code_line("if (ind < " + str(36 * NJ) + ") { s_temp[" + str(ICOffset) + " + ind] = s_XImats[" + str(36 * NJ) + " + ind]; }")
+    self.gen_add_code_line("else { s_M[ind - " + str(36 * NJ) + "] = static_cast<T>(0); }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    for jid in range(NJ - 1, 0, -1):
+        parent = self.robot.get_parent_id(jid)
+        S_ind = self.robot.get_S_index_by_id(jid)
+        S_sign = self.robot.get_S_sign_by_id(jid)
+        dof = jid + 5
+        self.gen_add_code_line("// CRBA body " + str(jid))
+        self.gen_add_parallel_loop("ind", "36", use_thread_group)
+        self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+        self.gen_add_code_line("s_temp[" + str(alphaOffset) + " + ind] = dot_prod<T,6,1,1>(&s_XImats[" + str(36 * jid) + " + 6*row], &s_temp[" + str(ICOffset + 36 * jid) + " + 6*col]);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+        self.gen_add_parallel_loop("ind", "36", use_thread_group)
+        self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+        self.gen_add_code_line("s_temp[" + str(betaOffset) + " + ind] = dot_prod<T,6,6,1>(&s_temp[" + str(alphaOffset) + " + row], &s_XImats[" + str(36 * jid) + " + 6*col]);")
+        self.gen_add_code_line("s_temp[" + str(ICOffset + 36 * parent) + " + ind] += s_temp[" + str(betaOffset) + " + ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+        self.gen_add_parallel_loop("row", "6", use_thread_group)
+        self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(ICOffset + 36 * jid + 6 * S_ind) + " + row];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_code_line("s_M[" + str(dof + nv * dof) + "] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(fhOffset + S_ind) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+        chain = []
+        curr = jid
+        while self.robot.get_parent_id(curr) > 0:
+            chain.append((curr, self.robot.get_parent_id(curr)))
+            curr = self.robot.get_parent_id(curr)
+        chain.append((curr, 0))
+        for x_jid, ancestor in chain:
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_temp[" + str(alphaOffset) + " + row] = dot_prod<T,6,1,1>(&s_XImats[" + str(36 * x_jid) + " + 6*row], &s_temp[" + str(fhOffset) + "]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            self.gen_add_parallel_loop("row", "6", use_thread_group)
+            self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = s_temp[" + str(alphaOffset) + " + row];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            if ancestor > 0:
+                a_S_ind = self.robot.get_S_index_by_id(ancestor)
+                a_S_sign = self.robot.get_S_sign_by_id(ancestor)
+                a_dof = ancestor + 5
+                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_code_line("s_M[" + str(dof + nv * a_dof) + "] = static_cast<T>(" + str(a_S_sign) + ") * s_temp[" + str(fhOffset + a_S_ind) + "];")
+                self.gen_add_code_line("s_M[" + str(a_dof + nv * dof) + "] = s_M[" + str(dof + nv * a_dof) + "];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+            else:
+                self.gen_add_parallel_loop("col", "6", use_thread_group)
+                self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+                self.gen_add_code_line("s_M[" + str(dof) + " + " + str(nv) + "*col] = s_temp[" + str(fhOffset) + " + S_col];")
+                self.gen_add_code_line("s_M[col + " + str(nv * dof) + "] = s_M[" + str(dof) + " + " + str(nv) + "*col];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+
+    self.gen_add_code_line("// floating-base root block H[:6,:6] = S^T * IC[0] * S")
+    self.gen_add_parallel_loop("ind", "36", use_thread_group)
+    self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+    self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
+    self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+    self.gen_add_code_line("s_M[row + " + str(nv) + "*col] = s_temp[" + str(ICOffset) + " + S_row + 6*S_col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    self.gen_add_end_function()
+
+
 
 
 def gen_crba_device_temp_mem_size(self):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_joints()
     wrapper_size = self.gen_topology_helpers_size() + 72*n # for XImats
     return self.gen_crba_inner_temp_mem_size() + wrapper_size
 
 def gen_crba_device(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    n = self.robot.get_num_joints()
 
     # construct the boilerplate and function definition
     func_params = ["s_M is a pointer to the matrix of inertia", \
@@ -285,7 +397,10 @@ def gen_crba_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    n = self.robot.get_num_joints()
+    input_count = nq + nv
     # define function def and params
     func_params = ["d_M is the pointer to the matrix of inertia", \
                     "d_q_qd is the vector of joint positions and velocities", \
@@ -309,25 +424,25 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
 
     # add shared memory variables
     shared_mem_size = self.gen_crba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", n*n), ("s_q_qd", 3*n)])
-    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)])
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(input_count),use_thread_group)
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_crba_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
         # save to global
-        self.gen_kernel_save_result("M","1",str(n*n),use_thread_group)
+        self.gen_kernel_save_result("M","1",str(nv*nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs_single_timing("q_qd",str(input_count),use_thread_group)
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -335,7 +450,7 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
         self.gen_crba_inner_function_call(use_thread_group)
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("M",str(n*n),use_thread_group)
+        self.gen_kernel_save_result_single_timing("M",str(nv*nv),use_thread_group)
     self.gen_add_end_function()
 
 def gen_crba_host(self, mode = 0):
@@ -375,14 +490,14 @@ def gen_crba_host(self, mode = 0):
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
                                  "int stride_q_qd;", \
-                                 "if (USE_COMPRESSED_MEM) {stride_q_qd = 2*NUM_JOINTS; " + \
+                                 "if (USE_COMPRESSED_MEM) {stride_q_qd = NUM_JOINTS + NUM_VEL; " + \
                                     "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd,hd_data->h_q_qd,stride_q_qd*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
-                                 "else {stride_q_qd = 3*NUM_JOINTS; " + \
+                                 "else {stride_q_qd = NUM_JOINTS + 2*NUM_VEL; " + \
                                     "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}"])
     else:
-        self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? 2*NUM_JOINTS: 3*NUM_JOINTS;")
+        self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? NUM_JOINTS + NUM_VEL : NUM_JOINTS + 2*NUM_VEL;")
     self.gen_add_code_line("// then call the kernel")
     func_call = func_call_start + func_call_end
     # add in compressed mem adjusts
@@ -399,12 +514,12 @@ def gen_crba_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                 "gpuErrchk(cudaMemcpy(hd_data->h_M,hd_data->d_M,NUM_JOINTS*NUM_JOINTS*" + \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_M,hd_data->d_M,NUM_VEL*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchk(cudaDeviceSynchronize());"])
     # finally report out timing if requested
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call ID %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        self.gen_add_code_line("printf(\"Single Call CRBA %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
 
 def gen_crba(self, use_thread_group = False):

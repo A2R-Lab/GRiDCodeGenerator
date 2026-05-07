@@ -9,8 +9,9 @@ def gen_get_XI_size(self, include_base_inertia = False, include_homogenous_trans
 
 def gen_get_Xhom_size(self):
     n = self.robot.get_num_pos()
+    NJ = self.robot.get_num_joints()
     nfj = self.robot.get_num_fixed_joints() if self.include_fixed_kinematic_targets else 0
-    Xhom_size = 16*(n+nfj) # we include fixed joint kinematic targets
+    Xhom_size = 16*(NJ+nfj) # one homogeneous transform per joint plus optional fixed kinematic targets
     dXhom_size = 16*n # kinematic targets are fixed so don't include (gradient is 0)
     d2Xhom_size = 16*n # kinematic targets are fixed so don't include (gradient is 0)
     return Xhom_size, dXhom_size, d2Xhom_size
@@ -118,7 +119,7 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     self.gen_add_end_function()
 
 def gen_load_update_XImats_helpers_temp_mem_size(self):
-    n = self.robot.get_num_joints()
+    n = self.robot.get_num_pos()
     return 2*n
 
 def gen_load_update_XImats_helpers_function_call(self, use_thread_group = False, updated_var_names = None):
@@ -378,6 +379,7 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
 
 def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
+    NJ = self.robot.get_num_joints()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
     baseXI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms=False) # need to know where the Xhom starts in XI to load from global to shared
     # add function description
@@ -436,65 +438,79 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
         self.gen_add_sync(use_thread_group)
     # else just load in XI from global to shared efficiently
     else:
-        self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size) + "]," + str(Xhom_size) + ");")
+        self.gen_add_parallel_loop("ind",str(Xhom_size),use_thread_group)
+        self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
         if include_gradients:
-            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_dXmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "]," + str(dXhom_size) + ");")
+            self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
         if include_hessians:
-            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_d2XmatsHom,d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "]," + str(d2Xhom_size) + ");")
+            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
+        self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_topology_helpers,d_robotModel->d_topology_helpers," + str(self.gen_topology_helpers_size()) + "*sizeof(int));")
-        self.gen_add_code_line("cgrps::wait(tgrp);")
+            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
+            self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
+            self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     # loop through Xmats and update all non-constant values serially
+    def replace_hom_config_symbols(str_val, ind):
+        if self.robot.floating_base:
+            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + 6) + "]")
+            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n + 6) + "]")
+            str_val = str_val.replace("theta","s_q[" + str(ind + 6) + "]")
+            str_val = str_val.replace("x_fb**2", "s_q[0]*s_q[0]")
+            str_val = str_val.replace("y_fb**2", "s_q[1]*s_q[1]")
+            str_val = str_val.replace("z_fb**2", "s_q[2]*s_q[2]")
+            str_val = str_val.replace("q1_fb**2", "s_q[3]*s_q[3]")
+            str_val = str_val.replace("q2_fb**2", "s_q[4]*s_q[4]")
+            str_val = str_val.replace("q3_fb**2", "s_q[5]*s_q[5]")
+            str_val = str_val.replace("q4_fb**2", "s_q[6]*s_q[6]")
+            str_val = str_val.replace("x_fb", "s_q[0]")
+            str_val = str_val.replace("y_fb", "s_q[1]")
+            str_val = str_val.replace("z_fb", "s_q[2]")
+            str_val = str_val.replace("q1_fb", "s_q[3]")
+            str_val = str_val.replace("q2_fb", "s_q[4]")
+            str_val = str_val.replace("q3_fb", "s_q[5]")
+            str_val = str_val.replace("q4_fb", "s_q[6]")
+        else:
+            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
+            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
+            str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+        return str_val
+
     self.gen_add_serial_ops(use_thread_group)
-    for ind in range(n):
+    for ind in range(NJ):
         self.gen_add_code_line("// X_hom[" + str(ind) + "]")
         for col in range(4):
             for row in range(4):
                 val = Xmats_hom[ind][row,col]
                 if not self.custom_is_constant(val):
                     # parse the symbolic value into the appropriate array access
-                    str_val = str(val)
-                    # first check for sin/cos (revolute)
-                    str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                    str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                    # then just the variable (prismatic)
-                    str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                    str_val = replace_hom_config_symbols(str(val), ind)
                     # then output the code
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                     self.gen_add_code_line("s_XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     if include_gradients:
         dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
-        for ind in range(n):
+        for ind in range(NJ):
             self.gen_add_code_line("// dX_hom[" + str(ind) + "]")
             for col in range(4):
                 for row in range(4):
                     val = dXmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = str(val)
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        str_val = replace_hom_config_symbols(str(val), ind)
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_dXmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     if include_hessians:
         d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
-        for ind in range(n):
+        for ind in range(NJ):
             self.gen_add_code_line("// d2X_hom[" + str(ind) + "]")
             for col in range(4):
                 for row in range(4):
                     val = d2Xmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = str(val)
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        str_val = replace_hom_config_symbols(str(val), ind)
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_d2XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")

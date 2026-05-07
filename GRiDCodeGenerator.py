@@ -44,7 +44,8 @@ class GRiDCodeGenerator:
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
-                            gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
+                            gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, idsva_so_needs_reference_order_output_repair, \
+                            gen_idsva_so_reference_order_output_repair, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
                             gen_idsva_so_device, gen_idsva_so_kernel, gen_idsva_so_host, gen_idsva_so, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
@@ -131,6 +132,8 @@ class GRiDCodeGenerator:
             algorithms.update({"id", "minv", "fd", "id_du"})
         if "id_du" in algorithms:
             algorithms.add("id")
+        if "aba" in algorithms and self.robot.floating_base:
+            algorithms.update({"id", "minv", "fd"})
         if "fdsva_so" in algorithms:
             algorithms.update({"id", "minv", "fd", "id_du", "fd_du", "idsva_so"})
         if "idsva_so" in algorithms:
@@ -221,8 +224,10 @@ class GRiDCodeGenerator:
         self.fd_du_use_global_temp = self.fd_du_spill_tier == 2
         id_du_t_count = [id_du_t_count_full, id_du_t_count_selective, id_du_t_count_emergency][self.id_du_spill_tier]
         fd_du_t_count = [fd_du_t_count_full, fd_du_t_count_selective, fd_du_t_count_emergency][self.fd_du_spill_tier]
-        aba_t_count = nv + 3*nv + 12*nv + self.gen_aba_inner_temp_mem_size() + XI_size
-        crba_t_count = n*n + 3*n + self.gen_crba_inner_temp_mem_size() + XI_size
+        aba_input_t_count = n + 2*nv
+        crba_input_t_count = n + nv
+        aba_t_count = nv + aba_input_t_count + 12*NJ + self.gen_aba_inner_temp_mem_size() + XI_size
+        crba_t_count = nv*nv + crba_input_t_count + self.gen_crba_inner_temp_mem_size() + XI_size
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         dee_t_count = n + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_inner_temp_mem_size() + XHom_size + dXhom_size
         d2ee_t_count = n + 6*n*n*self.robot.get_total_leaf_nodes() + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + XHom_size + dXhom_size + d2Xhom_size
@@ -577,21 +582,20 @@ class GRiDCodeGenerator:
 
         if has_all(("id", "minv", "fd", "id_du", "fd_du")):
             calls = [id_call, minv_call, fd_call, id_du_call, fd_du_call]
-            if "aba" in algorithms and not self.robot.floating_base:
+            if "aba" in algorithms:
                 calls.append(aba_call)
-            if "crba" in algorithms and not self.robot.floating_base:
+            if "crba" in algorithms:
                 calls.append(crba_call)
             emit_dynamics_combo("all_dynamics", "Run all generated non-second-order dynamics wrappers in sequence", calls)
             emit_dynamics_combo("dynamics_only", "Run all generated non-second-order dynamics wrappers in sequence", calls)
 
         kinematics_calls = []
-        if not self.robot.floating_base:
-            if "ee_pose" in algorithms:
-                kinematics_calls.append("end_effector_pose" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-            if "ee_pose_gradient" in algorithms:
-                kinematics_calls.append("end_effector_pose_gradient" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-            if "ee_pose_hessian" in algorithms:
-                kinematics_calls.append("end_effector_pose_gradient_hessian" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
+        if "ee_pose" in algorithms:
+            kinematics_calls.append("end_effector_pose" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
+        if "ee_pose_gradient" in algorithms and not self.robot.floating_base:
+            kinematics_calls.append("end_effector_pose_gradient" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
+        if "ee_pose_hessian" in algorithms and not self.robot.floating_base:
+            kinematics_calls.append("end_effector_pose_gradient_hessian" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
         if kinematics_calls:
             emit_kinematics_combo("kinematics_only", "Run all generated kinematics wrappers in sequence", kinematics_calls)
 
@@ -743,20 +747,22 @@ class GRiDCodeGenerator:
         self.gen_joint_limits_size()
         self.gen_init_joint_limits()
         self.gen_load_update_XImats_helpers(use_thread_group)
-        if not self.robot.floating_base: 
-            if include_homogenous_transforms and include_any_kinematics:
+        if include_homogenous_transforms and include_any_kinematics:
+            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
+            if not self.robot.floating_base:
                 # once with and once without the gradients
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
-            # then generate kinematic algorithms
-            if include_any_kinematics:
-                self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
-                                                include_pose = "ee_pose" in algorithms,
-                                                include_gradient = "ee_pose_gradient" in algorithms,
-                                                include_hessian = "ee_pose_hessian" in algorithms)
-        else:
-            print('eepos, aba, crba, second order dynamics, and debug mode are still under development for floating base')
+        # then generate kinematic algorithms
+        if include_any_kinematics:
+            if self.robot.floating_base and (("ee_pose_gradient" in algorithms) or ("ee_pose_hessian" in algorithms)):
+                print('floating-base eepose gradient/hessian are still under development; generating pose only')
+            self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
+                                            include_pose = "ee_pose" in algorithms,
+                                            include_gradient = ("ee_pose_gradient" in algorithms) and (not self.robot.floating_base),
+                                            include_hessian = ("ee_pose_hessian" in algorithms) and (not self.robot.floating_base))
+        if self.robot.floating_base:
+            print('floating-base second order dynamics and debug mode are still under development')
         # then generate the dynamics algorithms
         if "id" in algorithms:
             self.gen_inverse_dynamics(use_thread_group)
@@ -768,11 +774,11 @@ class GRiDCodeGenerator:
             self.gen_inverse_dynamics_gradient(use_thread_group)
         if "fd_du" in algorithms:
             self.gen_forward_dynamics_gradient(use_thread_group)
+        if "aba" in algorithms:
+            self.gen_aba(use_thread_group)
+        if "crba" in algorithms:
+            self.gen_crba(use_thread_group)
         if not self.robot.floating_base:
-            if "aba" in algorithms:
-                self.gen_aba(use_thread_group)
-            if "crba" in algorithms:
-                self.gen_crba(use_thread_group)
             if "idsva_so" in algorithms:
                 self.gen_idsva_so(use_thread_group)
             if "fdsva_so" in algorithms:

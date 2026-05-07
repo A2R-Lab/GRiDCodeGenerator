@@ -33,6 +33,159 @@ def gen_idsva_so_inner_function_call(self, use_thread_group = False, use_qdd_inp
     id_so_code = id_so_code_start + id_so_code_middle + id_so_code_end
     self.gen_add_code_line(id_so_code)
 
+def idsva_so_parent_topology_needs_reference_order_output_repair(parent_ids):
+    """
+    Return true when moving-joint fanout requires the reference-order repair.
+
+    Fanout directly from the fixed world/base parent is treated as independent
+    root chains and can keep the optimized assembly path. Fanout below a moving
+    joint can create order-sensitive duplicate tensor writes and needs repair.
+    """
+    direct_child_counts = {}
+    for parent_jid in parent_ids:
+        if parent_jid < 0:
+            continue
+        direct_child_counts[parent_jid] = direct_child_counts.get(parent_jid, 0) + 1
+    return any(count > 1 for count in direct_child_counts.values())
+
+def idsva_so_needs_reference_order_output_repair(self):
+    """
+    Returns true for fixed-base topologies where final IDSVA-SO tensor writes
+    are order-sensitive because at least one moving joint has multiple direct
+    children. Serial chains and base-rooted independent chain forests keep the
+    optimized parallel tensor assembly.
+    """
+    if self.robot.is_serial_chain():
+        return False
+    parent_ids = [self.robot.get_parent_id(jid) for jid in range(self.robot.get_num_joints())]
+    return idsva_so_parent_topology_needs_reference_order_output_repair(parent_ids)
+
+def gen_idsva_so_reference_order_output_repair(self, use_thread_group = False):
+    """
+    Emits a serial final tensor assembly pass that mirrors RBDReference.idsva_so.
+
+    The preceding generated code computes all reusable intermediates in
+    parallel. The final second-order tensors, however, have many symmetry and
+    duplicate-write relationships. Those writes are order-dependent for
+    branched topologies, so replay the reference loop order with one thread.
+    """
+    NV = self.robot.get_num_vel()
+    st_start = [0]
+    st_values = []
+    succ_start = [0]
+    succ_values = []
+    anc_start = [0]
+    anc_values = []
+    for jid in range(NV):
+        subtree = list(self.robot.get_subtree_by_id(jid))
+        successors = [st_j for st_j in subtree if st_j != jid]
+        ancestors = list(self.robot.get_ancestors_by_id(jid))
+        ancestors.insert(0, jid)
+        ancestors = ancestors[::-1]
+
+        st_values.extend(subtree)
+        st_start.append(len(st_values))
+        succ_values.extend(successors)
+        succ_start.append(len(succ_values))
+        anc_values.extend(ancestors)
+        anc_start.append(len(anc_values))
+
+    def int_array(values):
+        if values:
+            return ", ".join(map(str, values))
+        return "0"
+
+    self.gen_add_sync(use_thread_group)
+    self.gen_add_code_line("\n\n")
+    self.gen_add_code_line("// Reference-order final IDSVA-SO tensor assembly")
+    self.gen_add_code_line(f"static const int idsva_ref_st_start[] = {{ {int_array(st_start)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_st_values[] = {{ {int_array(st_values)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_succ_start[] = {{ {int_array(succ_start)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_succ_values[] = {{ {int_array(succ_values)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_anc_start[] = {{ {int_array(anc_start)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_anc_values[] = {{ {int_array(anc_values)} }};")
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
+    self.gen_add_code_line("for (int out_idx = 0; out_idx < 4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
+    self.gen_add_code_line("T rt1[36], rt2[36], rt3[36], rt4[36], rt5[36], rt6[36], rt7[36], rt8[36], rt9[36];")
+    self.gen_add_code_line("T rp1[6], rp2[6], rp3[6], rp4[6], rp5[6], rp6[6];")
+    self.gen_add_code_line("for (int jid = NUM_JOINTS - 1; jid >= 0; --jid) {", True)
+    self.gen_add_code_line("int st_begin = idsva_ref_st_start[jid];")
+    self.gen_add_code_line("int st_end = idsva_ref_st_start[jid + 1];")
+    self.gen_add_code_line("int succ_begin = idsva_ref_succ_start[jid];")
+    self.gen_add_code_line("int succ_end = idsva_ref_succ_start[jid + 1];")
+    self.gen_add_code_line("int anc_begin = idsva_ref_anc_start[jid];")
+    self.gen_add_code_line("int anc_end = idsva_ref_anc_start[jid + 1];")
+    self.gen_add_code_line("for (int anc_pos = anc_begin; anc_pos < anc_end; ++anc_pos) {", True)
+    self.gen_add_code_line("int ancestor_j = idsva_ref_anc_values[anc_pos];")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6;")
+    self.gen_add_code_line("int col = idx / 6;")
+    self.gen_add_code_line("rt1[idx] = S[jid*6 + row] * psid[ancestor_j*6 + col];")
+    self.gen_add_code_line("rt2[idx] = S[jid*6 + row] * S[ancestor_j*6 + col];")
+    self.gen_add_code_line("rt3[idx] = psid[jid*6 + row] * psid[ancestor_j*6 + col];")
+    self.gen_add_code_line("rt4[idx] = S[jid*6 + row] * psidd[ancestor_j*6 + col];")
+    self.gen_add_code_line("rt5[idx] = S[jid*6 + row] * psid_Sd[ancestor_j*6 + col];")
+    self.gen_add_code_line("rt6[idx] = S[ancestor_j*6 + row] * psid[jid*6 + col];")
+    self.gen_add_code_line("rt7[idx] = S[ancestor_j*6 + row] * psidd[jid*6 + col];")
+    self.gen_add_code_line("rt8[idx] = S[ancestor_j*6 + row] * S[jid*6 + col];")
+    self.gen_add_code_line("rt9[idx] = S[ancestor_j*6 + row] * psid_Sd[jid*6 + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("rp1[row] = crm_mul<T>(row, &psid[ancestor_j*6], &S[jid*6]);")
+    self.gen_add_code_line("rp2[row] = crm_mul<T>(row, &psidd[ancestor_j*6], &S[jid*6]);")
+    self.gen_add_code_line("rp3[row] = crm_mul<T>(row, &S[ancestor_j*6], &S[jid*6]);")
+    self.gen_add_code_line("rp4[row] = crm_mul<T>(row, &psid_Sd[ancestor_j*6], &S[jid*6]) - static_cast<T>(2) * crm_mul<T>(row, &psid[jid*6], &S[ancestor_j*6]);")
+    self.gen_add_code_line("rp5[row] = crm_mul<T>(row, &S[jid*6], &S[ancestor_j*6]);")
+    self.gen_add_code_line("rp6[row] = dot_prod<T, 6, 1, 1>(&IC_S[jid*6], &crm_S[ancestor_j*36 + row*6]) + dot_prod<T, 6, 1, 1>(&S[ancestor_j*6], &crf_S_IC[jid*36 + row*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_j = idsva_ref_st_values[st_pos];")
+    self.gen_add_code_line("d2tau_dq2[st_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + ancestor_j] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_j*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_j*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_j*6]);")
+    self.gen_add_code_line("d2tau_dvdq[st_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + ancestor_j] = -dot_prod<T, 36, 1, 1>(rt1, &D3[st_j*36]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ancestor_j < jid) {", True)
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_j = idsva_ref_st_values[st_pos];")
+    self.gen_add_code_line("d2tau_dq2[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + jid] = d2tau_dq2[st_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + ancestor_j];")
+    self.gen_add_code_line("d2tau_dqd2[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + jid] = -dot_prod<T, 36, 1, 1>(rt2, &D3[st_j*36]);")
+    self.gen_add_code_line("d2tau_dqd2[st_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + ancestor_j] = d2tau_dqd2[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + jid];")
+    self.gen_add_code_line("d2tau_dvdq[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + jid] = -dot_prod<T, 36, 1, 1>(rt6, &D3[st_j*36]) - dot_prod<T, 6, 1, 1>(rp3, &T2[st_j*6]) + dot_prod<T, 6, 1, 1>(rp4, &T1[st_j*6]);")
+    self.gen_add_code_line("d2tau_dq2[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j*NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(rt6, &D2[st_j*36]) + dot_prod<T, 36, 1, 1>(rt7, &D1[st_j*36]) - dot_prod<T, 6, 1, 1>(rp5, &T3[st_j*6]);")
+    self.gen_add_code_line("d2tau_dvdq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j*NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(rt6, &D3[st_j*36]) - dot_prod<T, 6, 1, 1>(rp5, &T4[st_j*6]);")
+    self.gen_add_code_line("dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j*NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(rt8, &D4[st_j*36]);")
+    self.gen_add_code_line("dM_dq[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + jid] = dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j*NUM_JOINTS + jid];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + jid] = dot_prod<T, 6, 1, 1>(rp6, &S[jid*6]);")
+    self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
+    self.gen_add_code_line("int succ_j = idsva_ref_succ_values[succ_pos];")
+    self.gen_add_code_line("d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(rt8, &D3[succ_j*36]);")
+    self.gen_add_code_line("d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + succ_j] = d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + jid];")
+    self.gen_add_code_line("d2tau_dvdq[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + succ_j] = dot_prod<T, 36, 1, 1>(rt8, &D2[succ_j*36]) + dot_prod<T, 36, 1, 1>(rt9, &D1[succ_j*36]);")
+    self.gen_add_code_line("d2tau_dq2[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + succ_j] = d2tau_dq2[ancestor_j*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + jid];")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
+    self.gen_add_code_line("int succ_j = idsva_ref_succ_values[succ_pos];")
+    self.gen_add_code_line("d2tau_dq2[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j] = dot_prod<T, 36, 1, 1>(rt1, &D2[succ_j*36]) + dot_prod<T, 36, 1, 1>(rt4, &D1[succ_j*36]);")
+    self.gen_add_code_line("d2tau_dqd2[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j] = dot_prod<T, 36, 1, 1>(rt2, &D3[succ_j*36]);")
+    self.gen_add_code_line("d2tau_dqd2[jid*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + ancestor_j] = d2tau_dqd2[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j];")
+    self.gen_add_code_line("d2tau_dvdq[jid*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + ancestor_j] = dot_prod<T, 36, 1, 1>(rt1, &D3[succ_j*36]);")
+    self.gen_add_code_line("d2tau_dq2[jid*NUM_JOINTS*NUM_JOINTS + succ_j*NUM_JOINTS + ancestor_j] = d2tau_dq2[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j];")
+    self.gen_add_code_line("d2tau_dvdq[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j] = dot_prod<T, 36, 1, 1>(rt2, &D2[succ_j*36]) + dot_prod<T, 36, 1, 1>(rt5, &D1[succ_j*36]);")
+    self.gen_add_code_line("dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + succ_j] = dot_prod<T, 36, 1, 1>(rt8, &D1[succ_j*36]);")
+    self.gen_add_code_line("dM_dq[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j*NUM_JOINTS + succ_j] = dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + succ_j];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ancestor_j == jid) {", True)
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_j = idsva_ref_st_values[st_pos];")
+    self.gen_add_code_line("d2tau_dqd2[st_j*NUM_JOINTS*NUM_JOINTS + jid*NUM_JOINTS + ancestor_j] = -dot_prod<T, 36, 1, 1>(rt2, &D1[st_j*36]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
 def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     """
     Generates the inner device function to compute the second order
@@ -162,6 +315,8 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_lines(vars)
 
     parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp([i for i in range(NV)], NO_GRAD_FLAG = True)
+    S_sign_cpp = self.gen_topology_S_sign_for_cpp([i for i in range(NV)])
+    parent_ind_cpp_for_jid = parent_ind_cpp
 
 
     # Compute Xup transformations
@@ -187,13 +342,14 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
+                    level_parent_ind_cpp = parent_ind_cpp_for_jid
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*36) for idx, jid in enumerate(inds)], select_var_vals)
             else:
                 jid_cpp = str(inds[0])
-                parent_ind_cpp = self.robot.get_parent_id(inds[0])
+                level_parent_ind_cpp = str(self.robot.get_parent_id(inds[0]))
             self.gen_add_code_line(f'int X_idx = {jid_cpp}*XIMAT_SIZE;')
             if bfs_level == 0: self.gen_add_code_line(f'Xup[X_idx + i % XIMAT_SIZE] = s_XImats[X_idx + i % XIMAT_SIZE]; // Parent is base')
-            else: self.gen_add_code_line(f'matmul<T>(i % 36, &Xup[{parent_ind_cpp} * XIMAT_SIZE], &s_XImats[X_idx], &Xup[X_idx], XIMAT_SIZE, 0);')
+            else: self.gen_add_code_line(f'matmul<T>(i % 36, &Xup[{level_parent_ind_cpp} * XIMAT_SIZE], &s_XImats[X_idx], &Xup[X_idx], XIMAT_SIZE, 0);')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             
@@ -244,7 +400,7 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line('// Transform S')
     self.gen_add_parallel_loop('i','6*NUM_JOINTS',use_thread_group)
     self.gen_add_code_line('int jid = i / 6;')
-    self.gen_add_code_line(f'S[i] = Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
+    self.gen_add_code_line(f'S[i] = ({S_sign_cpp}) * Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -278,13 +434,14 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
+                    level_parent_ind_cpp = parent_ind_cpp_for_jid
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*6) for idx, jid in enumerate(inds)], select_var_vals)
             else:
                 jid_cpp = str(inds[0])
-                parent_ind_cpp = self.robot.get_parent_id(inds[0])
+                level_parent_ind_cpp = str(self.robot.get_parent_id(inds[0]))
             self.gen_add_code_line(f'int idx = i % 6;')
             if bfs_level == 0: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = vJ[{jid_cpp}*6 + idx]; // Parent is base')
-            else: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = v[{parent_ind_cpp}*6 + idx] + vJ[{jid_cpp}*6 + idx];')
+            else: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = v[{level_parent_ind_cpp}*6 + idx] + vJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -295,7 +452,7 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_parallel_loop('i','6*NUM_JOINTS',use_thread_group)
     self.gen_add_code_line('int jid = i / 6;')
     self.gen_add_code_line('int index = i % 6;')
-    self.gen_add_code_line(f'if ({parent_ind_cpp} != -1) aJ[i] += crm_mul<T>(index, &v[{parent_ind_cpp}*6], &vJ[jid*6]);')
+    self.gen_add_code_line(f'if ({parent_ind_cpp_for_jid} != -1) aJ[i] += crm_mul<T>(index, &v[{parent_ind_cpp_for_jid}*6], &vJ[jid*6]);')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -308,8 +465,8 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line('int index = i % 6;')
     self.gen_add_code_line('if (i < 6*NUM_JOINTS) Sd[i] = crm_mul<T>(index, &v[jid*6], &S[jid*6]);')
     self.gen_add_code_line('else {', True)
-    self.gen_add_code_line(f'if ({parent_ind_cpp} == -1) psid[jid*6 + index] = 0;')
-    self.gen_add_code_line(f'else psid[i - 6 * NUM_JOINTS] = crm_mul<T>(index, &v[{parent_ind_cpp}*6], &S[jid*6]);')   
+    self.gen_add_code_line(f'if ({parent_ind_cpp_for_jid} == -1) psid[jid*6 + index] = 0;')
+    self.gen_add_code_line(f'else psid[i - 6 * NUM_JOINTS] = crm_mul<T>(index, &v[{parent_ind_cpp_for_jid}*6], &S[jid*6]);')   
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
@@ -334,13 +491,14 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
+                    level_parent_ind_cpp = parent_ind_cpp_for_jid
                     self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*6) for idx, jid in enumerate(inds)], select_var_vals)
             else:
                 jid_cpp = str(inds[0])
-                parent_ind_cpp = self.robot.get_parent_id(inds[0])
+                level_parent_ind_cpp = str(self.robot.get_parent_id(inds[0]))
             self.gen_add_code_line(f'int idx = i % 6;')
             if bfs_level == 0: self.gen_add_code_line(f"a[{jid_cpp}*6+ idx] = aJ[{jid_cpp}*6 + idx] + gravity * (idx == 5); // Base joint's parent is the world")
-            else: self.gen_add_code_line(f'a[{jid_cpp}*6 + idx] = a[{parent_ind_cpp}*6 + idx] + aJ[{jid_cpp}*6 + idx];')
+            else: self.gen_add_code_line(f'a[{jid_cpp}*6 + idx] = a[{level_parent_ind_cpp}*6 + idx] + aJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
         
@@ -361,8 +519,8 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line('int jid = (i / 6) % NUM_JOINTS;')
     self.gen_add_code_line('int index = i % 6;')
     self.gen_add_code_line('if (i < 6*NUM_JOINTS) {', True)
-    self.gen_add_code_line(f'if ({parent_ind_cpp} == -1) psidd[i] = crm_mul<T>(index, a_world, &S[jid*6]);')
-    self.gen_add_code_line(f'else psidd[i] = crm_mul<T>(index, &a[{parent_ind_cpp}*6], &S[jid*6]) + crm_mul<T>(index, &v[{parent_ind_cpp}*6], &psid[jid*6]);')
+    self.gen_add_code_line(f'if ({parent_ind_cpp_for_jid} == -1) psidd[i] = crm_mul<T>(index, a_world, &S[jid*6]);')
+    self.gen_add_code_line(f'else psidd[i] = crm_mul<T>(index, &a[{parent_ind_cpp_for_jid}*6], &S[jid*6]) + crm_mul<T>(index, &v[{parent_ind_cpp_for_jid}*6], &psid[jid*6]);')
     self.gen_add_end_control_flow()
     self.gen_add_code_line(f'else IC_v[i - 6*NUM_JOINTS] = dot_prod<T, 6, 6, 1>(&IC[index + jid*36], &v[jid*6]);')
     self.gen_add_end_control_flow()
@@ -431,20 +589,20 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
         for bfs_level in range(n_bfs_levels-1, 0, -1):
             inds = self.robot.get_ids_by_bfs_level(bfs_level)
             self.gen_add_code_line(f'// Compute propogations for bfs_level {bfs_level}')
-            self.gen_add_parallel_loop('i', str((36*2 + 6)*len(inds)), use_thread_group)
-            if len(inds) > 1: 
-                    select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid_cpp = "jid"
-                    self.gen_add_multi_threaded_select("(i)", "<", [str((idx+1)*(36*2 + 6)) for idx, jid in enumerate(inds)], select_var_vals)
-            else:
-                jid_cpp = str(inds[0])
-                parent_ind_cpp = self.robot.get_parent_id(inds[0])
-            self.gen_add_code_line(f'int idx = i % (36*2 + 6);')
-            self.gen_add_code_line(f'if (idx < 36) IC[{parent_ind_cpp}*36 + idx] += IC[{jid_cpp}*36 + idx];')
-            self.gen_add_code_line(f'else if (idx < 36*2) BC[{parent_ind_cpp}*36 + idx - 36] += BC[{jid_cpp}*36 + idx - 36];')
-            self.gen_add_code_line(f'else f[{parent_ind_cpp}*6 + idx - 36*2] += f[{jid_cpp}*6 + idx - 36*2];')
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            for jid in inds:
+                parent_ind = self.robot.get_parent_id(jid)
+                if parent_ind == -1:
+                    continue
+                self.gen_add_code_line(
+                    f'// Accumulate joint {jid} into parent {parent_ind}'
+                )
+                self.gen_add_parallel_loop('i','36*2 + 6', use_thread_group)
+                self.gen_add_code_line('int idx = i;')
+                self.gen_add_code_line(f'if (idx < 36) IC[{parent_ind}*36 + idx] += IC[{jid}*36 + idx];')
+                self.gen_add_code_line(f'else if (idx < 36*2) BC[{parent_ind}*36 + idx - 36] += BC[{jid}*36 + idx - 36];')
+                self.gen_add_code_line(f'else f[{parent_ind}*6 + idx - 36*2] += f[{jid}*6 + idx - 36*2];')
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
 
     # Begin B(IC, S) & B(IC, psid) computation
     # First compute crm(S), crf(S), IC @ S && crm(psid), crf(psid), IC @ psid, icrf(f), psid+Sd
@@ -806,16 +964,16 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_code_line(f'int st_j = st[index];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('if (ancestor_j < jid) {', True)
-    self.gen_add_code_line(f'if (i < {len(jids)}) dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid * NUM_JOINTS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D4[st_j*36]);')
-    self.gen_add_code_line(f'else if (i < {2*len(jids)}) dM_dq[st_j*NUM_JOINTS*NUM_JOINTS + jid * NUM_JOINTS + ancestor_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D4[st_j*36]);')
+    self.gen_add_code_line(f'if (i < {len(jids)}) dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j * NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D4[st_j*36]);')
+    self.gen_add_code_line(f'else if (i < {2*len(jids)}) dM_dq[st_j*NUM_JOINTS*NUM_JOINTS + ancestor_j * NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D4[st_j*36]);')
     self.gen_add_code_line('if (st_j != jid) {', True)
     self.gen_add_code_line(f'if (i < {3*len(jids)}) d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid * NUM_JOINTS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_code_line(f'else if (i < {4*len(jids)}) d2tau_dqd2[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j * NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_code_line(f'else if (i < {5*len(jids)}) d2tau_dvdq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j * NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D2[st_j*36]);')
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_code_line(f'if (jid != st_j && i < {6*len(jids)}) dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + st_j * NUM_JOINTS + jid] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
-    self.gen_add_code_line(f'else if (jid != st_j) dM_dq[jid*NUM_JOINTS*NUM_JOINTS + st_j * NUM_JOINTS + ancestor_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
+    self.gen_add_code_line(f'if (jid != st_j && i < {6*len(jids)}) dM_dq[ancestor_j*NUM_JOINTS*NUM_JOINTS + jid * NUM_JOINTS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
+    self.gen_add_code_line(f'else if (jid != st_j) dM_dq[jid*NUM_JOINTS*NUM_JOINTS + ancestor_j * NUM_JOINTS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -911,6 +1069,8 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+    if self.idsva_so_needs_reference_order_output_repair():
+        self.gen_idsva_so_reference_order_output_repair(use_thread_group)
 
     self.gen_add_end_function()
 
