@@ -756,13 +756,13 @@ class GRiDCodeGenerator:
         # then generate kinematic algorithms
         if include_any_kinematics:
             if self.robot.floating_base and (("ee_pose_gradient" in algorithms) or ("ee_pose_hessian" in algorithms)):
-                print('floating-base eepose gradient/hessian are still under development; generating pose only')
+                print('floating-base eepose gradient/hessian are intentionally disabled; generating pose only')
             self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
                                             include_pose = "ee_pose" in algorithms,
                                             include_gradient = ("ee_pose_gradient" in algorithms) and (not self.robot.floating_base),
                                             include_hessian = ("ee_pose_hessian" in algorithms) and (not self.robot.floating_base))
         if self.robot.floating_base:
-            print('floating-base second order dynamics and debug mode are still under development')
+            print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
         if "id" in algorithms:
             self.gen_inverse_dynamics(use_thread_group)
