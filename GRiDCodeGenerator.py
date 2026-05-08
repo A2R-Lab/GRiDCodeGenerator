@@ -326,6 +326,25 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_FD_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FD_DU_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
                                  "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_IDSVA_SO || IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
+                                 "__host__ __device__ inline bool grid_q_index_affects_joint(const int q_index, const int joint_id) {",
+                                 ("    if (joint_id == 0) { return q_index >= 0 && q_index < 7; } return q_index == joint_id + 6;" if self.robot.floating_base else "    return q_index == joint_id;"),
+                                 "}",
+                                 "__host__ __device__ inline int grid_d2xhom_offset(const int q_index_i, const int q_index_j) {",
+                                 ("    return 16 * (q_index_i * NUM_JOINTS + q_index_j);" if self.robot.floating_base else "    return 16 * q_index_i;"),
+                                 "}",
+                                 "template <typename T>",
+                                 "__device__ inline const T *grid_xhom_or_dxhom_ptr(const T *s_Xhom, const T *s_dXhom, const int q_index, const int joint_id) {",
+                                 "    return grid_q_index_affects_joint(q_index, joint_id) ? &s_dXhom[16 * q_index] : &s_Xhom[16 * joint_id];",
+                                 "}",
+                                 "template <typename T>",
+                                 "__device__ inline const T *grid_xhom_or_dxhom_or_d2xhom_ptr(const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, const int q_index_i, const int q_index_j, const int joint_id) {",
+                                 "    const bool i_affects = grid_q_index_affects_joint(q_index_i, joint_id);",
+                                 "    const bool j_affects = grid_q_index_affects_joint(q_index_j, joint_id);",
+                                 "    if (i_affects && j_affects) { return &s_d2Xhom[grid_d2xhom_offset(q_index_i, q_index_j)]; }",
+                                 "    if (i_affects) { return &s_dXhom[16 * q_index_i]; }",
+                                 "    if (j_affects) { return &s_dXhom[16 * q_index_j]; }",
+                                 "    return &s_Xhom[16 * joint_id];",
+                                 "}",
                                  "template <typename T, bool USE_DA_DF_SPILL>",
                                  "__device__ inline T *grid_id_du_temp_ptr(T *s_temp, T *s_temp_spill, int index) {",
                                  "    if (!USE_DA_DF_SPILL) { return &s_temp[index]; }",
@@ -592,9 +611,9 @@ class GRiDCodeGenerator:
         kinematics_calls = []
         if "ee_pose" in algorithms:
             kinematics_calls.append("end_effector_pose" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-        if "ee_pose_gradient" in algorithms and not self.robot.floating_base:
+        if "ee_pose_gradient" in algorithms:
             kinematics_calls.append("end_effector_pose_gradient" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-        if "ee_pose_hessian" in algorithms and not self.robot.floating_base:
+        if "ee_pose_hessian" in algorithms:
             kinematics_calls.append("end_effector_pose_gradient_hessian" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
         if kinematics_calls:
             emit_kinematics_combo("kinematics_only", "Run all generated kinematics wrappers in sequence", kinematics_calls)
@@ -749,18 +768,15 @@ class GRiDCodeGenerator:
         self.gen_load_update_XImats_helpers(use_thread_group)
         if include_homogenous_transforms and include_any_kinematics:
             self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
-            if not self.robot.floating_base:
-                # once with and once without the gradients
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
+            # once with and once without the gradients
+            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
+            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
         # then generate kinematic algorithms
         if include_any_kinematics:
-            if self.robot.floating_base and (("ee_pose_gradient" in algorithms) or ("ee_pose_hessian" in algorithms)):
-                print('floating-base eepose gradient/hessian are intentionally disabled; generating pose only')
             self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
                                             include_pose = "ee_pose" in algorithms,
-                                            include_gradient = ("ee_pose_gradient" in algorithms) and (not self.robot.floating_base),
-                                            include_hessian = ("ee_pose_hessian" in algorithms) and (not self.robot.floating_base))
+                                            include_gradient = "ee_pose_gradient" in algorithms,
+                                            include_hessian = "ee_pose_hessian" in algorithms)
         if self.robot.floating_base:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms

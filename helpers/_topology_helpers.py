@@ -13,8 +13,40 @@ def gen_get_Xhom_size(self):
     nfj = self.robot.get_num_fixed_joints() if self.include_fixed_kinematic_targets else 0
     Xhom_size = 16*(NJ+nfj) # one homogeneous transform per joint plus optional fixed kinematic targets
     dXhom_size = 16*n # kinematic targets are fixed so don't include (gradient is 0)
-    d2Xhom_size = 16*n # kinematic targets are fixed so don't include (gradient is 0)
+    d2Xhom_size = 16*(n*n if self.robot.floating_base else n) # floating root has dense local quaternion second derivatives
     return Xhom_size, dXhom_size, d2Xhom_size
+
+def _qinds_to_list(self, inds):
+    if isinstance(inds, (list, tuple, np.ndarray)):
+        return list(inds)
+    return [inds]
+
+def _global_hom_derivative_matrices_by_q(self):
+    n = self.robot.get_num_pos()
+    mats = [sp.zeros(4, 4) for _ in range(n)]
+    owners = [None for _ in range(n)]
+    for jid in range(self.robot.get_num_joints()):
+        qinds = _qinds_to_list(self, self.robot.get_joint_index_q(jid))
+        for local_ind, qind in enumerate(qinds):
+            mats[qind] = self.robot.get_dXmat_hom_local_by_id(jid, local_ind)
+            owners[qind] = jid
+    return mats, owners
+
+def _global_hom_second_derivative_matrices(self):
+    n = self.robot.get_num_pos()
+    if not self.robot.floating_base:
+        return self.robot.get_d2Xmats_hom_ordered_by_id(), list(range(n))
+
+    mats = [sp.zeros(4, 4) for _ in range(n*n)]
+    owners = [None for _ in range(n*n)]
+    for jid in range(self.robot.get_num_joints()):
+        qinds = _qinds_to_list(self, self.robot.get_joint_index_q(jid))
+        for local_i, qind_i in enumerate(qinds):
+            for local_j, qind_j in enumerate(qinds):
+                pair_ind = qind_i*n + qind_j
+                mats[pair_ind] = self.robot.get_d2Xmat_hom_local_by_id(jid, local_i, local_j)
+                owners[pair_ind] = jid
+    return mats, owners
 
 def custom_is_constant(self,val):
     # 1. Check for SymPy constants (e.g., sp.pi, sp.Integer(5), or an expression like x+1)
@@ -75,8 +107,8 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     # add the X_hom if asked (follow the method from Xmats)
     if (include_homogenous_transforms):
         Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id(include_fixed_joints = self.include_fixed_kinematic_targets)
-        dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
-        d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
+        dXmats_hom, _ = _global_hom_derivative_matrices_by_q(self)
+        d2Xmats_hom, _ = _global_hom_second_derivative_matrices(self)
         Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
         for ind in range(len(Xmats_hom)):
             self.gen_add_code_line("// Xhom[" + str(ind) + "]")
@@ -278,7 +310,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
                     val = Xmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = str(val)
+                        str_val = sp.ccode(val)
                         # first check for sin/cos (revolute)
                         str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
                         str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
@@ -294,7 +326,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
                     val = dXmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = str(val)
+                        str_val = sp.ccode(val)
                         # first check for sin/cos (revolute)
                         str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
                         str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
@@ -310,7 +342,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
                     val = d2Xmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = str(val)
+                        str_val = sp.ccode(val)
                         # first check for sin/cos (revolute)
                         str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
                         str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
@@ -421,11 +453,15 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     if use_trig:
         self.gen_add_parallel_loop("ind",str(Xhom_size),use_thread_group)
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
-        if include_gradients:
-            self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
-        if include_hessians:
-            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
         self.gen_add_end_control_flow()
+        if include_gradients:
+            self.gen_add_parallel_loop("ind",str(dXhom_size),use_thread_group)
+            self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
+            self.gen_add_end_control_flow()
+        if include_hessians:
+            self.gen_add_parallel_loop("ind",str(d2Xhom_size),use_thread_group)
+            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
+            self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
@@ -440,11 +476,15 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     else:
         self.gen_add_parallel_loop("ind",str(Xhom_size),use_thread_group)
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
-        if include_gradients:
-            self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
-        if include_hessians:
-            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
         self.gen_add_end_control_flow()
+        if include_gradients:
+            self.gen_add_parallel_loop("ind",str(dXhom_size),use_thread_group)
+            self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
+            self.gen_add_end_control_flow()
+        if include_hessians:
+            self.gen_add_parallel_loop("ind",str(d2Xhom_size),use_thread_group)
+            self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
+            self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
@@ -484,33 +524,35 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                 val = Xmats_hom[ind][row,col]
                 if not self.custom_is_constant(val):
                     # parse the symbolic value into the appropriate array access
-                    str_val = replace_hom_config_symbols(str(val), ind)
+                    str_val = replace_hom_config_symbols(sp.ccode(val), ind)
                     # then output the code
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                     self.gen_add_code_line("s_XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     if include_gradients:
-        dXmats_hom = self.robot.get_dXmats_hom_ordered_by_id()
-        for ind in range(NJ):
+        dXmats_hom, dXhom_owners = _global_hom_derivative_matrices_by_q(self)
+        for ind in range(n):
+            owner_jid = dXhom_owners[ind]
             self.gen_add_code_line("// dX_hom[" + str(ind) + "]")
             for col in range(4):
                 for row in range(4):
                     val = dXmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = replace_hom_config_symbols(str(val), ind)
+                        str_val = replace_hom_config_symbols(sp.ccode(val), owner_jid if owner_jid is not None else ind)
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_dXmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     if include_hessians:
-        d2Xmats_hom = self.robot.get_d2Xmats_hom_ordered_by_id()
-        for ind in range(NJ):
+        d2Xmats_hom, d2Xhom_owners = _global_hom_second_derivative_matrices(self)
+        for ind in range(len(d2Xmats_hom)):
+            owner_jid = d2Xhom_owners[ind]
             self.gen_add_code_line("// d2X_hom[" + str(ind) + "]")
             for col in range(4):
                 for row in range(4):
                     val = d2Xmats_hom[ind][row,col]
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
-                        str_val = replace_hom_config_symbols(str(val), ind)
+                        str_val = replace_hom_config_symbols(sp.ccode(val), owner_jid if owner_jid is not None else ind)
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_d2XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
