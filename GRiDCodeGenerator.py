@@ -37,7 +37,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
                             gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, gen_end_effector_pose_gradient_kernel, \
-                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
+                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_d2_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
                             gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, gen_X_single_thread, gen_X_warp, \
                             gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
@@ -230,7 +230,19 @@ class GRiDCodeGenerator:
         crba_t_count = nv*nv + crba_input_t_count + self.gen_crba_inner_temp_mem_size() + XI_size
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         dee_t_count = n + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_inner_temp_mem_size() + XHom_size + dXhom_size
-        d2ee_t_count = n + 6*n*n*self.robot.get_total_leaf_nodes() + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + XHom_size + dXhom_size + d2Xhom_size
+        d2ee_inner_temp_count_full = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
+        d2ee_inner_temp_count_shared = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp=False)
+        d2ee_workspace_temp_count = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()
+        d2ee_full_t_count = n + 6*n*n*self.robot.get_total_leaf_nodes() + 6*n*self.robot.get_total_leaf_nodes() + d2ee_inner_temp_count_full + XHom_size + dXhom_size + d2Xhom_size
+        d2ee_spill_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size
+        d2ee_spill_d2xhom_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size
+        self.d2ee_spill_tier = 0
+        if "ee_pose_hessian" in getattr(self, "generated_algorithms", set()):
+            if py_arena_bytes(d2ee_full_t_count) > self.cuda_target_shared_mem_bytes:
+                self.d2ee_spill_tier = 1 if py_arena_bytes(d2ee_spill_t_count) <= self.cuda_target_shared_mem_bytes else 2
+        self.d2ee_use_workspace_temp = self.d2ee_spill_tier >= 1
+        self.d2ee_use_workspace_d2xhom = self.d2ee_spill_tier >= 2
+        d2ee_t_count = [d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count][self.d2ee_spill_tier]
         idsva_so_inner_temp_count = self.gen_idsva_so_inner_temp_mem_size()
         idsva_so_base_t_count = (2*nv + n) + idsva_so_inner_temp_count + XI_size
         idsva_so_full_t_count = idsva_so_base_t_count + 4*nv**3
@@ -257,7 +269,12 @@ class GRiDCodeGenerator:
                                            id_du_temp_count,
                                            fd_du_temp_count,
                                            2*nv*nv)
-        so_workspace_t_count = 8*max(nv**3, 1)
+        d2ee_workspace_t_count = 0
+        if self.d2ee_use_workspace_temp:
+            d2ee_workspace_t_count += d2ee_workspace_temp_count
+        if self.d2ee_use_workspace_d2xhom:
+            d2ee_workspace_t_count += d2Xhom_size
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -278,9 +295,13 @@ class GRiDCodeGenerator:
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
                                  "const int GRID_GENERATES_IDSVA_SO = " + str(int(getattr(self, "generate_idsva_so", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
+                                 "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
                                  "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_use_global_output)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_GLOBAL_TENSORS = " + str(int(self.fdsva_so_use_global_tensors)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_TEMP = " + str(int(self.fdsva_so_use_workspace_temp)) + ";", \
+                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_temp)) + ";", \
+                                 "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = " + str(int(self.d2ee_use_workspace_d2xhom)) + ";", \
+                                 "const int GRID_D2EE_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
                                  "const int GRID_ID_DU_SHARED_TIER_VALUE = " + str(self.id_du_spill_tier) + ";", \
                                  "const int GRID_FD_DU_SHARED_TIER_VALUE = " + str(self.fd_du_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(id_du_temp_layout["spill_start"]) + ";", \
@@ -325,7 +346,10 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_ID_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_ID_DU_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_FD_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FD_DU_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
-                                 "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_IDSVA_SO || IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>() + (GRID_D2EE_USES_WORKSPACE_D2XHOM ? sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT) : 0); }",
+                                 "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_D2EE || D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_IDSVA_SO || IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
                                  "__host__ __device__ inline bool grid_q_index_affects_joint(const int q_index, const int joint_id) {",
                                  ("    if (joint_id == 0) { return q_index >= 0 && q_index < 7; } return q_index == joint_id + 6;" if self.robot.floating_base else "    return q_index == joint_id;"),
                                  "}",
@@ -446,6 +470,7 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    if (GRID_D2EE_USES_WORKSPACE_TEMP && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -516,6 +541,16 @@ class GRiDCodeGenerator:
                 "gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
                 "gpuErrchk(cudaFuncSetAttribute(fdsva_so_kern,cudaFuncAttributeMaxDynamicSharedMemorySize, FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
                 "gpuErrchk(cudaFuncSetAttribute(fdsva_so_kern_timing,cudaFuncAttributeMaxDynamicSharedMemorySize, FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
+            ]
+        if getattr(self, "generate_ee_pose_hessian", True):
+            init_lines += [
+                "if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {",
+                "    auto d2ee_kern = static_cast<void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)>(&end_effector_pose_gradient_hessian_kernel<T>);",
+                "    auto d2ee_kern_timing = static_cast<void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)>(&end_effector_pose_gradient_hessian_kernel_single_timing<T>);",
+                "    gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
+                "    gpuErrchk(cudaFuncSetAttribute(d2ee_kern,cudaFuncAttributeMaxDynamicSharedMemorySize, D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
+                "    gpuErrchk(cudaFuncSetAttribute(d2ee_kern_timing,cudaFuncAttributeMaxDynamicSharedMemorySize, D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
+                "}",
             ]
         init_lines += ["gpuErrchk(cudaDeviceSynchronize());",
                        "// allocate streams",
@@ -661,6 +696,7 @@ class GRiDCodeGenerator:
         self.generated_algorithms = algorithms
         self.generate_id_du = "id_du" in algorithms
         self.generate_fd_du = "fd_du" in algorithms
+        self.generate_ee_pose_hessian = "ee_pose_hessian" in algorithms
         self.generate_idsva_so = ("idsva_so" in algorithms) and (not self.robot.floating_base)
         self.generate_fdsva_so = ("fdsva_so" in algorithms) and (not self.robot.floating_base)
         include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
@@ -768,9 +804,10 @@ class GRiDCodeGenerator:
         self.gen_load_update_XImats_helpers(use_thread_group)
         if include_homogenous_transforms and include_any_kinematics:
             self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
-            # once with and once without the gradients
-            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
-            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
+            if "ee_pose_gradient" in algorithms or "ee_pose_hessian" in algorithms:
+                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
+            if "ee_pose_hessian" in algorithms:
+                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
         # then generate kinematic algorithms
         if include_any_kinematics:
             self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,

@@ -76,7 +76,7 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     n = self.robot.get_num_pos()
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
     baseXI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms = False) #just base XI_size to know where Xhom starts in XI (if needed)
-    self.gen_add_code_line("T *h_XImats = (T *)malloc(" + str(XI_size) + "*sizeof(T));")
+    self.gen_add_code_line("T *h_XImats = (T *)calloc(" + str(XI_size) + ",sizeof(T));")
     # loop through Xmats and add all constant values from the sp matrix (initialize non-constant to 0)
     Xmats = self.robot.get_Xmats_ordered_by_id()
     for ind in range(len(Xmats)):
@@ -107,8 +107,11 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     # add the X_hom if asked (follow the method from Xmats)
     if (include_homogenous_transforms):
         Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id(include_fixed_joints = self.include_fixed_kinematic_targets)
-        dXmats_hom, _ = _global_hom_derivative_matrices_by_q(self)
-        d2Xmats_hom, _ = _global_hom_second_derivative_matrices(self)
+        generated_algorithms = getattr(self, "generated_algorithms", set())
+        include_hom_gradients = ("ee_pose_gradient" in generated_algorithms) or ("ee_pose_hessian" in generated_algorithms)
+        include_hom_hessians = "ee_pose_hessian" in generated_algorithms
+        dXmats_hom, _ = _global_hom_derivative_matrices_by_q(self) if include_hom_gradients else ([], [])
+        d2Xmats_hom, _ = _global_hom_second_derivative_matrices(self) if include_hom_hessians else ([], [])
         Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
         for ind in range(len(Xmats_hom)):
             self.gen_add_code_line("// Xhom[" + str(ind) + "]")
@@ -121,27 +124,29 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
                     cpp_ind = baseXI_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
                     self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
         # and the gradients
-        for ind in range(len(dXmats_hom)):
-            self.gen_add_code_line("// dXhom[" + str(ind) + "]")
-            for col in range(4):
-                for row in range(4):
-                    val = dXmats_hom[ind][row,col]
-                    if not self.custom_is_constant(val): # initialize to 0
-                        val = 0
-                    str_val = str(val)
-                    cpp_ind = baseXI_size + Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
-                    self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
+        if include_hom_gradients:
+            for ind in range(len(dXmats_hom)):
+                self.gen_add_code_line("// dXhom[" + str(ind) + "]")
+                for col in range(4):
+                    for row in range(4):
+                        val = dXmats_hom[ind][row,col]
+                        if not self.custom_is_constant(val): # initialize to 0
+                            val = 0
+                        str_val = str(val)
+                        cpp_ind = baseXI_size + Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
+                        self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
         # and the 2nd derivatives
-        for ind in range(len(d2Xmats_hom)):
-            self.gen_add_code_line("// d2Xhom[" + str(ind) + "]")
-            for col in range(4):
-                for row in range(4):
-                    val = d2Xmats_hom[ind][row,col]
-                    if not self.custom_is_constant(val): # initialize to 0
-                        val = 0
-                    str_val = str(val)
-                    cpp_ind = baseXI_size + Xhom_size + dXhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
-                    self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
+        if include_hom_hessians:
+            for ind in range(len(d2Xmats_hom)):
+                self.gen_add_code_line("// d2Xhom[" + str(ind) + "]")
+                for col in range(4):
+                    for row in range(4):
+                        val = d2Xmats_hom[ind][row,col]
+                        if not self.custom_is_constant(val): # initialize to 0
+                            val = 0
+                        str_val = str(val)
+                        cpp_ind = baseXI_size + Xhom_size + dXhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4)
+                        self.gen_add_code_line("h_XImats[" + str(cpp_ind) + "] = static_cast<T>(" + str_val + ");")
     # allocate and transfer data to the GPU, free CPU memory and return the pointer to the memory
     self.gen_add_code_line("T *d_XImats; gpuErrchk(cudaMalloc((void**)&d_XImats," + str(XI_size) + "*sizeof(T)));")
     self.gen_add_code_line("gpuErrchk(cudaMemcpy(d_XImats,h_XImats," + str(XI_size) + "*sizeof(T),cudaMemcpyHostToDevice));")
@@ -392,7 +397,8 @@ def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = Fals
     self.gen_add_code_line(code_start + code_end)
 
 def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_gradients = False,
-                                                 include_hessians = False, extra_t_buffers = None):
+                                                 include_hessians = False, extra_t_buffers = None,
+                                                 include_d2xhom_shared = True):
     n = self.robot.get_num_pos()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
     if extra_t_buffers is None:
@@ -400,7 +406,7 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
     hom_buffers = [("s_XmatsHom", Xhom_size)]
     if include_gradients:
         hom_buffers.append(("s_dXmatsHom", dXhom_size))
-    if include_hessians:
+    if include_hessians and include_d2xhom_shared:
         hom_buffers.append(("s_d2XmatsHom", d2Xhom_size))
     self.gen_declare_shared_arena(extra_t_buffers + hom_buffers, temp_mem_size,
                                   include_topology_helpers = (not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n)))),

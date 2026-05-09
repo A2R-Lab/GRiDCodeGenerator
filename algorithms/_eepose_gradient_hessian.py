@@ -702,10 +702,16 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
         self.gen_add_code_line("printf(\"Single Call DEEPOS %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
 
-def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
+def gen_end_effector_pose_gradient_hessian_d2_temp_mem_size(self):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
-    return 2*num_ees*(16*(n+1) + 16*n*n)
+    return 2*16*num_ees*n*n
+
+def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self, include_d2_temp = True):
+    n = self.robot.get_num_pos()
+    num_ees = self.robot.get_total_leaf_nodes()
+    d2_temp_size = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size() if include_d2_temp else 0
+    return 2*16*num_ees*(n+1) + d2_temp_size
 
 def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
@@ -717,13 +723,14 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
+        s_d2eeTemp_name = "s_d2eeTemp", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     code_start = "end_effector_pose_gradient_hessian_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", " + var_names["s_d2Xhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["s_d2eeTemp_name"] + ");"
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -745,11 +752,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                    "s_dXhom is the pointer to the 1st derivative of the homogenous transformation matricies ", \
                    "s_d2Xhom is the pointer to the 2nd derivative of the homogenous transformation matricies ", \
                    "s_temp is a pointer to helper shared memory of size " + \
-                            str(self.gen_end_effector_pose_gradient_inner_temp_mem_size())]
+                            str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)), \
+                   "s_d2eeTemp is a pointer to helper memory of size " + \
+                            str(self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size())]
     func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, "
-    func_def_end = "T *s_temp) {"
+    func_def_end = "T *s_temp, T *s_d2eeTemp) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -894,7 +903,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// For each hessian term in parallel chain up the transform")
     self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
     self.gen_add_code_line("//")
-    self.gen_add_code_line("T *s_d2eeTemp = &s_deeTemp[" + str(2*16*num_ees*n) + "];")
     self.gen_add_code_line("// set eeTemp and deeTemp to the right offsets")
     self.gen_add_code_line("s_eeTemp = &s_eeTemp[eeTemp_Offset];")
     self.gen_add_code_line("s_deeTemp = &s_deeTemp[deeTemp_Offset];")
@@ -1102,6 +1110,7 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     # add the shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
+    self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
     self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
@@ -1111,14 +1120,17 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
     # define function def and params
+    use_workspace_temp = getattr(self, "d2ee_use_workspace_temp", False)
+    use_workspace_d2xhom = getattr(self, "d2ee_use_workspace_d2xhom", False)
     func_params = ["d_d2eePos is the vector of end effector positions gradients", \
                    "d_deePos is the vector of end effector positions gradients", \
+                   "d_workspace is the generated global spill workspace", \
                    "d_q is the vector of joint positions", \
                    "stride_q is the stide between each q", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_d2eePos, T *d_deePos, const T *d_q, const int stride_q, "
+    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_d2eePos, T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -1130,28 +1142,46 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     self.gen_add_code_line("__global__")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
+    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = not use_workspace_temp)
+    extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_d2eePos", 6*n*n*num_ees), ("s_deePos", 6*n*num_ees)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True,
-                                                      extra_t_buffers = [("s_q", n), ("s_d2eePos", 6*n*n*num_ees), ("s_deePos", 6*n*num_ees)])
+                                                      extra_t_buffers = extra_t_buffers,
+                                                      include_d2xhom_shared = not use_workspace_d2xhom)
+    if not use_workspace_temp:
+        self.gen_add_code_line("(void)d_workspace;")
+        self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        if use_workspace_d2xhom:
+            self.gen_add_code_line("T *s_d2XmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES<T>()]);")
+        if use_workspace_temp:
+            self.gen_add_code_line("T *s_d2eePos = &d_d2eePos[k*" + str(6*n*n*num_ees) + "];")
+            self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
+            self.gen_add_code_line("T *s_d2eeTemp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES<T>()]);")
         # compute
         self.gen_add_code_line("// compute")
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
-        # save to global
-        self.gen_kernel_save_result("d2eePos",str(6*n*n*num_ees),str(6*n*n*num_ees),use_thread_group)
-        self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
+        if not use_workspace_temp:
+            # save to global
+            self.gen_kernel_save_result("d2eePos",str(6*n*n*num_ees),str(6*n*n*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
         self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        if use_workspace_d2xhom:
+            self.gen_add_code_line("T *s_d2XmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES<T>()]);")
+        if use_workspace_temp:
+            self.gen_add_code_line("T *s_d2eePos = d_d2eePos;")
+            self.gen_add_code_line("T *s_deePos = d_deePos;")
+            self.gen_add_code_line("T *s_d2eeTemp = reinterpret_cast<T *>(&d_workspace[GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES<T>()]);")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -1159,9 +1189,10 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
         self.gen_add_end_control_flow()
-        # save to global
-        self.gen_kernel_save_result_single_timing("d2eePos",str(6*n*n*num_ees),use_thread_group)
-        self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
+        if not use_workspace_temp:
+            # save to global
+            self.gen_kernel_save_result_single_timing("d2eePos",str(6*n*n*num_ees),use_thread_group)
+            self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
@@ -1191,7 +1222,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient_hessian requires all-data or kinematics gridData\");")
-    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_q,stride_q,"
+    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -1220,8 +1251,12 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_gradient_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
+    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
