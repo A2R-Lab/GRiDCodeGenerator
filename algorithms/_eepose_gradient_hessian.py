@@ -14,13 +14,14 @@ def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, up
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
+        s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     code_start = "end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T>(" + var_names["s_eePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group and serial chains
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -42,11 +43,12 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                    "s_q is the vector of joint positions", \
                    "s_Xhom is the pointer to the homogenous transformation matricies ", \
                    "s_temp is a pointer to helper shared memory of size " + \
-                            str(self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name))]
+                            str(self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)), \
+                   "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
     func_notes = ["Assumes the Xhom matricies have already been updated for the given q", "Defaults to all leave nodes if fixed_target_name is not provided"]
     func_def_start = "void end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_eePos, const T *s_q, const T *s_Xhom, "
-    func_def_end = "T *s_temp) {"
+    func_def_end = "T *s_temp, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -96,11 +98,11 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 if parent == -1:
                     break # if no parent then we are done (this can happen if we have a fixed joint that is not at the end of the chain)
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16),use_thread_group)
-                self.gen_add_code_line("int row = ind % 4; int col = ind / 4;")
                 even = bfs_level % 2
                 tempDstOffset = 16*(even)
                 tempSrcOffset = 16*(not even)
+                self.gen_add_parallel_loop("ind",str(16),use_thread_group)
+                self.gen_add_code_line("int row = ind % 4; int col = ind / 4;")
                 self.gen_add_code_line("s_temp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*" + str(parent) + " + row], &s_temp[" + str(tempSrcOffset) + " + 4*col]);")
                 self.gen_add_end_control_flow()
@@ -120,8 +122,6 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 self.gen_add_sync(use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*num_ees),use_thread_group)
-                self.gen_add_code_line("int row = ind % 4; int col = (ind / 4) % 4; int eeOffset = ind - (ind % 16);")
                 # get the parents we need at this level working backwards from all_ees
                 curr_parents = all_ees
                 for i in range(bfs_level):
@@ -130,6 +130,8 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 even = bfs_level % 2
                 tempDstOffset = 16*num_ees*(even)
                 tempSrcOffset = 16*num_ees*(not even)
+                self.gen_add_parallel_loop("ind",str(16*num_ees),use_thread_group)
+                self.gen_add_code_line("int row = ind % 4; int col = (ind / 4) % 4; int eeOffset = ind - (ind % 16);")
                 # get parents for this level
                 select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
@@ -189,7 +191,8 @@ def gen_end_effector_pose_device(self, use_thread_group = False, fixed_target_na
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
     self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
@@ -218,7 +221,9 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_eePos", 6*num_ees)])
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_eePos", 6*num_ees)],
+                                                      include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -332,13 +337,14 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
+        s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     code_start = "end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T>(" + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -361,11 +367,12 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                    "s_Xhom is the pointer to the homogenous transformation matricies ", \
                    "s_dXhom is the pointer to the gradient of the homogenous transformation matricies ", \
                    "s_temp is a pointer to helper shared memory of size " + \
-                            str(self.gen_end_effector_pose_gradient_inner_temp_mem_size())]
+                            str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()), \
+                   "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
     func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
     func_def_start = "void end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, "
-    func_def_end = "T *s_temp) {"
+    func_def_end = "T *s_temp, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -428,12 +435,12 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 if parent == -1:
                     break # if no parent then we are done (this can happen if we have a fixed joint that is not at the end of the chain)
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
-                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 # need to swap dst and start each time
                 even = bfs_level % 2
                 tempDstOffset = 16*n*(even)
                 tempSrcOffset = 16*n*(not even)
+                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, " + str(parent) + ");")
@@ -484,9 +491,6 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                     self.gen_add_sync(use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
-                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
                 # get the parents we need at this level working backwards from all_ees
                 curr_parents = all_ees
                 for i in range(bfs_level):
@@ -495,6 +499,36 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 even = bfs_level % 2
                 tempDstOffset = 16*n*num_ees*(even)
                 tempSrcOffset = 16*n*num_ees*(not even)
+                packed_parent_runs = []
+                run_start = 0
+                while run_start < num_ees:
+                    parent_jid = curr_parents[run_start]
+                    run_end = run_start + 1
+                    while run_end < num_ees and curr_parents[run_end] == parent_jid:
+                        run_end += 1
+                    if parent_jid != -1:
+                        packed_parent_runs.append((run_start, run_end - run_start, parent_jid))
+                    run_start = run_end
+                self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
+                if packed_parent_runs:
+                    self.gen_add_code_line("// Packed EE-gradient pose-temp update for consecutive equal-parent runs.")
+                    for run_start, run_len, parent_jid in packed_parent_runs:
+                        self.gen_add_code_line("grid_linalg_packed_gemm_nvidia_colmajor<T,4,4," + str(4*n*run_len) + ">(&s_Xhom[16*" + str(parent_jid) + "], &s_eeTemp[" + str(tempSrcOffset + 16*n*run_start) + "], &s_eeTemp[" + str(tempDstOffset + 16*n*run_start) + "], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
+                select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
+                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
+                if (-1 in curr_parents):
+                    self.gen_add_code_line("if(parent_jid == -1){continue;}")
+                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, parent_jid);")
+                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
+                                       "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
+                self.gen_add_end_control_flow()
+                self.gen_add_code_line("#else")
+                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
+                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
                 # get parents for this level
                 select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
@@ -506,6 +540,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
                 self.gen_add_end_control_flow()
+                self.gen_add_code_line("#endif")
                 self.gen_add_sync(use_thread_group)
                 if self.DEBUG_MODE:
                     self.gen_add_sync(use_thread_group)
@@ -574,7 +609,8 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
     self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
@@ -603,7 +639,10 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, extra_t_buffers = [("s_q", n), ("s_deePos", 6*n*num_ees)])
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True,
+                                                      extra_t_buffers = [("s_q", n), ("s_deePos", 6*n*num_ees)],
+                                                      include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -724,13 +763,14 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
         s_d2eeTemp_name = "s_d2eeTemp", \
+        s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     code_start = "end_effector_pose_gradient_hessian_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", " + var_names["s_d2Xhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ", " + var_names["s_d2eeTemp_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["s_d2eeTemp_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -754,11 +794,12 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                    "s_temp is a pointer to helper shared memory of size " + \
                             str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)), \
                    "s_d2eeTemp is a pointer to helper memory of size " + \
-                            str(self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size())]
+                            str(self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()), \
+                   "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
     func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, "
-    func_def_end = "T *s_temp, T *s_d2eeTemp) {"
+    func_def_end = "T *s_temp, T *s_d2eeTemp, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -806,8 +847,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
-                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 # get the parents we need at this level working backwards from all_ees
                 parent = all_ees[0]
                 for i in range(bfs_level):
@@ -818,6 +857,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 tempSrcOffset_ee = 16*num_ees*(not even)
                 tempDstOffset_dee = 16*n*num_ees*(even)
                 tempSrcOffset_dee = 16*n*num_ees*(not even)
+                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
+                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 self.gen_add_code_line("if(djid == 0){s_eeTemp[ind + " + str(tempDstOffset_ee) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset_ee) + " + colInd]);}")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, " + str(parent) + ");")
@@ -863,9 +904,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                                   "for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}"]
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int rc = ind % 16; int curr_ee = ind / " + str(16*n) + "; int djid = (ind / 16) % " + str(n) + ";")
-                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row; int colInd_ee = 16*curr_ee + rc - row;")
                 # get the parents we need at this level working backwards from all_ees
                 curr_parents = all_ees
                 for i in range(bfs_level):
@@ -876,6 +914,9 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 tempSrcOffset_ee = 16*num_ees*(not even)
                 tempDstOffset_dee = 16*n*num_ees*(even)
                 tempSrcOffset_dee = 16*n*num_ees*(not even)
+                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int rc = ind % 16; int curr_ee = ind / " + str(16*n) + "; int djid = (ind / 16) % " + str(n) + ";")
+                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row; int colInd_ee = 16*curr_ee + rc - row;")
                 # get parents for this level
                 select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
@@ -923,8 +964,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
-                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int row = rc % 4; int colInd = ind - row;")
                 # get the parents we need at this level working backwards from all_ees
                 parent = all_ees[0]
                 for i in range(bfs_level):
@@ -933,6 +972,8 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 even = bfs_level % 2
                 tempDstOffset = 16*n*n*(even)
                 tempSrcOffset = 16*n*n*(not even)
+                self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
+                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int row = rc % 4; int colInd = ind - row;")
                 self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = grid_xhom_or_dxhom_or_d2xhom_ptr<T>(s_Xhom, s_dXhom, s_d2Xhom, djid_i, djid_j, " + str(parent) + ");")
                 self.gen_add_code_line("s_d2eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom_d2Xhom[row], &s_d2eeTemp[" + str(tempSrcOffset) + " + colInd]);")
@@ -976,9 +1017,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                     self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                self.gen_add_parallel_loop("ind",str(16*n*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int djid_ij = (ind / 16) % " + str(n*n) + "; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + ";" + \
-                                       "int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 # get the parents we need at this level working backwards from all_ees
                 curr_parents = all_ees
                 for i in range(bfs_level):
@@ -987,6 +1025,9 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 even = bfs_level % 2
                 tempDstOffset = 16*n*n*num_ees*(even)
                 tempSrcOffset = 16*n*n*num_ees*(not even)
+                self.gen_add_parallel_loop("ind",str(16*n*n*num_ees),use_thread_group)
+                self.gen_add_code_line("int djid_ij = (ind / 16) % " + str(n*n) + "; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + ";" + \
+                                       "int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
                 # get parents for this level
                 select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*n*(i+1)) for i in range(num_ees)], select_var_vals)
@@ -1109,7 +1150,9 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True,
+                                                      include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
@@ -1146,7 +1189,9 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_d2eePos", 6*n*n*num_ees), ("s_deePos", 6*n*num_ees)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True,
                                                       extra_t_buffers = extra_t_buffers,
-                                                      include_d2xhom_shared = not use_workspace_d2xhom)
+                                                      include_d2xhom_shared = not use_workspace_d2xhom,
+                                                      include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if not use_workspace_temp:
         self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")

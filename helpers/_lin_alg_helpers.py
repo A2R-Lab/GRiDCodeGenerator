@@ -1,3 +1,225 @@
+from pathlib import Path
+import subprocess
+
+
+_GLASS_BASE_FILES = [
+    "src/base/L1/reduce.cuh",
+    "src/base/L1/dot.cuh",
+    "src/base/L2/gemv.cuh",
+    "src/base/L3/gemm.cuh",
+]
+
+_GLASS_NVIDIA_FILES = [
+    "src/nvidia/l1.cuh",
+    "src/nvidia/l2.cuh",
+    "src/nvidia/l3.cuh",
+]
+
+
+def _grid_repo_root():
+    return Path(__file__).resolve().parents[2]
+
+
+def _glass_root():
+    root = _grid_repo_root() / "GLASS"
+    if not root.exists():
+        raise FileNotFoundError(
+            "GLASS submodule is missing. Run `git submodule update --init GLASS` "
+            "from the GRiD-A2R repository root."
+        )
+    return root
+
+
+def _glass_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(_glass_root()), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _emit_glass_source_file(self, relative_path):
+    source_path = _glass_root() / relative_path
+    if not source_path.exists():
+        raise FileNotFoundError("Required GLASS source file is missing: " + str(source_path))
+    self.gen_add_code_line("// BEGIN GLASS " + relative_path)
+    for line in source_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#pragma once"):
+            continue
+        if stripped.startswith("#include"):
+            continue
+        self.gen_add_code_line(line)
+    self.gen_add_code_line("// END GLASS " + relative_path)
+    self.gen_add_code_line("")
+
+
+def _ee_gradient_packed_gemm_k_values(self):
+    if self.robot.is_serial_chain():
+        return []
+    n = self.robot.get_num_pos()
+    all_ees = self.robot.get_leaf_nodes()
+    num_ees = len(all_ees)
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
+    values = set()
+    for bfs_level in range(1, n_bfs_levels):
+        curr_parents = all_ees
+        for _ in range(bfs_level):
+            curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
+        run_start = 0
+        while run_start < num_ees:
+            parent_jid = curr_parents[run_start]
+            run_end = run_start + 1
+            while run_end < num_ees and curr_parents[run_end] == parent_jid:
+                run_end += 1
+            if parent_jid != -1:
+                values.add(4 * n * (run_end - run_start))
+            run_start = run_end
+    if num_ees > 0:
+        values.add(4 * n * num_ees)
+    return sorted(values)
+
+
+def _nvidia_gemm_sizes(self):
+    sizes = {(4, 4, 4)}
+    for k in _ee_gradient_packed_gemm_k_values(self):
+        sizes.add((4, 4, k))
+    return sorted(sizes)
+
+
+def _nvidia_gemv_sizes(self):
+    return []
+
+
+def gen_grid_linalg_backend_helpers(self):
+    """
+    Generate GRiD-owned linear algebra backend wrappers.
+
+    The generated header remains self-contained by copying the required GLASS
+    source fragments from the GLASS submodule at codegen time.
+    """
+    glass_commit = _glass_commit()
+    self.gen_add_func_doc("Vendored GLASS linear algebra helpers")
+    self.gen_add_code_line("// Temporarily leave the generated namespace so GLASS keeps its public namespace.")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_lines([
+        "",
+        "// Vendored from GLASS at codegen time.",
+        "// Source repository: git@github.com:A2R-Lab/GLASS.git",
+        "// Pinned commit: " + glass_commit,
+        "namespace glass {",
+        "",
+    ])
+    for relative_path in _GLASS_BASE_FILES:
+        _emit_glass_source_file(self, relative_path)
+    self.gen_add_code_line("} // namespace glass")
+    self.gen_add_code_line("")
+    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
+    self.gen_add_code_line("#ifndef SMS")
+    self.gen_add_code_line("#define SMS GRID_CUBLASDX_SM")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("namespace glass {")
+    self.gen_add_code_line("namespace nvidia {")
+    for relative_path in _GLASS_NVIDIA_FILES:
+        _emit_glass_source_file(self, relative_path)
+    self.gen_add_code_line("// Generated NVIDIA wrapper instantiations used by this robot.")
+    for m, n in _nvidia_gemv_sizes(self):
+        self.gen_add_code_line("DEFINE_NVIDIA_GEMV(" + str(m) + ", " + str(n) + ")")
+    for m, n, k in _nvidia_gemm_sizes(self):
+        self.gen_add_code_line("DEFINE_NVIDIA_GEMM(" + str(m) + ", " + str(n) + ", " + str(k) + ")")
+    self.gen_add_code_line("} // namespace nvidia")
+    self.gen_add_code_line("} // namespace glass")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("")
+    self.gen_add_code_line("namespace " + self.file_namespace + " {", True)
+    self.gen_add_func_doc("Compile-time linear algebra backend controls")
+    self.gen_add_code_lines([
+        "const int GRID_LINALG_GLASS_VALUE = GRID_LINALG_GLASS;",
+        "const int GRID_LINALG_GLASS_NVIDIA_VALUE = GRID_LINALG_GLASS_NVIDIA;",
+        "const int GRID_CUDA_LINALG_BACKEND_VALUE = GRID_CUDA_LINALG_BACKEND;",
+        "const int GRID_CUDA_USE_GLASS_NVIDIA_VALUE = GRID_CUDA_USE_GLASS_NVIDIA;",
+        "",
+        "template <typename T, int M, int N, int K>",
+        "__host__ __device__ constexpr size_t grid_linalg_nvidia_gemm_smem_bytes() {",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "    return glass::nvidia::gemm_smem_size<float, M, N, K>();",
+        "#else",
+        "    return static_cast<size_t>(0);",
+        "#endif",
+        "}",
+        "",
+        "template <typename T>",
+        "__host__ __device__ constexpr size_t GRID_LINALG_NVIDIA_MAX_HELPER_BYTES() {",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "    size_t bytes = grid_linalg_nvidia_gemm_smem_bytes<T, 4, 4, 4>();",
+        "    size_t b66 = grid_linalg_nvidia_gemm_smem_bytes<T, 6, 6, 6>();",
+        "    size_t b661 = grid_linalg_nvidia_gemm_smem_bytes<T, 6, 6, 1>();",
+        "    bytes = bytes > b66 ? bytes : b66;",
+        "    bytes = bytes > b661 ? bytes : b661;",
+        "    return bytes;",
+        "#else",
+        "    return static_cast<size_t>(0);",
+        "#endif",
+        "}",
+        "",
+        "template <typename T, int M, int N, int K, bool TRANSPOSE_B = false, bool ROW_MAJOR_A = false, bool ROW_MAJOR_B = false, bool ROW_MAJOR_C = false>",
+        "__device__ void grid_linalg_gemm_glass(const T *A, const T *B, T *C, T alpha, T beta) {",
+        "    T *A_mut = const_cast<T *>(A);",
+        "    T *B_mut = const_cast<T *>(B);",
+        "    if (!TRANSPOSE_B && !ROW_MAJOR_A && !ROW_MAJOR_B && !ROW_MAJOR_C) {",
+        "        glass::gemm<T, M, N, K>(alpha, A_mut, B_mut, beta, C);",
+        "    }",
+        "    else {",
+        "        glass::gemm_ex<T, TRANSPOSE_B, ROW_MAJOR_A, ROW_MAJOR_B, ROW_MAJOR_C>(M, N, K, alpha, A_mut, B_mut, beta, C);",
+        "    }",
+        "    __syncthreads();",
+        "}",
+        "",
+        "template <typename T, int M, int N, int K, bool TRANSPOSE_B = false, bool ROW_MAJOR_A = false, bool ROW_MAJOR_B = false, bool ROW_MAJOR_C = false>",
+        "__device__ void grid_linalg_gemm_default(const T *A, const T *B, T *C, T alpha, T beta) {",
+        "    grid_linalg_gemm_glass<T, M, N, K, TRANSPOSE_B, ROW_MAJOR_A, ROW_MAJOR_B, ROW_MAJOR_C>(A, B, C, alpha, beta);",
+        "}",
+        "",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "template <typename T, int M, int N, int K>",
+        "__device__ void grid_linalg_packed_gemm_nvidia_colmajor(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *smem) {",
+        "    static_assert(sizeof(T) == sizeof(float), \"glass-nvidia backend currently supports float only\");",
+        "    glass::nvidia::gemm<float, M, N, K>(static_cast<float>(alpha), reinterpret_cast<float *>(const_cast<T *>(A)), reinterpret_cast<float *>(const_cast<T *>(B)), static_cast<float>(beta), reinterpret_cast<float *>(C), reinterpret_cast<char *>(smem));",
+        "}",
+        "#endif",
+        "",
+        "template <typename T, int M, int N, int K, bool TRANSPOSE_B = false, bool ROW_MAJOR_A = false, bool ROW_MAJOR_B = false, bool ROW_MAJOR_C = false>",
+        "__device__ void grid_linalg_gemm(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
+        "    (void)glass_nvidia_smem;",
+        "    grid_linalg_gemm_glass<T, M, N, K, TRANSPOSE_B, ROW_MAJOR_A, ROW_MAJOR_B, ROW_MAJOR_C>(A, B, C, alpha, beta);",
+        "}",
+        "",
+        "template <typename T, int M, int N, bool TRANSPOSE = false, bool ROW_MAJOR_A = false>",
+        "__device__ void grid_linalg_gemv(const T *A, const T *x, T *y, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
+        "    (void)glass_nvidia_smem;",
+        "    T *A_mut = const_cast<T *>(A);",
+        "    T *x_mut = const_cast<T *>(x);",
+        "    if (!TRANSPOSE && !ROW_MAJOR_A) {",
+        "        glass::gemv<T, M, N>(alpha, A_mut, x_mut, beta, y);",
+        "    }",
+        "    else {",
+        "        glass::gemv_ex<T, TRANSPOSE, ROW_MAJOR_A>(M, N, alpha, A_mut, x_mut, beta, y);",
+        "    }",
+        "    __syncthreads();",
+        "}",
+        "",
+        "template <typename T, int N, int S1, int S2>",
+        "__device__ T grid_linalg_dot_strided(const T *vec1, const T *vec2) {",
+        "    T result = static_cast<T>(0);",
+        "    for (int i = 0; i < N; i++) { result += vec1[i * S1] * vec2[i * S2]; }",
+        "    return result;",
+        "}",
+        ""
+    ])
+
+
 def gen_invert_matrix(self, use_thread_group=False):
     """
     This function generates a matrix inversion function for cuda.

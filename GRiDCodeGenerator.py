@@ -15,7 +15,7 @@ class GRiDCodeGenerator:
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
                          gen_topology_S_sign_for_cpp, gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
-                         gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_outer_product, custom_is_constant
+                         gen_grid_linalg_backend_helpers, gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_outer_product, custom_is_constant
 
     # then import all of the algorithms
     from .algorithms import gen_inverse_dynamics_inner_temp_mem_size, gen_inverse_dynamics_inner_function_call, \
@@ -145,13 +145,67 @@ class GRiDCodeGenerator:
         # first all of the includes
         self.gen_add_code_line("")
         self.gen_add_code_line("#include <assert.h>")
+        self.gen_add_code_line("#include <cstddef>")
         self.gen_add_code_line("#include <stdint.h>")
         self.gen_add_code_line("#include <stddef.h>")
+        self.gen_add_code_line("#include <math.h>")
         self.gen_add_code_line("#include <stdio.h>")
         self.gen_add_code_line("#include <stdlib.h>")
         self.gen_add_code_line("#include <string.h>")
         self.gen_add_code_line("#include <time.h>")
         self.gen_add_code_line("#include <cuda_runtime.h>")
+        self.gen_add_code_lines([
+            "",
+            "#define GRID_LINALG_GLASS 0",
+            "#define GRID_LINALG_GLASS_NVIDIA 1",
+            "",
+            "#ifndef GRID_CUDA_LINALG_BACKEND",
+            "#define GRID_CUDA_LINALG_BACKEND GRID_LINALG_GLASS",
+            "#endif",
+            "",
+            "#if GRID_CUDA_LINALG_BACKEND != GRID_LINALG_GLASS && GRID_CUDA_LINALG_BACKEND != GRID_LINALG_GLASS_NVIDIA",
+            "#error \"GRID_CUDA_LINALG_BACKEND must be GRID_LINALG_GLASS or GRID_LINALG_GLASS_NVIDIA\"",
+            "#endif",
+            "",
+            "#if defined(__has_include)",
+            "#if __has_include(<cub/cub.cuh>)",
+            "#define GRID_CUB_HEADER_AVAILABLE 1",
+            "#else",
+            "#define GRID_CUB_HEADER_AVAILABLE 0",
+            "#endif",
+            "#if __has_include(<cublasdx.hpp>)",
+            "#define GRID_CUBLASDX_HEADER_AVAILABLE 1",
+            "#else",
+            "#define GRID_CUBLASDX_HEADER_AVAILABLE 0",
+            "#endif",
+            "#else",
+            "#define GRID_CUB_HEADER_AVAILABLE 0",
+            "#define GRID_CUBLASDX_HEADER_AVAILABLE 0",
+            "#endif",
+            "",
+            "#if GRID_CUDA_LINALG_BACKEND == GRID_LINALG_GLASS_NVIDIA",
+            "#if __cplusplus < 201703L",
+            "#error \"GRiD glass-nvidia backend requires compiling generated CUDA with -std=c++17 or newer\"",
+            "#endif",
+            "#ifndef GRID_CUBLASDX_SM",
+            "#error \"GRiD glass-nvidia backend requires GRID_CUBLASDX_SM=<compute_capability*10>\"",
+            "#endif",
+            "#if !GRID_CUB_HEADER_AVAILABLE",
+            "#error \"GRiD glass-nvidia backend requires cub/cub.cuh; set CUDA include paths or use GRID_CUDA_LINALG_BACKEND=GRID_LINALG_GLASS\"",
+            "#endif",
+            "#if !GRID_CUBLASDX_HEADER_AVAILABLE",
+            "#error \"GRiD glass-nvidia backend requires cublasdx.hpp; set MathDx include paths or use GRID_CUDA_LINALG_BACKEND=GRID_LINALG_GLASS\"",
+            "#endif",
+            "#define GRID_CUDA_USE_GLASS_NVIDIA 1",
+            "#else",
+            "#define GRID_CUDA_USE_GLASS_NVIDIA 0",
+            "#endif",
+            "",
+            "#if GRID_CUDA_USE_GLASS_NVIDIA",
+            "#include <cub/cub.cuh>",
+            "#include <cublasdx.hpp>",
+            "#endif",
+        ])
         if use_thread_group:
             self.gen_add_code_line("#include <cooperative_groups.h>")
             self.gen_add_code_line("#include <cooperative_groups/memcpy_async.h>")
@@ -281,6 +335,8 @@ class GRiDCodeGenerator:
         # 16-byte alignment padding.
         legacy_count_pad = topology_count + 8
         legacy_arena_count = lambda t_count: int(t_count + legacy_count_pad)
+        self.gen_add_code_line("template <typename T, int M, int N, int K> __host__ __device__ constexpr size_t grid_linalg_nvidia_gemm_smem_bytes();")
+        self.gen_add_code_line("template <typename T> __host__ __device__ constexpr size_t GRID_LINALG_NVIDIA_MAX_HELPER_BYTES();")
         self.gen_add_code_lines(["const int NUM_JOINTS = " + str(self.robot.get_num_pos()) + ";", \
                                  "const int NUM_VEL = " + str(self.robot.get_num_vel()) + ";", \
                                  "const int NUM_EES = " + str(self.robot.get_total_leaf_nodes()) + ";", \
@@ -323,6 +379,10 @@ class GRiDCodeGenerator:
                                  f"const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(fdsva_so_t_count)};", \
                                  "const int SUGGESTED_THREADS = " + str(min(suggested_threads, 512)) + ";"]) # max of 512 to avoid exceeding available registers
         self.gen_add_code_lines([
+                                 "#define GRID_GENERATED_NUM_JOINTS " + str(n),
+                                 "#define GRID_GENERATED_NUM_EES " + str(self.robot.get_total_leaf_nodes()),
+                                 ""])
+        self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
@@ -335,9 +395,16 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t FD_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(aba_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t CRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(crba_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(d2ee_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_EE_LINALG_SHARED_BYTES() {",
+                                 "#if GRID_CUDA_USE_GLASS_NVIDIA",
+                                 "    return grid_linalg_nvidia_gemm_smem_bytes<T, 4, 4, 4 * NUM_JOINTS * GRID_GENERATED_NUM_EES>();",
+                                 "#else",
+                                 "    return static_cast<size_t>(0);",
+                                 "#endif",
+                                 "}",
+                                 "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(d2ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fdsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
@@ -790,6 +857,7 @@ class GRiDCodeGenerator:
         self.gen_crm()
         self.gen_crm_mul()
         # then the linear algebra related helpers
+        self.gen_grid_linalg_backend_helpers()
         self.gen_invert_matrix(use_thread_group)
         self.gen_matmul()
         self.gen_matmul_trans() 

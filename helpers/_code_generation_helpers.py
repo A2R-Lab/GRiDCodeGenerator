@@ -210,13 +210,17 @@ def gen_add_shared_memory_helpers(self):
         "}",
         "",
         "template <typename T>",
-        "__host__ __device__ inline size_t grid_shared_arena_bytes(size_t t_count, size_t int_count = 0) {",
+        "__host__ __device__ inline size_t grid_shared_arena_bytes(size_t t_count, size_t int_count = 0, size_t extra_byte_count = 0) {",
         "    size_t offset = 0;",
         "    offset = grid_align_up(offset, alignof(T));",
         "    offset += sizeof(T) * t_count;",
         "    if (int_count > 0) {",
         "        offset = grid_align_up(offset, alignof(int));",
         "        offset += sizeof(int) * int_count;",
+        "    }",
+        "    if (extra_byte_count > 0) {",
+        "        offset = grid_align_up(offset, static_cast<size_t>(16));",
+        "        offset += extra_byte_count;",
         "    }",
         "    return grid_align_up(offset, static_cast<size_t>(16));",
         "}",
@@ -311,13 +315,17 @@ def gen_add_shared_memory_helpers(self):
 
 def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_helpers = True,
                              ximat_name = "s_XImats", ximat_size = 0,
-                             temp_name = "s_temp", topology_name = "s_topology_helpers"):
+                             temp_name = "s_temp", topology_name = "s_topology_helpers",
+                             extra_byte_regions = None):
+    if extra_byte_regions is None:
+        extra_byte_regions = []
     topology_count = self.gen_topology_helpers_size() if include_topology_helpers else 0
     t_region_count = sum(int(count) for _, count in t_buffers)
     if ximat_size:
         t_region_count += int(ximat_size)
     if temp_mem_size is not None:
         t_region_count += int(temp_mem_size)
+    extra_byte_expr = " + ".join(str(count) for _, count in extra_byte_regions) if extra_byte_regions else "0"
     self.gen_add_code_line("// GRID shared arena layout")
     for name, count in t_buffers:
         self.gen_add_code_line("//   T " + name + "[" + str(count) + "]")
@@ -327,6 +335,8 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "]")
     if topology_count > 0:
         self.gen_add_code_line("//   int " + topology_name + "[" + str(topology_count) + "]")
+    for name, count in extra_byte_regions:
+        self.gen_add_code_line("//   bytes " + name + "[" + str(count) + "]")
     self.gen_add_code_line("extern __shared__ __align__(16) unsigned char s_arena[];")
     self.gen_add_code_line("size_t s_arena_offset = 0;")
     for name, count in t_buffers:
@@ -347,8 +357,15 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(int));")
         self.gen_add_code_line("int *" + topology_name + " = grid_arena_ptr<int>(s_arena, s_arena_offset);")
         self.gen_add_code_line("s_arena_offset += sizeof(int) * static_cast<size_t>(" + str(topology_count) + ");")
+    for name, count in extra_byte_regions:
+        self.gen_add_code_line("unsigned char *" + name + " = nullptr;")
+        self.gen_add_code_line("if (static_cast<size_t>(" + str(count) + ") > 0) {", True)
+        self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, static_cast<size_t>(16));")
+        self.gen_add_code_line(name + " = grid_arena_ptr<unsigned char>(s_arena, s_arena_offset);")
+        self.gen_add_code_line("s_arena_offset += static_cast<size_t>(" + str(count) + ");")
+        self.gen_add_end_control_flow()
     self.gen_add_code_line("#ifdef GRID_CUDA_DEBUG_LAYOUT")
-    self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + "));")
+    self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
     self.gen_add_code_line("#endif")
     self.gen_add_code_line("(void)s_arena_offset;")
 
