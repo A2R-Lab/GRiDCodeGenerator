@@ -852,12 +852,14 @@ class GRiDCodeGenerator:
         self.gen_add_shared_memory_helpers()
         # then generate any constants and other helpers
         self.gen_add_constants_helpers(include_base_inertia, include_homogenous_transforms)
+        # then the linear algebra related helpers
+        # Emit GLASS before spatial algebra because dot_prod is a compatibility
+        # shim over glass::dot_strided.
+        self.gen_grid_linalg_backend_helpers()
         # then the spatial algebra related helpers
         self.gen_spatial_algebra_helpers()
         self.gen_crm()
         self.gen_crm_mul()
-        # then the linear algebra related helpers
-        self.gen_grid_linalg_backend_helpers()
         self.gen_invert_matrix(use_thread_group)
         self.gen_matmul()
         self.gen_matmul_trans() 

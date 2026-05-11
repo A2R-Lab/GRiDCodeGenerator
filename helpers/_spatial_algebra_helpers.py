@@ -135,11 +135,7 @@ def gen_spatial_algebra_helpers(self):
             self.gen_add_code_line("T dot_prod(const T *vec1, T *vec2) {", True)
         else:
             self.gen_add_code_line("T dot_prod(T *vec1, T *vec2) {", True)
-        self.gen_add_code_line("T result = 0;")
-        self.gen_add_code_line("for(int i = 0; i < N; i++) {", True)
-        self.gen_add_code_line("result += vec1[i*S1] * vec2[i*S2];")
-        self.gen_add_end_control_flow()
-        self.gen_add_code_line("return result;")
+        self.gen_add_code_line("return ::glass::dot_strided<T, N, S1, S2>(vec1, vec2);")
         self.gen_add_end_function()
 
     # Then the motion vector matrix cross product operations

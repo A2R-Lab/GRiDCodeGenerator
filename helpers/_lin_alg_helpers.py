@@ -5,8 +5,11 @@ import subprocess
 _GLASS_BASE_FILES = [
     "src/base/L1/reduce.cuh",
     "src/base/L1/dot.cuh",
+    "src/base/L1/dot_strided.cuh",
     "src/base/L2/gemv.cuh",
+    "src/base/L2/gemv_strided.cuh",
     "src/base/L3/gemm.cuh",
+    "src/base/L3/gemm_strided.cuh",
 ]
 
 _GLASS_NVIDIA_FILES = [
@@ -86,11 +89,21 @@ def _nvidia_gemm_sizes(self):
     sizes = {(4, 4, 4)}
     for k in _ee_gradient_packed_gemm_k_values(self):
         sizes.add((4, 4, k))
+    for size in _nvidia_row_strided_gemm_sizes(self):
+        sizes.add(size)
     return sorted(sizes)
 
 
 def _nvidia_gemv_sizes(self):
-    return []
+    return sorted(set(_nvidia_row_strided_gemv_sizes(self)))
+
+
+def _nvidia_row_strided_gemv_sizes(self):
+    return [(6, 6)]
+
+
+def _nvidia_row_strided_gemm_sizes(self):
+    return [(6, 6, 6)]
 
 
 def gen_grid_linalg_backend_helpers(self):
@@ -150,6 +163,33 @@ def gen_grid_linalg_backend_helpers(self):
         "#endif",
         "}",
         "",
+        "template <typename T, int M, int N>",
+        "__host__ __device__ constexpr size_t grid_linalg_nvidia_gemv_smem_bytes() {",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "    return glass::nvidia::gemv_smem_size<float, M, N>();",
+        "#else",
+        "    return static_cast<size_t>(0);",
+        "#endif",
+        "}",
+        "",
+        "template <typename T, int M, int N, int ROW_STRIDE>",
+        "__host__ __device__ constexpr size_t grid_linalg_nvidia_row_strided_gemv_smem_bytes() {",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "    return glass::nvidia::row_strided_gemv_smem_size<float, M, N>();",
+        "#else",
+        "    return static_cast<size_t>(0);",
+        "#endif",
+        "}",
+        "",
+        "template <typename T, int M, int N, int K, int A_RS, int B_RS>",
+        "__host__ __device__ constexpr size_t grid_linalg_nvidia_row_strided_gemm_smem_bytes() {",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "    return glass::nvidia::row_strided_gemm_smem_size<float, M, N, K>();",
+        "#else",
+        "    return static_cast<size_t>(0);",
+        "#endif",
+        "}",
+        "",
         "template <typename T>",
         "__host__ __device__ constexpr size_t GRID_LINALG_NVIDIA_MAX_HELPER_BYTES() {",
         "#if GRID_CUDA_USE_GLASS_NVIDIA",
@@ -190,6 +230,20 @@ def gen_grid_linalg_backend_helpers(self):
         "}",
         "#endif",
         "",
+        "#if GRID_CUDA_USE_GLASS_NVIDIA",
+        "template <typename T, int M, int N, int ROW_STRIDE>",
+        "__device__ void grid_linalg_row_strided_gemv_nvidia(const T *A, const T *x, T *y, T alpha, T beta, unsigned char *smem) {",
+        "    static_assert(sizeof(T) == sizeof(float), \"glass-nvidia row-strided GEMV currently supports float only\");",
+        "    ::glass::nvidia::row_strided_gemv<float, M, N, ROW_STRIDE>(static_cast<float>(alpha), reinterpret_cast<float *>(const_cast<T *>(A)), reinterpret_cast<float *>(const_cast<T *>(x)), static_cast<float>(beta), reinterpret_cast<float *>(y), reinterpret_cast<char *>(smem));",
+        "}",
+        "",
+        "template <typename T, int M, int N, int K, int A_RS, int B_RS>",
+        "__device__ void grid_linalg_row_strided_gemm_nvidia(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *smem) {",
+        "    static_assert(sizeof(T) == sizeof(float), \"glass-nvidia row-strided GEMM currently supports float only\");",
+        "    ::glass::nvidia::row_strided_gemm<float, M, N, K, A_RS, B_RS>(static_cast<float>(alpha), reinterpret_cast<float *>(const_cast<T *>(A)), reinterpret_cast<float *>(const_cast<T *>(B)), static_cast<float>(beta), reinterpret_cast<float *>(C), reinterpret_cast<char *>(smem));",
+        "}",
+        "#endif",
+        "",
         "template <typename T, int M, int N, int K, bool TRANSPOSE_B = false, bool ROW_MAJOR_A = false, bool ROW_MAJOR_B = false, bool ROW_MAJOR_C = false>",
         "__device__ void grid_linalg_gemm(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
         "    (void)glass_nvidia_smem;",
@@ -210,11 +264,21 @@ def gen_grid_linalg_backend_helpers(self):
         "    __syncthreads();",
         "}",
         "",
+        "template <typename T, int M, int N, int ROW_STRIDE>",
+        "__device__ void grid_linalg_row_strided_gemv(const T *A, const T *x, T *y, T alpha, T beta) {",
+        "    ::glass::row_strided_gemv<T, M, N, ROW_STRIDE>(A, x, y, alpha, beta);",
+        "    __syncthreads();",
+        "}",
+        "",
+        "template <typename T, int M, int N, int K, int A_RS, int B_RS>",
+        "__device__ void grid_linalg_row_strided_gemm(const T *A, const T *B, T *C, T alpha, T beta) {",
+        "    ::glass::row_strided_gemm<T, M, N, K, A_RS, B_RS>(A, B, C, alpha, beta);",
+        "    __syncthreads();",
+        "}",
+        "",
         "template <typename T, int N, int S1, int S2>",
         "__device__ T grid_linalg_dot_strided(const T *vec1, const T *vec2) {",
-        "    T result = static_cast<T>(0);",
-        "    for (int i = 0; i < N; i++) { result += vec1[i * S1] * vec2[i * S2]; }",
-        "    return result;",
+        "    return ::glass::dot_strided<T, N, S1, S2>(vec1, vec2);",
         "}",
         ""
     ])
