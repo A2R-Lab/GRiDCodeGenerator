@@ -99,73 +99,21 @@ def gen_crba_inner(self, use_thread_group = False):
 
         if len(inds) > 1 and has_linear_axis:
             for jid in inds:
-                self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-                self.gen_add_code_line(f"int jid = {jid};")
-                self.gen_add_code_line("int row = ind % 6; int col = (ind / 6); int jid6 = jid * 6;")
-                self.gen_add_code_line("alpha[6*jid6 + row + (6*col)] = dot_prod<T,6,1,1>(&s_XImats[6*jid6 + row*6],&s_XImats[36*(jid+" + str(imat_offset) + ") + (col*6)]);")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group) 
-
-                self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-                self.gen_add_code_line(f"int jid = {jid};")
-                self.gen_add_code_line("int parent_ind = " + str(self.robot.get_parent_id(jid)) + ";")
-                self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid6 = jid * 6;")
-                self.gen_add_code_line("beta[6*jid6 + col + (6*row)] = dot_prod<T,6,6,1>(&alpha[6*jid6 + row],&s_XImats[6*jid6 + (col*6)]);")
-                self.gen_add_code_line("s_XImats[36*(parent_ind +" + str(imat_offset) + ") + col + (6*row)] += beta[6*jid6 + col + (6*row)];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group) 
+                parent_ind = self.robot.get_parent_id(jid)
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1));")
 
         elif len(inds) > 1:
-            self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            self.gen_add_multi_threaded_select("ind", "< ", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
-            jid = "jid"
-            self.gen_add_code_line("s_jid_list[ind] = jid;")
-            #self.gen_add_code_line("for(int i=0; i<"+ str(len(inds)) +"; i++){int count = 0; if(jid != s_jid_list[i]){s_jid_list[count] = jid; count += 1;}}")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
-
-            for i in range(len(inds)):
-                self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-                self.gen_add_code_line("int jid = s_jid_list[" + str(len(inds)+ i*6) + "];")
-                self.gen_add_code_line("int row = ind % 6; int col = (ind / 6); int jid6 = jid * 6;")
-                self.gen_add_code_line("alpha[6*jid6 + row + (6*col)] = dot_prod<T,6,1,1>(&s_XImats[6*jid6 + row*6],&s_XImats[36*(jid+" + str(n-7) + "+7) + (col*6)]);")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-
-                self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-                self.gen_add_code_line("int jid = s_jid_list[" + str(len(inds)+ i*6) + "];")
-                self.gen_add_code_line("int parent_ind = " + str(parent_ind_cpp) + ";")
-                self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid6 = jid * 6;")
-                self.gen_add_code_line("beta[6*jid6 + col + (6*row)] = dot_prod<T,6,6,1>(&alpha[6*jid6 + row],&s_XImats[6*jid6 + (col*6)]);")
-                self.gen_add_code_line("s_XImats[36*(parent_ind +" + str(n-7) + "+7) + col + (6*row)] += beta[6*jid6 + col + (6*row)];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+            for jid in inds:
+                parent_ind = self.robot.get_parent_id(jid)
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1));")
 
         else:
-            self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + str(jid) + " ;")
-        
-            self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid6 = jid * 6;")
-            #self.gen_add_code_line("alpha[ind] = dot_prod<T,6,6,1>(&s_XImats[36*(ind+7)],&s_XImats[36*ind + row]);")
-            self.gen_add_code_line("alpha[6*jid6 + row + (6*col)] = dot_prod<T,6,1,1>(&s_XImats[6*jid6 + row*6],&s_XImats[36*(jid+" + str(imat_offset) + ") + (col*6)]);")
-
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group) 
-
-            self.gen_add_parallel_loop("ind",str(36),use_thread_group)
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + str(jid) + " ;")
-            self.gen_add_code_line("int parent_ind = " + str(parent_ind_cpp) + ";")
-
-            self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid6 = jid * 6;")
-            #self.gen_add_code_line("alpha[ind] = dot_prod<T,6,6,1>(&s_XImats[36*(ind+7)],&s_XImats[36*ind + row]);")
-            self.gen_add_code_line("beta[6*jid6 + col + (6*row)] = dot_prod<T,6,6,1>(&alpha[6*jid6 + row],&s_XImats[6*jid6 + (col*6)]);")
-            self.gen_add_code_line("s_XImats[36*(parent_ind +" + str(imat_offset) + ") + col + (6*row)] += beta[6*jid6 + col + (6*row)];")
-        
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            jid = inds[0]
+            parent_ind = self.robot.get_parent_id(jid)
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1));")
 
     # Calculation of M[ind,ind]
     self.gen_add_code_line("//")
@@ -289,17 +237,8 @@ def gen_crba_inner_floating(self, use_thread_group = False):
         S_sign = self.robot.get_S_sign_by_id(jid)
         dof = jid + 5
         self.gen_add_code_line("// CRBA body " + str(jid))
-        self.gen_add_parallel_loop("ind", "36", use_thread_group)
-        self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
-        self.gen_add_code_line("s_temp[" + str(alphaOffset) + " + ind] = dot_prod<T,6,1,1>(&s_XImats[" + str(36 * jid) + " + 6*row], &s_temp[" + str(ICOffset + 36 * jid) + " + 6*col]);")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_parallel_loop("ind", "36", use_thread_group)
-        self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
-        self.gen_add_code_line("s_temp[" + str(betaOffset) + " + ind] = dot_prod<T,6,6,1>(&s_temp[" + str(alphaOffset) + " + row], &s_XImats[" + str(36 * jid) + " + 6*col]);")
-        self.gen_add_code_line("s_temp[" + str(ICOffset + 36 * parent) + " + ind] += s_temp[" + str(betaOffset) + " + ind];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{ICOffset + 36*jid}], &s_temp[{alphaOffset}], static_cast<T>(1), static_cast<T>(0));")
+        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1));")
 
         self.gen_add_parallel_loop("row", "6", use_thread_group)
         self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(ICOffset + 36 * jid + 6 * S_ind) + " + row];")
@@ -389,7 +328,7 @@ def gen_crba_device(self, use_thread_group = False):
 
     # add the shared memory variables
     shared_mem_size = self.gen_crba_device_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
 
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -424,7 +363,7 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
 
     # add shared memory variables
     shared_mem_size = self.gen_crba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)])
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")

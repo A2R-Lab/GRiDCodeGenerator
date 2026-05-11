@@ -66,7 +66,7 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     self.gen_add_parallel_loop("ind",str(3*n**3),use_thread_group)
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
     self.gen_add_code_line(f'if (ind < {n**3}) inner_dq[ind] += rot_dq[ind] + d2tau_dqdq[ind]; // Started with dM_dq*da_dq')
-    self.gen_add_code_line(f'else if (ind < {2*n**3}) inner_cross[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_df_dqd[{n}*j]) + d2tau_dvdq[i*{n*n} + k*{n} + j];')
+    self.gen_add_code_line(f'else if (ind < {2*n**3}) inner_cross[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_df_dqd[{n}*j]) + d2tau_dvdq[i*{n*n} + j*{n} + k];')
     self.gen_add_code_line(f'else inner_tau[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_Minv[{n}*j]);')
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
@@ -201,6 +201,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_sync(use_thread_group)
     self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
     self.gen_idsva_so_inner_function_call(use_thread_group)
+    self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
     self.gen_fdsva_so_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
@@ -273,6 +274,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
         self.gen_idsva_so_inner_function_call(use_thread_group)
+        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_sync(use_thread_group)
@@ -296,6 +298,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
         self.gen_idsva_so_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
+        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_end_control_flow()

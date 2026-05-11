@@ -158,30 +158,25 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             comment = "// s_v[k] = X[k]*v[parent_k] + S[k]*qd[k] and s_a[k] = X[k]*a[parent_k]"
             comment += " + S[k]*qdd[k] + mxS[k](v[k])*qd[k]" if use_qdd_input else " + mxS[k](v[k])*qd[k]"
             self.gen_add_code_line(comment)
-            # do in parallel Xmat then add qd/qdd
-            self.gen_add_parallel_loop("ind",str(6*2*len(inds)),use_thread_group)
-            self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int comp_mod = comp % " + str(len(inds)) + "; int vFlag = comp == comp_mod;")
-            # adjust for only one ind and thus fixed Srow and jid and jid_parent
-            if len(inds) > 1:
-                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                jid = "jid"
-                self.gen_add_multi_threaded_select("comp_mod", "==", [str(i) for i in range(len(inds))], select_var_vals)
-            else:
-                jid = str(inds[0])
-            self.gen_add_code_line("int vaOffset = !vFlag * " + str(6*n) + "; int jid6 = 6 * " + jid + ";")
-            if self.robot.floating_base: # 6-dof offset on qd for non-fb joints, 0 idx offset => + 5
-                if jid != 'jid': qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + str(int(jid) + 5) + "]);"
-                else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + jid + " + 5]);"
-            else: qd_qdd_val_code = "T qd_qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (vFlag * s_qd[" + jid + "]);"
-            if use_qdd_input:
-                if self.robot.floating_base: 
-                    if jid != 'jid': qd_qdd_val_code = qd_qdd_val_code.replace(");", " + !vFlag * s_qdd[" + str(int(jid) + 5) + "]);")
-                    else: qd_qdd_val_code = qd_qdd_val_code.replace(");", " + !vFlag * s_qdd[" + jid + " + 5]);")
-                else: qd_qdd_val_code = qd_qdd_val_code.replace(");", " + !vFlag * s_qdd[" + jid + "]);")
-            self.gen_add_code_line(qd_qdd_val_code)
-            self.gen_add_code_line("// compute based on the branch and use bool multiply for no branch")
-            self.gen_add_code_line("s_vaf[vaOffset + jid6 + row] = dot_prod<T,6,6,1>(&s_XImats[6*jid6 + row], &s_vaf[vaOffset + 6*" + parent_ind_cpp + "]) + qd_qdd_val;")
-            self.gen_add_end_control_flow()
+            # per-jid row_strided_gemv for v and a
+            for jid_val in inds:
+                parent_val = self.robot.get_parent_id(jid_val)
+                s_ind_val = self.robot.get_S_index_by_id(jid_val)
+                s_sign_val = self.robot.get_S_sign_by_id(jid_val)
+                qd_idx = str(jid_val + 5) if self.robot.floating_base else str(jid_val)
+                # v[jid] = X[jid]*v[parent] + S[jid]*qd[jid]
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*parent_val}], &s_vaf[{6*jid_val}], static_cast<T>(1), static_cast<T>(0));")
+                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_code_line(f"s_vaf[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{qd_idx}];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+                # a[jid] = X[jid]*a[parent] (+ S[jid]*qdd[jid] if use_qdd_input)
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*n + 6*parent_val}], &s_vaf[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0));")
+                if use_qdd_input:
+                    self.gen_add_serial_ops(use_thread_group)
+                    self.gen_add_code_line(f"s_vaf[{6*n + 6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qdd[{qd_idx}];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync(use_thread_group)
 
             # add debug if requested
             if self.DEBUG_MODE:
@@ -280,27 +275,11 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
         self.gen_add_code_line("// s_f update where bfs_level is " + str(bfs_level))
         self.gen_add_code_line("//     joints are: " + ", ".join(joint_names))
         self.gen_add_code_line("//     links are: " + ", ".join(link_names))
-        # update f parent from f
+        # update f parent from f (sequential GEMVs are safe even for repeated parents)
         self.gen_add_code_line("// s_f[parent_k] += X[k]^T*f[k]")
-        self.gen_add_parallel_loop("ind",str(6*len(inds)),use_thread_group)
-        self.gen_add_code_line("int row = ind % 6;")
-        if len(inds) > 1:
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
-            jid = "jid"
-        else:
-            jid = str(inds[0])
-        self.gen_add_code_line("T val = dot_prod<T,6,1,1>(&s_XImats[36*" + jid + " + 6*row], &s_vaf[" + str(12*n) + " + 6*" + jid + "]);")
-        self.gen_add_code_line("int dstOffset = " + str(12*n) + " + 6*" + parent_ind_cpp + " + row;")
-        # be careful to make sure you don't have multiuple parents the same -- else add atomics
-        # we use atomics because there could still be some atomic parallelism at this level vs. simply looping
-        if self.robot.has_repeated_parents(inds):
-            self.gen_add_code_line("// using atomics due to repeated parent")
-            self.gen_add_code_line("atomicAdd(&s_vaf[dstOffset], val);")
-        else:    
-            self.gen_add_code_line("s_vaf[dstOffset] += val;")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        for jid_val in inds:
+            parent_val = self.robot.get_parent_id(jid_val)
+            self.gen_add_code_line(f"grid_linalg_gemv<T,6,6,true>(&s_XImats[{36*jid_val}], &s_vaf[{12*n + 6*jid_val}], &s_vaf[{12*n + 6*parent_val}], static_cast<T>(1), static_cast<T>(1));")
 
         if self.DEBUG_MODE:
             self.gen_add_sync(use_thread_group)
@@ -371,7 +350,7 @@ def gen_inverse_dynamics_device(self, use_thread_group = False, compute_c = Fals
     # add the shared memory variables
     shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
     extra_t_buffers = [("s_vaf", 18*n)] if compute_c else []
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_inverse_dynamics_inner_function_call(use_thread_group,compute_c,use_qdd_input)
@@ -409,7 +388,7 @@ def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = 
     if use_qdd_input:
         extra_t_buffers.append(("s_qdd", n))
     shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")

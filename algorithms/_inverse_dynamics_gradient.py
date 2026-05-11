@@ -937,7 +937,7 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_vaf", 18*n)])
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_vaf", 18*n)], include_linalg_scratch=True)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
@@ -988,7 +988,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
         if use_selective_spill else self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     )
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
     if use_thread_group:

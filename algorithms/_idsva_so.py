@@ -314,6 +314,12 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     
     self.gen_add_code_lines(vars)
 
+    self.gen_add_code_line("// Initialize output tensor; optimized assembly paths only write structurally nonzero entries.")
+    self.gen_add_parallel_loop('i', '4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS', use_thread_group)
+    self.gen_add_code_line("s_idsva_so[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
     parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp([i for i in range(NV)], NO_GRAD_FLAG = True)
     S_sign_cpp = self.gen_topology_S_sign_for_cpp([i for i in range(NV)])
     parent_ind_cpp_for_jid = parent_ind_cpp
@@ -1075,7 +1081,34 @@ def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     self.gen_add_end_function()
 
         
+def gen_idsva_so_public_dvdq_layout_repair(self, use_thread_group = False):
+    """
+    Emit a final public-output repair for the optimized IDSVA-SO assembly path.
 
+    The optimized path stores the d2tau_dvdq block with the last two axes
+    transposed relative to RBDReference/public CUDA output. FDSVA consumes the
+    inner tensor directly, so callers that consume public-layout tensors should
+    run this repair after inner assembly instead of changing the optimized
+    assembly order in the first corrective pass.
+    """
+    if self.idsva_so_needs_reference_order_output_repair():
+        return
+
+    NV = self.robot.get_num_vel()
+    block_offset = 2 * NV**3
+    self.gen_add_sync(use_thread_group)
+    self.gen_add_code_line("// Repair public d2tau_dvdq layout for optimized IDSVA-SO output")
+    self.gen_add_parallel_loop("dvdq_swap_idx", "NUM_JOINTS*NUM_JOINTS*NUM_JOINTS", use_thread_group)
+    self.gen_add_code_line("int dvdq_i = dvdq_swap_idx / (NUM_JOINTS*NUM_JOINTS);")
+    self.gen_add_code_line("int dvdq_j = (dvdq_swap_idx / NUM_JOINTS) % NUM_JOINTS;")
+    self.gen_add_code_line("int dvdq_k = dvdq_swap_idx % NUM_JOINTS;")
+    self.gen_add_code_line("if (dvdq_j < dvdq_k) {", True)
+    self.gen_add_code_line(f"T dvdq_tmp = s_idsva_so[{block_offset} + dvdq_i*NUM_JOINTS*NUM_JOINTS + dvdq_j*NUM_JOINTS + dvdq_k];")
+    self.gen_add_code_line(f"s_idsva_so[{block_offset} + dvdq_i*NUM_JOINTS*NUM_JOINTS + dvdq_j*NUM_JOINTS + dvdq_k] = s_idsva_so[{block_offset} + dvdq_i*NUM_JOINTS*NUM_JOINTS + dvdq_k*NUM_JOINTS + dvdq_j];")
+    self.gen_add_code_line(f"s_idsva_so[{block_offset} + dvdq_i*NUM_JOINTS*NUM_JOINTS + dvdq_k*NUM_JOINTS + dvdq_j] = dvdq_tmp;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
 
 
 def gen_idsva_so_device_temp_mem_size(self):
@@ -1113,6 +1146,7 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = False, s
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_idsva_so_inner_function_call(use_thread_group)
+    self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
     self.gen_add_end_function()
 
 def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
@@ -1167,7 +1201,7 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
         self.gen_idsva_so_inner_function_call(use_thread_group)
-        self.gen_add_sync(use_thread_group)
+        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
         if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
         self.gen_add_end_control_flow()
     else:
@@ -1184,8 +1218,8 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
         self.gen_idsva_so_inner_function_call(use_thread_group)
+        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
         # save to global
         if not use_global_output: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
     self.gen_add_end_function()

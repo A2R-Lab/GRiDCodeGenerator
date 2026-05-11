@@ -137,7 +137,7 @@ def gen_forward_dynamics_device(self, use_thread_group = False):
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_forward_dynamics_inner_function_call(use_thread_group)
@@ -165,7 +165,7 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", 3*n+self.robot.floating_base), ("s_qdd", n)])
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", 3*n+self.robot.floating_base), ("s_qdd", n)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n+self.robot.floating_base) + "]; T *s_u = &s_q_qd_u[" + str(2*n+self.robot.floating_base) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")

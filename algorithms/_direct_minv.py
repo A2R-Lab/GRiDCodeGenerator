@@ -317,27 +317,27 @@ def gen_direct_minv_inner(self, use_thread_group = False):
 
             # Finally IA[parent_ind] += IA_Update_Temp * Xmat
             self.gen_add_code_line("// IA[parent_ind] += IA_Update_Temp * Xmat")
-            self.gen_add_parallel_loop("ind",str(6*6*len(inds)),use_thread_group)
-            self.gen_add_code_line("int col = ind / 6; int row = ind % 6;")
-            if len(inds) > 1:
+            if len(inds) > 1 and self.robot.has_repeated_parents(inds):
+                self.gen_add_parallel_loop("ind",str(6*6*len(inds)),use_thread_group)
+                self.gen_add_code_line("int col = ind / 6; int row = ind % 6;")
                 self.gen_add_code_line("int col_max6 = col % 6; int jid_ind = col / 6;")
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("jid_ind", "==", [str(i) for i in range(len(inds))], select_var_vals)
                 self.gen_add_code_line("T * src = &s_temp[" + str(IaTempOffset) + " + 36*jid_ind + row]; " + \
                                         "T * dst = &s_temp[" + str(IAOffset) + " + 36*" + parent_ind_cpp + " + 6*col_max6 + row];")
-                dot_prod_code = "dot_prod<T,6,6,1>(src,&s_XImats[36*jid + 6*col_max6])"
-                if self.robot.has_repeated_parents(inds):
-                    self.gen_add_code_line("// Atomics required for shared parent")
-                    self.gen_add_code_line("T val = " + dot_prod_code + ";")
-                    self.gen_add_code_line("atomicAdd(dst,val);")
-                else:
-                    self.gen_add_code_line("*dst += " + dot_prod_code + ";")
+                self.gen_add_code_line("// Atomics required for shared parent")
+                self.gen_add_code_line("T val = dot_prod<T,6,6,1>(src,&s_XImats[36*jid + 6*col_max6]);")
+                self.gen_add_code_line("atomicAdd(dst,val);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
+            elif len(inds) > 1:
+                for i, jid_val in enumerate(inds):
+                    parent_val = self.robot.get_parent_id(jid_val)
+                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset + 36*i}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1));")
             else:
-                jid = inds[0]
-                self.gen_add_code_line("s_temp[" + str(IAOffset + 36*self.robot.get_parent_id(jid)) + " + 6*col + row] += dot_prod<T,6,6,1>(" + \
-                                            "&s_temp[" + str(IaTempOffset) + " + row],&s_XImats[" + str(36*jid) + " + 6*col]);")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+                jid_val = inds[0]
+                parent_val = self.robot.get_parent_id(jid_val)
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1));")
 
             if self.DEBUG_MODE:
                 self.gen_add_sync(use_thread_group)
@@ -494,7 +494,7 @@ def gen_direct_minv_device(self, use_thread_group = False):
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
     shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_direct_minv_inner_function_call(use_thread_group)
@@ -518,7 +518,7 @@ def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = 
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_Minv", n*n)])
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_Minv", n*n)], include_linalg_scratch=True)
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:

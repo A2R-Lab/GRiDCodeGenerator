@@ -97,7 +97,7 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     if not use_qdd_Minv_input:
         extra_t_buffers += [("s_Minv", n*n), ("s_qdd", n)]
     shared_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     # then run the computation
@@ -154,7 +154,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         max(self.gen_direct_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     )
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_qdd_Minv_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
