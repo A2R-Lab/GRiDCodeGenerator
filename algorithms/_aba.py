@@ -41,6 +41,12 @@ def gen_aba_inner_floating(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    temp_size = self.gen_aba_inner_temp_mem_size()
+    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
+    self.gen_add_code_line(f"unsigned char *s_linalg_smem = reinterpret_cast<unsigned char *>(s_temp + {temp_size});")
+    self.gen_add_code_line("#else")
+    self.gen_add_code_line("unsigned char *s_linalg_smem = nullptr;")
+    self.gen_add_code_line("#endif")
     self.gen_add_code_line("// Recursive floating ABA root-port.")
 
     self.gen_add_code_line("// Initialize IA = I and clear c")
@@ -78,7 +84,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
             jid6 = 6 * jid
             parent6 = 6 * parent
             self.gen_add_code_line("// v[" + str(jid) + "] = X[" + str(jid) + "]*v[" + str(parent) + "] + S*qdot")
-            self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid}], &s_va[{parent6}], &s_va[{jid6}], static_cast<T>(1), static_cast<T>(0));")
+            self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid}], &s_va[{parent6}], &s_va[{jid6}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
             self.gen_add_serial_ops(use_thread_group)
             self.gen_add_code_line(f"s_va[{jid6 + S_ind}] += static_cast<T>({S_sign}) * s_qd[{dof}];")
             self.gen_add_end_control_flow()
@@ -165,7 +171,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
 
             self.gen_add_code_line("// temp = X.T*IA*X")
             self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{IAOffset + 36*jid}], &s_temp[{tempVecOffset}], static_cast<T>(1), static_cast<T>(0));")
-            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{tempVecOffset}], &s_XImats[{36*jid}], &s_temp[{tempMatOffset}], static_cast<T>(1), static_cast<T>(0));")
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{tempVecOffset}], &s_XImats[{36*jid}], &s_temp[{tempMatOffset}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
             self.gen_add_parallel_loop("ind", "36", use_thread_group)
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + row + 6*col] -= s_temp[" + str(UOffset + jid6) + " + row] * s_temp[" + str(UOffset + jid6) + " + col] / s_temp[" + str(dOffset + jid) + "];")
@@ -235,7 +241,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
             self.gen_add_code_line("s_qdd[" + str(dof) + "] = tempval / s_temp[" + str(dOffset + jid) + "];")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
-            self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid}], &s_va[{6*NJ + parent6}], &s_va[{6*NJ + jid6}], static_cast<T>(1), static_cast<T>(0));")
+            self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid}], &s_va[{6*NJ + parent6}], &s_va[{6*NJ + jid6}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
             self.gen_add_parallel_loop("row", "6", use_thread_group)
             self.gen_add_code_line("s_va[" + str(6 * NJ + jid6) + " + row] += s_temp[" + str(cOffset + jid6) + " + row];")
             self.gen_add_end_control_flow()
@@ -275,6 +281,12 @@ def gen_aba_inner(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    temp_size = self.gen_aba_inner_temp_mem_size()
+    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
+    self.gen_add_code_line(f"unsigned char *s_linalg_smem = reinterpret_cast<unsigned char *>(s_temp + {temp_size});")
+    self.gen_add_code_line("#else")
+    self.gen_add_code_line("unsigned char *s_linalg_smem = nullptr;")
+    self.gen_add_code_line("#endif")
 
     #
     # Initial Debug Prints if Requested
@@ -345,7 +357,7 @@ def gen_aba_inner(self, use_thread_group = False):
                 parent_val = self.robot.get_parent_id(jid_val)
                 s_ind_val = self.robot.get_S_index_by_id(jid_val)
                 s_sign_val = self.robot.get_S_sign_by_id(jid_val)
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*parent_val}], &s_va[{6*jid_val}], static_cast<T>(1), static_cast<T>(0));")
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*parent_val}], &s_va[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
                 self.gen_add_serial_ops(use_thread_group)
                 self.gen_add_code_line(f"s_va[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{jid_val}];")
                 self.gen_add_end_control_flow()
@@ -535,7 +547,7 @@ def gen_aba_inner(self, use_thread_group = False):
                     parent_val = self.robot.get_parent_id(jid_val)
                     self.gen_add_code_line("// X[" + str(jid_val) + "].T*Ia[" + str(jid_val) + "]*X[" + str(jid_val) + "] -> IA[" + str(parent_val) + "]")
                     self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid_val}], &s_temp[{36*(n+jid_val)}], &s_temp[{98*n + 36*jid_val}], static_cast<T>(1), static_cast<T>(0));")
-                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{98*n + 36*jid_val}], &s_XImats[{36*jid_val}], &s_temp[{36*parent_val}], static_cast<T>(1), static_cast<T>(1));")
+                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{98*n + 36*jid_val}], &s_XImats[{36*jid_val}], &s_temp[{36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
 
             # update pA of the parent (sequential GEMVs safe even for repeated parents)
             self.gen_add_code_line("// pA[parent] += X[k].T*pa[k]")
@@ -595,7 +607,7 @@ def gen_aba_inner(self, use_thread_group = False):
             # per-jid GEMV: a[jid] = X[jid]*a[parent] + c[jid]
             for jid_val in inds:
                 parent_val = self.robot.get_parent_id(jid_val)
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*n + 6*parent_val}], &s_va[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0));")
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*n + 6*parent_val}], &s_va[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
                 self.gen_add_parallel_loop("row", "6", use_thread_group)
                 self.gen_add_code_line(f"s_va[{6*n + 6*jid_val} + row] += s_temp[{72*n + 6*jid_val} + row];")
                 self.gen_add_end_control_flow()

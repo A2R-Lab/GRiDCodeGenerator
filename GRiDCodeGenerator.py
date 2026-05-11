@@ -338,7 +338,12 @@ class GRiDCodeGenerator:
         self.gen_add_code_line("template <typename T, int M, int N, int K> __host__ __device__ constexpr size_t grid_linalg_nvidia_gemm_smem_bytes();")
         self.gen_add_code_line("template <typename T> __host__ __device__ constexpr size_t GRID_LINALG_NVIDIA_MAX_HELPER_BYTES();")
         self.gen_add_code_lines(["const int NUM_JOINTS = " + str(self.robot.get_num_pos()) + ";", \
+                                 "const int NUM_POS = " + str(self.robot.get_num_pos()) + ";", \
                                  "const int NUM_VEL = " + str(self.robot.get_num_vel()) + ";", \
+                                 "const int NUM_BODIES = " + str(self.robot.get_num_bodies()) + ";", \
+                                 "const int SECOND_ORDER_COORDS = " + str(self.robot.get_num_vel()) + ";", \
+                                 "const int SECOND_ORDER_TENSOR_SIZE = " + str(4 * self.robot.get_num_vel()**3) + ";", \
+                                 "const int Q_QD_U_STRIDE = " + str(self.robot.get_num_pos() + 2 * self.robot.get_num_vel()) + ";", \
                                  "const int NUM_EES = " + str(self.robot.get_total_leaf_nodes()) + ";", \
                                  "const int TOPOLOGY_HELPERS_COUNT = " + str(topology_count) + ";", \
                                  "const int DYNAMICS_XI_T_COUNT = " + str(XI_size) + ";", \
@@ -520,8 +525,8 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_M, NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dc_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, 4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, 4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));", \
                       "    hd_data->h_c = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_Minv = (T *)malloc(NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -529,8 +534,8 @@ class GRiDCodeGenerator:
                       "    hd_data->h_qdd = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_dc_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_df_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_idsva_so = (T *)malloc(4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_df2 = (T *)malloc(4*NUM_JOINTS*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_idsva_so = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_df2 = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "// kinematics outputs", \
                       "if (needs_kinematics) {", \
@@ -757,15 +762,17 @@ class GRiDCodeGenerator:
 
     # finally generate all of the code
     def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
-                     codegen_profile = "all", algorithm_list = None):
+                     codegen_profile = "all", algorithm_list = None, enable_floating_second_order = False):
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
         self.generate_id_du = "id_du" in algorithms
         self.generate_fd_du = "fd_du" in algorithms
         self.generate_ee_pose_hessian = "ee_pose_hessian" in algorithms
-        self.generate_idsva_so = ("idsva_so" in algorithms) and (not self.robot.floating_base)
-        self.generate_fdsva_so = ("fdsva_so" in algorithms) and (not self.robot.floating_base)
+        self.enable_floating_second_order = enable_floating_second_order
+        allow_second_order = (not self.robot.floating_base) or enable_floating_second_order
+        self.generate_idsva_so = ("idsva_so" in algorithms) and allow_second_order
+        self.generate_fdsva_so = ("fdsva_so" in algorithms) and allow_second_order
         include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
         include_homogenous_transforms = include_homogenous_transforms or include_any_kinematics
         # first generate the file info
@@ -884,7 +891,7 @@ class GRiDCodeGenerator:
                                             include_pose = "ee_pose" in algorithms,
                                             include_gradient = "ee_pose_gradient" in algorithms,
                                             include_hessian = "ee_pose_hessian" in algorithms)
-        if self.robot.floating_base:
+        if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
         if "id" in algorithms:
@@ -901,7 +908,7 @@ class GRiDCodeGenerator:
             self.gen_aba(use_thread_group)
         if "crba" in algorithms:
             self.gen_crba(use_thread_group)
-        if not self.robot.floating_base:
+        if not self.robot.floating_base or enable_floating_second_order:
             if "idsva_so" in algorithms:
                 self.gen_idsva_so(use_thread_group)
             if "fdsva_so" in algorithms:
