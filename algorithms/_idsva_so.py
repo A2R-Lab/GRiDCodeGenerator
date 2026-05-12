@@ -1,5 +1,97 @@
 SHARED_MEMORY_JOINT_THRESHOLD = 10 # Max shared memory threshold => Write directly to RAM
 
+def _idsva_so_as_index_list(index):
+    if isinstance(index, list):
+        return [int(v) for v in index]
+    if isinstance(index, tuple):
+        return [int(v) for v in index]
+    if hasattr(index, "flatten"):
+        return [int(v) for v in index.flatten()]
+    return [int(index)]
+
+def _idsva_so_int_array(values):
+    return ", ".join(map(str, values)) if values else "0"
+
+def _idsva_so_unit_axis(column):
+    values = column.reshape(-1).tolist() if hasattr(column, "reshape") else list(column)
+    for row, value in enumerate(values):
+        value = float(value)
+        if abs(value) == 1.0:
+            return row, (1 if value > 0.0 else -1)
+    raise ValueError("Floating IDSVA-SO expected unit joint subspace columns.")
+
+def _idsva_so_floating_velocity_metadata(robot):
+    num_bodies = robot.get_num_bodies()
+    body_v_start = [0]
+    body_v_index = []
+    vel_to_body = [0] * robot.get_num_vel()
+    vel_to_local_col = [0] * robot.get_num_vel()
+    vel_s_index = [0] * robot.get_num_vel()
+    vel_s_sign = [1] * robot.get_num_vel()
+
+    for body_id in range(num_bodies):
+        v_inds = _idsva_so_as_index_list(robot.get_joint_index_v(body_id))
+        S = robot.get_S_by_id(body_id)
+        if len(S.shape) == 1:
+            S_cols = [S]
+        else:
+            S_cols = [S[:, col] for col in range(S.shape[1])]
+        if len(v_inds) != len(S_cols):
+            raise ValueError(
+                "Floating IDSVA-SO velocity metadata expected one S column per velocity index."
+            )
+        for local_col, vel_index in enumerate(v_inds):
+            body_v_index.append(vel_index)
+            vel_to_body[vel_index] = body_id
+            vel_to_local_col[vel_index] = local_col
+            s_index, s_sign = _idsva_so_unit_axis(S_cols[local_col])
+            vel_s_index[vel_index] = s_index
+            vel_s_sign[vel_index] = s_sign
+        body_v_start.append(len(body_v_index))
+
+    subtree_v_start = [0]
+    subtree_v_index = []
+    successor_v_start = [0]
+    successor_v_index = []
+    ancestor_body_start = [0]
+    ancestor_body_index = []
+    for body_id in range(num_bodies):
+        subtree = list(robot.get_subtree_by_id(body_id))
+        successors = [subtree_body for subtree_body in subtree if subtree_body != body_id]
+        ancestors = list(robot.get_ancestors_by_id(body_id))
+        ancestors.insert(0, body_id)
+        ancestors = ancestors[::-1]
+
+        for subtree_body in subtree:
+            subtree_v_index.extend(
+                body_v_index[body_v_start[subtree_body]:body_v_start[subtree_body + 1]]
+            )
+        subtree_v_start.append(len(subtree_v_index))
+
+        for successor_body in successors:
+            successor_v_index.extend(
+                body_v_index[body_v_start[successor_body]:body_v_start[successor_body + 1]]
+            )
+        successor_v_start.append(len(successor_v_index))
+
+        ancestor_body_index.extend(ancestors)
+        ancestor_body_start.append(len(ancestor_body_index))
+
+    return {
+        "body_v_start": body_v_start,
+        "body_v_index": body_v_index,
+        "vel_to_body": vel_to_body,
+        "vel_to_local_col": vel_to_local_col,
+        "vel_s_index": vel_s_index,
+        "vel_s_sign": vel_s_sign,
+        "subtree_v_start": subtree_v_start,
+        "subtree_v_index": subtree_v_index,
+        "successor_v_start": successor_v_start,
+        "successor_v_index": successor_v_index,
+        "ancestor_body_start": ancestor_body_start,
+        "ancestor_body_index": ancestor_body_index,
+    }
+
 def gen_idsva_so_inner_temp_mem_size(self):
     """
     Returns the total size of the temporary memory required for the
@@ -10,6 +102,13 @@ def gen_idsva_so_inner_temp_mem_size(self):
         second order idsva inner function.
     """
     NV = self.robot.get_num_vel()
+    num_bodies = self.robot.get_num_bodies()
+    if self.robot.floating_base:
+        body_mat_count = 8 * 36 * num_bodies
+        body_vec_count = 7 * 6 * num_bodies
+        vel_vec_count = 12 * 6 * NV
+        vel_mat_count = 9 * 36 * NV
+        return int(body_mat_count + body_vec_count + vel_vec_count + vel_mat_count + 6 + 64)
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     return int(36 * NV * 10 + 30 * NV + 6 + len(jids_a)*36)
 
@@ -186,11 +285,383 @@ def gen_idsva_so_reference_order_output_repair(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qdd_input = False):
+    """
+    Emits a floating-base diagnostic IDSVA-SO path with explicit body/velocity
+    split memory. Fixed-base keeps the optimized generator path below.
+    """
+    NV = self.robot.get_num_vel()
+    num_bodies = self.robot.get_num_bodies()
+    metadata = _idsva_so_floating_velocity_metadata(self.robot)
+    parent_ids = [self.robot.get_parent_id(body_id) for body_id in range(num_bodies)]
+
+    func_params = ["s_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*NV**3), \
+                   "s_q is the vector of joint positions", \
+                   "s_qd is the vector of joint velocities", \
+                   "s_qdd is the vector of joint accelerations", \
+                   "s_temp is a pointer to helper shared memory of size  = " + \
+                            str(self.gen_idsva_so_inner_temp_mem_size()), \
+                   "gravity is the gravity constant"]
+    func_def_start = "void idsva_so_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
+    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
+    func_notes = [
+        "Floating diagnostic path: body-indexed spatial state plus packed velocity-indexed derivative columns.",
+        "d2tau_dq is assembled analytically in velocity-coordinate tensor space.",
+    ]
+    if use_thread_group:
+        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
+        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
+    func_def = func_def_start + func_def_end
+
+    self.gen_add_func_doc("Computes floating-base second-order inverse dynamics diagnostics",func_notes,func_params,None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+
+    self.gen_add_code_lines([
+        "// Floating IDSVA-SO split-memory layout.",
+        "T *I = s_XImats + XIMAT_SIZE*NUM_BODIES;",
+        "T *Xdown = s_temp;",
+        "T *Xup = Xdown + 36*NUM_BODIES;",
+        "T *IC = Xup + 36*NUM_BODIES;",
+        "T *I_Xup = IC + 36*NUM_BODIES;",
+        "T *BC = I_Xup + 36*NUM_BODIES;",
+        "T *crm_v = BC + 36*NUM_BODIES;",
+        "T *crf_v = crm_v + 36*NUM_BODIES;",
+        "T *vJ = crf_v + 36*NUM_BODIES;",
+        "T *v = vJ + 6*NUM_BODIES;",
+        "T *aJ = v + 6*NUM_BODIES;",
+        "T *a = aJ + 6*NUM_BODIES;",
+        "T *f = a + 6*NUM_BODIES;",
+        "T *IC_v = f + 6*NUM_BODIES;",
+        "T *a_world = IC_v + 6*NUM_BODIES;",
+        "T *S_vel = a_world + 6;",
+        "T *Sd_vel = S_vel + 6*NUM_VEL;",
+        "T *psid_vel = Sd_vel + 6*NUM_VEL;",
+        "T *psidd_vel = psid_vel + 6*NUM_VEL;",
+        "T *psid_Sd_vel = psidd_vel + 6*NUM_VEL;",
+        "T *IC_S = psid_Sd_vel + 6*NUM_VEL;",
+        "T *IC_psid = IC_S + 6*NUM_VEL;",
+        "T *ICT_S = IC_psid + 6*NUM_VEL;",
+        "T *T1 = IC_S;",
+        "T *T2 = ICT_S + 6*NUM_VEL;",
+        "T *T3 = T2 + 6*NUM_VEL;",
+        "T *T4 = T3 + 6*NUM_VEL;",
+        "T *crm_S = T4 + 6*NUM_VEL;",
+        "T *crf_S = crm_S + 36*NUM_VEL;",
+        "T *crm_psid = crf_S + 36*NUM_VEL;",
+        "T *crf_psid = crm_psid + 36*NUM_VEL;",
+        "T *icrf_f = crf_psid + 36*NUM_VEL;",
+        "T *B_IC_S = icrf_f + 36*NUM_BODIES;",
+        "T *D1 = B_IC_S + 36*NUM_VEL;",
+        "T *D2 = D1 + 36*NUM_VEL;",
+        "T *D3 = B_IC_S;",
+        "T *D4 = D2 + 36*NUM_VEL;",
+        "T *crf_S_IC = D4 + 36*NUM_VEL;",
+        "T *d2tau_dq2 = s_idsva_so;",
+        "T *d2tau_dqd2 = d2tau_dq2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
+        "T *d2tau_dvdq = d2tau_dqd2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
+        "T *dM_dq = d2tau_dvdq + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
+        "",
+        f"static const int idsva_float_parent[] = {{ {_idsva_so_int_array(parent_ids)} }};",
+        f"static const int body_v_start[] = {{ {_idsva_so_int_array(metadata['body_v_start'])} }};",
+        f"static const int body_v_index[] = {{ {_idsva_so_int_array(metadata['body_v_index'])} }};",
+        f"static const int vel_to_body[] = {{ {_idsva_so_int_array(metadata['vel_to_body'])} }};",
+        f"static const int vel_s_index[] = {{ {_idsva_so_int_array(metadata['vel_s_index'])} }};",
+        f"static const int vel_s_sign[] = {{ {_idsva_so_int_array(metadata['vel_s_sign'])} }};",
+        f"static const int subtree_v_start[] = {{ {_idsva_so_int_array(metadata['subtree_v_start'])} }};",
+        f"static const int subtree_v_index[] = {{ {_idsva_so_int_array(metadata['subtree_v_index'])} }};",
+        f"static const int successor_v_start[] = {{ {_idsva_so_int_array(metadata['successor_v_start'])} }};",
+        f"static const int successor_v_index[] = {{ {_idsva_so_int_array(metadata['successor_v_index'])} }};",
+        f"static const int ancestor_body_start[] = {{ {_idsva_so_int_array(metadata['ancestor_body_start'])} }};",
+        f"static const int ancestor_body_index[] = {{ {_idsva_so_int_array(metadata['ancestor_body_index'])} }};",
+        "",
+    ])
+
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
+    self.gen_add_code_line("for (int out_idx = 0; out_idx < SECOND_ORDER_TENSOR_SIZE; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
+    self.gen_add_code_line("a_world[0] = static_cast<T>(0); a_world[1] = static_cast<T>(0); a_world[2] = static_cast<T>(0);")
+    self.gen_add_code_line("a_world[3] = static_cast<T>(0); a_world[4] = static_cast<T>(0); a_world[5] = gravity;")
+
+    self.gen_add_code_line("// Compute accumulated Xup transforms.")
+    self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
+    self.gen_add_code_line("int parent = idsva_float_parent[jid];")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6;")
+    self.gen_add_code_line("int col = idx / 6;")
+    self.gen_add_code_line("if (parent < 0) {", True)
+    self.gen_add_code_line("Xup[jid*36 + idx] = s_XImats[jid*36 + idx];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * Xup[parent*36 + kk + 6*col];")
+    self.gen_add_code_line("Xup[jid*36 + idx] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Compute IC = Xup^T * I * Xup.")
+    self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += I[jid*36 + row + 6*kk] * Xup[jid*36 + kk + 6*col];")
+    self.gen_add_code_line("I_Xup[jid*36 + idx] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += Xup[jid*36 + kk + 6*row] * I_Xup[jid*36 + kk + 6*col];")
+    self.gen_add_code_line("IC[jid*36 + idx] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Compute Xdown using the same spatial-transform inverse pattern as the fixed path.")
+    self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) Xdown[flat] = static_cast<T>(0);")
+    self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) {", True)
+    self.gen_add_code_line("int idx = flat % 36;")
+    self.gen_add_code_line("int sub_idx = idx % 18;")
+    self.gen_add_code_line("if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {", True)
+    self.gen_add_code_line("Xdown[flat] = Xup[flat + 5];")
+    self.gen_add_code_line("Xdown[flat + 5] = Xup[flat];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else if (idx % 18 == 2 || idx % 18 == 5) {", True)
+    self.gen_add_code_line("Xdown[flat] = Xup[flat + 10];")
+    self.gen_add_code_line("Xdown[flat + 10] = Xup[flat];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 && sub_idx != 12 && sub_idx != 15) {", True)
+    self.gen_add_code_line("Xdown[flat] = Xup[flat];")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Transform each velocity-coordinate S column.")
+    self.gen_add_code_line("for (int vel = 0; vel < NUM_VEL; ++vel) {", True)
+    self.gen_add_code_line("int jid = vel_to_body[vel];")
+    self.gen_add_code_line("int s_col = vel_s_index[vel];")
+    self.gen_add_code_line("T s_sign = static_cast<T>(vel_s_sign[vel]);")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) S_vel[vel*6 + row] = s_sign * Xdown[jid*36 + s_col*6 + row];")
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Forward pass in body order.")
+    self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
+    self.gen_add_code_line("int parent = idsva_float_parent[jid];")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("vJ[jid*6 + row] = static_cast<T>(0);")
+    self.gen_add_code_line("aJ[jid*6 + row] = static_cast<T>(0);")
+    self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
+    self.gen_add_code_line("int vel = body_v_index[pos];")
+    self.gen_add_code_line("vJ[jid*6 + row] += S_vel[vel*6 + row] * s_qd[vel];")
+    self.gen_add_code_line("aJ[jid*6 + row] += S_vel[vel*6 + row] * s_qdd[vel];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (parent < 0) {", True)
+    self.gen_add_code_line("v[jid*6 + row] = static_cast<T>(0);")
+    self.gen_add_code_line("a[jid*6 + row] = dot_prod<T, 6, 6, 1>(&Xdown[jid*36 + row], a_world);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("v[jid*6 + row] = v[parent*6 + row];")
+    self.gen_add_code_line("a[jid*6 + row] = a[parent*6 + row];")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) aJ[jid*6 + row] += crm_mul<T>(row, &v[jid*6], &vJ[jid*6]);")
+    self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
+    self.gen_add_code_line("int vel = body_v_index[pos];")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("psid_vel[vel*6 + row] = crm_mul<T>(row, &v[jid*6], &S_vel[vel*6]);")
+    self.gen_add_code_line("psidd_vel[vel*6 + row] = crm_mul<T>(row, &a[jid*6], &S_vel[vel*6]) + crm_mul<T>(row, &v[jid*6], &psid_vel[vel*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("v[jid*6 + row] += vJ[jid*6 + row];")
+    self.gen_add_code_line("a[jid*6 + row] += aJ[jid*6 + row];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
+    self.gen_add_code_line("int vel = body_v_index[pos];")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) Sd_vel[vel*6 + row] = crm_mul<T>(row, &v[jid*6], &S_vel[vel*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("crm_v[jid*36 + idx] = crm<T>(idx, &v[jid*6]);")
+    self.gen_add_code_line("crf_v[jid*36 + row*6 + col] = -crm<T>(idx, &v[jid*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) IC_v[jid*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &v[jid*6]);")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("BC[jid*36 + idx] = dot_prod<T, 6, 6, 1>(&crf_v[jid*36 + row], &IC[jid*36 + col*6]) + icrf<T>(idx, &IC_v[jid*6]) - dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_v[jid*36 + col*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) f[jid*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &a[jid*6]) + dot_prod<T, 6, 6, 1>(&crf_v[jid*36 + row], &IC_v[jid*6]);")
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Backward accumulation of body-indexed composite quantities.")
+    self.gen_add_code_line("for (int jid = NUM_BODIES - 1; jid >= 0; --jid) {", True)
+    self.gen_add_code_line("int parent = idsva_float_parent[jid];")
+    self.gen_add_code_line("if (parent >= 0) {", True)
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) { IC[parent*36 + idx] += IC[jid*36 + idx]; BC[parent*36 + idx] += BC[jid*36 + idx]; }")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) f[parent*6 + row] += f[jid*6 + row];")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Build velocity-indexed T and D intermediates.")
+    self.gen_add_code_line("for (int jid = NUM_BODIES - 1; jid >= 0; --jid) {", True)
+    self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
+    self.gen_add_code_line("int vel = body_v_index[pos];")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("crm_S[vel*36 + idx] = crm<T>(idx, &S_vel[vel*6]);")
+    self.gen_add_code_line("crf_S[vel*36 + row*6 + col] = -crm<T>(idx, &S_vel[vel*6]);")
+    self.gen_add_code_line("crm_psid[vel*36 + idx] = crm<T>(idx, &psid_vel[vel*6]);")
+    self.gen_add_code_line("crf_psid[vel*36 + row*6 + col] = -crm<T>(idx, &psid_vel[vel*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("IC_S[vel*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &S_vel[vel*6]);")
+    self.gen_add_code_line("IC_psid[vel*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &psid_vel[vel*6]);")
+    self.gen_add_code_line("psid_Sd_vel[vel*6 + row] = psid_vel[vel*6 + row] + Sd_vel[vel*6 + row];")
+    self.gen_add_code_line("ICT_S[vel*6 + row] = dot_prod<T, 6, 1, 1>(&IC[jid*36 + row*6], &S_vel[vel*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("icrf_f[jid*36 + idx] = icrf<T>(idx, &f[jid*6]);")
+    self.gen_add_code_line("B_IC_S[vel*36 + idx] = dot_prod<T, 6, 6, 1>(&crf_S[vel*36 + row], &IC[jid*36 + col*6]) + icrf<T>(idx, &IC_S[vel*6]) - dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_S[vel*36 + col*6]);")
+    self.gen_add_code_line("D2[vel*36 + idx] = dot_prod<T, 6, 6, 1>(&crf_psid[vel*36 + row], &IC[jid*36 + col*6]) + icrf<T>(idx, &IC_psid[vel*6]) - dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_psid[vel*36 + col*6]);")
+    self.gen_add_code_line("// RBDReference stores D1 with NumPy default flatten() order, unlike D2/D3/D4.")
+    self.gen_add_code_line("D1[vel*36 + row*6 + col] = dot_prod<T, 6, 6, 1>(&crf_S[vel*36 + row], &IC[jid*36 + col*6]) - dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_S[vel*36 + col*6]);")
+    self.gen_add_code_line("D2[vel*36 + idx] += dot_prod<T, 6, 6, 1>(&crf_S[vel*36 + row], &BC[jid*36 + col*6]) - dot_prod<T, 6, 6, 1>(&BC[jid*36 + row], &crm_S[vel*36 + col*6]);")
+    self.gen_add_code_line("D4[vel*36 + idx] = icrf<T>(idx, &ICT_S[vel*6]);")
+    self.gen_add_code_line("crf_S_IC[vel*36 + idx] = dot_prod<T, 6, 6, 1>(&crf_S[vel*36 + row], &IC[jid*36 + col*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("T2[vel*6 + row] = -dot_prod<T, 6, 1, 1>(&BC[jid*36 + row*6], &S_vel[vel*6]);")
+    self.gen_add_code_line("T3[vel*6 + row] = dot_prod<T, 6, 6, 1>(&BC[jid*36 + row], &psid_vel[vel*6]) + dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &psidd_vel[vel*6]) + dot_prod<T, 6, 6, 1>(&icrf_f[jid*36 + row], &S_vel[vel*6]);")
+    self.gen_add_code_line("T4[vel*6 + row] = dot_prod<T, 6, 6, 1>(&BC[jid*36 + row], &S_vel[vel*6]) + dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &psid_Sd_vel[vel*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_line("// Reference-order velocity-indexed tensor assembly.")
+    self.gen_add_code_line("T rt1[36], rt2[36], rt3[36], rt4[36], rt5[36], rt6[36], rt7[36], rt8[36], rt9[36];")
+    self.gen_add_code_line("T rp1[6], rp2[6], rp3[6], rp4[6], rp5[6], rp6[6];")
+    self.gen_add_code_line("for (int jid = NUM_BODIES - 1; jid >= 0; --jid) {", True)
+    self.gen_add_code_line("int st_begin = subtree_v_start[jid]; int st_end = subtree_v_start[jid + 1];")
+    self.gen_add_code_line("int succ_begin = successor_v_start[jid]; int succ_end = successor_v_start[jid + 1];")
+    self.gen_add_code_line("int anc_begin = ancestor_body_start[jid]; int anc_end = ancestor_body_start[jid + 1];")
+    self.gen_add_code_line("for (int dpos = body_v_start[jid]; dpos < body_v_start[jid + 1]; ++dpos) {", True)
+    self.gen_add_code_line("int dd = body_v_index[dpos];")
+    self.gen_add_code_line("for (int anc_pos = anc_begin; anc_pos < anc_end; ++anc_pos) {", True)
+    self.gen_add_code_line("int ancestor_body = ancestor_body_index[anc_pos];")
+    self.gen_add_code_line("for (int cpos = body_v_start[ancestor_body]; cpos < body_v_start[ancestor_body + 1]; ++cpos) {", True)
+    self.gen_add_code_line("int cc = body_v_index[cpos];")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("rt1[idx] = S_vel[dd*6 + row] * psid_vel[cc*6 + col];")
+    self.gen_add_code_line("rt2[idx] = S_vel[dd*6 + row] * S_vel[cc*6 + col];")
+    self.gen_add_code_line("rt3[idx] = psid_vel[dd*6 + row] * psid_vel[cc*6 + col];")
+    self.gen_add_code_line("rt4[idx] = S_vel[dd*6 + row] * psidd_vel[cc*6 + col];")
+    self.gen_add_code_line("rt5[idx] = S_vel[dd*6 + row] * psid_Sd_vel[cc*6 + col];")
+    self.gen_add_code_line("rt6[idx] = S_vel[cc*6 + row] * psid_vel[dd*6 + col];")
+    self.gen_add_code_line("rt7[idx] = S_vel[cc*6 + row] * psidd_vel[dd*6 + col];")
+    self.gen_add_code_line("rt8[idx] = S_vel[cc*6 + row] * S_vel[dd*6 + col];")
+    self.gen_add_code_line("rt9[idx] = S_vel[cc*6 + row] * psid_Sd_vel[dd*6 + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("rp1[row] = crm_mul<T>(row, &psid_vel[cc*6], &S_vel[dd*6]);")
+    self.gen_add_code_line("rp2[row] = crm_mul<T>(row, &psidd_vel[cc*6], &S_vel[dd*6]);")
+    self.gen_add_code_line("rp3[row] = crm_mul<T>(row, &S_vel[cc*6], &S_vel[dd*6]);")
+    self.gen_add_code_line("rp4[row] = crm_mul<T>(row, &psid_Sd_vel[cc*6], &S_vel[dd*6]) - static_cast<T>(2) * crm_mul<T>(row, &psid_vel[dd*6], &S_vel[cc*6]);")
+    self.gen_add_code_line("rp5[row] = crm_mul<T>(row, &S_vel[dd*6], &S_vel[cc*6]);")
+    self.gen_add_code_line("rp6[row] = dot_prod<T, 6, 1, 1>(&IC_S[dd*6], &crm_S[cc*36 + row*6]) + dot_prod<T, 6, 1, 1>(&S_vel[cc*6], &crf_S_IC[dd*36 + row*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_vel*6]);")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt1, &D3[st_vel*36]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ancestor_body < jid) {", True)
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc];")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("T dqd_val = -dot_prod<T, 36, 1, 1>(rt2, &D3[st_vel*36]);")
+    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = dqd_val;")
+    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = dqd_val;")
+    self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = -dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp3, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp4, &T1[st_vel*6]);")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D2[st_vel*36]) + dot_prod<T, 36, 1, 1>(rt7, &D1[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T3[st_vel*6]);")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T4[st_vel*6]);")
+    self.gen_add_code_line("T dm_val = dot_prod<T, 36, 1, 1>(rt8, &D4[st_vel*36]);")
+    self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dm_val;")
+    self.gen_add_code_line("dM_dq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = dm_val;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("T dqd_diag = static_cast<T>(0);")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line("dqd_diag += S_vel[dd*6 + row] * dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], rp3);")
+    self.gen_add_code_line("dqd_diag += S_vel[cc*6 + row] * dot_prod<T, 6, 6, 1>(&crf_S[dd*36 + row], &IC_S[dd*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + dd] = dqd_diag;")
+    self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
+    self.gen_add_code_line("int succ_vel = successor_v_index[succ_pos];")
+    self.gen_add_code_line("T dqd_succ = dot_prod<T, 36, 1, 1>(rt8, &D3[succ_vel*36]);")
+    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd] = dqd_succ;")
+    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dqd_succ;")
+    self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt8, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt9, &D1[succ_vel*36]);")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd];")
+    self.gen_add_code_line("#endif")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
+    self.gen_add_code_line("int succ_vel = successor_v_index[succ_pos];")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt1, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt4, &D1[succ_vel*36]);")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("T dqd_child = dot_prod<T, 36, 1, 1>(rt2, &D3[succ_vel*36]);")
+    self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dqd_child;")
+    self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dqd_child;")
+    self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dot_prod<T, 36, 1, 1>(rt1, &D3[succ_vel*36]);")
+    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+    self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel];")
+    self.gen_add_code_line("#endif")
+    self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt2, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt5, &D1[succ_vel*36]);")
+    self.gen_add_code_line("T dm_child = dot_prod<T, 36, 1, 1>(rt8, &D1[succ_vel*36]);")
+    self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dm_child;")
+    self.gen_add_code_line("dM_dq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dm_child;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ancestor_body == jid) {", True)
+    self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
+    self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
+    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt2, &D1[st_vel*36]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_end_control_flow()
+    if self.robot.floating_base and self.robot.using_quaternion:
+        self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
+        self.gen_add_code_line("// Reduced quaternion-vector q columns differentiate rotation with a factor of two at the identity convention used by GRiD/RBDReference.")
+        self.gen_add_code_line("for (int q_col = 3; q_col < 6 && q_col < NUM_VEL; ++q_col) {", True)
+        self.gen_add_code_line("for (int rc = 0; rc < NUM_VEL*NUM_VEL; ++rc) {", True)
+        self.gen_add_code_line("d2tau_dq2[rc*NUM_VEL + q_col] *= static_cast<T>(2);")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("#endif")
+    self.gen_add_sync(use_thread_group)
+    self.gen_add_end_function()
+
 def gen_idsva_so_inner(self, use_thread_group = False, use_qdd_input = False):
     """
     Generates the inner device function to compute the second order
     idsva.
     """
+    if self.robot.floating_base:
+        self.gen_idsva_so_floating_reference_inner(use_thread_group, use_qdd_input)
+        return
+
     NV = self.robot.get_num_vel()
     num_bodies = self.robot.get_num_bodies()
     max_bfs_levels = self.robot.get_max_bfs_level()
@@ -1092,7 +1563,7 @@ def gen_idsva_so_public_dvdq_layout_repair(self, use_thread_group = False):
     run this repair after inner assembly instead of changing the optimized
     assembly order in the first corrective pass.
     """
-    if self.idsva_so_needs_reference_order_output_repair():
+    if self.robot.floating_base or self.idsva_so_needs_reference_order_output_repair():
         return
 
     NV = self.robot.get_num_vel()
@@ -1283,6 +1754,94 @@ def gen_idsva_so_host(self, mode = 0):
                                  "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchk(cudaDeviceSynchronize());"])
+        if self.robot.floating_base and not single_call_timing:
+            self.gen_add_code_lines([
+                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_FINITE_DIFF || GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_COMPARE",
+                "// Diagnostic floating q-side completion: match RBDReference's reduced-q finite-difference convention.",
+                "const T grid_idsva_so_dq_step = sizeof(T) == sizeof(float) ? static_cast<T>(1e-2) : static_cast<T>(1e-6);",
+                "const int grid_idsva_so_q_qd_stride = NUM_POS + NUM_VEL;",
+                "T *grid_idsva_so_q_orig = (T *)malloc(NUM_POS*num_timesteps*sizeof(T));",
+                "T *grid_idsva_so_dc_dq_pos = (T *)malloc(NUM_VEL*NUM_VEL*num_timesteps*sizeof(T));",
+                "long long grid_idsva_so_dq_bad = 0;",
+                "T grid_idsva_so_dq_max_abs = static_cast<T>(0);",
+                "double grid_idsva_so_dq_rel_num = 0.0;",
+                "double grid_idsva_so_dq_rel_den = 0.0;",
+                "if (grid_idsva_so_q_orig == nullptr || grid_idsva_so_dc_dq_pos == nullptr) {",
+                "    fprintf(stderr, \"GRiD idsva_so floating finite-difference allocation failed\\n\");",
+                "    free(grid_idsva_so_q_orig);",
+                "    free(grid_idsva_so_dc_dq_pos);",
+                "    return;",
+                "}",
+                "for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
+                "    const T *grid_src = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
+                "    for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q] = grid_src[grid_q];",
+                "    for (int grid_qdd = 0; grid_qdd < NUM_VEL; ++grid_qdd) hd_data->h_qdd[grid_ts*NUM_VEL + grid_qdd] = grid_src[NUM_POS + NUM_VEL + grid_qdd];",
+                "}",
+                "for (int grid_dind = 0; grid_dind < NUM_VEL; ++grid_dind) {",
+                "    for (int grid_sign_iter = 0; grid_sign_iter < 2; ++grid_sign_iter) {",
+                "        const T grid_sign = grid_sign_iter == 0 ? static_cast<T>(1) : static_cast<T>(-1);",
+                "        for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
+                "            T *grid_dst = &hd_data->h_q_qd[grid_ts*grid_idsva_so_q_qd_stride];",
+                "            const T *grid_src = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
+                "            for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_dst[grid_q] = grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q];",
+                "            for (int grid_v = 0; grid_v < NUM_VEL; ++grid_v) grid_dst[NUM_POS + grid_v] = grid_src[NUM_POS + grid_v];",
+                "            const int grid_q_col = grid_dind < 6 ? grid_dind : grid_dind + 1;",
+                "            grid_dst[grid_q_col] += grid_sign * grid_idsva_so_dq_step;",
+                "            T grid_quat_norm = sqrt(grid_dst[3]*grid_dst[3] + grid_dst[4]*grid_dst[4] + grid_dst[5]*grid_dst[5] + grid_dst[6]*grid_dst[6]);",
+                "            if (grid_quat_norm != static_cast<T>(0)) {",
+                "                grid_dst[3] /= grid_quat_norm; grid_dst[4] /= grid_quat_norm; grid_dst[5] /= grid_quat_norm; grid_dst[6] /= grid_quat_norm;",
+                "            }",
+                "        }",
+                "        gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd, hd_data->h_q_qd, grid_idsva_so_q_qd_stride*num_timesteps*sizeof(T), cudaMemcpyHostToDevice, streams[0]));",
+                "        gpuErrchk(cudaMemcpyAsync(hd_data->d_qdd, hd_data->h_qdd, NUM_VEL*num_timesteps*sizeof(T), cudaMemcpyHostToDevice, streams[1]));",
+                "        gpuErrchk(cudaDeviceSynchronize());",
+                "        inverse_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dc_du, hd_data->d_workspace, hd_data->d_q_qd, grid_idsva_so_q_qd_stride, hd_data->d_qdd, d_robotModel, gravity, num_timesteps);",
+                "        gpuErrchk(cudaPeekAtLastError());",
+                "        gpuErrchk(cudaDeviceSynchronize());",
+                "        gpuErrchk(cudaMemcpy(hd_data->h_dc_du, hd_data->d_dc_du, 2*NUM_VEL*NUM_VEL*num_timesteps*sizeof(T), cudaMemcpyDeviceToHost));",
+                "        if (grid_sign_iter == 0) {",
+                "            for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
+                "                for (int grid_idx = 0; grid_idx < NUM_VEL*NUM_VEL; ++grid_idx) grid_idsva_so_dc_dq_pos[grid_ts*NUM_VEL*NUM_VEL + grid_idx] = hd_data->h_dc_du[grid_ts*2*NUM_VEL*NUM_VEL + grid_idx];",
+                "            }",
+                "        } else {",
+                "            for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
+                "                T *grid_out = &hd_data->h_idsva_so[grid_ts*SECOND_ORDER_TENSOR_SIZE];",
+                "                for (int grid_col = 0; grid_col < NUM_VEL; ++grid_col) {",
+                "                    for (int grid_row = 0; grid_row < NUM_VEL; ++grid_row) {",
+                "                        const int grid_dc_idx = grid_col*NUM_VEL + grid_row;",
+                "                        const int grid_out_idx = grid_row*NUM_VEL*NUM_VEL + grid_col*NUM_VEL + grid_dind;",
+                "                        const T grid_fd_val = (grid_idsva_so_dc_dq_pos[grid_ts*NUM_VEL*NUM_VEL + grid_dc_idx] - hd_data->h_dc_du[grid_ts*2*NUM_VEL*NUM_VEL + grid_dc_idx]) / (static_cast<T>(2) * grid_idsva_so_dq_step);",
+                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_FINITE_DIFF",
+                "                        grid_out[grid_out_idx] = grid_fd_val;",
+                "#else",
+                "                        const T grid_analytic_val = grid_out[grid_out_idx];",
+                "                        const T grid_abs_err = fabs(grid_analytic_val - grid_fd_val);",
+                "                        const T grid_tol = static_cast<T>(2e-3) + static_cast<T>(2e-3) * fabs(grid_fd_val);",
+                "                        if (grid_abs_err > grid_idsva_so_dq_max_abs) grid_idsva_so_dq_max_abs = grid_abs_err;",
+                "                        grid_idsva_so_dq_rel_num += static_cast<double>(grid_abs_err) * static_cast<double>(grid_abs_err);",
+                "                        grid_idsva_so_dq_rel_den += static_cast<double>(grid_fd_val) * static_cast<double>(grid_fd_val);",
+                "                        if (grid_abs_err > grid_tol) {",
+                "                            if (grid_idsva_so_dq_bad < 20) fprintf(stderr, \"GRiD idsva_so d2tau_dq analytic mismatch ts=%d row=%d col=%d dind=%d analytic=%g fd=%g abs=%g\\n\", grid_ts, grid_row, grid_col, grid_dind, static_cast<double>(grid_analytic_val), static_cast<double>(grid_fd_val), static_cast<double>(grid_abs_err));",
+                "                            ++grid_idsva_so_dq_bad;",
+                "                        }",
+                "#endif",
+                "                    }",
+                "                }",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+                "for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
+                "    T *grid_dst = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
+                "    for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_dst[grid_q] = grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q];",
+                "}",
+                "free(grid_idsva_so_q_orig);",
+                "free(grid_idsva_so_dc_dq_pos);",
+                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_COMPARE",
+                "fprintf(stderr, \"GRiD idsva_so d2tau_dq analytic-vs-fd summary bad=%lld max_abs=%g rel=%g\\n\", grid_idsva_so_dq_bad, static_cast<double>(grid_idsva_so_dq_max_abs), sqrt(grid_idsva_so_dq_rel_num / (grid_idsva_so_dq_rel_den > 0.0 ? grid_idsva_so_dq_rel_den : 1.0)));",
+                "#endif",
+                "#endif",
+            ])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call ID-SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

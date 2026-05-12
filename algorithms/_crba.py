@@ -62,11 +62,7 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     temp_size = self.gen_crba_inner_temp_mem_size()
-    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
-    self.gen_add_code_line(f"unsigned char *s_linalg_smem = reinterpret_cast<unsigned char *>(s_temp + {temp_size});")
-    self.gen_add_code_line("#else")
-    self.gen_add_code_line("unsigned char *s_linalg_smem = nullptr;")
-    self.gen_add_code_line("#endif")
+    self.gen_linalg_smem_setup(temp_size)
 
 
     # first clear the matrix
@@ -107,19 +103,19 @@ def gen_crba_inner(self, use_thread_group = False):
             for jid in inds:
                 parent_ind = self.robot.get_parent_id(jid)
                 self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
-                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
 
         elif len(inds) > 1:
             for jid in inds:
                 parent_ind = self.robot.get_parent_id(jid)
                 self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
-                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
 
         else:
             jid = inds[0]
             parent_ind = self.robot.get_parent_id(jid)
             self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0));")
-            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
 
     # Calculation of M[ind,ind]
     self.gen_add_code_line("//")
@@ -230,11 +226,7 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     temp_size = self.gen_crba_inner_temp_mem_size()
-    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
-    self.gen_add_code_line(f"unsigned char *s_linalg_smem = reinterpret_cast<unsigned char *>(s_temp + {temp_size});")
-    self.gen_add_code_line("#else")
-    self.gen_add_code_line("unsigned char *s_linalg_smem = nullptr;")
-    self.gen_add_code_line("#endif")
+    self.gen_linalg_smem_setup(temp_size)
 
     self.gen_add_code_line("// Initialize IC = I and clear H")
     self.gen_add_parallel_loop("ind", str(36 * NJ + nv * nv), use_thread_group)
@@ -250,7 +242,7 @@ def gen_crba_inner_floating(self, use_thread_group = False):
         dof = jid + 5
         self.gen_add_code_line("// CRBA body " + str(jid))
         self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{ICOffset + 36*jid}], &s_temp[{alphaOffset}], static_cast<T>(1), static_cast<T>(0));")
-        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
 
         self.gen_add_parallel_loop("row", "6", use_thread_group)
         self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(ICOffset + 36 * jid + 6 * S_ind) + " + row];")

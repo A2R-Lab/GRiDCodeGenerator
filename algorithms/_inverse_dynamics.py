@@ -68,11 +68,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     temp_size = self.gen_inverse_dynamics_inner_temp_mem_size()
-    self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
-    self.gen_add_code_line(f"unsigned char *s_linalg_smem = reinterpret_cast<unsigned char *>(s_temp + {temp_size});")
-    self.gen_add_code_line("#else")
-    self.gen_add_code_line("unsigned char *s_linalg_smem = nullptr;")
-    self.gen_add_code_line("#endif")
+    self.gen_linalg_smem_setup(temp_size)
     #
     # Initial Debug Prints if Requested
     #
@@ -171,13 +167,13 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                 s_sign_val = self.robot.get_S_sign_by_id(jid_val)
                 qd_idx = str(jid_val + 5) if self.robot.floating_base else str(jid_val)
                 # v[jid] = X[jid]*v[parent] + S[jid]*qd[jid]
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*parent_val}], &s_vaf[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*parent_val}], &s_vaf[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), {self.linalg_smem_for(6,6,6)});")
                 self.gen_add_serial_ops(use_thread_group)
                 self.gen_add_code_line(f"s_vaf[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{qd_idx}];")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
                 # a[jid] = X[jid]*a[parent] (+ S[jid]*qdd[jid] if use_qdd_input)
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*n + 6*parent_val}], &s_vaf[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*n + 6*parent_val}], &s_vaf[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0), {self.linalg_smem_for(6,6,6)});")
                 if use_qdd_input:
                     self.gen_add_serial_ops(use_thread_group)
                     self.gen_add_code_line(f"s_vaf[{6*n + 6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qdd[{qd_idx}];")
