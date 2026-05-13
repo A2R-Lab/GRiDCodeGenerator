@@ -1,3 +1,18 @@
+import os
+
+# GRID_NO_LICM_BARRIER=1 suppresses the anti-LICM machinery (volatile input
+# reload, syncthreads-protected output write, __noinline__ grid_licm_barrier call)
+# emitted by gen_anti_licm_input_reload + gen_anti_licm_output_write. Use this
+# when ptxas hangs on floating-base kernels on older toolkits/GPUs (we've seen
+# this on sm_86 with stock CUDA). Batch timings (N=16..256) are unaffected;
+# single-call timings on _single_timing kernels may LICM-elide and report
+# sub-microsecond nonsense values for ABA/FD/MINV/CRBA/ID/EE_POSE.
+# Read at call time, not import time, so CLI flags in grid/run.py can set it
+# after this module is already imported.
+def _no_licm_barrier() -> bool:
+    return os.environ.get("GRID_NO_LICM_BARRIER", "0") == "1"
+
+
 def gen_add_code_line(self, new_code_line, add_indent_after = False):
     self.code_str += self.indent_level * "    " + new_code_line + "\n"
     if add_indent_after:
@@ -203,6 +218,14 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
     elides nearly all of it, producing absurdly fast single-call timings
     (e.g. the historical fd_du = 0.00 us symptom on iiwa14).
     """
+    if _no_licm_barrier():
+        # Opt-out path: emit nothing. Inputs were loaded before the rep loop;
+        # the rep body runs against stable data and nvcc is free to LICM-elide.
+        # Trade-off documented at the top of this module.
+        self.gen_add_code_line(
+            "// anti-LICM suppressed (GRID_NO_LICM_BARRIER=1); single-call may elide"
+        )
+        return
     # Both sides are volatile: read forces re-load from global; write to shared
     # via `volatile T *` cast forces nvcc to emit each store and prevents CSE
     # across iterations. Without the volatile write, nvcc proves the shared
@@ -258,6 +281,11 @@ def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
     """
     if load_from_name is None:
         load_from_name = "s_" + store_to_name
+    if _no_licm_barrier():
+        self.gen_add_code_line(
+            "// anti-LICM output write suppressed (GRID_NO_LICM_BARRIER=1)"
+        )
+        return
     # __syncthreads() so thread 0 sees other threads' writes to s_<output>.
     # Without this, thread 0 only sees its own writes (or stale init-load values),
     # and if the inner algo doesn't have thread 0 personally write s_<output>[rep & 7],
