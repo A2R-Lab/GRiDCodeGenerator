@@ -1685,6 +1685,10 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        if use_qdd_input:
+            self.gen_anti_licm_input_reload("q_qd",str(2*n),use_thread_group,"qdd",str(n))
+        else:
+            self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")

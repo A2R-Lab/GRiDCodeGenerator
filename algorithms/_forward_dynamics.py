@@ -183,12 +183,21 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base))
+        input_count = 3*n + self.robot.floating_base
+        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(input_count))
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        # Anti-LICM: with -rdc=true (set by test/benchmarks/baselines/grid/run.py
+        # unconditionally), the grid_licm_barrier call inside input_reload becomes
+        # a true cross-CU function call that nvcc cannot inline. This defeats the
+        # LICM hoist of forward_dynamics_inner out of the rep loop. The original
+        # concern that th=0 cuBLASDx mode regressed with input_reload is moot:
+        # th=0 is being removed in Phase 5c anyway (cuBLASDx K=1 tile incompat).
+        self.gen_anti_licm_input_reload("q_qd_u",str(input_count),use_thread_group)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group)
+        self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("qdd",str(n),use_thread_group)

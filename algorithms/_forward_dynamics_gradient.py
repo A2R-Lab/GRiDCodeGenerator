@@ -204,6 +204,17 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        # anti-LICM: reload inputs from volatile globals each iter so nvcc -O3
+        # can't prove the inner body is loop-invariant. See
+        # gen_anti_licm_input_reload for the rationale (historical
+        # fd_du=0.00us symptom).
+        if use_qdd_Minv_input:
+            self.gen_anti_licm_input_reload(
+                "q_qd", str(2*n + self.robot.floating_base), use_thread_group,
+                "qdd", str(n), "Minv", str(n*n))
+        else:
+            self.gen_anti_licm_input_reload(
+                "q_qd_u", str(3*n + self.robot.floating_base), use_thread_group)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_forward_dynamics_gradient_inner_python(
             use_thread_group,
@@ -212,6 +223,15 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             "s_temp_spill",
             "GRID_FD_DU_USES_DA_DF_SPILL"
         ) # use the temp mem to store s_df_du
+        # anti-LICM companion: per-iter volatile write of one output element
+        # to a varying global address so the iter has an observable side
+        # effect that depends on this rep's computation.
+        self.gen_add_code_line(
+            "if ((threadIdx.x | threadIdx.y | threadIdx.z) == 0) { "
+            "reinterpret_cast<volatile T *>(d_df_du)[rep & 63] = "
+            + ("d_df_du_k[rep & 63];" if (use_global_temp or use_selective_spill) else "s_temp[rep & 63];")
+            + " }"
+        )
         self.gen_add_end_control_flow()
         # save to global
         if not (use_global_temp or use_selective_spill):

@@ -287,6 +287,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q_qd_u",str(3*n),use_thread_group)
         if use_global_tensors:
             self.gen_add_code_line('T *s_df2 = d_df2;')
             self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')

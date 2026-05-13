@@ -1029,12 +1029,17 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        if use_qdd_input:
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
+        else:
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group)
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
         self.gen_inverse_dynamics_gradient_inner_function_call(
             use_thread_group,
             dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
         )
+        self.gen_anti_licm_output_write("dc_du")
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)

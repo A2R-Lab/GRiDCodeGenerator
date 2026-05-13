@@ -189,6 +189,86 @@ def gen_kernel_load_inputs_single_timing(self, name, amount, use_thread_group = 
         self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
+                                     name2 = None, amount2 = 1, name3 = None, amount3 = 1):
+    """Inside a `for (rep ...)` single_timing loop, reload all inputs from
+    device memory via a `const volatile T *` cast. This forces nvcc -O3 to
+    treat the inputs as unknown across iterations and prevents loop-invariant
+    code motion (LICM) from eliding the algorithm body.
+
+    Mirrors `gen_kernel_load_inputs_single_timing` but emits volatile reads
+    and is intended to be called inside the rep loop body, not before it.
+
+    Without this, nvcc proves that the inner work has stable inputs and
+    elides nearly all of it, producing absurdly fast single-call timings
+    (e.g. the historical fd_du = 0.00 us symptom on iiwa14).
+    """
+    # Both sides are volatile: read forces re-load from global; write to shared
+    # via `volatile T *` cast forces nvcc to emit each store and prevents CSE
+    # across iterations. Without the volatile write, nvcc proves the shared
+    # array's contents are loop-invariant for alias reads of subranges (e.g.
+    # s_qd = &s_q_qd_u[NUM_JOINTS]) — which is what made FD/FD_DU/ID_DU
+    # still elide after the -rdc=true switch.
+    self.gen_add_code_line("// anti-LICM: volatile reload of inputs each rep")
+    self.gen_add_parallel_loop("_aopt_i", amount, use_thread_group)
+    self.gen_add_code_line(
+        "reinterpret_cast<volatile T *>(s_" + name + ")[_aopt_i] = "
+        "reinterpret_cast<const volatile T *>(d_" + name + ")[_aopt_i];"
+    )
+    self.gen_add_end_control_flow()
+    if name2 is not None:
+        self.gen_add_parallel_loop("_aopt_i", amount2, use_thread_group)
+        self.gen_add_code_line(
+            "reinterpret_cast<volatile T *>(s_" + name2 + ")[_aopt_i] = "
+            "reinterpret_cast<const volatile T *>(d_" + name2 + ")[_aopt_i];"
+        )
+        self.gen_add_end_control_flow()
+    if name3 is not None:
+        self.gen_add_parallel_loop("_aopt_i", amount3, use_thread_group)
+        self.gen_add_code_line(
+            "reinterpret_cast<volatile T *>(s_" + name3 + ")[_aopt_i] = "
+            "reinterpret_cast<const volatile T *>(d_" + name3 + ")[_aopt_i];"
+        )
+        self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # Compiler-memory clobber + __noinline__ barrier call. With -rdc=true
+    # (set by test/benchmarks/baselines/grid/run.py for both glass and
+    # glass-nvidia backends), nvcc treats grid_licm_barrier as an opaque
+    # cross-CU device function call and cannot hoist the inner-algorithm
+    # work that follows out of the rep loop. The asm clobber doubles as
+    # belt-and-suspenders for the same purpose.
+    self.gen_add_code_line('asm volatile("" ::: "memory");')
+    barrier_args = "s_" + name
+    if name2 is not None:
+        barrier_args += ", s_" + name2
+    if name3 is not None:
+        barrier_args += ", s_" + name3
+    self.gen_add_code_line(f"grid_licm_barrier({barrier_args});")
+
+def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
+    """Inside a `for (rep ...)` single_timing loop, write the per-iter output's
+    first element to a varying global address. Companion to
+    `gen_anti_licm_input_reload`: the input reload prevents LICM in the SIMT
+    path, but cuBLASDx-templated paths can still prove invariance unless
+    we also force a per-iter side effect that depends on the iter's work.
+
+    The destination cycles through 1024 slots of d_<store_to_name>, well
+    within the MAX_TIMESTEPS=256 × output_size_per_step allocation any
+    kernel's output buffer gets in init_gridData.
+    """
+    if load_from_name is None:
+        load_from_name = "s_" + store_to_name
+    # __syncthreads() so thread 0 sees other threads' writes to s_<output>.
+    # Without this, thread 0 only sees its own writes (or stale init-load values),
+    # and if the inner algo doesn't have thread 0 personally write s_<output>[rep & 7],
+    # the value is invariant across reps and LICM elides the entire algo.
+    self.gen_add_code_line("__syncthreads();")
+    self.gen_add_code_line(
+        "if ((threadIdx.x | threadIdx.y | threadIdx.z) == 0) { "
+        "reinterpret_cast<volatile T *>(d_" + store_to_name + ")[rep & 1023] = "
+        "reinterpret_cast<const volatile T *>(" + load_from_name + ")[rep & 7]; }"
+    )
+
 def gen_kernel_save_result_single_timing(self, store_to_name, amount, use_thread_group = False, load_from_name = None):
     if load_from_name is None:
         load_from_name = "s_" + store_to_name
@@ -200,6 +280,40 @@ def gen_kernel_save_result_single_timing(self, store_to_name, amount, use_thread
 
 def gen_add_shared_memory_helpers(self):
     self.gen_add_code_lines([
+        "// __noinline__ barrier called inside _single_timing rep loops. Each call",
+        "// receives pointers to per-rep input + output shared-memory arrays; nvcc",
+        "// cannot see across the call (because of __noinline__), so it must assume",
+        "// the function reads/writes everything those pointers point to. This",
+        "// defeats the LICM hoist nvcc otherwise performs on linalg-heavy algos",
+        "// (ABA / FD / MINV / *_DU) where alias tracking from s_q_qd_tau -> s_q",
+        "// fails. The asm-volatile memory clobber doubles up as a belt-and-",
+        "// suspenders barrier. Empty body means zero runtime cost beyond the",
+        "// call/return overhead (~5-10 ns on a 2 GHz GPU).",
+        "// Volatile self-store at a runtime-dependent (threadIdx.x-derived) index",
+        "// forces nvcc to emit a real SASS instruction AND prevents it from proving",
+        "// that only index [0] of each pointer is clobbered. With v[0]=v[0] alone,",
+        "// nvcc determines that subranges like s_qd = &s_q_qd_u[NUM_JOINTS] are",
+        "// untouched and proves them loop-invariant, which is why FD/FD_DU/ID_DU",
+        "// still elided even with -rdc=true. Using threadIdx.x & 0x3F gives idx in",
+        "// [0, 64), and the bound `idx < min(63, max_seen_input)` keeps us in",
+        "// range for the smallest robot arrays while spanning more of the larger",
+        "// ones. nvcc must assume any of [0..63] could have been clobbered, which",
+        "// covers s_q, s_qd, s_u (or s_q_qd_u's q/qd/tau subranges) for most",
+        "// floating-base robots' single-input arrays.",
+        "template <typename T>",
+        "__attribute__((noinline)) __noinline__ __device__",
+        "void grid_licm_barrier(T *p1, T *p2 = nullptr, T *p3 = nullptr) {",
+        "    // 0..3 from threadIdx.x; bounded so even tiny inputs don't OOB",
+        "    // (smallest possible per-name array is NUM_JOINTS=7 on iiwa14).",
+        "    // A runtime-dependent idx (vs the literal 0 we tried first) prevents",
+        "    // nvcc from proving that only [0] is clobbered while [19], [37], etc",
+        "    // (alias-pointer subranges) are loop-invariant.",
+        "    int idx = static_cast<int>(threadIdx.x) & 0x3;",
+        "    if (p1 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p1); v[idx] = v[idx]; }",
+        "    if (p2 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p2); v[idx] = v[idx]; }",
+        "    if (p3 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p3); v[idx] = v[idx]; }",
+        "}",
+        "",
         "__host__ __device__ constexpr size_t grid_align_up(size_t offset, size_t alignment) {",
         "    return (offset + alignment - 1) / alignment * alignment;",
         "}",
