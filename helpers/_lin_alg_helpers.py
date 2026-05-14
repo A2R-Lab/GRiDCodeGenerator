@@ -16,6 +16,11 @@ _GLASS_BASE_FILES = [
 # wrapping (or other top-level scope) and must be vendored at global scope so
 # we don't end up with nested glass::nvidia::glass::nvidia::... symbols.
 _GLASS_NVIDIA_GLOBAL_SCOPE_FILES = [
+    # tuning_table.cuh defines `namespace _glass_tuning { cublasdx_wins<>; ... }`
+    # which the SIMT query (query_simt.cuh) looks up when deciding whether to
+    # dispatch to cuBLASDx or fall through to the SIMT path. Must come before
+    # any file (l3.cuh, l3_simt.cuh) that consumes `should_use_cublasdx<>`.
+    "src/nvidia/tuning_table.cuh",
     # types.cuh defines glass::nvidia::layout (with its own namespace block)
     # plus the private helper macros (_GLASS_CUBLAS_LAYOUT, _GLASS_ASSERT_BLOCKDIM_GEQ).
     "src/nvidia/types.cuh",
@@ -27,7 +32,16 @@ _GLASS_NVIDIA_FILES = [
     "src/nvidia/sizes.cuh",
     "src/nvidia/l1.cuh",
     "src/nvidia/l2.cuh",
+    # query_simt.cuh defines should_use_cublasdx<>, print_dispatch<>, and
+    # related dispatch helpers that work WITHOUT cuBLASDx. l3.cuh's auto-
+    # dispatching gemm<> primary template calls should_use_cublasdx<>, so
+    # this must come BEFORE l3.cuh.
+    "src/nvidia/query_simt.cuh",
     "src/nvidia/l3.cuh",
+    # l3_simt.cuh defines gemm_batched_1d (P0-1) and gemm_strided_batched_1d
+    # (P0-2) — the 1D-launch batched APIs used by the eepose codegen for
+    # parent-shared 4×4×4 chain GEMMs.
+    "src/nvidia/l3_simt.cuh",
     # query.cuh provides gemm_min_block_threads / gemm_block_threads_valid so
     # the static_asserts emitted below can validate SUGGESTED_THREADS at
     # compile time per (M, N, K, SM) tuple without needing a DEFINE_NVIDIA_*.
@@ -83,43 +97,60 @@ def _emit_glass_source_file(self, relative_path):
     self.gen_add_code_line("")
 
 
-def _ee_gradient_packed_gemm_k_values(self):
-    if self.robot.is_serial_chain():
-        return []
-    n = self.robot.get_num_pos()
-    all_ees = self.robot.get_leaf_nodes()
-    num_ees = len(all_ees)
-    n_bfs_levels = self.robot.get_max_bfs_level() + 1
-    values = set()
-    for bfs_level in range(1, n_bfs_levels):
-        curr_parents = all_ees
-        for _ in range(bfs_level):
-            curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
-        run_start = 0
-        while run_start < num_ees:
-            parent_jid = curr_parents[run_start]
-            run_end = run_start + 1
-            while run_end < num_ees and curr_parents[run_end] == parent_jid:
-                run_end += 1
-            if parent_jid != -1:
-                values.add(4 * n * (run_end - run_start))
-            run_start = run_end
-    if num_ees > 0:
-        values.add(4 * n * num_ees)
-    return sorted(values)
+# NOTE: `_ee_gradient_packed_gemm_k_values` (previously here) collected the
+# K dimensions used by an older packed-K codegen path that emitted a single
+# big (4, 4, 4*n*run_len) GEMM. That path is gone — the eepose gradient now
+# uses `glass::nvidia::gemm_strided_batched_1d<T,4,4,4,BATCH,TC>` from
+# l3_simt.cuh, which is SIMT-only and needs no DEFINE_NVIDIA_GEMM macro.
+# Removed to stop emitting stale `DEFINE_NVIDIA_GEMM_BLOCKDIM_SM(4, 4, K)`
+# macros that produced unused cuBLASDx specializations.
+
+
+def _cublasdx_wins_heuristic(m, n, k=None):
+    """Match the conservative shape heuristic in GLASS's tuning_table.cuh
+    primary template `_glass_tuning::cublasdx_wins<>`:
+
+        max(M, N, K) >= 16 AND min(M, N, K) >= 4
+
+    Used to decide whether to emit a DEFINE_NVIDIA_GEMM*_BLOCKDIM_SM macro
+    (which creates an explicit specialization that always routes to
+    cuBLASDx, bypassing auto-dispatch). For shapes the heuristic says SIMT
+    wins, we skip the DEFINE so GLASS's primary-template auto-dispatch
+    handles them — `should_use_cublasdx<T,M,N,K,SM>()` will return false
+    and the SIMT fallback runs.
+
+    Note: this is the conservative heuristic; for shapes with a per-SM
+    measurement in tuning_table.cuh the answer may differ. We could parse
+    that file here for tighter filtering, but the heuristic suffices to
+    keep small-shape SIMT routing correct.
+    """
+    dims = [d for d in (m, n, k) if d is not None]
+    return max(dims) >= 16 and min(dims) >= 4
 
 
 def _nvidia_gemm_sizes(self):
-    sizes = {(4, 4, 4)}
-    for k in _ee_gradient_packed_gemm_k_values(self):
-        sizes.add((4, 4, k))
+    """Shapes for which we emit DEFINE_NVIDIA_GEMM_BLOCKDIM_SM macros.
+
+    Phase 5a: filter by `_cublasdx_wins_heuristic(M,N,K)` so we only emit
+    the explicit-specialization macro for shapes where cuBLASDx wins.
+    For small shapes (e.g. (4,4,4), (6,6,6)) we skip the DEFINE entirely
+    and let GLASS's primary `glass::nvidia::gemm<>` template auto-dispatch
+    to its SIMT fallback. Emitting the DEFINE for a SIMT-winning shape
+    creates an explicit specialization that bypasses auto-dispatch and
+    forces cuBLASDx — which both regresses perf and (for (6,6,6)) causes
+    cudaErrorIllegalAddress on glass-nvidia builds.
+    """
+    candidates = {(4, 4, 4)}
     for size in _nvidia_row_strided_gemm_sizes(self):
-        sizes.add(size)
-    return sorted(sizes)
+        candidates.add(size)
+    return sorted(s for s in candidates if _cublasdx_wins_heuristic(*s))
 
 
 def _nvidia_gemv_sizes(self):
-    return sorted(set(_nvidia_row_strided_gemv_sizes(self)))
+    return sorted(
+        s for s in set(_nvidia_row_strided_gemv_sizes(self))
+        if _cublasdx_wins_heuristic(*s)
+    )
 
 
 def _nvidia_row_strided_gemv_sizes(self):
@@ -130,36 +161,13 @@ def _nvidia_row_strided_gemm_sizes(self):
     return [(6, 6, 6)]
 
 
-def linalg_smem_for(self, m, n, k=None):
-    """Return the C expression to pass as the `glass_nvidia_smem` trailing
-    argument of a grid_linalg_* call: either `s_linalg_smem` (route through
-    cuBLASDx) or `nullptr` (route through the pure-SIMT glass path).
-
-    Heuristic from GLASS README "Choosing the right backend":
-      - max(m, n, k) >= GLASS_NVIDIA_MIN_DIM   → cuBLASDx (return s_linalg_smem)
-      - max(m, n, k) <  GLASS_NVIDIA_MIN_DIM   → glass SIMT (return nullptr)
-
-    The threshold defaults to 16 (the lower end of the "tensor cores win"
-    band per the GLASS README) and can be overridden at codegen time via the
-    GRID_BENCH_NVIDIA_MIN_DIM environment variable. The minimum is floored
-    at 4: cuBLASDx mishandles K=1 (and likely K<4) tiles on Blackwell —
-    forcing it everywhere via threshold=0 produced `cudaErrorIllegalAddress`
-    on floating-base robots (see Phase 5c in CHANGELOG.md). On iiwa14 the
-    threshold=0 stress mode was also 1.7x slower than the default, so there
-    is no win to recover. Use threshold=1024 to force pure-SIMT everywhere
-    (pure-glass mode while still compiling with the glass-nvidia backend —
-    useful for A/B).
-
-    The choice is baked into the generated header, so changing the threshold
-    requires regenerating (the codegen tree is part of the cache key).
-    """
-    import os
-    requested = int(os.environ.get("GRID_BENCH_NVIDIA_MIN_DIM", "16"))
-    threshold = max(requested, 4)
-    dims = [d for d in (m, n, k) if d is not None]
-    if max(dims) >= threshold:
-        return "s_linalg_smem"
-    return "nullptr"
+# Phase 5a cleanup: `linalg_smem_for()` removed. GLASS now auto-dispatches
+# between cuBLASDx and pure-SIMT at compile time via `should_use_cublasdx<>`
+# (see GLASS/src/nvidia/query_simt.cuh + tuning_table.cuh). The codegen-time
+# shape threshold this helper used to compute is no longer needed — the
+# wrappers always route through `glass::nvidia::*` for glass-nvidia builds
+# and let GLASS pick at compile time. Callers no longer pass a trailing
+# smem argument to grid_linalg_gemm / grid_linalg_row_strided_gemv.
 
 
 def gen_linalg_smem_setup(self, temp_size):
@@ -417,10 +425,18 @@ def gen_grid_linalg_backend_helpers(self):
         "}",
         "#endif",
         "",
+        "// Phase 5a: dropped the codegen-time backend heuristic (linalg_smem_for).",
+        "// Wrappers still take `s_linalg_smem` as a parameter (callers always pass",
+        "// it — emitted unconditionally by gen_linalg_smem_setup), but no longer",
+        "// branch on it. On glass-nvidia builds the nvidia path is taken when",
+        "// layouts are uniform; GLASS's gemm<> auto-dispatches between cuBLASDx",
+        "// and SIMT via should_use_cublasdx<>. The smem pointer is dead/unused on",
+        "// glass-only builds (marked (void)).",
         "template <typename T, int M, int N, int K, bool TRANSPOSE_B = false, bool ROW_MAJOR_A = false, bool ROW_MAJOR_B = false, bool ROW_MAJOR_C = false>",
         "__device__ void grid_linalg_gemm(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
+        "    (void)glass_nvidia_smem;",
         "#if GRID_CUDA_USE_GLASS_NVIDIA",
-        "    if (glass_nvidia_smem != nullptr && !ROW_MAJOR_A && !ROW_MAJOR_B && !ROW_MAJOR_C) {",
+        "    if constexpr (!ROW_MAJOR_A && !ROW_MAJOR_B && !ROW_MAJOR_C) {",
         "        if constexpr (TRANSPOSE_B) {",
         "            grid_linalg_packed_gemm_nvidia_transb<T, M, N, K>(A, B, C, alpha, beta, glass_nvidia_smem);",
         "        } else {",
@@ -447,15 +463,14 @@ def gen_grid_linalg_backend_helpers(self):
         "    __syncthreads();",
         "}",
         "",
+        "// row_strided_gemv: GLASS's nvidia variant has no auto-dispatch and the",
+        "// only consumer here is 6×6 GEMV — SIMT wins handily for that shape. Just",
+        "// route through SIMT unconditionally. (Pre-Phase-5a, linalg_smem_for(6,6,6)",
+        "// returned nullptr so the SIMT path was already always taken.) See GLASS",
+        "// RFC docs/handoff-glass-rfc-gemv-auto-dispatch.md for upstream fix.",
         "template <typename T, int M, int N, int ROW_STRIDE>",
         "__device__ void grid_linalg_row_strided_gemv(const T *A, const T *x, T *y, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
-        "#if GRID_CUDA_USE_GLASS_NVIDIA",
-        "    if (glass_nvidia_smem != nullptr) {",
-        "        grid_linalg_row_strided_gemv_nvidia<T, M, N, ROW_STRIDE>(A, x, y, alpha, beta, glass_nvidia_smem);",
-        "        __syncthreads();",
-        "        return;",
-        "    }",
-        "#endif",
+        "    (void)glass_nvidia_smem;",
         "    ::glass::row_strided_gemv<T, M, N, ROW_STRIDE>(A, x, y, alpha, beta);",
         "    __syncthreads();",
         "}",

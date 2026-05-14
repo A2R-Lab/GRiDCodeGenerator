@@ -335,11 +335,11 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             elif len(inds) > 1:
                 for i, jid_val in enumerate(inds):
                     parent_val = self.robot.get_parent_id(jid_val)
-                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset + 36*i}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
+                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset + 36*i}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
             else:
                 jid_val = inds[0]
                 parent_val = self.robot.get_parent_id(jid_val)
-                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1), {self.linalg_smem_for(6,6,6)});")
+                self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
 
             if self.DEBUG_MODE:
                 self.gen_add_sync(use_thread_group)
