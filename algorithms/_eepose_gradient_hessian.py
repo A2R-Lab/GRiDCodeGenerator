@@ -511,23 +511,14 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                     if parent_jid != -1:
                         packed_parent_runs.append((run_start, run_end - run_start, parent_jid))
                     run_start = run_end
-                self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
-                if packed_parent_runs:
-                    self.gen_add_code_line("// Packed EE-gradient pose-temp update for consecutive equal-parent runs.")
-                    for run_start, run_len, parent_jid in packed_parent_runs:
-                        self.gen_add_code_line("grid_linalg_packed_gemm_nvidia_colmajor<T,4,4," + str(4*n*run_len) + ">(&s_Xhom[16*" + str(parent_jid) + "], &s_eeTemp[" + str(tempSrcOffset + 16*n*run_start) + "], &s_eeTemp[" + str(tempDstOffset + 16*n*run_start) + "], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
-                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
-                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
-                select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
-                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
-                if (-1 in curr_parents):
-                    self.gen_add_code_line("if(parent_jid == -1){continue;}")
-                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, parent_jid);")
-                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_end_control_flow()
-                self.gen_add_code_line("#else")
+                # Note: previously this had a `#if GRID_CUDA_USE_GLASS_NVIDIA`
+                # branch that emitted `grid_linalg_packed_gemm_nvidia_colmajor<T,4,4,4*n*run_len>(
+                # &s_Xhom[16*parent_jid], ...)`. That was semantically wrong: cuBLASDx
+                # interpreted it as one big M=4×N=4×K=4*n*run_len GEMM that sums over K,
+                # while the intent was BATCH=run_len separate 4×4×4 GEMMs sharing one A.
+                # The OOB read past s_Xhom caused `cudaErrorIllegalAddress` on go2/g1.
+                # See GRiD-A2R RFC docs/glass-rfc-batched-1d.md for the proper API request
+                # (1D-launch batched GEMM) and the codegen-side TODO for Phase 7.
                 self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
                 self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
                 self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
@@ -542,7 +533,6 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
                 self.gen_add_end_control_flow()
-                self.gen_add_code_line("#endif")
                 self.gen_add_sync(use_thread_group)
                 if self.DEBUG_MODE:
                     self.gen_add_sync(use_thread_group)

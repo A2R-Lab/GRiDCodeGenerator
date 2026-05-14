@@ -48,14 +48,28 @@ def _global_hom_second_derivative_matrices(self):
                 owners[pair_ind] = jid
     return mats, owners
 
-def custom_is_constant(self,val):
-    # 1. Check for SymPy constants (e.g., sp.pi, sp.Integer(5), or an expression like x+1)
-    if hasattr(val, 'is_constant'):
+def custom_is_constant(self, val):
+    # Memoize per codegen instance. sympy `is_constant()` is expensive (it
+    # runs simplify → cancel → factor_terms internally) and gets called on
+    # every cell of every Xmat / Xhom / dXhom / d2Xhom matrix — many cells
+    # are duplicate expressions (literal 0, 1, sin(q_k), etc.) so caching
+    # collapses tens of thousands of calls to a few hundred unique ones.
+    # On g1_floating: dropped ~22min codegen by ~Nx (see Phase 7a profile).
+    if not hasattr(val, 'is_constant'):
+        return isinstance(val, (int, float, complex, np.number))
+    cache = getattr(self, '_is_constant_cache', None)
+    if cache is None:
+        cache = {}
+        self._is_constant_cache = cache
+    try:
+        if val in cache:
+            return cache[val]
+        result = val.is_constant()
+        cache[val] = result
+        return result
+    except TypeError:
+        # Unhashable expression — fall back to uncached call.
         return val.is_constant()
-    
-    # 2. Check for standard Python/NumPy numbers
-    # This covers int, float, np.float64, np.int32, etc.
-    return isinstance(val, (int, float, complex, np.number))
 
 def gen_init_XImats(self, include_base_inertia = False, include_homogenous_transforms = False):
     # add function description
