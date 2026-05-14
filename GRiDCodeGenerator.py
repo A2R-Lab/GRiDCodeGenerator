@@ -608,66 +608,151 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines(code_lines)
         self.gen_add_end_function()
 
+    # Manifest of every algorithm kernel that needs cudaFuncSetAttribute
+    # (MaxDynamicSharedMemorySize). Each entry:
+    #   (algo_label, algo_short_name, gate_attr, bytes_macro, [(kernel_name, signature), ...])
+    #
+    # algo_short_name matches the keys used in self.generated_algorithms (see
+    # _normalize_codegen_algorithms). gate_attr is the legacy `self.generate_*`
+    # bool — when present we honor it for back-compat; otherwise we rely on
+    # algo_short_name membership in self.generated_algorithms.
+    #
+    # Why we apply this to EVERY kernel, not just the historically-large ones:
+    # without cudaFuncSetAttribute(MaxDynamicSharedMemorySize, BYTES), a kernel
+    # whose dynamic shared mem at runtime exceeds the device default per-block
+    # limit (48 KB on most consumer NVIDIA GPUs incl. sm_8x) launches and fails
+    # silently with cudaErrorInvalidConfiguration. The launch error doesn't
+    # propagate through cudaDeviceSynchronize() reliably, so timings come back
+    # as bogus ~0 us values. We hit this on g1 floating where ABA / FD / MINV
+    # need 52-57 KB shared mem. The call is a no-op when BYTES is already
+    # under the device default.
+    KERNEL_ATTR_MANIFEST = [
+        # (algo_label, algo_short, gate_attr, bytes_macro, [(kernel_name<T>, signature), ...])
+        ("inverse_dynamics", "id", None, "ID_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("inverse_dynamics_kernel<T>",
+             "void (*)(T *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("direct_minv", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("direct_minv_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("direct_minv_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("forward_dynamics", "fd", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("forward_dynamics_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("forward_dynamics_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("aba", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("aba_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("aba_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("crba", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("crba_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("crba_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("end_effector_pose", "ee_pose", None, "EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("end_effector_pose_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("end_effector_pose_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("end_effector_pose_gradient", "ee_pose_gradient", None, "DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("end_effector_pose_gradient_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("end_effector_pose_gradient_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("inverse_dynamics_gradient", "id_du", "generate_id_du", "ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("inverse_dynamics_gradient_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_gradient_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_gradient_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_gradient_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("forward_dynamics_gradient", "fd_du", "generate_fd_du", "FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("forward_dynamics_gradient_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)"),
+            ("forward_dynamics_gradient_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("forward_dynamics_gradient_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)"),
+            ("forward_dynamics_gradient_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("idsva_so", "idsva_so", "generate_idsva_so", "IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("idsva_so_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("idsva_so_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("fdsva_so_kernel<T>",
+             "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
+            ("fdsva_so_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
+        ]),
+        # ee_pose_hessian is special: only emitted when its shared-mem fits the
+        # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime
+        # guard wraps the cudaFuncSetAttribute call.
+        ("end_effector_pose_gradient_hessian", "ee_pose_hessian", "generate_ee_pose_hessian",
+         "D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("end_effector_pose_gradient_hessian_kernel<T>",
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
+            ("end_effector_pose_gradient_hessian_kernel_single_timing<T>",
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+    ]
+
     def gen_init_close_grid(self):
         # set the max shared mem to account for large robots and allocate streams
         MAX_STREAMS = 3 # max needed in any of our functions
-        self.gen_add_func_doc("Sets shared mem needed for gradient kernels and initializes streams for host functions", \
+        self.gen_add_func_doc("Sets MaxDynamicSharedMemorySize for every algorithm kernel and initializes streams for host functions", \
                               [], [], "A pointer to the array of streams")
         self.gen_add_code_line("template <typename T>")
         self.gen_add_code_line("__host__")
         self.gen_add_code_line("cudaStream_t *init_grid(){", True)
-        # TODO: 2nd Order memory attributes
-        init_lines = ["// set the max temp memory for generated gradient kernels"]
-        if getattr(self, "generate_id_du", True):
-            init_lines += [
-                "auto id_grad_kern1 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)>(&inverse_dynamics_gradient_kernel<T>);",
-                "auto id_grad_kern2 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)>(&inverse_dynamics_gradient_kernel<T>);",
-                "auto id_grad_kern_timing1 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)>(&inverse_dynamics_gradient_kernel_single_timing<T>);",
-                "auto id_grad_kern_timing2 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)>(&inverse_dynamics_gradient_kernel_single_timing<T>);",
-                "gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics_gradient\", ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(id_grad_kern1,cudaFuncAttributeMaxDynamicSharedMemorySize, ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(id_grad_kern2,cudaFuncAttributeMaxDynamicSharedMemorySize, ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(id_grad_kern_timing1,cudaFuncAttributeMaxDynamicSharedMemorySize, ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(id_grad_kern_timing2,cudaFuncAttributeMaxDynamicSharedMemorySize, ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-            ]
-        if getattr(self, "generate_fd_du", True):
-            init_lines += [
-                "auto fd_grad_kern1 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)>(&forward_dynamics_gradient_kernel<T>);",
-                "auto fd_grad_kern2 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)>(&forward_dynamics_gradient_kernel<T>);",
-                "auto fd_grad_kern_timing1 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)>(&forward_dynamics_gradient_kernel_single_timing<T>);",
-                "auto fd_grad_kern_timing2 = static_cast<void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)>(&forward_dynamics_gradient_kernel_single_timing<T>);",
-                "gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_gradient\", FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fd_grad_kern1,cudaFuncAttributeMaxDynamicSharedMemorySize, FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fd_grad_kern2,cudaFuncAttributeMaxDynamicSharedMemorySize, FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fd_grad_kern_timing1,cudaFuncAttributeMaxDynamicSharedMemorySize, FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fd_grad_kern_timing2,cudaFuncAttributeMaxDynamicSharedMemorySize, FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-            ]
-        if getattr(self, "generate_idsva_so", True):
-            init_lines += [
-                "auto idsva_so_kern = static_cast<void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)>(&idsva_so_kernel<T>);",
-                "auto idsva_so_kern_timing = static_cast<void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)>(&idsva_so_kernel_single_timing<T>);",
-                "gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(idsva_so_kern,cudaFuncAttributeMaxDynamicSharedMemorySize, IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(idsva_so_kern_timing,cudaFuncAttributeMaxDynamicSharedMemorySize, IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-            ]
-        if getattr(self, "generate_fdsva_so", True):
-            init_lines += [
-                "auto fdsva_so_kern = static_cast<void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)>(&fdsva_so_kernel<T>);",
-                "auto fdsva_so_kern_timing = static_cast<void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)>(&fdsva_so_kernel_single_timing<T>);",
-                "gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fdsva_so_kern,cudaFuncAttributeMaxDynamicSharedMemorySize, FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "gpuErrchk(cudaFuncSetAttribute(fdsva_so_kern_timing,cudaFuncAttributeMaxDynamicSharedMemorySize, FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-            ]
-        if getattr(self, "generate_ee_pose_hessian", True):
-            init_lines += [
-                "if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {",
-                "    auto d2ee_kern = static_cast<void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)>(&end_effector_pose_gradient_hessian_kernel<T>);",
-                "    auto d2ee_kern_timing = static_cast<void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)>(&end_effector_pose_gradient_hessian_kernel_single_timing<T>);",
-                "    gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "    gpuErrchk(cudaFuncSetAttribute(d2ee_kern,cudaFuncAttributeMaxDynamicSharedMemorySize, D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "    gpuErrchk(cudaFuncSetAttribute(d2ee_kern_timing,cudaFuncAttributeMaxDynamicSharedMemorySize, D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));",
-                "}",
-            ]
+        # Enable opt-in dynamic shared memory for every generated algorithm
+        # kernel. See KERNEL_ATTR_MANIFEST docstring for why this matters
+        # (silently-failing launches on g1 floating ABA/FD/MINV without it).
+        init_lines = ["// enable opt-in dynamic shared memory for every algorithm kernel"]
+        generated_set = getattr(self, "generated_algorithms", None)
+        alias_counter = 0
+        for entry in self.KERNEL_ATTR_MANIFEST:
+            algo_label, algo_short, gate_attr, bytes_macro, kernels = entry
+            # Honor the legacy generate_* gate when present; otherwise fall
+            # back to membership in generated_algorithms; if neither is set
+            # (legacy callers), assume the algo is generated.
+            if gate_attr is not None and not getattr(self, gate_attr, True):
+                continue
+            if gate_attr is None and generated_set is not None and algo_short not in generated_set:
+                continue
+            guarded = (algo_label == "end_effector_pose_gradient_hessian")
+            indent = "    " if guarded else ""
+            if guarded:
+                init_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
+            init_lines.append(f"{indent}gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
+            for kernel_name, signature in kernels:
+                alias = f"_grid_kern_alias_{alias_counter}"
+                alias_counter += 1
+                init_lines.append(f"{indent}auto {alias} = static_cast<{signature}>(&{kernel_name});")
+                init_lines.append(f"{indent}gpuErrchk(cudaFuncSetAttribute({alias}, cudaFuncAttributeMaxDynamicSharedMemorySize, {bytes_macro}));")
+            if guarded:
+                init_lines.append("}")
         init_lines += ["gpuErrchk(cudaDeviceSynchronize());",
                        "// allocate streams",
                        "cudaStream_t *streams = (cudaStream_t *)malloc(" + str(MAX_STREAMS) + "*sizeof(cudaStream_t));",

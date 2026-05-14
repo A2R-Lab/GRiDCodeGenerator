@@ -245,9 +245,11 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
         self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
+        self.gen_anti_licm_output_write("eePos")
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("eePos",str(6*num_ees),use_thread_group)
@@ -664,9 +666,11 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
+        self.gen_anti_licm_output_write("deePos")
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
@@ -1230,9 +1234,11 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+        self.gen_anti_licm_output_write("d2eePos")
         self.gen_add_end_control_flow()
         if not use_workspace_temp:
             # save to global
