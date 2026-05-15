@@ -517,6 +517,7 @@ def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = 
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
@@ -590,14 +591,14 @@ def gen_direct_minv_host(self, mode = 0):
                                  "else {stride_q = 3*NUM_JOINTS; " + \
                                     "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     else:
         self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
     # then compute
     self.gen_add_code_line("// then call the kernel")
     func_call = "if (USE_COMPRESSED_MEM) {" + func_call_start + func_call_end + "}"
     func_call2 = "else                    {" + func_call_start.replace("hd_data->d_q","hd_data->d_q_qd_u") + func_call_end + "}"
-    func_call_code = [func_call, func_call2, "gpuErrchk(cudaDeviceSynchronize());"]
+    func_call_code = [func_call, func_call2, "gpuErrchkKernel();"]
     # wrap function call in timing (if needed)
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
@@ -609,7 +610,7 @@ def gen_direct_minv_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_Minv,hd_data->d_Minv,NUM_JOINTS*NUM_JOINTS*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call Minv %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

@@ -977,6 +977,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     use_selective_spill = getattr(self, "id_du_use_selective_spill", False)
@@ -1089,7 +1090,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
                                  "if (USE_QDD_FLAG) {gpuErrchk(cudaMemcpyAsync(hd_data->d_qdd,hd_data->h_qdd,NUM_JOINTS*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[1]));}", \
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     else:
         self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? 2*NUM_JOINTS: 3*NUM_JOINTS;")
     # then compute but adjust for compressed mem and qdd usage
@@ -1103,7 +1104,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     func_call_with_qdd_mem_adjust2 = "    else                    {" + func_call_with_qdd.replace("hd_data->d_q_qd","hd_data->d_q_qd_u") + "}"
     # compule into a set of code
     func_call_code = ["if (USE_QDD_FLAG) {", func_call_with_qdd_mem_adjust, func_call_with_qdd_mem_adjust2, "}", \
-                      "else {", func_call_mem_adjust, func_call_mem_adjust2, "}", "gpuErrchk(cudaDeviceSynchronize());"]
+                      "else {", func_call_mem_adjust, func_call_mem_adjust2, "}", "gpuErrchkKernel();"]
     # wrap function call in timing (if needed)
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
@@ -1118,7 +1119,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_dc_du,hd_data->d_dc_du,NUM_JOINTS*2*NUM_JOINTS*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call ID_DU %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

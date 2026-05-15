@@ -363,6 +363,7 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
                             func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables
@@ -449,7 +450,7 @@ def gen_crba_host(self, mode = 0):
     func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
     func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q_qd","hd_data->d_q_qd_u") + "}"
     # compule into a set of code
-    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchk(cudaDeviceSynchronize());"]
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchkKernel();"]
     # wrap function call in timing (if needed)
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
@@ -461,7 +462,7 @@ def gen_crba_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_M,hd_data->d_M,NUM_VEL*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call CRBA %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
