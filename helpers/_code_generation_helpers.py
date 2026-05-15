@@ -216,7 +216,7 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
 
     Without this, nvcc proves that the inner work has stable inputs and
     elides nearly all of it, producing absurdly fast single-call timings
-    (e.g. the historical fd_du = 0.00 us symptom on iiwa14).
+    (e.g. the historical fd_du = 0.00 us symptom on a 7-DoF arm).
     """
     if _no_licm_barrier():
         # Opt-out path: emit nothing. Inputs were loaded before the rep loop;
@@ -332,7 +332,7 @@ def gen_add_shared_memory_helpers(self):
         "__attribute__((noinline)) __noinline__ __device__",
         "void grid_licm_barrier(T *p1, T *p2 = nullptr, T *p3 = nullptr) {",
         "    // 0..3 from threadIdx.x; bounded so even tiny inputs don't OOB",
-        "    // (smallest possible per-name array is NUM_JOINTS=7 on iiwa14).",
+        "    // (smallest realistic per-name array is NUM_JOINTS=7).",
         "    // A runtime-dependent idx (vs the literal 0 we tried first) prevents",
         "    // nvcc from proving that only [0] is clobbered while [19], [37], etc",
         "    // (alias-pointer subranges) are loop-invariant.",
