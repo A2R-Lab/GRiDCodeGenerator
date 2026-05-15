@@ -19,8 +19,27 @@ def gen_add_code_line(self, new_code_line, add_indent_after = False):
         self.indent_level += 1
 
 def gen_add_code_lines(self, new_code_lines, add_indent_after = False):
-    for new_code_line in new_code_lines:
-        self.gen_add_code_line(new_code_line)
+    """Emit a list of code lines.
+
+    Items are emitted in order via `gen_add_code_line`. A literal `True`
+    immediately following a line is consumed and treated as that line's
+    `add_indent_after` flag (i.e., opens a new indented block). This lets
+    callers write `[\"if (cond) {\", True, ...]` inline rather than splitting
+    out a separate `gen_add_code_line(line, True)` call.
+
+    The trailing `add_indent_after` parameter still controls whether the
+    overall block indents one more level after all lines are emitted.
+    """
+    i = 0
+    while i < len(new_code_lines):
+        line = new_code_lines[i]
+        opens = (i + 1 < len(new_code_lines)) and (new_code_lines[i + 1] is True)
+        if opens:
+            self.gen_add_code_line(line, True)
+            i += 2
+        else:
+            self.gen_add_code_line(line)
+            i += 1
     if add_indent_after:
         self.indent_level += 1
 

@@ -47,6 +47,8 @@ class GRiDCodeGenerator:
                             gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, idsva_so_needs_reference_order_output_repair, \
                             gen_idsva_so_reference_order_output_repair, gen_idsva_so_floating_reference_inner, gen_idsva_so_public_dvdq_layout_repair, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
                             gen_idsva_so_device, gen_idsva_so_kernel, gen_idsva_so_host, gen_idsva_so, \
+                            gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
+                            gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
 
@@ -360,7 +362,10 @@ class GRiDCodeGenerator:
             d2ee_workspace_t_count += d2ee_workspace_temp_count
         if self.d2ee_use_workspace_d2xhom:
             d2ee_workspace_t_count += d2Xhom_size
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count)
+        # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
+        # tensors live in d_workspace instead of shared memory for larger robots.
+        idsva_so_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, idsva_so_grav_spill_t_count)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -418,18 +423,6 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines([
                                  "#define GRID_GENERATED_NUM_JOINTS " + str(n),
                                  "#define GRID_GENERATED_NUM_EES " + str(self.robot.get_total_leaf_nodes()),
-                                 "#ifndef GRID_FLOATING_SO_DQ_ANALYTIC",
-                                 "#define GRID_FLOATING_SO_DQ_ANALYTIC 1",
-                                 "#endif",
-                                 "#ifndef GRID_FLOATING_SO_DQ_FINITE_DIFF",
-                                 "#define GRID_FLOATING_SO_DQ_FINITE_DIFF 2",
-                                 "#endif",
-                                 "#ifndef GRID_FLOATING_SO_DQ_COMPARE",
-                                 "#define GRID_FLOATING_SO_DQ_COMPARE 3",
-                                 "#endif",
-                                 "#ifndef GRID_FLOATING_SO_DQ_MODE",
-                                 "#define GRID_FLOATING_SO_DQ_MODE GRID_FLOATING_SO_DQ_FINITE_DIFF",
-                                 "#endif",
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -696,9 +689,9 @@ class GRiDCodeGenerator:
         ]),
         ("idsva_so", "idsva_so", "generate_idsva_so", "IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("idsva_so_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("fdsva_so_kernel<T>",

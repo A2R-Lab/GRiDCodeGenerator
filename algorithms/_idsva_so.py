@@ -108,9 +108,574 @@ def gen_idsva_so_inner_temp_mem_size(self):
         body_vec_count = 7 * 6 * num_bodies
         vel_vec_count = 12 * 6 * NV
         vel_mat_count = 9 * 36 * NV
-        return int(body_mat_count + body_vec_count + vel_vec_count + vel_mat_count + 6 + 64)
+        base_count = body_mat_count + body_vec_count + vel_vec_count + vel_mat_count + 6 + 64
+        # Gravity-shim shared portion only — d2X / d2a / d2f spill to `d_workspace`
+        # (see `gen_floating_gravity_d2tau_dq_spill_count`).
+        return int(base_count + gen_floating_gravity_d2tau_dq_shared_count(self))
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     return int(36 * NV * 10 + 30 * NV + 6 + len(jids_a)*36)
+
+def _floating_gravity_lie_metadata(robot):
+    """Per-velocity Lie-generator metadata for the floating-base gravity Hessian.
+
+    For each velocity coordinate `vi` belonging to body `jid`:
+      - `body[vi] = jid`
+      - `s_index[vi]` is the row in S_local that the unit-axis column points along.
+      - `s_sign[vi]` is the unit-axis sign in S_local.
+      - `lie_sign_flip[vi] = 1` iff the right-Lie generator `B` such that
+        `dXmat/dq = Xmat @ B` is `-crm(S_local)` rather than `+crm(S_local)` in this
+        codebase's Xmat convention.
+
+    Empirically (from `_spatial_xmat_derivative_func` for non-root joints), the GRiD
+    codebase's `Xmat(q)` is defined such that `dXmat/dq = -Xmat @ crm(S_local)` for
+    all non-root single-DoF joints. For the floating-base root, the Python helper at
+    `_floating_gravity_d2tau_dq_lie_direct` uses `B = +crm` for rotation columns and
+    `B = -crm` for translation columns (Featherstone xlt sign convention).
+
+    Combined rule for `lie_sign_flip`:
+      - Root rotation columns (local_col >= 3 for the floating-base joint): 0.
+      - Root translation columns (local_col < 3): 1.
+      - All non-root joints: 1.
+    """
+    num_bodies = robot.get_num_bodies()
+    num_vel = robot.get_num_vel()
+    body = [0] * num_vel
+    s_index = [0] * num_vel
+    s_sign = [1] * num_vel
+    lie_sign_flip = [0] * num_vel
+
+    for body_id in range(num_bodies):
+        v_inds = _idsva_so_as_index_list(robot.get_joint_index_v(body_id))
+        S = robot.get_S_by_id(body_id)
+        if len(S.shape) == 1:
+            S_cols = [S]
+        else:
+            S_cols = [S[:, col] for col in range(S.shape[1])]
+        for local_col, vel_index in enumerate(v_inds):
+            row_idx, sign = _idsva_so_unit_axis(S_cols[local_col])
+            body[vel_index] = body_id
+            s_index[vel_index] = row_idx
+            s_sign[vel_index] = sign
+            # Flip sign for non-root joints (sympy Xmat convention) and for root
+            # translation columns (Featherstone xlt sign convention).
+            if body_id != 0:
+                lie_sign_flip[vel_index] = 1
+            elif local_col < 3:
+                lie_sign_flip[vel_index] = 1
+
+    return {
+        "body": body,
+        "s_index": s_index,
+        "s_sign": s_sign,
+        # Keep the field name `is_root_translation` for backwards-compat with
+        # the existing emission code; it now means "needs Lie-sign flip".
+        "is_root_translation": lie_sign_flip,
+    }
+
+def gen_floating_gravity_d2tau_dq_spill_count(self):
+    """Floats of the gravity-Hessian helper that live in the global `d_workspace`
+    spill region (per timestep). The spill set is {grav_d2X, grav_d2a, grav_d2f} —
+    the three O(NV²·NB) tensors that dominate the memory budget for larger robots.
+    """
+    NV = self.robot.get_num_vel()
+    NB = self.robot.get_num_bodies()
+    d2X_count = 36 * NV * NV
+    d2a_count = 6 * NV * NV * NB
+    d2f_count = 6 * NV * NV * NB
+    return int(d2X_count + d2a_count + d2f_count)
+
+
+def gen_floating_gravity_d2tau_dq_shared_count(self):
+    """Floats of the gravity-Hessian helper that stay in shared memory.
+    Includes dX (sparse-but-stored-dense), a/da, f/df, and the 6x6 scratch buffers.
+    """
+    NV = self.robot.get_num_vel()
+    NB = self.robot.get_num_bodies()
+    dX_count = 36 * NV
+    a_count = 6 * NB
+    da_count = 6 * NV * NB
+    f_count = a_count
+    df_count = da_count
+    scratch_count = 4 * 36
+    return int(dX_count + a_count + da_count + f_count + df_count + scratch_count)
+
+
+def gen_floating_gravity_d2tau_dq_temp_mem_size(self):
+    """Total floats the gravity-Hessian helper needs (shared + spill).
+
+    The kernel emitter splits this into a shared-memory portion (the smaller arrays
+    plus scratch) and a `d_workspace` spill portion (d2X / d2a / d2f) so larger
+    robots (g1, etc.) still fit. See `gen_floating_gravity_d2tau_dq_shared_count`
+    and `gen_floating_gravity_d2tau_dq_spill_count`.
+    """
+    return int(gen_floating_gravity_d2tau_dq_shared_count(self)
+               + gen_floating_gravity_d2tau_dq_spill_count(self))
+
+def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
+    """Emit (inline) the floating-base gravity-Hessian addition into `d2tau_dq2`.
+
+    Translates the Python helper `_floating_gravity_d2tau_dq_lie_direct` (see
+    `RBDReference/RBDReference.py`) into CUDA emission for use inside
+    `gen_idsva_so_floating_reference_inner`.
+
+    Preconditions (set up by the caller):
+      - `Xup[NB*36]` contains cumulative world-frame joint transforms.
+      - `I[NB*36]` is body-frame inertia (the constant inertia tensor for each body).
+      - `s_q` holds joint position parameters.
+      - `d2tau_dq2[NV*NV*NV]` is the output buffer; we add to it here.
+
+    Memory allocated from the caller's scratch (carved by the caller). Phase A
+    assumes the carve fits; Phase D moves the large tensors to `d_workspace`.
+
+    Algorithm (one-pass body-frame propagation):
+      1. dX[vi] = X[jid(vi)] @ B_vi   (Lie generator, with translation sign flip
+         for the floating-base root).
+      2. d2X[vi][vj] = X[jid] @ B_vj @ B_vi when vi, vj share a body; else 0.
+      3. Forward: a[jid] = X[jid] @ a[parent] with `a[parent_of_root] = -gravity`;
+         carry first/second derivatives via the standard chain rule.
+      4. f = I @ a per body (all bodies, batched conceptually).
+      5. Backward: project onto each joint's S, propagate f-derivatives to parent.
+      6. Output: d2tau_dq2[v_index_of_jid_dof, :, :] += S^T @ d2f[jid, :, :].
+
+    See `RBDReference.py` line ~2371 for the body-major Python reference this mirrors.
+    """
+    NV = self.robot.get_num_vel()
+    NB = self.robot.get_num_bodies()
+    lie_meta = _floating_gravity_lie_metadata(self.robot)
+    parent_ids = [self.robot.get_parent_id(b) for b in range(NB)]
+
+    # Wrap the entire emission in a single-thread block so the helper is self-contained
+    # and safe to call regardless of whether the caller is already in a thread-zero scope.
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
+    # Compute the shared-memory base offset: existing main-sweep temp size MINUS the
+    # gravity-shim's shared portion (we want grav_scratch to point at where the helper's
+    # shared arrays live, which is right after the main-sweep allocations).
+    main_sweep_count = self.gen_idsva_so_inner_temp_mem_size() - gen_floating_gravity_d2tau_dq_shared_count(self)
+    self.gen_add_code_lines([
+        "// ===== Gravity-Hessian (Lie-tangent) addition into d2tau_dq2 =====",
+        "// Shared portion (dX / a / da / f / df / 4x36 scratch) lives in s_temp; the",
+        "// three O(NV*NV*NB) tensors (d2X / d2a / d2f) spill to s_temp_spill which the",
+        "// kernel emitter points into d_workspace per-timestep.",
+        f"static const int grav_lie_body[] = {{ {_idsva_so_int_array(lie_meta['body'])} }};",
+        f"static const int grav_lie_s_index[] = {{ {_idsva_so_int_array(lie_meta['s_index'])} }};",
+        f"static const int grav_lie_s_sign[] = {{ {_idsva_so_int_array(lie_meta['s_sign'])} }};",
+        f"static const int grav_lie_is_root_translation[] = {{ {_idsva_so_int_array(lie_meta['is_root_translation'])} }};",
+        f"static const int grav_lie_parent[] = {{ {_idsva_so_int_array(parent_ids)} }};",
+        "",
+        "// Shared-memory carve (small arrays).",
+        f"T *grav_scratch = s_temp + {main_sweep_count};",
+        "T *grav_dX      = grav_scratch;",
+        "T *grav_a       = grav_dX      + 36*NUM_VEL;",
+        "T *grav_da      = grav_a       + 6*NUM_BODIES;",
+        "T *grav_f       = grav_da      + 6*NUM_VEL*NUM_BODIES;",
+        "T *grav_df      = grav_f       + 6*NUM_BODIES;",
+        "T *grav_invX    = grav_df      + 6*NUM_VEL*NUM_BODIES;",
+        "T *grav_tmpA    = grav_invX    + 36;",
+        "T *grav_tmpB    = grav_tmpA    + 36;",
+        "T *grav_tmpC    = grav_tmpB    + 36;",
+        "// Global-memory spill carve (large per-timestep tensors).",
+        "T *grav_d2X     = s_temp_spill;",
+        "T *grav_d2a     = grav_d2X     + 36*NUM_VEL*NUM_VEL;",
+        "T *grav_d2f     = grav_d2a     + 6*NUM_VEL*NUM_VEL*NUM_BODIES;",
+        "",
+        "// gravity_vec mirrors Python's `gravity_vec[5] = -GRAVITY`. In CUDA the `gravity`",
+        "// parameter is the *positive magnitude* of gravitational acceleration (= 9.81),",
+        "// matching the convention used by the rest of the GRiD CUDA functions; the Python",
+        "// helper takes signed GRAVITY = -9.81. So Python's `gravity_vec[5] = -GRAVITY = +9.81`",
+        "// equals CUDA's `gravity_vec[5] = +gravity`.",
+        "T grav_gravity_vec[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                          static_cast<T>(0), static_cast<T>(0), gravity };",
+        "",
+        "// Zero scratch (single-thread; could be parallelised across threadIdx for speed).",
+        "for (int idx = 0; idx < 36*NUM_VEL; ++idx) grav_dX[idx] = static_cast<T>(0);",
+        "for (int idx = 0; idx < 36*NUM_VEL*NUM_VEL; ++idx) grav_d2X[idx] = static_cast<T>(0);",
+        "for (int idx = 0; idx < 6*NUM_BODIES; ++idx) { grav_a[idx] = static_cast<T>(0); grav_f[idx] = static_cast<T>(0); }",
+        "for (int idx = 0; idx < 6*NUM_VEL*NUM_BODIES; ++idx) { grav_da[idx] = static_cast<T>(0); grav_df[idx] = static_cast<T>(0); }",
+        "for (int idx = 0; idx < 6*NUM_VEL*NUM_VEL*NUM_BODIES; ++idx) { grav_d2a[idx] = static_cast<T>(0); grav_d2f[idx] = static_cast<T>(0); }",
+        "",
+        "// ---- (1) Build Lie generators B[vi] = +/- crm(unit_axis_si).",
+        "//        Root (jid==0):  dX[vi] = X_local[0] @ B[vi]   (Featherstone xlt convention,",
+        "//                        sign flip on translation columns baked into B).",
+        "//        Non-root joints: dX[vi] = B[vi] @ X_local[jid] (codebase's sympy convention:",
+        "//                         dXmat/dq = -crm(S_local) @ Xmat, with B = -crm(S_local)).",
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "int jid = grav_lie_body[vi];",
+        "int s_row = grav_lie_s_index[vi];",
+        "T sign = static_cast<T>(grav_lie_s_sign[vi]);",
+        "if (grav_lie_is_root_translation[vi]) sign = -sign;",
+        "T B[36];",
+        "T e_vec[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "               static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "e_vec[s_row] = sign;",
+        "for (int idx = 0; idx < 36; ++idx) B[idx] = crm<T>(idx, e_vec);",
+        "for (int idx = 0; idx < 36; ++idx) {", True,
+        "int row = idx % 6; int col = idx / 6;",
+        "T acc = static_cast<T>(0);",
+        "if (jid == 0) {",
+        "    for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * B[kk + 6*col];",
+        "} else {",
+        "    for (int kk = 0; kk < 6; ++kk) acc += B[row + 6*kk] * s_XImats[jid*36 + kk + 6*col];",
+        "}",
+        "grav_dX[vi*36 + idx] = acc;",
+        "",  # close inner idx loop
+        ])
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_lines([
+        "",
+        "// ---- (2) Build d2X[vi][vj] when vi, vj share a body.",
+        "//        Root (jid_i==0):  d2X[vi,vj] = X_local[0] @ Bj @ Bi   (right multiplication).",
+        "//        Non-root:         d2X[vi,vj] = Bj @ Bi @ X_local[jid] (left multiplication;",
+        "//                          for single-DoF non-root vi==vj this is B^2 @ X_local).",
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "int jid_i = grav_lie_body[vi];",
+        "for (int vj = 0; vj < NUM_VEL; ++vj) {", True,
+        "if (grav_lie_body[vj] != jid_i) continue;  // d2X is zero for cross-body pairs.",
+        "T sign_i = static_cast<T>(grav_lie_s_sign[vi]);",
+        "if (grav_lie_is_root_translation[vi]) sign_i = -sign_i;",
+        "T sign_j = static_cast<T>(grav_lie_s_sign[vj]);",
+        "if (grav_lie_is_root_translation[vj]) sign_j = -sign_j;",
+        "T Bi[36], Bj[36];",
+        "T ei[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "            static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "T ej[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "            static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "ei[grav_lie_s_index[vi]] = sign_i;",
+        "ej[grav_lie_s_index[vj]] = sign_j;",
+        "for (int idx = 0; idx < 36; ++idx) { Bi[idx] = crm<T>(idx, ei); Bj[idx] = crm<T>(idx, ej); }",
+        "// tmpA = Bj @ Bi  (6x6 @ 6x6).",
+        "for (int idx = 0; idx < 36; ++idx) {", True,
+        "int row = idx % 6; int col = idx / 6;",
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Bj[row + 6*kk] * Bi[kk + 6*col];",
+        "grav_tmpA[idx] = acc;",
+        ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// Multiply tmpA by X_local on the correct side (right for root, left for non-root).")
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("if (jid_i == 0) {")
+    self.gen_add_code_line("    for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid_i*36 + row + 6*kk] * grav_tmpA[kk + 6*col];")
+    self.gen_add_code_line("} else {")
+    self.gen_add_code_line("    for (int kk = 0; kk < 6; ++kk) acc += grav_tmpA[row + 6*kk] * s_XImats[jid_i*36 + kk + 6*col];")
+    self.gen_add_code_line("}")
+    self.gen_add_code_line("grav_d2X[(vi*NUM_VEL + vj)*36 + idx] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+
+    self.gen_add_code_lines([
+        "",
+        "// ---- (3) Forward sweep: propagate a, da, d2a through the tree (body frame).",
+        "//        Root (parent < 0): a[0] = inv(X_local[0]) @ gravity_vec. Since X_local[0]",
+        "//        equals the cumulative Xup[0] (no parent in the chain), Xdown[0] is its inverse.",
+        "//        Non-root: a[jid] = X_local[jid] @ a[parent]; carry first/second derivatives.",
+        "for (int jid = 0; jid < NUM_BODIES; ++jid) {", True,
+        "int parent = grav_lie_parent[jid];",
+        "if (parent < 0) {", True,
+        "    // ---- Root: a[0] = inv(X[0]) @ gravity_vec.",
+        "    for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xdown[jid*36 + row + 6*kk] * grav_gravity_vec[kk];",
+        "grav_a[jid*6 + row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # close root row loop
+
+    # da[0, vi] = -inv_X @ dX[vi] @ a[0], only for vi whose body is root (else stays 0).
+    self.gen_add_code_lines([
+        "    // da[0, vi] = -inv_X @ dX[vi] @ a[0] for root coords; zero otherwise.",
+        "    for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "if (grav_lie_body[vi] != jid) continue;",
+        "// tmp = dX[vi] @ a[0]   (6-vector).",
+        "T tmp_v[6];",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += grav_dX[vi*36 + row + 6*kk] * grav_a[jid*6 + kk];",
+        "tmp_v[row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # close tmp_v row loop
+    self.gen_add_code_lines([
+        "// grav_da[jid, vi] = -inv_X @ tmp_v = -Xdown[jid] @ tmp_v.",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xdown[jid*36 + row + 6*kk] * tmp_v[kk];",
+        "grav_da[(jid*NUM_VEL + vi)*6 + row] = -acc;",
+        ])
+    self.gen_add_end_control_flow()  # close da row loop
+    self.gen_add_end_control_flow()  # close vi loop
+
+    # d2a[0, vi, vj] for root coords only.
+    self.gen_add_code_lines([
+        "    // d2a[0, vi, vj] = -inv_X @ (dX[vi]@da[0,vj] + dX[vj]@da[0,vi] + d2X[vi,vj]@a[0]).",
+        "    // Nonzero only when both vi and vj are coords of the root body.",
+        "    for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "if (grav_lie_body[vi] != jid) continue;",
+        "for (int vj = 0; vj < NUM_VEL; ++vj) {", True,
+        "if (grav_lie_body[vj] != jid) continue;",
+        "T inner_v[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                 static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "// dX[vi] @ da[0, vj].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) inner_v[row] += grav_dX[vi*36 + row + 6*kk] * grav_da[(jid*NUM_VEL + vj)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # close row loop term1
+    self.gen_add_code_lines([
+        "// dX[vj] @ da[0, vi].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) inner_v[row] += grav_dX[vj*36 + row + 6*kk] * grav_da[(jid*NUM_VEL + vi)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # close row loop term2
+    self.gen_add_code_lines([
+        "// d2X[vi, vj] @ a[0].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) inner_v[row] += grav_d2X[(vi*NUM_VEL + vj)*36 + row + 6*kk] * grav_a[jid*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # close row loop term3
+    self.gen_add_code_lines([
+        "// grav_d2a[0, vi, vj] = -Xdown[0] @ inner_v.",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xdown[jid*36 + row + 6*kk] * inner_v[kk];",
+        "grav_d2a[((jid*NUM_VEL + vi)*NUM_VEL + vj)*6 + row] = -acc;",
+        ])
+    self.gen_add_end_control_flow()  # close d2a row loop
+    self.gen_add_end_control_flow()  # close vj loop
+    self.gen_add_end_control_flow()  # close vi loop
+
+    self.gen_add_end_control_flow()  # close parent < 0 branch
+    # Non-root branch.
+    self.gen_add_code_lines([
+        "else {", True,
+        "    // ---- Non-root: a[jid] = X_local[jid] @ a[parent].",
+        "    for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * grav_a[parent*6 + kk];",
+        "grav_a[jid*6 + row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # close a row loop
+    self.gen_add_code_lines([
+        "    // da[jid, vi] = dX[jid, vi] @ a[parent]   (only when vi is a coord of jid)",
+        "    //            + X_local[jid] @ da[parent, vi]   (always for any vi that affects parent).",
+        "    for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "T row_vals[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                  static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "// First term: dX[jid, vi] @ a[parent], only when vi is a coord of jid.",
+        "if (grav_lie_body[vi] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vi*36 + row + 6*kk] * grav_a[parent*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # row loop
+    self.gen_add_end_control_flow()  # if dX nonzero
+    self.gen_add_code_lines([
+        "// Second term: X_local[jid] @ da[parent, vi].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * grav_da[(parent*NUM_VEL + vi)*6 + kk];",
+        "row_vals[row] += acc;",
+        ])
+    self.gen_add_end_control_flow()  # row loop second term
+    self.gen_add_code_lines([
+        "for (int row = 0; row < 6; ++row) grav_da[(jid*NUM_VEL + vi)*6 + row] = row_vals[row];",
+        ])
+    self.gen_add_end_control_flow()  # vi loop
+    # d2a non-root: 4 terms.
+    self.gen_add_code_lines([
+        "    // d2a[jid, vi, vj] = d2X[jid, vi, vj] @ a[parent]   (only when both vi, vj coords of jid)",
+        "    //               + dX[jid, vi] @ da[parent, vj]   (only when vi is a coord of jid)",
+        "    //               + dX[jid, vj] @ da[parent, vi]   (only when vj is a coord of jid)",
+        "    //               + X_local[jid] @ d2a[parent, vi, vj]   (always).",
+        "    for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "for (int vj = 0; vj < NUM_VEL; ++vj) {", True,
+        "T row_vals[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                  static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "// Term 1: d2X[jid, vi, vj] @ a[parent].",
+        "if (grav_lie_body[vi] == jid && grav_lie_body[vj] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_d2X[(vi*NUM_VEL + vj)*36 + row + 6*kk] * grav_a[parent*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # row loop
+    self.gen_add_end_control_flow()  # if d2X nonzero
+    self.gen_add_code_lines([
+        "// Term 2: dX[jid, vi] @ da[parent, vj].",
+        "if (grav_lie_body[vi] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vi*36 + row + 6*kk] * grav_da[(parent*NUM_VEL + vj)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # row loop
+    self.gen_add_end_control_flow()  # if dX[vi] nonzero
+    self.gen_add_code_lines([
+        "// Term 3: dX[jid, vj] @ da[parent, vi].",
+        "if (grav_lie_body[vj] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vj*36 + row + 6*kk] * grav_da[(parent*NUM_VEL + vi)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # row loop
+    self.gen_add_end_control_flow()  # if dX[vj] nonzero
+    self.gen_add_code_lines([
+        "// Term 4: X_local[jid] @ d2a[parent, vi, vj].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * grav_d2a[((parent*NUM_VEL + vi)*NUM_VEL + vj)*6 + kk];",
+        "row_vals[row] += acc;",
+        ])
+    self.gen_add_end_control_flow()  # row loop term 4
+    self.gen_add_code_lines([
+        "for (int row = 0; row < 6; ++row) grav_d2a[((jid*NUM_VEL + vi)*NUM_VEL + vj)*6 + row] = row_vals[row];",
+        ])
+    self.gen_add_end_control_flow()  # vj loop
+    self.gen_add_end_control_flow()  # vi loop
+    self.gen_add_end_control_flow()  # else branch
+    self.gen_add_end_control_flow()  # jid loop
+
+    # ---- (4) f = I @ a, df = I @ da, d2f = I @ d2a per body. Body-frame inertia
+    # `I` is the per-body Imat from the layout (set up by the caller, see line ~324).
+    self.gen_add_code_lines([
+        "",
+        "// ---- (4) f = I @ a (and derivatives) per body, body-frame inertia.",
+        "for (int jid = 0; jid < NUM_BODIES; ++jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += I[jid*36 + row + 6*kk] * grav_a[jid*6 + kk];",
+        "grav_f[jid*6 + row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # f row loop
+    self.gen_add_code_lines([
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += I[jid*36 + row + 6*kk] * grav_da[(jid*NUM_VEL + vi)*6 + kk];",
+        "grav_df[(jid*NUM_VEL + vi)*6 + row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # df row loop
+    self.gen_add_end_control_flow()  # vi loop for df
+    self.gen_add_code_lines([
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "for (int vj = 0; vj < NUM_VEL; ++vj) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += I[jid*36 + row + 6*kk] * grav_d2a[((jid*NUM_VEL + vi)*NUM_VEL + vj)*6 + kk];",
+        "grav_d2f[((jid*NUM_VEL + vi)*NUM_VEL + vj)*6 + row] = acc;",
+        ])
+    self.gen_add_end_control_flow()  # d2f row loop
+    self.gen_add_end_control_flow()  # vj loop
+    self.gen_add_end_control_flow()  # vi loop for d2f
+    self.gen_add_end_control_flow()  # jid loop
+
+    self.gen_add_code_lines([
+        "",
+        "// ---- (5) Backward sweep: project d2f onto each joint's S (body-frame motion subspace),",
+        "//        ADD into d2tau_dq2 (caller's main sweep is expected to have run with gravity=0).",
+        "//        Then bubble f, df, d2f to the parent via X_local transposes.",
+        "for (int jid = NUM_BODIES - 1; jid >= 0; --jid) {", True,
+        "// Projection: for each velocity coord finds_c of jid, d2tau_dq2[finds_c, k, l] += S_body[:, c] . d2f[jid, k, l, :].",
+        "// Body-frame S has a single nonzero entry per column: row=grav_lie_s_index[finds_c], value=grav_lie_s_sign[finds_c].",
+        "for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True,
+        "int finds_c = body_v_index[pos];",
+        "int s_row = grav_lie_s_index[finds_c];",
+        "T s_sign = static_cast<T>(grav_lie_s_sign[finds_c]);",
+        "for (int k = 0; k < NUM_VEL; ++k) {", True,
+        "for (int l = 0; l < NUM_VEL; ++l) {", True,
+        "T proj = s_sign * grav_d2f[((jid*NUM_VEL + k)*NUM_VEL + l)*6 + s_row];",
+        "d2tau_dq2[(finds_c*NUM_VEL + k)*NUM_VEL + l] += proj;",
+        ])
+    self.gen_add_end_control_flow()  # l loop
+    self.gen_add_end_control_flow()  # k loop
+    self.gen_add_end_control_flow()  # pos loop (velocity coords of jid)
+
+    # Parent update: skip when root.
+    self.gen_add_code_lines([
+        "int parent = grav_lie_parent[jid];",
+        "if (parent < 0) continue;",
+        "// Build X_local transpose once per body (used in all three parent updates).",
+        "T Xt[36];",
+        "for (int idx = 0; idx < 36; ++idx) {", True,
+        "int row = idx % 6; int col = idx / 6;",
+        "Xt[idx] = s_XImats[jid*36 + col + 6*row];",
+        ])
+    self.gen_add_end_control_flow()  # Xt loop
+    self.gen_add_code_lines([
+        "// f[parent] += Xt @ f[jid].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xt[row + 6*kk] * grav_f[jid*6 + kk];",
+        "grav_f[parent*6 + row] += acc;",
+        ])
+    self.gen_add_end_control_flow()  # f update row loop
+
+    # df parent update.
+    self.gen_add_code_lines([
+        "// df[parent, vi] += dXt[vi] @ f[jid]   (only when vi is a coord of jid)",
+        "//                + Xt @ df[jid, vi]   (always).",
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "T row_vals[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                  static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "if (grav_lie_body[vi] == jid) {", True,
+        "// dXt[vi] uses dX[vi].T, i.e., swap row<->col indices.",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vi*36 + kk + 6*row] * grav_f[jid*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # dXt row loop
+    self.gen_add_end_control_flow()  # if dX nonzero
+    self.gen_add_code_lines([
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xt[row + 6*kk] * grav_df[(jid*NUM_VEL + vi)*6 + kk];",
+        "row_vals[row] += acc;",
+        ])
+    self.gen_add_end_control_flow()  # Xt @ df row loop
+    self.gen_add_code_lines([
+        "for (int row = 0; row < 6; ++row) grav_df[(parent*NUM_VEL + vi)*6 + row] += row_vals[row];",
+        ])
+    self.gen_add_end_control_flow()  # vi loop for df
+
+    # d2f parent update.
+    self.gen_add_code_lines([
+        "// d2f[parent, vi, vj] += d2Xt[vi,vj]@f[jid] + dXt[vi]@df[jid,vj] + dXt[vj]@df[jid,vi] + Xt@d2f[jid,vi,vj].",
+        "for (int vi = 0; vi < NUM_VEL; ++vi) {", True,
+        "for (int vj = 0; vj < NUM_VEL; ++vj) {", True,
+        "T row_vals[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
+        "                  static_cast<T>(0), static_cast<T>(0), static_cast<T>(0) };",
+        "// Term 1: d2Xt[vi, vj] @ f[jid] — nonzero only when both vi, vj are coords of jid.",
+        "if (grav_lie_body[vi] == jid && grav_lie_body[vj] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_d2X[(vi*NUM_VEL + vj)*36 + kk + 6*row] * grav_f[jid*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # term 1 row loop
+    self.gen_add_end_control_flow()  # if d2X nonzero
+    self.gen_add_code_lines([
+        "// Term 2: dXt[vi] @ df[jid, vj].",
+        "if (grav_lie_body[vi] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vi*36 + kk + 6*row] * grav_df[(jid*NUM_VEL + vj)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # term 2 row loop
+    self.gen_add_end_control_flow()  # if dX[vi] nonzero
+    self.gen_add_code_lines([
+        "// Term 3: dXt[vj] @ df[jid, vi].",
+        "if (grav_lie_body[vj] == jid) {", True,
+        "for (int row = 0; row < 6; ++row) {", True,
+        "for (int kk = 0; kk < 6; ++kk) row_vals[row] += grav_dX[vj*36 + kk + 6*row] * grav_df[(jid*NUM_VEL + vi)*6 + kk];",
+        ])
+    self.gen_add_end_control_flow()  # term 3 row loop
+    self.gen_add_end_control_flow()  # if dX[vj] nonzero
+    self.gen_add_code_lines([
+        "// Term 4: Xt @ d2f[jid, vi, vj].",
+        "for (int row = 0; row < 6; ++row) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int kk = 0; kk < 6; ++kk) acc += Xt[row + 6*kk] * grav_d2f[((jid*NUM_VEL + vi)*NUM_VEL + vj)*6 + kk];",
+        "row_vals[row] += acc;",
+        ])
+    self.gen_add_end_control_flow()  # term 4 row loop
+    self.gen_add_code_lines([
+        "for (int row = 0; row < 6; ++row) grav_d2f[((parent*NUM_VEL + vi)*NUM_VEL + vj)*6 + row] += row_vals[row];",
+        ])
+    self.gen_add_end_control_flow()  # vj loop
+    self.gen_add_end_control_flow()  # vi loop for d2f
+    self.gen_add_end_control_flow()  # jid backward loop
+    self.gen_add_end_control_flow()  # close thread-zero wrap
+    self.gen_add_sync(use_thread_group)
 
 def gen_idsva_so_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None):
     var_names = dict( \
@@ -119,6 +684,7 @@ def gen_idsva_so_inner_function_call(self, use_thread_group = False, use_qdd_inp
         s_qd_name = "s_qd", \
         s_qdd_name = "s_qdd", \
         s_temp_name = "s_temp", \
+        s_temp_spill_name = "s_temp_spill", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
@@ -126,7 +692,11 @@ def gen_idsva_so_inner_function_call(self, use_thread_group = False, use_qdd_inp
             var_names[key] = value
     id_so_code_start = "idsva_so_inner<T>(" + var_names["s_idsva_so_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", "
     id_so_code_middle = self.gen_insert_helpers_function_call()
-    id_so_code_end = f'' + var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    if self.robot.floating_base:
+        # Floating-base inner signature includes the gravity-shim spill pointer.
+        id_so_code_end = var_names["s_temp_name"] + ", " + var_names["s_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
+    else:
+        id_so_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_so_code_start = id_so_code_start.replace("(","(tgrp, ")
     id_so_code = id_so_code_start + id_so_code_middle + id_so_code_end
@@ -304,6 +874,9 @@ def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qd
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
     func_def_end = "T *s_temp, const T gravity) {"
+    func_params.insert(-1, "s_temp_spill is a pointer to global-memory scratch (per-timestep) of size = " + \
+                            str(gen_floating_gravity_d2tau_dq_spill_count(self)) + " floats")
+    func_def_end = "T *s_temp, T *s_temp_spill, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "Floating diagnostic path: body-indexed spatial state plus packed velocity-indexed derivative columns.",
@@ -381,8 +954,10 @@ def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qd
 
     self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
     self.gen_add_code_line("for (int out_idx = 0; out_idx < SECOND_ORDER_TENSOR_SIZE; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
+    self.gen_add_code_line("// Floating-base: run main sweep with gravity = 0; gravity Hessian added below by")
+    self.gen_add_code_line("// `gen_floating_gravity_d2tau_dq_lie_inline` (mirrors Python idsva_gravity = 0.0 + shim).")
     self.gen_add_code_line("a_world[0] = static_cast<T>(0); a_world[1] = static_cast<T>(0); a_world[2] = static_cast<T>(0);")
-    self.gen_add_code_line("a_world[3] = static_cast<T>(0); a_world[4] = static_cast<T>(0); a_world[5] = gravity;")
+    self.gen_add_code_line("a_world[3] = static_cast<T>(0); a_world[4] = static_cast<T>(0); a_world[5] = static_cast<T>(0);")
 
     self.gen_add_code_line("// Compute accumulated Xup transforms.")
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
@@ -572,24 +1147,18 @@ def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qd
     self.gen_add_end_control_flow()
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_vel*6]);")
-    self.gen_add_code_line("#endif")
     self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt1, &D3[st_vel*36]);")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (ancestor_body < jid) {", True)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc];")
-    self.gen_add_code_line("#endif")
     self.gen_add_code_line("T dqd_val = -dot_prod<T, 36, 1, 1>(rt2, &D3[st_vel*36]);")
     self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = dqd_val;")
     self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = dqd_val;")
     self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = -dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp3, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp4, &T1[st_vel*6]);")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D2[st_vel*36]) + dot_prod<T, 36, 1, 1>(rt7, &D1[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T3[st_vel*6]);")
-    self.gen_add_code_line("#endif")
     self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T4[st_vel*6]);")
     self.gen_add_code_line("T dm_val = dot_prod<T, 36, 1, 1>(rt8, &D4[st_vel*36]);")
     self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dm_val;")
@@ -607,23 +1176,17 @@ def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qd
     self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd] = dqd_succ;")
     self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dqd_succ;")
     self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt8, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt9, &D1[succ_vel*36]);")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd];")
-    self.gen_add_code_line("#endif")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
     self.gen_add_code_line("int succ_vel = successor_v_index[succ_pos];")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt1, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt4, &D1[succ_vel*36]);")
-    self.gen_add_code_line("#endif")
     self.gen_add_code_line("T dqd_child = dot_prod<T, 36, 1, 1>(rt2, &D3[succ_vel*36]);")
     self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dqd_child;")
     self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dqd_child;")
     self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dot_prod<T, 36, 1, 1>(rt1, &D3[succ_vel*36]);")
-    self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
     self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel];")
-    self.gen_add_code_line("#endif")
     self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt2, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt5, &D1[succ_vel*36]);")
     self.gen_add_code_line("T dm_child = dot_prod<T, 36, 1, 1>(rt8, &D1[succ_vel*36]);")
     self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dm_child;")
@@ -642,14 +1205,16 @@ def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qd
 
     self.gen_add_end_control_flow()
     if self.robot.floating_base and self.robot.using_quaternion:
-        self.gen_add_code_line("#if GRID_FLOATING_SO_DQ_MODE != GRID_FLOATING_SO_DQ_FINITE_DIFF")
         self.gen_add_code_line("// Reduced quaternion-vector q columns differentiate rotation with a factor of two at the identity convention used by GRiD/RBDReference.")
         self.gen_add_code_line("for (int q_col = 3; q_col < 6 && q_col < NUM_VEL; ++q_col) {", True)
         self.gen_add_code_line("for (int rc = 0; rc < NUM_VEL*NUM_VEL; ++rc) {", True)
         self.gen_add_code_line("d2tau_dq2[rc*NUM_VEL + q_col] *= static_cast<T>(2);")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_code_line("#endif")
+    # Phase B: emit the Lie-tangent gravity-Hessian addition. Main sweep above ran with
+    # a_world[5] = 0, so this call provides the missing gravity contribution to d2tau_dq2
+    # (mirrors the Python `idsva_so` + `_floating_gravity_d2tau_dq_lie_direct` pattern).
+    self.gen_floating_gravity_d2tau_dq_lie_inline(use_thread_group)
     self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()
 
@@ -1634,7 +2199,14 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
                    "gravity is the gravity constant", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void idsva_so_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, "
+    # Floating-base SO kernels take a global-memory workspace pointer for the
+    # gravity-shim's d2X/d2a/d2f spill (Phase D). Fixed-base SO doesn't need it
+    # but we still emit the parameter so the kernel signature is uniform across
+    # base modes and host launchers don't fork.
+    func_def_start = "void idsva_so_kernel(T *d_idsva_so, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
+    func_params.insert(1, "d_workspace is a per-timestep global-memory scratch buffer of " + \
+                          str(gen_floating_gravity_d2tau_dq_spill_count(self)) + " floats per timestep " + \
+                          "(only used when robot.floating_base is True)")
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     if use_qdd_input: # TODO
         func_def_start += "const T *d_qdd, "
@@ -1655,6 +2227,10 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
         extra_t_buffers.append(("s_qdd", n))
     shared_mem_size = self.gen_idsva_so_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
+    spill_floats = gen_floating_gravity_d2tau_dq_spill_count(self) if self.robot.floating_base else 0
+    # `s_temp_spill` is always declared so the inner-function call site has a uniform
+    # shape; for fixed-base SO it stays nullptr (inner doesn't dereference it).
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_qdd_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}];")
     else:
@@ -1666,6 +2242,13 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
         else:
             self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(2*n + NUM_POS),use_thread_group)
+        if self.robot.floating_base:
+            # Per-timestep spill region for the gravity-Hessian helper. The workspace
+            # is shared with the gradient kernels, so SO lives at the SO offset within
+            # each timestep slot (see `GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES` in grid.cuh).
+            self.gen_add_code_line(
+                "s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);"
+            )
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -1682,6 +2265,9 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
             self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n))
         else:
             self.gen_kernel_load_inputs_single_timing("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
+        if self.robot.floating_base:
+            # Single-timing path reuses one slot in the workspace across all reps.
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -1729,7 +2315,7 @@ def gen_idsva_so_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_host requires all-data or dynamics gridData\");")
     func_call_start = "idsva_so_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
-        "hd_data->d_q_qd_u,stride_q_qd,"
+        "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -1758,94 +2344,11 @@ def gen_idsva_so_host(self, mode = 0):
                                  "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchk(cudaDeviceSynchronize());"])
-        if self.robot.floating_base and not single_call_timing:
-            self.gen_add_code_lines([
-                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_FINITE_DIFF || GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_COMPARE",
-                "// Diagnostic floating q-side completion: match RBDReference's reduced-q finite-difference convention.",
-                "const T grid_idsva_so_dq_step = sizeof(T) == sizeof(float) ? static_cast<T>(1e-2) : static_cast<T>(1e-6);",
-                "const int grid_idsva_so_q_qd_stride = NUM_POS + NUM_VEL;",
-                "T *grid_idsva_so_q_orig = (T *)malloc(NUM_POS*num_timesteps*sizeof(T));",
-                "T *grid_idsva_so_dc_dq_pos = (T *)malloc(NUM_VEL*NUM_VEL*num_timesteps*sizeof(T));",
-                "long long grid_idsva_so_dq_bad = 0;",
-                "T grid_idsva_so_dq_max_abs = static_cast<T>(0);",
-                "double grid_idsva_so_dq_rel_num = 0.0;",
-                "double grid_idsva_so_dq_rel_den = 0.0;",
-                "if (grid_idsva_so_q_orig == nullptr || grid_idsva_so_dc_dq_pos == nullptr) {",
-                "    fprintf(stderr, \"GRiD idsva_so floating finite-difference allocation failed\\n\");",
-                "    free(grid_idsva_so_q_orig);",
-                "    free(grid_idsva_so_dc_dq_pos);",
-                "    return;",
-                "}",
-                "for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
-                "    const T *grid_src = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
-                "    for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q] = grid_src[grid_q];",
-                "    for (int grid_qdd = 0; grid_qdd < NUM_VEL; ++grid_qdd) hd_data->h_qdd[grid_ts*NUM_VEL + grid_qdd] = grid_src[NUM_POS + NUM_VEL + grid_qdd];",
-                "}",
-                "for (int grid_dind = 0; grid_dind < NUM_VEL; ++grid_dind) {",
-                "    for (int grid_sign_iter = 0; grid_sign_iter < 2; ++grid_sign_iter) {",
-                "        const T grid_sign = grid_sign_iter == 0 ? static_cast<T>(1) : static_cast<T>(-1);",
-                "        for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
-                "            T *grid_dst = &hd_data->h_q_qd[grid_ts*grid_idsva_so_q_qd_stride];",
-                "            const T *grid_src = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
-                "            for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_dst[grid_q] = grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q];",
-                "            for (int grid_v = 0; grid_v < NUM_VEL; ++grid_v) grid_dst[NUM_POS + grid_v] = grid_src[NUM_POS + grid_v];",
-                "            const int grid_q_col = grid_dind < 6 ? grid_dind : grid_dind + 1;",
-                "            grid_dst[grid_q_col] += grid_sign * grid_idsva_so_dq_step;",
-                "            T grid_quat_norm = sqrt(grid_dst[3]*grid_dst[3] + grid_dst[4]*grid_dst[4] + grid_dst[5]*grid_dst[5] + grid_dst[6]*grid_dst[6]);",
-                "            if (grid_quat_norm != static_cast<T>(0)) {",
-                "                grid_dst[3] /= grid_quat_norm; grid_dst[4] /= grid_quat_norm; grid_dst[5] /= grid_quat_norm; grid_dst[6] /= grid_quat_norm;",
-                "            }",
-                "        }",
-                "        gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd, hd_data->h_q_qd, grid_idsva_so_q_qd_stride*num_timesteps*sizeof(T), cudaMemcpyHostToDevice, streams[0]));",
-                "        gpuErrchk(cudaMemcpyAsync(hd_data->d_qdd, hd_data->h_qdd, NUM_VEL*num_timesteps*sizeof(T), cudaMemcpyHostToDevice, streams[1]));",
-                "        gpuErrchk(cudaDeviceSynchronize());",
-                "        inverse_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dc_du, hd_data->d_workspace, hd_data->d_q_qd, grid_idsva_so_q_qd_stride, hd_data->d_qdd, d_robotModel, gravity, num_timesteps);",
-                "        gpuErrchk(cudaPeekAtLastError());",
-                "        gpuErrchk(cudaDeviceSynchronize());",
-                "        gpuErrchk(cudaMemcpy(hd_data->h_dc_du, hd_data->d_dc_du, 2*NUM_VEL*NUM_VEL*num_timesteps*sizeof(T), cudaMemcpyDeviceToHost));",
-                "        if (grid_sign_iter == 0) {",
-                "            for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
-                "                for (int grid_idx = 0; grid_idx < NUM_VEL*NUM_VEL; ++grid_idx) grid_idsva_so_dc_dq_pos[grid_ts*NUM_VEL*NUM_VEL + grid_idx] = hd_data->h_dc_du[grid_ts*2*NUM_VEL*NUM_VEL + grid_idx];",
-                "            }",
-                "        } else {",
-                "            for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
-                "                T *grid_out = &hd_data->h_idsva_so[grid_ts*SECOND_ORDER_TENSOR_SIZE];",
-                "                for (int grid_col = 0; grid_col < NUM_VEL; ++grid_col) {",
-                "                    for (int grid_row = 0; grid_row < NUM_VEL; ++grid_row) {",
-                "                        const int grid_dc_idx = grid_col*NUM_VEL + grid_row;",
-                "                        const int grid_out_idx = grid_row*NUM_VEL*NUM_VEL + grid_col*NUM_VEL + grid_dind;",
-                "                        const T grid_fd_val = (grid_idsva_so_dc_dq_pos[grid_ts*NUM_VEL*NUM_VEL + grid_dc_idx] - hd_data->h_dc_du[grid_ts*2*NUM_VEL*NUM_VEL + grid_dc_idx]) / (static_cast<T>(2) * grid_idsva_so_dq_step);",
-                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_FINITE_DIFF",
-                "                        grid_out[grid_out_idx] = grid_fd_val;",
-                "#else",
-                "                        const T grid_analytic_val = grid_out[grid_out_idx];",
-                "                        const T grid_abs_err = fabs(grid_analytic_val - grid_fd_val);",
-                "                        const T grid_tol = static_cast<T>(2e-3) + static_cast<T>(2e-3) * fabs(grid_fd_val);",
-                "                        if (grid_abs_err > grid_idsva_so_dq_max_abs) grid_idsva_so_dq_max_abs = grid_abs_err;",
-                "                        grid_idsva_so_dq_rel_num += static_cast<double>(grid_abs_err) * static_cast<double>(grid_abs_err);",
-                "                        grid_idsva_so_dq_rel_den += static_cast<double>(grid_fd_val) * static_cast<double>(grid_fd_val);",
-                "                        if (grid_abs_err > grid_tol) {",
-                "                            if (grid_idsva_so_dq_bad < 20) fprintf(stderr, \"GRiD idsva_so d2tau_dq analytic mismatch ts=%d row=%d col=%d dind=%d analytic=%g fd=%g abs=%g\\n\", grid_ts, grid_row, grid_col, grid_dind, static_cast<double>(grid_analytic_val), static_cast<double>(grid_fd_val), static_cast<double>(grid_abs_err));",
-                "                            ++grid_idsva_so_dq_bad;",
-                "                        }",
-                "#endif",
-                "                    }",
-                "                }",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-                "for (int grid_ts = 0; grid_ts < num_timesteps; ++grid_ts) {",
-                "    T *grid_dst = &hd_data->h_q_qd_u[grid_ts*Q_QD_U_STRIDE];",
-                "    for (int grid_q = 0; grid_q < NUM_POS; ++grid_q) grid_dst[grid_q] = grid_idsva_so_q_orig[grid_ts*NUM_POS + grid_q];",
-                "}",
-                "free(grid_idsva_so_q_orig);",
-                "free(grid_idsva_so_dc_dq_pos);",
-                "#if GRID_FLOATING_SO_DQ_MODE == GRID_FLOATING_SO_DQ_COMPARE",
-                "fprintf(stderr, \"GRiD idsva_so d2tau_dq analytic-vs-fd summary bad=%lld max_abs=%g rel=%g\\n\", grid_idsva_so_dq_bad, static_cast<double>(grid_idsva_so_dq_max_abs), sqrt(grid_idsva_so_dq_rel_num / (grid_idsva_so_dq_rel_den > 0.0 ? grid_idsva_so_dq_rel_den : 1.0)));",
-                "#endif",
-                "#endif",
-            ])
+        # (Removed) Historical floating-base runtime FD diagnostic that compared the
+        # analytic d2tau_dq path against a `inverse_dynamics_gradient`-based finite
+        # difference. Gated by `GRID_FLOATING_SO_DQ_MODE`. Deleted alongside the macros
+        # — Phase A+B make the analytic floating-base d2tau_dq correct in one pass.
+
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call ID-SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

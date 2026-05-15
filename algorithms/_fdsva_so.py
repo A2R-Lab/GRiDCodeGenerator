@@ -193,7 +193,11 @@ def gen_fdsva_so_device(self, use_thread_group = False):
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
-    
+    # Phase D: floating-base idsva_so_inner takes a gravity-shim spill pointer.
+    # fdsva_so_device currently nulls it out — floating-base fdsva_so runtime correctness
+    # requires plumbing d_workspace through this device function (follow-up).
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_direct_minv_inner_function_call(use_thread_group)
@@ -249,6 +253,11 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];")
+    # Phase D: idsva_so_inner needs a gravity-shim spill pointer when floating-base.
+    # fdsva_so currently routes its own s_fdsva_temp through the SO workspace slot, so
+    # there's no spare region here to hand to the shim — null it out. Full floating-base
+    # fdsva_so correctness is a follow-up that needs to share the SO workspace cleanly.
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     fd_start = "forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, "
