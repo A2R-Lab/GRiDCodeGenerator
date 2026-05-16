@@ -240,6 +240,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
                             func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables
@@ -356,12 +357,12 @@ def gen_fdsva_so_host(self, mode = 0):
         self.gen_add_code_lines(["// start code with memory transfer", \
                                  "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd_qdd" + \
                                     ("*num_timesteps" if not single_call_timing else "") + "*sizeof(T),cudaMemcpyHostToDevice,streams[0]));", \
-                                 "gpuErrchk(cudaDeviceSynchronize());"])    
+                                 "gpuErrchkKernel();"])    
     
     # then compute:
     self.gen_add_code_line("// call the kernel")
     func_call = func_call_start + func_call_end
-    func_call_code = [func_call, "gpuErrchk(cudaDeviceSynchronize());"]
+    func_call_code = [func_call, "gpuErrchkKernel();"]
     # wrap function call in timing (if needed)
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
@@ -376,7 +377,7 @@ def gen_fdsva_so_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                 "gpuErrchk(cudaMemcpy(hd_data->h_df2,hd_data->d_df2," + \
                                 ("num_timesteps*" if not single_call_timing else "") + str(4*n**3) + "*sizeof(T),cudaMemcpyDeviceToHost));",
-                                "gpuErrchk(cudaDeviceSynchronize());"])
+                                "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call FDSVA_SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

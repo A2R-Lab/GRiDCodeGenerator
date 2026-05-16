@@ -542,6 +542,19 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
             str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
         return str_val
 
+    # Split the per-matrix updates into separate serial sections (one each
+    # for X_hom, dX_hom, d2X_hom) with a __syncthreads() between each.
+    # WHY: nvcc allocates registers per-region; one giant `if(tid==0) {...}`
+    # containing hundreds of `static_cast<T>(expr)` writes (esp. when the
+    # Hessian is included — O(NJ × n²) entries × 16 cells each) pushes
+    # peak per-thread register usage above the __launch_bounds__ cap that
+    # bigger robots impose (140+ regs vs cap of 128 at SUGGESTED_THREADS=512).
+    # Three smaller serial sections drop peak per-thread reg usage to a
+    # function of the largest individual matrix group, not the sum.
+    # NOTE on future work: the entire serial section can be parallelized
+    # by fanning each per-matrix block out across threads via parallel_loop —
+    # would let any thread count consume the function, not just thread 0.
+    # See conversation 2026-05-16 for the design discussion.
     self.gen_add_serial_ops(use_thread_group)
     for ind in range(NJ):
         self.gen_add_code_line("// X_hom[" + str(ind) + "]")
@@ -554,7 +567,10 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                     # then output the code
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                     self.gen_add_code_line("s_XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
     if include_gradients:
+        self.gen_add_serial_ops(use_thread_group)
         dXmats_hom, dXhom_owners = _global_hom_derivative_matrices_by_q(self)
         for ind in range(n):
             owner_jid = dXhom_owners[ind]
@@ -568,7 +584,10 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_dXmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     if include_hessians:
+        self.gen_add_serial_ops(use_thread_group)
         d2Xmats_hom, d2Xhom_owners = _global_hom_second_derivative_matrices(self)
         for ind in range(len(d2Xmats_hom)):
             owner_jid = d2Xhom_owners[ind]
@@ -582,9 +601,8 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                         # then output the code
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_d2XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
-    # end the serial section
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()
 
 def gen_topology_helpers_size(self):
