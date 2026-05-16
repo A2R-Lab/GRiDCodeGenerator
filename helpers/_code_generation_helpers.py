@@ -1,7 +1,7 @@
 import os
 
 # GRID_NO_LICM_BARRIER=1 suppresses the anti-LICM machinery (volatile input
-# reload, syncthreads-protected output write, __noinline__ grid_licm_barrier call)
+# reload, rep-stomp, output->input feedback, syncthreads-protected output write)
 # emitted by gen_anti_licm_input_reload + gen_anti_licm_output_write. Use this
 # when ptxas hangs on floating-base kernels on older toolkits/GPUs (we've seen
 # this on sm_86 with stock CUDA). Batch timings (N=16..256) are unaffected;
@@ -388,40 +388,6 @@ def gen_kernel_save_result_single_timing(self, store_to_name, amount, use_thread
 
 def gen_add_shared_memory_helpers(self):
     self.gen_add_code_lines([
-        "// __noinline__ barrier called inside _single_timing rep loops. Each call",
-        "// receives pointers to per-rep input + output shared-memory arrays; nvcc",
-        "// cannot see across the call (because of __noinline__), so it must assume",
-        "// the function reads/writes everything those pointers point to. This",
-        "// defeats the LICM hoist nvcc otherwise performs on linalg-heavy algos",
-        "// (ABA / FD / MINV / *_DU) where alias tracking from s_q_qd_tau -> s_q",
-        "// fails. The asm-volatile memory clobber doubles up as a belt-and-",
-        "// suspenders barrier. Empty body means zero runtime cost beyond the",
-        "// call/return overhead (~5-10 ns on a 2 GHz GPU).",
-        "// Volatile self-store at a runtime-dependent (threadIdx.x-derived) index",
-        "// forces nvcc to emit a real SASS instruction AND prevents it from proving",
-        "// that only index [0] of each pointer is clobbered. With v[0]=v[0] alone,",
-        "// nvcc determines that subranges like s_qd = &s_q_qd_u[NUM_JOINTS] are",
-        "// untouched and proves them loop-invariant, which is why FD/FD_DU/ID_DU",
-        "// still elided even with -rdc=true. Using threadIdx.x & 0x3F gives idx in",
-        "// [0, 64), and the bound `idx < min(63, max_seen_input)` keeps us in",
-        "// range for the smallest robot arrays while spanning more of the larger",
-        "// ones. nvcc must assume any of [0..63] could have been clobbered, which",
-        "// covers s_q, s_qd, s_u (or s_q_qd_u's q/qd/tau subranges) for most",
-        "// floating-base robots' single-input arrays.",
-        "template <typename T>",
-        "__attribute__((noinline)) __noinline__ __device__",
-        "void grid_licm_barrier(T *p1, T *p2 = nullptr, T *p3 = nullptr) {",
-        "    // 0..3 from threadIdx.x; bounded so even tiny inputs don't OOB",
-        "    // (smallest realistic per-name array is NUM_JOINTS=7).",
-        "    // A runtime-dependent idx (vs the literal 0 we tried first) prevents",
-        "    // nvcc from proving that only [0] is clobbered while [19], [37], etc",
-        "    // (alias-pointer subranges) are loop-invariant.",
-        "    int idx = static_cast<int>(threadIdx.x) & 0x3;",
-        "    if (p1 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p1); v[idx] = v[idx]; }",
-        "    if (p2 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p2); v[idx] = v[idx]; }",
-        "    if (p3 != nullptr) { volatile T *v = reinterpret_cast<volatile T*>(p3); v[idx] = v[idx]; }",
-        "}",
-        "",
         "__host__ __device__ constexpr size_t grid_align_up(size_t offset, size_t alignment) {",
         "    return (offset + alignment - 1) / alignment * alignment;",
         "}",
