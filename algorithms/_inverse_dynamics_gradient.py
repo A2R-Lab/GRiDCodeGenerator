@@ -1031,9 +1031,9 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),feedback_from="dc_du")
         else:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group)
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,feedback_from="dc_du")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
         self.gen_inverse_dynamics_gradient_inner_function_call(

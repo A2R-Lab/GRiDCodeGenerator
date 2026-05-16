@@ -195,7 +195,7 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
         # LICM hoist of forward_dynamics_inner out of the rep loop. The original
         # concern that th=0 cuBLASDx mode regressed with input_reload is moot:
         # th=0 is being removed in Phase 5c anyway (cuBLASDx K=1 tile incompat).
-        self.gen_anti_licm_input_reload("q_qd_u",str(input_count),use_thread_group)
+        self.gen_anti_licm_input_reload("q_qd_u",str(input_count),use_thread_group,feedback_from="qdd")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group)
         self.gen_anti_licm_output_write("qdd")

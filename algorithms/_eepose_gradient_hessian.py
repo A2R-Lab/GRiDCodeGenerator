@@ -246,7 +246,7 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="eePos")
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
         self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
@@ -688,7 +688,17 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
+        # TODO(licm-eepose-grad): rep-stomp + output→input feedback is in
+        # place here (and works for ee_pose, aba, crba, fd, id, etc.), but
+        # ee_pose_gradient floating-base on sm_86 / CUDA 12.6 still measures
+        # ~0 µs in single_timing — kernel SASS has the rep loop and 2 CALLs
+        # to non-empty inner functions, but ptxas appears to find some path
+        # to optimize the body away. Root cause unknown; needs deeper SASS
+        # comparison with ee_pose (which does measure correctly) and possibly
+        # a deeper data-flow defense (e.g. write rep into multiple slots, or
+        # have the inner-fn read the feedback value directly). See run notes
+        # from 2026-05-16.
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
@@ -1257,7 +1267,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="d2eePos")
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
         self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
