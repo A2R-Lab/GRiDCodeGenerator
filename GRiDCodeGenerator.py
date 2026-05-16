@@ -47,6 +47,9 @@ class GRiDCodeGenerator:
                             gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, idsva_so_needs_reference_order_output_repair, \
                             gen_idsva_so_reference_order_output_repair, gen_idsva_so_floating_reference_inner, gen_idsva_so_public_dvdq_layout_repair, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
                             gen_idsva_so_device, gen_idsva_so_kernel, gen_idsva_so_host, gen_idsva_so, \
+                            gen_idsva_so_spatial_v2_temp_mem_size, gen_idsva_so_spatial_v2_inner, \
+                            gen_idsva_so_spatial_v2_inner_function_call, gen_idsva_so_spatial_v2_kernel, \
+                            gen_idsva_so_spatial_v2_host, gen_idsva_so_spatial_v2, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
@@ -331,11 +334,31 @@ class GRiDCodeGenerator:
         self.d2ee_use_workspace_temp = self.d2ee_spill_tier >= 1
         self.d2ee_use_workspace_d2xhom = self.d2ee_spill_tier >= 2
         d2ee_t_count = [d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count][self.d2ee_spill_tier]
+        # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
+        # would exceed the target, recompute with the gravity-shim's dX/a/da/f/df
+        # spilled into d_workspace alongside d2X/d2a/d2f. Saves 50-60 KB on g1-class
+        # robots without changing iiwa14/go2 behavior.
+        self.idsva_so_grav_full_spill = False
         idsva_so_inner_temp_count = self.gen_idsva_so_inner_temp_mem_size()
         idsva_so_base_t_count = (2*nv + n) + idsva_so_inner_temp_count + XI_size
         idsva_so_full_t_count = idsva_so_base_t_count + 4*nv**3
         self.idsva_so_use_global_output = py_arena_bytes(idsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
         idsva_so_t_count = idsva_so_base_t_count if self.idsva_so_use_global_output else idsva_so_full_t_count
+        if self.robot.floating_base and py_arena_bytes(idsva_so_t_count) > self.cuda_target_shared_mem_bytes:
+            self.idsva_so_grav_full_spill = True
+            idsva_so_inner_temp_count = self.gen_idsva_so_inner_temp_mem_size()
+            idsva_so_base_t_count = (2*nv + n) + idsva_so_inner_temp_count + XI_size
+            idsva_so_full_t_count = idsva_so_base_t_count + 4*nv**3
+            self.idsva_so_use_global_output = py_arena_bytes(idsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
+            idsva_so_t_count = idsva_so_base_t_count if self.idsva_so_use_global_output else idsva_so_full_t_count
+
+        # spatial_v2 path has its own (smaller) scratch — no gravity-shim shared, no
+        # main-sweep extras. Sized via gen_idsva_so_spatial_v2_temp_mem_size.
+        idsva_so_spatial_v2_inner_temp_count = self.gen_idsva_so_spatial_v2_temp_mem_size() if self.robot.floating_base else idsva_so_inner_temp_count
+        idsva_so_spatial_v2_base_t_count = (2*nv + n) + idsva_so_spatial_v2_inner_temp_count + XI_size
+        idsva_so_spatial_v2_full_t_count = idsva_so_spatial_v2_base_t_count + 4*nv**3
+        self.idsva_so_spatial_v2_use_global_output = py_arena_bytes(idsva_so_spatial_v2_full_t_count) > self.cuda_target_shared_mem_bytes
+        idsva_so_spatial_v2_t_count = idsva_so_spatial_v2_base_t_count if self.idsva_so_spatial_v2_use_global_output else idsva_so_spatial_v2_full_t_count
 
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
         fdsva_so_inner_temp_count = 4*nv**3
@@ -448,6 +471,7 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(d2ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_SPATIAL_V2_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_spatial_v2_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fdsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(so_workspace_t_count) + "); }",
@@ -693,6 +717,16 @@ class GRiDCodeGenerator:
             ("idsva_so_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
+        # spatial_v2-style single-pass alternative (opt-in via enable_idsva_so_spatial_v2).
+        # No d_workspace param — gravity is handled in the main sweep, not via shim.
+        # Uses its own shared-mem macro (~25 KB for g1 vs shim's ~162 KB).
+        ("idsva_so_spatial_v2", "idsva_so_spatial_v2", "generate_idsva_so_spatial_v2",
+         "IDSVA_SO_SPATIAL_V2_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("idsva_so_spatial_v2_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("idsva_so_spatial_v2_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
         ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("fdsva_so_kernel<T>",
              "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
@@ -884,7 +918,8 @@ class GRiDCodeGenerator:
 
     # finally generate all of the code
     def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
-                     codegen_profile = "all", algorithm_list = None, enable_floating_second_order = False):
+                     codegen_profile = "all", algorithm_list = None, enable_floating_second_order = False,
+                     enable_idsva_so_spatial_v2 = False):
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
@@ -895,6 +930,7 @@ class GRiDCodeGenerator:
         allow_second_order = (not self.robot.floating_base) or enable_floating_second_order
         self.generate_idsva_so = ("idsva_so" in algorithms) and allow_second_order
         self.generate_fdsva_so = ("fdsva_so" in algorithms) and allow_second_order
+        self.generate_idsva_so_spatial_v2 = bool(enable_idsva_so_spatial_v2) and self.generate_idsva_so
         include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
         include_homogenous_transforms = include_homogenous_transforms or include_any_kinematics
         # first generate the file info
@@ -1033,6 +1069,11 @@ class GRiDCodeGenerator:
         if not self.robot.floating_base or enable_floating_second_order:
             if "idsva_so" in algorithms:
                 self.gen_idsva_so(use_thread_group)
+                # Optional: emit the spatial_v2 single-pass alternative path alongside
+                # the existing emission. Co-exists with `idsva_so_kernel`/`idsva_so_host`;
+                # the new entry point is `idsva_so_spatial_v2_kernel`/`idsva_so_spatial_v2_host`.
+                if enable_idsva_so_spatial_v2:
+                    self.gen_idsva_so_spatial_v2(use_thread_group)
             if "fdsva_so" in algorithms:
                 self.gen_fdsva_so(use_thread_group)
         self.gen_combination_functions(algorithms, fixed_target_name)
