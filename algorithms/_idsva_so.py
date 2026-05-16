@@ -2423,10 +2423,6 @@ def gen_idsva_so_host(self, mode = 0):
                                  "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchk(cudaDeviceSynchronize());"])
-        # (Removed) Historical floating-base runtime FD diagnostic that compared the
-        # analytic d2tau_dq path against a `inverse_dynamics_gradient`-based finite
-        # difference. Gated by `GRID_FLOATING_SO_DQ_MODE`. Deleted alongside the macros
-        # — Phase A+B make the analytic floating-base d2tau_dq correct in one pass.
 
     # finally report out timing if requested
     if single_call_timing:
