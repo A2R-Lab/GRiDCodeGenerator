@@ -2412,9 +2412,13 @@ def gen_idsva_so_host(self, mode = 0):
     # TODO - qdd=0 optimization
     
     func_call_code = [f'{func_call_start}{func_call_end}']
-    # wrap function call in timing (if needed)
+    # wrap function call in timing (if needed). The sync between the launch
+    # and `clock_gettime(end)` is REQUIRED: kernel launch is async, so
+    # without it the timer captures only host-side launch overhead, not
+    # actual kernel work. Other algorithms (FD/ABA/etc.) already do this.
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
@@ -2424,10 +2428,19 @@ def gen_idsva_so_host(self, mode = 0):
                                  "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchkKernel();"])
+    else:
+        # compute_only path needs an explicit sync after the kernel launch
+        # so the caller's batch-timing loop captures actual kernel completion
+        # time (otherwise the async launch returns ~immediately and we
+        # measure ~launch-overhead per call regardless of N).
+        self.gen_add_code_line("gpuErrchkKernel();")
 
-    # finally report out timing if requested
+    # finally report out timing if requested. Label format matches the
+    # bench's `parse_grid_output` parser, which keys on "single call idsva_so"
+    # (lowercase): emit "IDSVA_SO" so the parser picks it up. The old
+    # "ID-SO" label was silently dropped by the parser → null timings.
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call ID-SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        self.gen_add_code_line("printf(\"Single Call IDSVA_SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
 
 def gen_idsva_so(self, use_thread_group = False):
@@ -3100,8 +3113,13 @@ def gen_idsva_so_spatial_v2_host(self, mode = 0):
         ])
     self.gen_add_code_line("// then call the kernel")
     func_call_code = [f'{func_call_start}{func_call_end}']
+    # See gen_idsva_so_host for the same fix: sync between launch and
+    # clock_gettime(end) is required for real single-call timing, and
+    # compute_only needs a sync so callers' batch timers see actual
+    # kernel-completion time (not just async-launch overhead).
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so_spatial_v2\", IDSVA_SO_SPATIAL_V2_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
@@ -3111,8 +3129,14 @@ def gen_idsva_so_spatial_v2_host(self, mode = 0):
             "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
             "gpuErrchkKernel();",
         ])
+    else:
+        self.gen_add_code_line("gpuErrchkKernel();")
+    # Label kept distinct from the original IDSVA_SO so a future bench
+    # that times both can keep them separate. The parser doesn't know
+    # this label today; if/when the bench wires it up, add a
+    # _GRID_SINGLE_LABELS entry.
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call SV2 ID-SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        self.gen_add_code_line("printf(\"Single Call IDSVA_SO_SV2 %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
     self.gen_add_end_function()
 
 

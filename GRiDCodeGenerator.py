@@ -1021,6 +1021,23 @@ class GRiDCodeGenerator:
         self.gen_add_includes(use_thread_group)
         # then add the gpu error macro
         self.gen_add_gpu_err()
+        # File-scope preprocessor mirrors of the second-order codegen gates.
+        # We also emit `const int GRID_GENERATES_*_SO` inside `namespace grid`
+        # below (for C++ runtime / test consumers), but `#if X` requires a
+        # preprocessor macro — a namespaced const reads as the undefined-symbol
+        # zero in `#if`, silently turning off any consumer that gates on it
+        # (notably the bench's timeGRiD_{single,batch}.cu measure_* blocks).
+        # Different names from the namespaced const avoid macro/const collision.
+        self.gen_add_code_line(
+            "#define GRID_HAS_IDSVA_SO " + str(int(getattr(self, "generate_idsva_so", True)))
+        )
+        self.gen_add_code_line(
+            "#define GRID_HAS_FDSVA_SO " + str(int(getattr(self, "generate_fdsva_so", True)))
+        )
+        self.gen_add_code_line(
+            "#define GRID_HAS_IDSVA_SO_SPATIAL_V2 " + str(int(getattr(self, "generate_idsva_so_spatial_v2", False)))
+        )
+        self.gen_add_code_line("")
         # then open our namespace
         self.gen_add_func_doc("All functions are kept in this namespace")
         self.gen_add_code_line("namespace " + self.file_namespace + " {", True)
