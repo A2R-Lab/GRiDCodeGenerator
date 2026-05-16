@@ -895,6 +895,16 @@ class GRiDCodeGenerator:
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow() # end of function but don't want spacing
         self.gen_add_code_line("#define gpuErrchk(err) {gpuAssert(err, __FILE__, __LINE__);}")
+        # gpuErrchkKernel catches BOTH (a) synchronous launch-time errors via
+        # cudaPeekAtLastError — e.g. cudaErrorLaunchOutOfResources (code 701)
+        # when the kernel asks for more registers than the SM can give — and
+        # (b) asynchronous execution-time errors via cudaDeviceSynchronize.
+        # Use this after every <<<>>> kernel launch. Plain cudaDeviceSynchronize
+        # alone does NOT propagate launch-time errors: a launch can fail before
+        # work is queued, leaving the stream empty, so sync returns success and
+        # the next call clears the error. That's why the overnight bench was
+        # silently reporting failed launches as ~2us "compute time."
+        self.gen_add_code_line("#define gpuErrchkKernel() {gpuErrchk(cudaPeekAtLastError()); gpuErrchk(cudaDeviceSynchronize());}")
         self.gen_add_code_line("")
 
         # also add printMat for debug if requested

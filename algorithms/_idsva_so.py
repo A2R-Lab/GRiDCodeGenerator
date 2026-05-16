@@ -2297,6 +2297,7 @@ def gen_idsva_so_kernel(self, use_thread_group = False, use_qdd_input = False, s
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
@@ -2405,7 +2406,7 @@ def gen_idsva_so_host(self, mode = 0):
         self.gen_add_code_lines(["// start code with memory transfer", \
                                 "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" + \
                                 ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));", \
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # TODO then compute but adjust for compressed mem and qdd usage
     self.gen_add_code_line("// then call the kernel")
     # TODO - qdd=0 optimization
@@ -2422,7 +2423,7 @@ def gen_idsva_so_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
 
     # finally report out timing if requested
     if single_call_timing:
@@ -3095,7 +3096,7 @@ def gen_idsva_so_spatial_v2_host(self, mode = 0):
         self.gen_add_code_lines([
             "// start code with memory transfer",
             "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));",
-            "gpuErrchk(cudaDeviceSynchronize());",
+            "gpuErrchkKernel();",
         ])
     self.gen_add_code_line("// then call the kernel")
     func_call_code = [f'{func_call_start}{func_call_end}']
@@ -3108,7 +3109,7 @@ def gen_idsva_so_spatial_v2_host(self, mode = 0):
         self.gen_add_code_lines([
             "// finally transfer the result back",
             "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-            "gpuErrchk(cudaDeviceSynchronize());",
+            "gpuErrchkKernel();",
         ])
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call SV2 ID-SO %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")

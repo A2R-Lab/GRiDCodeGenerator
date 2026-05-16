@@ -139,6 +139,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     self.gen_add_func_doc("Computes the gradient of forward dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     extra_t_buffers = [("s_q_qd", 2*n+self.robot.floating_base),
@@ -282,12 +283,12 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
                                  "    gpuErrchk(cudaMemcpyAsync(hd_data->d_Minv,hd_data->h_Minv,NUM_JOINTS*NUM_JOINTS*" + \
                                         ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[2]));", \
                                  "}", \
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # then compute
     self.gen_add_code_line("// then call the kernel")
     func_call = func_call_start + func_call_end
     func_call_with_qdd_minv = func_call_start + "hd_data->d_qdd, hd_data->d_Minv, " + func_call_end
-    func_call_code = ["if (USE_QDD_MINV_FLAG) {" + func_call_with_qdd_minv + "}", "else {" + func_call + "}", "gpuErrchk(cudaDeviceSynchronize());"]
+    func_call_code = ["if (USE_QDD_MINV_FLAG) {" + func_call_with_qdd_minv + "}", "else {" + func_call + "}", "gpuErrchkKernel();"]
     # wrap function call in timing (if needed)
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
@@ -302,7 +303,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_df_du,hd_data->d_df_du,NUM_JOINTS*2*NUM_JOINTS*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
-                                 "gpuErrchk(cudaDeviceSynchronize());"])
+                                 "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
         self.gen_add_code_line("printf(\"Single Call FD_DU %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
