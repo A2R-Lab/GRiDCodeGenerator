@@ -541,7 +541,7 @@ def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = 
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group)
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="Minv")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_anti_licm_output_write("Minv")

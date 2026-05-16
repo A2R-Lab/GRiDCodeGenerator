@@ -224,18 +224,34 @@ def gen_kernel_load_inputs_single_timing(self, name, amount, use_thread_group = 
     self.gen_add_sync(use_thread_group)
 
 def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
-                                     name2 = None, amount2 = 1, name3 = None, amount3 = 1):
+                                     name2 = None, amount2 = 1, name3 = None, amount3 = 1, \
+                                     feedback_from = None):
     """Inside a `for (rep ...)` single_timing loop, reload all inputs from
-    device memory via a `const volatile T *` cast. This forces nvcc -O3 to
-    treat the inputs as unknown across iterations and prevents loop-invariant
-    code motion (LICM) from eliding the algorithm body.
+    device memory via a `const volatile T *` cast, stomp one slot of each
+    input with `static_cast<T>(rep)`, and (when `feedback_from` is given)
+    inject the previous rep's output back into the input. This creates a
+    true loop-carried data dependency that no LICM pass can hoist.
 
-    Mirrors `gen_kernel_load_inputs_single_timing` but emits volatile reads
-    and is intended to be called inside the rep loop body, not before it.
+    The feedback chain is the strongest defense: input[N] := f(d_input,
+    rep, d_output[(rep-k) & 0x3FF])  with output[N] written by the rep N
+    body. Because input N depends on output N-1, output N depends on input
+    N, and so on, ptxas would need to symbolically execute every iteration
+    to find a fixed point — far beyond any LICM pass's budget.
 
-    Without this, nvcc proves that the inner work has stable inputs and
-    elides nearly all of it, producing absurdly fast single-call timings
-    (e.g. the historical fd_du = 0.00 us symptom on a 7-DoF arm).
+    Earlier defenses tried in order of failure:
+      1. `__noinline__ grid_licm_barrier()` — defeated when ptxas stripped
+         the function as no-op self-stores.
+      2. Rep-stomp alone (`s_input[rep % N] = static_cast<T>(rep)`) — kept
+         in this helper as the first line of defense, but ptxas can still
+         prove subsets of work loop-invariant via partial value-range analysis
+         (observed for end_effector_pose_gradient on sm_86 / CUDA 12.6).
+
+    Joint-position values are safe across all GRiD algos: sin/cos are
+    well-defined for any float; the algos don't assert ranges on q/qd/u.
+    `feedback_from` is the name of the output buffer
+    (matching `gen_anti_licm_output_write`'s `store_to_name`), so the read
+    is `d_<feedback_from>[(rep - k) & 0x3FF]`. The output buffer is sized
+    NUM_TIMESTEPS * output_per_step which is comfortably > 1024.
     """
     if _no_licm_barrier():
         # Opt-out path: emit nothing. Inputs were loaded before the rep loop;
@@ -247,10 +263,9 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
         return
     # Both sides are volatile: read forces re-load from global; write to shared
     # via `volatile T *` cast forces nvcc to emit each store and prevents CSE
-    # across iterations. Without the volatile write, nvcc proves the shared
-    # array's contents are loop-invariant for alias reads of subranges (e.g.
-    # s_qd = &s_q_qd_u[NUM_JOINTS]) — which is what made FD/FD_DU/ID_DU
-    # still elide after the -rdc=true switch.
+    # across iterations. The volatile reload alone is insufficient (compiler
+    # can prove d_* contents are loop-invariant when no kernel writes them) —
+    # the rep-stomp below provides the actual LICM defense.
     self.gen_add_code_line("// anti-LICM: volatile reload of inputs each rep")
     self.gen_add_parallel_loop("_aopt_i", amount, use_thread_group)
     self.gen_add_code_line(
@@ -273,19 +288,65 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
         )
         self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    # Compiler-memory clobber + __noinline__ barrier call. With -rdc=true
-    # (set by test/benchmarks/baselines/grid/run.py for both glass and
-    # glass-nvidia backends), nvcc treats grid_licm_barrier as an opaque
-    # cross-CU device function call and cannot hoist the inner-algorithm
-    # work that follows out of the rep loop. The asm clobber doubles as
-    # belt-and-suspenders for the same purpose.
-    self.gen_add_code_line('asm volatile("" ::: "memory");')
-    barrier_args = "s_" + name
+    # anti-LICM defense (1/2): stomp one input slot with `rep`. First line
+    # of defense. The compiler cannot fold the loop induction variable, so
+    # at minimum one input slot provably varies per rep.
+    self.gen_add_code_line("// anti-LICM (1/2): stomp one input slot with `rep`")
+    self.gen_add_code_line("if ((threadIdx.x | threadIdx.y | threadIdx.z) == 0) {")
+    self.gen_add_code_line(
+        "    reinterpret_cast<volatile T *>(s_" + name + ")[rep % (" + str(amount) + ")] = "
+        "static_cast<T>(rep);"
+    )
     if name2 is not None:
-        barrier_args += ", s_" + name2
+        self.gen_add_code_line(
+            "    reinterpret_cast<volatile T *>(s_" + name2 + ")[rep % (" + str(amount2) + ")] = "
+            "static_cast<T>(rep);"
+        )
     if name3 is not None:
-        barrier_args += ", s_" + name3
-    self.gen_add_code_line(f"grid_licm_barrier({barrier_args});")
+        self.gen_add_code_line(
+            "    reinterpret_cast<volatile T *>(s_" + name3 + ")[rep % (" + str(amount3) + ")] = "
+            "static_cast<T>(rep);"
+        )
+    self.gen_add_code_line("}")
+    # anti-LICM defense (2/2): output→input feedback. Reads previous reps'
+    # output values from d_<feedback_from> and adds them into input slots.
+    # Combined with the output write at end of rep, this creates a closed
+    # loop-carried dependency cycle: ptxas would need to symbolically
+    # execute all NUM_TIMESTEPS iterations to find any fixed point, far
+    # beyond any LICM budget. Reading 3 staggered slots ensures even
+    # aggressive cycle analysis can't collapse the chain.
+    if feedback_from is not None:
+        self.gen_add_code_line(
+            "// anti-LICM (2/2): feedback prev rep's d_" + feedback_from
+            + " into s_" + name + " (true loop-carried dep)"
+        )
+        self.gen_add_code_line("if ((threadIdx.x | threadIdx.y | threadIdx.z) == 0) {")
+        self.gen_add_code_line(
+            "    T _aopt_fb1 = reinterpret_cast<const volatile T *>(d_"
+            + feedback_from + ")[(rep + 0x3FF) & 0x3FF];"
+        )
+        self.gen_add_code_line(
+            "    T _aopt_fb2 = reinterpret_cast<const volatile T *>(d_"
+            + feedback_from + ")[(rep + 0x3FE) & 0x3FF];"
+        )
+        self.gen_add_code_line(
+            "    T _aopt_fb3 = reinterpret_cast<const volatile T *>(d_"
+            + feedback_from + ")[(rep + 0x3FD) & 0x3FF];"
+        )
+        self.gen_add_code_line(
+            "    reinterpret_cast<volatile T *>(s_" + name
+            + ")[(rep + 1) % (" + str(amount) + ")] += _aopt_fb1;"
+        )
+        self.gen_add_code_line(
+            "    reinterpret_cast<volatile T *>(s_" + name
+            + ")[(rep + 2) % (" + str(amount) + ")] += _aopt_fb2;"
+        )
+        self.gen_add_code_line(
+            "    reinterpret_cast<volatile T *>(s_" + name
+            + ")[(rep + 3) % (" + str(amount) + ")] += _aopt_fb3;"
+        )
+        self.gen_add_code_line("}")
+    self.gen_add_sync(use_thread_group)
 
 def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
     """Inside a `for (rep ...)` single_timing loop, write the per-iter output's
