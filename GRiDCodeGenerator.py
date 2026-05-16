@@ -768,7 +768,19 @@ class GRiDCodeGenerator:
                 continue
             if gate_attr is None and generated_set is not None and algo_short not in generated_set:
                 continue
-            guarded = (algo_label == "end_effector_pose_gradient_hessian")
+            # Kernels whose shared-mem may exceed the compile target for some
+            # robots (d2ee + fdsva_so on large floating-base) get wrapped in a
+            # compile-time-resolvable size guard so init_grid doesn't fail
+            # registration when the kernel literally can't fit on a device
+            # even with cudaFuncSetAttribute. idsva_so / spatial_v2 are not
+            # guarded — their runtime `grid_check_dynamic_shared_memory_bytes`
+            # picks up the actual per-device cap (which can exceed the codegen
+            # target on some GPUs), and we want them registered so that the
+            # check + attribute setup happens in lockstep.
+            guarded = algo_label in {
+                "end_effector_pose_gradient_hessian",
+                "fdsva_so",
+            }
             indent = "    " if guarded else ""
             if guarded:
                 init_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")

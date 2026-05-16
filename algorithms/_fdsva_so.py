@@ -254,10 +254,13 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];")
-    # Phase D: idsva_so_inner needs a gravity-shim spill pointer when floating-base.
-    # fdsva_so currently routes its own s_fdsva_temp through the SO workspace slot, so
-    # there's no spare region here to hand to the shim — null it out. Full floating-base
-    # fdsva_so correctness is a follow-up that needs to share the SO workspace cleanly.
+    # idsva_so_inner needs a gravity-shim spill pointer when floating-base.
+    # When use_workspace_temp is False, the SO workspace slot is free and we
+    # can hand it to the shim directly. When True (very large robots where
+    # fdsva_so's own temp buffer also lives in workspace), the SO slot is
+    # already taken by s_fdsva_temp — that conflict still needs follow-up
+    # work to either bump the workspace allocation or carve a distinct
+    # region for the grav spill.
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
@@ -275,6 +278,10 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
             self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[k*{4*n**3}];')
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
+        elif self.robot.floating_base:
+            # Hand the SO workspace slot to idsva_so_inner's grav spill. Safe
+            # because !use_workspace_temp means fdsva_so doesn't touch this region.
+            self.gen_add_code_line('s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -303,6 +310,10 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
             self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
+        elif self.robot.floating_base:
+            # Hand the SO workspace slot to idsva_so_inner's grav spill (single
+            # timestep — slot 0 of the per-timestep workspace).
+            self.gen_add_code_line('s_temp_spill = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_add_code_line(fd_start + fd_end)

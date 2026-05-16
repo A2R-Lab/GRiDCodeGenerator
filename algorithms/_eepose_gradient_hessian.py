@@ -688,16 +688,18 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        # TODO(licm-eepose-grad): rep-stomp + output→input feedback is in
-        # place here (and works for ee_pose, aba, crba, fd, id, etc.), but
-        # ee_pose_gradient floating-base on sm_86 / CUDA 12.6 still measures
-        # ~0 µs in single_timing — kernel SASS has the rep loop and 2 CALLs
-        # to non-empty inner functions, but ptxas appears to find some path
-        # to optimize the body away. Root cause unknown; needs deeper SASS
-        # comparison with ee_pose (which does measure correctly) and possibly
-        # a deeper data-flow defense (e.g. write rep into multiple slots, or
-        # have the inner-fn read the feedback value directly). See run notes
-        # from 2026-05-16.
+        # TODO(licm-eepose-grad): sm_86-specific, deprioritized. The
+        # rep-stomp + output→input feedback in gen_anti_licm_input_reload
+        # works for every other algorithm. ee_pose_gradient floating-base
+        # on sm_86 / CUDA 12.6 still measures ~0 µs in single_timing — kernel
+        # SASS has the rep loop and 2 CALLs to non-empty inner functions,
+        # but ptxas appears to find some path to optimize the body away.
+        # Confirmed sm_120 / Blackwell is fine (iiwa14_fixed 1.78 µs,
+        # iiwa14_floating 306 µs, g1_floating 322 µs single-call, all real;
+        # smoke 2026-05-16). If/when someone needs to fix on sm_86, do a
+        # SASS diff vs ee_pose (which does measure correctly) and consider
+        # a stronger defense (write rep into multiple slots, or have the
+        # inner-fn read the feedback value directly).
         self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
         # then load/update X and run the algo
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
