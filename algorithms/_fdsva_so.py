@@ -162,7 +162,8 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
     self.gen_add_code_line(fdsva_so_code)
 
 def gen_fdsva_so_device(self, use_thread_group = False):
-    n = self.robot.get_num_pos()
+    # NUM_VEL is the SO tensor dimension. See gen_fdsva_so_kernel for details.
+    n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
                    "s_df_du is a pointer to memory for the derivative of forward dynamics WRT q,qd of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
@@ -210,7 +211,13 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
+    # NUM_VEL is the SO tensor dimension (rank-3 nv*nv*nv) and the Minv /
+    # df_du / qdd dimension; NUM_POS is only the q-vector size (differs from
+    # NUM_VEL for floating-base because of the quaternion). fdsva_so_inner
+    # itself already uses NUM_VEL for all math; matching here is what fixes
+    # the floating-base OOB writes to s_df2 and s_idsva_so.
+    n = self.robot.get_num_vel()
+    NUM_POS = self.robot.get_num_pos()
     use_global_tensors = getattr(self, "fdsva_so_use_global_tensors", n > MEMORY_THRESHOLD)
     use_workspace_temp = getattr(self, "fdsva_so_use_workspace_temp", False)
     shared_temp_size = max(
@@ -243,8 +250,8 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
 
-    # add shared memory variables
-    extra_t_buffers = [("s_q_qd_u", 4*n), ("s_Minv", n*n), ("s_qdd", n), ("s_df_du", 2*n*n)]
+    # add shared memory variables — NUM_POS for q, NUM_VEL (n) for everything else
+    extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_Minv", n*n), ("s_qdd", n), ("s_df_du", 2*n*n)]
     if not use_global_tensors:
         extra_t_buffers.append(("s_idsva_so", n*n*n*4))
         extra_t_buffers.append(("s_df2", 4*n*n*n))
@@ -253,7 +260,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_code_line("(void)d_workspace;")
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
-    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];")
+    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
     # idsva_so_body_frame_inner needs a gravity-shim spill pointer when floating-base.
     # When use_workspace_temp is False, the SO workspace slot is free and we
     # can hand it to the shim directly. When True (very large robots where
@@ -272,7 +279,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(NUM_POS + 2*n),use_thread_group)
         if use_global_tensors:
             self.gen_add_code_line(f'T *s_df2 = &d_df2[k*{4*n**3}];')
             self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[k*{4*n**3}];')
@@ -300,11 +307,11 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n),use_thread_group)
+        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u",str(3*n),use_thread_group)
+        self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
         if use_global_tensors:
             self.gen_add_code_line('T *s_df2 = d_df2;')
             self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')
@@ -329,7 +336,8 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     self.gen_add_end_function()
 
 def gen_fdsva_so_host(self, mode = 0):
-    n = self.robot.get_num_pos()
+    # NUM_VEL is the SO tensor dimension. See gen_fdsva_so_kernel for details.
+    n = self.robot.get_num_vel()
     # default is to do the full kernel call -- options are for single timing or compute only kernel wrapper
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
@@ -360,7 +368,7 @@ def gen_fdsva_so_host(self, mode = 0):
 
     func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_workspace,hd_data->d_idsva_so,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
-    self.gen_add_code_line("int stride_q_qd_qdd = 3*NUM_JOINTS;")
+    self.gen_add_code_line("int stride_q_qd_qdd = Q_QD_U_STRIDE;")
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
