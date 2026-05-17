@@ -193,7 +193,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
-    # Phase D: floating-base idsva_so_inner takes a gravity-shim spill pointer.
+    # Phase D: floating-base idsva_so_body_frame_inner takes a gravity-shim spill pointer.
     # fdsva_so_device currently nulls it out — floating-base fdsva_so runtime correctness
     # requires plumbing d_workspace through this device function (follow-up).
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
@@ -204,8 +204,8 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, gravity);")
     self.gen_add_sync(use_thread_group)
     self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
-    self.gen_idsva_so_inner_function_call(use_thread_group)
-    self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
+    self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
+    self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
     self.gen_fdsva_so_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
@@ -214,7 +214,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     use_global_tensors = getattr(self, "fdsva_so_use_global_tensors", n > MEMORY_THRESHOLD)
     use_workspace_temp = getattr(self, "fdsva_so_use_workspace_temp", False)
     shared_temp_size = max(
-        self.gen_idsva_so_inner_temp_mem_size(),
+        self.gen_idsva_so_body_frame_inner_temp_mem_size(),
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
     )
     if not use_workspace_temp:
@@ -254,7 +254,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n) + "]; T *s_u = &s_q_qd_u[2 * " + str(n) + "];")
-    # idsva_so_inner needs a gravity-shim spill pointer when floating-base.
+    # idsva_so_body_frame_inner needs a gravity-shim spill pointer when floating-base.
     # When use_workspace_temp is False, the SO workspace slot is free and we
     # can hand it to the shim directly. When True (very large robots where
     # fdsva_so's own temp buffer also lives in workspace), the SO slot is
@@ -279,7 +279,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         elif self.robot.floating_base:
-            # Hand the SO workspace slot to idsva_so_inner's grav spill. Safe
+            # Hand the SO workspace slot to idsva_so_body_frame_inner's grav spill. Safe
             # because !use_workspace_temp means fdsva_so doesn't touch this region.
             self.gen_add_code_line('s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         # compute
@@ -290,8 +290,8 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
-        self.gen_idsva_so_inner_function_call(use_thread_group)
-        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_sync(use_thread_group)
@@ -311,7 +311,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         elif self.robot.floating_base:
-            # Hand the SO workspace slot to idsva_so_inner's grav spill (single
+            # Hand the SO workspace slot to idsva_so_body_frame_inner's grav spill (single
             # timestep — slot 0 of the per-timestep workspace).
             self.gen_add_code_line('s_temp_spill = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
@@ -319,8 +319,8 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
-        self.gen_idsva_so_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
-        self.gen_idsva_so_public_dvdq_layout_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_end_control_flow()

@@ -44,12 +44,12 @@ class GRiDCodeGenerator:
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
-                            gen_idsva_so_inner_temp_mem_size, gen_idsva_so_inner_function_call, idsva_so_needs_reference_order_output_repair, \
-                            gen_idsva_so_reference_order_output_repair, gen_idsva_so_floating_reference_inner, gen_idsva_so_public_dvdq_layout_repair, gen_idsva_so_inner, gen_idsva_so_device_temp_mem_size, \
-                            gen_idsva_so_device, gen_idsva_so_kernel, gen_idsva_so_host, gen_idsva_so, \
-                            gen_idsva_so_spatial_v2_temp_mem_size, gen_idsva_so_spatial_v2_inner, \
-                            gen_idsva_so_spatial_v2_inner_function_call, gen_idsva_so_spatial_v2_kernel, \
-                            gen_idsva_so_spatial_v2_host, gen_idsva_so_spatial_v2, \
+                            gen_idsva_so_body_frame_inner_temp_mem_size, gen_idsva_so_body_frame_inner_function_call, idsva_so_needs_reference_order_output_repair, \
+                            gen_idsva_so_reference_order_output_repair, gen_idsva_so_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, gen_idsva_so_device_temp_mem_size, \
+                            gen_idsva_so_body_frame_device, gen_idsva_so_body_frame_kernel, gen_idsva_so_body_frame_host, gen_idsva_so_body_frame, \
+                            gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
+                            gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \
+                            gen_idsva_so_world_frame_host, gen_idsva_so_world_frame, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
@@ -76,16 +76,16 @@ class GRiDCodeGenerator:
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
         all_algorithms = {
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
-            "idsva_so", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
+            "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
         }
         profile_algorithms = {
             "all": all_algorithms,
-            "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so", "fdsva_so"},
+            "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so"},
             "dynamics-core": {"id", "minv", "fd"},
             "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du"},
             "kinematics": {"ee_pose"},
             "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
-            "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so", "fdsva_so"},
+            "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame", "fdsva_so"},
         }
         aliases = {
             "all-dynamics": "dynamics",
@@ -99,7 +99,7 @@ class GRiDCodeGenerator:
             "id-gradient": "id_du",
             "forward-dynamics-gradient": "fd_du",
             "fd-gradient": "fd_du",
-            "idsva-so": "idsva_so",
+            "idsva-so": "idsva_so_body_frame",
             "fdsva-so": "fdsva_so",
             "ee-pose": "ee_pose",
             "end-effector-pose": "ee_pose",
@@ -140,8 +140,8 @@ class GRiDCodeGenerator:
         if "aba" in algorithms and self.robot.floating_base:
             algorithms.update({"id", "minv", "fd"})
         if "fdsva_so" in algorithms:
-            algorithms.update({"id", "minv", "fd", "id_du", "fd_du", "idsva_so"})
-        if "idsva_so" in algorithms:
+            algorithms.update({"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame"})
+        if "idsva_so_body_frame" in algorithms:
             algorithms.add("id")
             if self.robot.floating_base:
                 algorithms.add("id_du")
@@ -338,35 +338,35 @@ class GRiDCodeGenerator:
         # would exceed the target, recompute with the gravity-shim's dX/a/da/f/df
         # spilled into d_workspace alongside d2X/d2a/d2f. Saves 50-60 KB on g1-class
         # robots without changing iiwa14/go2 behavior.
-        self.idsva_so_grav_full_spill = False
-        idsva_so_inner_temp_count = self.gen_idsva_so_inner_temp_mem_size()
-        idsva_so_base_t_count = (2*nv + n) + idsva_so_inner_temp_count + XI_size
-        idsva_so_full_t_count = idsva_so_base_t_count + 4*nv**3
-        self.idsva_so_use_global_output = py_arena_bytes(idsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
-        idsva_so_t_count = idsva_so_base_t_count if self.idsva_so_use_global_output else idsva_so_full_t_count
-        if self.robot.floating_base and py_arena_bytes(idsva_so_t_count) > self.cuda_target_shared_mem_bytes:
-            self.idsva_so_grav_full_spill = True
-            idsva_so_inner_temp_count = self.gen_idsva_so_inner_temp_mem_size()
-            idsva_so_base_t_count = (2*nv + n) + idsva_so_inner_temp_count + XI_size
-            idsva_so_full_t_count = idsva_so_base_t_count + 4*nv**3
-            self.idsva_so_use_global_output = py_arena_bytes(idsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
-            idsva_so_t_count = idsva_so_base_t_count if self.idsva_so_use_global_output else idsva_so_full_t_count
+        self.idsva_so_body_frame_grav_full_spill = False
+        idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+        idsva_so_body_frame_base_t_count = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
+        idsva_so_body_frame_full_t_count = idsva_so_body_frame_base_t_count + 4*nv**3
+        self.idsva_so_body_frame_use_global_output = py_arena_bytes(idsva_so_body_frame_full_t_count) > self.cuda_target_shared_mem_bytes
+        idsva_so_body_frame_t_count = idsva_so_body_frame_base_t_count if self.idsva_so_body_frame_use_global_output else idsva_so_body_frame_full_t_count
+        if self.robot.floating_base and py_arena_bytes(idsva_so_body_frame_t_count) > self.cuda_target_shared_mem_bytes:
+            self.idsva_so_body_frame_grav_full_spill = True
+            idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+            idsva_so_body_frame_base_t_count = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
+            idsva_so_body_frame_full_t_count = idsva_so_body_frame_base_t_count + 4*nv**3
+            self.idsva_so_body_frame_use_global_output = py_arena_bytes(idsva_so_body_frame_full_t_count) > self.cuda_target_shared_mem_bytes
+            idsva_so_body_frame_t_count = idsva_so_body_frame_base_t_count if self.idsva_so_body_frame_use_global_output else idsva_so_body_frame_full_t_count
 
-        # spatial_v2 path has its own (smaller) scratch — no gravity-shim shared, no
-        # main-sweep extras. Sized via gen_idsva_so_spatial_v2_temp_mem_size.
-        idsva_so_spatial_v2_inner_temp_count = self.gen_idsva_so_spatial_v2_temp_mem_size() if self.robot.floating_base else idsva_so_inner_temp_count
-        idsva_so_spatial_v2_base_t_count = (2*nv + n) + idsva_so_spatial_v2_inner_temp_count + XI_size
-        idsva_so_spatial_v2_full_t_count = idsva_so_spatial_v2_base_t_count + 4*nv**3
-        self.idsva_so_spatial_v2_use_global_output = py_arena_bytes(idsva_so_spatial_v2_full_t_count) > self.cuda_target_shared_mem_bytes
-        idsva_so_spatial_v2_t_count = idsva_so_spatial_v2_base_t_count if self.idsva_so_spatial_v2_use_global_output else idsva_so_spatial_v2_full_t_count
+        # world-frame path has its own (smaller) scratch — no gravity-shim shared, no
+        # main-sweep extras. Sized via gen_idsva_so_world_frame_temp_mem_size.
+        idsva_so_world_frame_inner_temp_count = self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base else idsva_so_body_frame_inner_temp_count
+        idsva_so_world_frame_base_t_count = (2*nv + n) + idsva_so_world_frame_inner_temp_count + XI_size
+        idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
+        self.idsva_so_world_frame_use_global_output = py_arena_bytes(idsva_so_world_frame_full_t_count) > self.cuda_target_shared_mem_bytes
+        idsva_so_world_frame_t_count = idsva_so_world_frame_base_t_count if self.idsva_so_world_frame_use_global_output else idsva_so_world_frame_full_t_count
 
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
         fdsva_so_inner_temp_count = 4*nv**3
         fdsva_so_fd_gradient_inline_temp_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
-        fdsva_so_shared_temp_count = max(idsva_so_inner_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        fdsva_so_shared_temp_count = max(idsva_so_body_frame_inner_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         fdsva_so_full_t_count = fdsva_so_base_t_count + 8*nv**3 + fdsva_so_shared_temp_count
         fdsva_so_global_t_count = fdsva_so_base_t_count + fdsva_so_shared_temp_count
-        fdsva_so_workspace_temp_t_count = fdsva_so_base_t_count + max(idsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        fdsva_so_workspace_temp_t_count = fdsva_so_base_t_count + max(idsva_so_body_frame_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         self.fdsva_so_use_global_tensors = py_arena_bytes(fdsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
         self.fdsva_so_use_workspace_temp = (
             self.fdsva_so_use_global_tensors and
@@ -387,8 +387,8 @@ class GRiDCodeGenerator:
             d2ee_workspace_t_count += d2Xhom_size
         # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
         # tensors live in d_workspace instead of shared memory for larger robots.
-        idsva_so_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, idsva_so_grav_spill_t_count)
+        idsva_so_body_frame_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, idsva_so_body_frame_grav_spill_t_count)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -414,10 +414,10 @@ class GRiDCodeGenerator:
                                  "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
                                  "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
-                                 "const int GRID_GENERATES_IDSVA_SO = " + str(int(getattr(self, "generate_idsva_so", True))) + ";", \
+                                 "const int GRID_GENERATES_IDSVA_SO_BODY_FRAME = " + str(int(getattr(self, "generate_idsva_so_body_frame", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
                                  "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
-                                 "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_use_global_output)) + ";", \
+                                 "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_body_frame_use_global_output)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_GLOBAL_TENSORS = " + str(int(self.fdsva_so_use_global_tensors)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_TEMP = " + str(int(self.fdsva_so_use_workspace_temp)) + ";", \
                                  "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_temp)) + ";", \
@@ -440,7 +440,7 @@ class GRiDCodeGenerator:
                                  "const int EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(ee_t_count)) + ";", \
                                  "const int DEE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(dee_t_count)) + ";", \
                                  "const int D2EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(d2ee_t_count)) + ";", \
-                                 f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(idsva_so_t_count)};", \
+                                 f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(idsva_so_body_frame_t_count)};", \
                                  f"const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(fdsva_so_t_count)};", \
                                  "const int SUGGESTED_THREADS = " + str(self.suggested_threads) + ";"]) # max of 512 to avoid exceeding available registers
         self.gen_add_code_lines([
@@ -470,8 +470,8 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(d2ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_SPATIAL_V2_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_spatial_v2_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_body_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_world_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fdsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(so_workspace_t_count) + "); }",
@@ -482,7 +482,7 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>() + (GRID_D2EE_USES_WORKSPACE_D2XHOM ? sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT) : 0); }",
-                                 "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_D2EE || D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_IDSVA_SO || IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
+                                 "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_D2EE || D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_IDSVA_SO_BODY_FRAME || IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
                                  "__host__ __device__ inline bool grid_q_index_affects_joint(const int q_index, const int joint_id) {",
                                  ("    if (joint_id == 0) { return q_index >= 0 && q_index < 7; } return q_index == joint_id + 6;" if self.robot.floating_base else "    return q_index == joint_id;"),
                                  "}",
@@ -711,20 +711,20 @@ class GRiDCodeGenerator:
             ("forward_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("idsva_so", "idsva_so", "generate_idsva_so", "IDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("idsva_so_kernel<T>",
+        ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("idsva_so_body_frame_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-            ("idsva_so_kernel_single_timing<T>",
+            ("idsva_so_body_frame_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        # spatial_v2-style single-pass alternative (opt-in via enable_idsva_so_spatial_v2).
+        # world-frame single-pass alternative (opt-in via enable_idsva_so_world_frame).
         # No d_workspace param — gravity is handled in the main sweep, not via shim.
         # Uses its own shared-mem macro (~25 KB for g1 vs shim's ~162 KB).
-        ("idsva_so_spatial_v2", "idsva_so_spatial_v2", "generate_idsva_so_spatial_v2",
-         "IDSVA_SO_SPATIAL_V2_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("idsva_so_spatial_v2_kernel<T>",
+        ("idsva_so_world_frame", "idsva_so_world_frame", "generate_idsva_so_world_frame",
+         "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("idsva_so_world_frame_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
-            ("idsva_so_spatial_v2_kernel_single_timing<T>",
+            ("idsva_so_world_frame_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
@@ -772,7 +772,7 @@ class GRiDCodeGenerator:
             # robots (d2ee + fdsva_so on large floating-base) get wrapped in a
             # compile-time-resolvable size guard so init_grid doesn't fail
             # registration when the kernel literally can't fit on a device
-            # even with cudaFuncSetAttribute. idsva_so / spatial_v2 are not
+            # even with cudaFuncSetAttribute. idsva_so / world_frame are not
             # guarded — their runtime `grid_check_dynamic_shared_memory_bytes`
             # picks up the actual per-device cap (which can exceed the codegen
             # target on some GPUs), and we want them registered so that the
@@ -941,7 +941,7 @@ class GRiDCodeGenerator:
     # finally generate all of the code
     def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = False,
-                     enable_idsva_so_spatial_v2 = False):
+                     enable_idsva_so_world_frame = False):
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
@@ -950,9 +950,9 @@ class GRiDCodeGenerator:
         self.generate_ee_pose_hessian = "ee_pose_hessian" in algorithms
         self.enable_floating_second_order = enable_floating_second_order
         allow_second_order = (not self.robot.floating_base) or enable_floating_second_order
-        self.generate_idsva_so = ("idsva_so" in algorithms) and allow_second_order
+        self.generate_idsva_so_body_frame = ("idsva_so_body_frame" in algorithms) and allow_second_order
         self.generate_fdsva_so = ("fdsva_so" in algorithms) and allow_second_order
-        self.generate_idsva_so_spatial_v2 = bool(enable_idsva_so_spatial_v2) and self.generate_idsva_so
+        self.generate_idsva_so_world_frame = bool(enable_idsva_so_world_frame) and self.generate_idsva_so_body_frame
         include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
         include_homogenous_transforms = include_homogenous_transforms or include_any_kinematics
         # first generate the file info
@@ -1013,9 +1013,9 @@ class GRiDCodeGenerator:
             "    __global__ end_effector_pose_gradient_hessian_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_gradient_hessian<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ idsva_so_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, T *s_XImats, T *s_mem, const T gravity)",\
-            "    __global__ idsva_so_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
-            "    __host__   idsva_so_host<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __device__ idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, T *s_XImats, T *s_mem, const T gravity)",\
+            "    __global__ idsva_so_body_frame_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
+            "    __host__   idsva_so_body_frame_host<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ fdsva_so_inner(T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau, T *s_XImats, T *s_temp, const T gravity)",\
             "    __device__ fdsva_so_device(T *s_df2, T *s_df_du, const T *s_q, const T *s_qd, const T *s_u, const robotModel<T> *d_robotModel, const T gravity)", \
@@ -1041,13 +1041,13 @@ class GRiDCodeGenerator:
         # (notably the bench's timeGRiD_{single,batch}.cu measure_* blocks).
         # Different names from the namespaced const avoid macro/const collision.
         self.gen_add_code_line(
-            "#define GRID_HAS_IDSVA_SO " + str(int(getattr(self, "generate_idsva_so", True)))
+            "#define GRID_HAS_IDSVA_SO_BODY_FRAME " + str(int(getattr(self, "generate_idsva_so_body_frame", True)))
         )
         self.gen_add_code_line(
             "#define GRID_HAS_FDSVA_SO " + str(int(getattr(self, "generate_fdsva_so", True)))
         )
         self.gen_add_code_line(
-            "#define GRID_HAS_IDSVA_SO_SPATIAL_V2 " + str(int(getattr(self, "generate_idsva_so_spatial_v2", False)))
+            "#define GRID_HAS_IDSVA_SO_WORLD_FRAME " + str(int(getattr(self, "generate_idsva_so_world_frame", False)))
         )
         self.gen_add_code_line("")
         # then open our namespace
@@ -1106,13 +1106,13 @@ class GRiDCodeGenerator:
         if "crba" in algorithms:
             self.gen_crba(use_thread_group)
         if not self.robot.floating_base or enable_floating_second_order:
-            if "idsva_so" in algorithms:
-                self.gen_idsva_so(use_thread_group)
-                # Optional: emit the spatial_v2 single-pass alternative path alongside
-                # the existing emission. Co-exists with `idsva_so_kernel`/`idsva_so_host`;
-                # the new entry point is `idsva_so_spatial_v2_kernel`/`idsva_so_spatial_v2_host`.
-                if enable_idsva_so_spatial_v2:
-                    self.gen_idsva_so_spatial_v2(use_thread_group)
+            if "idsva_so_body_frame" in algorithms:
+                self.gen_idsva_so_body_frame(use_thread_group)
+                # Optional: emit the world-frame single-pass alternative path alongside
+                # the existing emission. Co-exists with `idsva_so_body_frame_kernel`/`idsva_so_body_frame_host`;
+                # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame_host`.
+                if enable_idsva_so_world_frame:
+                    self.gen_idsva_so_world_frame(use_thread_group)
             if "fdsva_so" in algorithms:
                 self.gen_fdsva_so(use_thread_group)
         self.gen_combination_functions(algorithms, fixed_target_name)
