@@ -381,8 +381,9 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_crba_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
-        # save to global
-        self.gen_kernel_save_result("M","1",str(nv*nv),use_thread_group)
+        # save to global  (stride = nv*nv per timestep — without this, batches
+        # overlap since each block writes nv*nv elements starting at offset k*1)
+        self.gen_kernel_save_result("M",str(nv*nv),str(nv*nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
