@@ -45,7 +45,7 @@ class GRiDCodeGenerator:
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
                             gen_idsva_so_body_frame_inner_temp_mem_size, gen_idsva_so_body_frame_inner_function_call, idsva_so_needs_reference_order_output_repair, \
-                            gen_idsva_so_reference_order_output_repair, gen_idsva_so_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, gen_idsva_so_device_temp_mem_size, \
+                            gen_idsva_so_body_frame_reference_order_output_repair, gen_idsva_so_body_frame_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, gen_idsva_so_body_frame_device_temp_mem_size, \
                             gen_idsva_so_body_frame_device, gen_idsva_so_body_frame_kernel, gen_idsva_so_body_frame_host, gen_idsva_so_body_frame, \
                             gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
                             gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \

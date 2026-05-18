@@ -253,7 +253,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
 
     Translates the Python helper `_floating_gravity_d2tau_dq_lie_direct` (see
     `RBDReference/RBDReference.py`) into CUDA emission for use inside
-    `gen_idsva_so_floating_reference_inner`.
+    `gen_idsva_so_body_frame_floating_reference_inner`.
 
     Preconditions (set up by the caller):
       - `Xup[NB*36]` contains cumulative world-frame joint transforms.
@@ -799,7 +799,7 @@ def idsva_so_needs_reference_order_output_repair(self):
     parent_ids = [self.robot.get_parent_id(jid) for jid in range(self.robot.get_num_joints())]
     return idsva_so_parent_topology_needs_reference_order_output_repair(parent_ids)
 
-def gen_idsva_so_reference_order_output_repair(self, use_thread_group = False):
+def gen_idsva_so_body_frame_reference_order_output_repair(self, use_thread_group = False):
     """
     Emits a serial final tensor assembly pass that mirrors RBDReference.idsva_so.
 
@@ -925,7 +925,7 @@ def gen_idsva_so_reference_order_output_repair(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
-def gen_idsva_so_floating_reference_inner(self, use_thread_group = False, use_qdd_input = False):
+def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = False, use_qdd_input = False):
     """
     Emits a floating-base diagnostic IDSVA-SO path with explicit body/velocity
     split memory. Fixed-base keeps the optimized generator path below.
@@ -1303,7 +1303,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     idsva.
     """
     if self.robot.floating_base:
-        self.gen_idsva_so_floating_reference_inner(use_thread_group, use_qdd_input)
+        self.gen_idsva_so_body_frame_floating_reference_inner(use_thread_group, use_qdd_input)
         return
 
     NV = self.robot.get_num_vel()
@@ -2192,7 +2192,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_sync(use_thread_group)
 
     if self.idsva_so_needs_reference_order_output_repair():
-        self.gen_idsva_so_reference_order_output_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_reference_order_output_repair(use_thread_group)
 
     self.gen_add_end_function()
 
@@ -2227,7 +2227,7 @@ def gen_idsva_so_body_frame_public_dvdq_layout_repair(self, use_thread_group = F
     self.gen_add_sync(use_thread_group)
 
 
-def gen_idsva_so_device_temp_mem_size(self):
+def gen_idsva_so_body_frame_device_temp_mem_size(self):
     return self.gen_idsva_so_body_frame_inner_temp_mem_size()
     
 
@@ -2463,7 +2463,7 @@ def gen_idsva_so_body_frame(self, use_thread_group = False):
 # `RBDReference.idsva_so_world_frame` (a faithful port of spatial_v2_extended's
 # `ID_SO_derivatives.m`). World-frame propagation; gravity baked into the main
 # sweep at the floating-base root; no separate gravity-shim. Co-exists with the
-# existing shim-based `gen_idsva_so_floating_reference_inner` path.
+# existing shim-based `gen_idsva_so_body_frame_floating_reference_inner` path.
 # =============================================================================
 
 def gen_idsva_so_world_frame_temp_mem_size(self):
