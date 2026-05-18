@@ -834,7 +834,8 @@ def gen_aba_host(self, mode = 0):
                                 "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call ABA %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("aba"))
     self.gen_add_end_function()
 
 def gen_aba(self, use_thread_group = False):

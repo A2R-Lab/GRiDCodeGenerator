@@ -324,7 +324,8 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call EEPOS %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("ee_pose"))
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_inner_temp_mem_size(self, fixed_target_name = ""):
@@ -776,7 +777,8 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call DEEPOS %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("ee_pose_gradient"))
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_hessian_d2_temp_mem_size(self):
@@ -1353,7 +1355,8 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested
     if single_call_timing:
-        self.gen_add_code_line("printf(\"Single Call DEEPOS %fus\\n\",time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));")
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("ee_pose_gradient"))
     self.gen_add_end_function()
 
 def gen_X_single_thread(self, fixed_target_name = ""):

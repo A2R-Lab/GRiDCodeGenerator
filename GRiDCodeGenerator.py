@@ -50,9 +50,10 @@ class GRiDCodeGenerator:
                             gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
                             gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \
                             gen_idsva_so_world_frame_host, gen_idsva_so_world_frame, \
+                            gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
-                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
+                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
 
     # finally import the test code
@@ -363,15 +364,37 @@ class GRiDCodeGenerator:
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
         fdsva_so_inner_temp_count = 4*nv**3
         fdsva_so_fd_gradient_inline_temp_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
-        fdsva_so_shared_temp_count = max(idsva_so_body_frame_inner_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        # fdsva_so dispatches to world_frame_inner for floating-base (smaller
+        # footprint + no grav-shim spill) and body_frame_inner for fixed-base.
+        fdsva_so_inner_idsva_so_temp_count = (
+            idsva_so_world_frame_inner_temp_count if self.robot.floating_base
+            else idsva_so_body_frame_inner_temp_count
+        )
+        fdsva_so_shared_temp_count = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         fdsva_so_full_t_count = fdsva_so_base_t_count + 8*nv**3 + fdsva_so_shared_temp_count
         fdsva_so_global_t_count = fdsva_so_base_t_count + fdsva_so_shared_temp_count
-        fdsva_so_workspace_temp_t_count = fdsva_so_base_t_count + max(idsva_so_body_frame_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         self.fdsva_so_use_global_tensors = py_arena_bytes(fdsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
         self.fdsva_so_use_workspace_temp = (
             self.fdsva_so_use_global_tensors and
             py_arena_bytes(fdsva_so_global_t_count) > self.cuda_target_shared_mem_bytes
         )
+        # MEM1: fd_grad_inline's id_du_gradient_inner can spill its da_dq..fxvi
+        # band into d_workspace's grad section (same pattern id_du_kernel uses).
+        # Triggers ON ROBOT SIZE — whenever the kernel without spill would
+        # exceed the target shared-mem cap. Decoupled from use_workspace_temp
+        # so it's a generic size-based pattern reusable for other algos.
+        fdsva_so_fd_gradient_inline_spilled_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled()
+        no_spill_t_count = fdsva_so_base_t_count + max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        if self.fdsva_so_use_workspace_temp:
+            no_spill_t_count_workspace_tier = no_spill_t_count
+        else:
+            # in the global-tensors-but-not-workspace tier, fdsva_so_inner also lives in shared
+            no_spill_t_count_workspace_tier = no_spill_t_count + fdsva_so_inner_temp_count
+        self.fdsva_so_fd_grad_use_spill = (
+            py_arena_bytes(no_spill_t_count_workspace_tier) > self.cuda_target_shared_mem_bytes
+        )
+        spilled_t_count = fdsva_so_base_t_count + max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
+        fdsva_so_workspace_temp_t_count = spilled_t_count if self.fdsva_so_fd_grad_use_spill else no_spill_t_count
         if self.fdsva_so_use_global_tensors:
             fdsva_so_t_count = fdsva_so_workspace_temp_t_count if self.fdsva_so_use_workspace_temp else fdsva_so_global_t_count
         else:
@@ -748,15 +771,23 @@ class GRiDCodeGenerator:
     def gen_init_close_grid(self):
         # set the max shared mem to account for large robots and allocate streams
         MAX_STREAMS = 3 # max needed in any of our functions
-        self.gen_add_func_doc("Sets MaxDynamicSharedMemorySize for every algorithm kernel and initializes streams for host functions", \
-                              [], [], "A pointer to the array of streams")
+        # ----- init_grid_kernel_attrs<T>(): cudaFuncSetAttribute for every kernel --
+        # Split out from init_grid so per-algo TU callers can invoke ONLY the
+        # attribute-setting part (without stream allocation), needed because
+        # cudaFuncSetAttribute operates on the TU-local host stub. The per-algo
+        # TU split (P6-7b) calls this from a static initializer in each
+        # measure_X_*_entry so its stubs get the attribute set.
+        self.gen_add_func_doc("Set MaxDynamicSharedMemorySize for every algorithm kernel "
+                              "(callable from any TU; idempotent). __forceinline__ is "
+                              "REQUIRED so the &kernel<T> expressions resolve to the "
+                              "CALLING TU's host stubs — otherwise the linker merges this "
+                              "function across TUs and we set the attribute on one TU's "
+                              "stubs while the launch goes through a different TU's.",
+                              [], [], None)
         self.gen_add_code_line("template <typename T>")
-        self.gen_add_code_line("__host__")
-        self.gen_add_code_line("cudaStream_t *init_grid(){", True)
-        # Enable opt-in dynamic shared memory for every generated algorithm
-        # kernel. See KERNEL_ATTR_MANIFEST docstring for why this matters
-        # (silently-failing launches on g1 floating ABA/FD/MINV without it).
-        init_lines = ["// enable opt-in dynamic shared memory for every algorithm kernel"]
+        self.gen_add_code_line("__host__ __forceinline__")
+        self.gen_add_code_line("void init_grid_kernel_attrs(){", True)
+        attr_lines = ["// enable opt-in dynamic shared memory for every algorithm kernel"]
         generated_set = getattr(self, "generated_algorithms", None)
         alias_counter = 0
         for entry in self.KERNEL_ATTR_MANIFEST:
@@ -783,24 +814,34 @@ class GRiDCodeGenerator:
             }
             indent = "    " if guarded else ""
             if guarded:
-                init_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
-            init_lines.append(f"{indent}gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
+                attr_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
+            attr_lines.append(f"{indent}gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
             for kernel_name, signature in kernels:
                 alias = f"_grid_kern_alias_{alias_counter}"
                 alias_counter += 1
-                init_lines.append(f"{indent}auto {alias} = static_cast<{signature}>(&{kernel_name});")
-                init_lines.append(f"{indent}gpuErrchk(cudaFuncSetAttribute({alias}, cudaFuncAttributeMaxDynamicSharedMemorySize, {bytes_macro}));")
+                attr_lines.append(f"{indent}auto {alias} = static_cast<{signature}>(&{kernel_name});")
+                attr_lines.append(f"{indent}gpuErrchk(cudaFuncSetAttribute({alias}, cudaFuncAttributeMaxDynamicSharedMemorySize, {bytes_macro}));")
             if guarded:
-                init_lines.append("}")
-        init_lines += ["gpuErrchk(cudaDeviceSynchronize());",
-                       "// allocate streams",
-                       "cudaStream_t *streams = (cudaStream_t *)malloc(" + str(MAX_STREAMS) + "*sizeof(cudaStream_t));",
-                       "int priority, minPriority, maxPriority;",
-                       "gpuErrchk(cudaDeviceGetStreamPriorityRange(&minPriority, &maxPriority));",
-                       "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){",
-                       "    int adjusted_max = maxPriority - i; priority = adjusted_max > minPriority ? adjusted_max : minPriority;",
-                       "    gpuErrchk(cudaStreamCreateWithPriority(&(streams[i]),cudaStreamNonBlocking,priority));",
-                       "}", "return streams;"]
+                attr_lines.append("}")
+        self.gen_add_code_lines(attr_lines)
+        self.gen_add_end_function()
+
+        # ----- init_grid<T>(): full init = attrs + streams (the original API) ----
+        self.gen_add_func_doc("Sets MaxDynamicSharedMemorySize for every algorithm kernel and initializes streams for host functions", \
+                              [], [], "A pointer to the array of streams")
+        self.gen_add_code_line("template <typename T>")
+        self.gen_add_code_line("__host__")
+        self.gen_add_code_line("cudaStream_t *init_grid(){", True)
+        init_lines = ["init_grid_kernel_attrs<T>();",
+                      "gpuErrchk(cudaDeviceSynchronize());",
+                      "// allocate streams",
+                      "cudaStream_t *streams = (cudaStream_t *)malloc(" + str(MAX_STREAMS) + "*sizeof(cudaStream_t));",
+                      "int priority, minPriority, maxPriority;",
+                      "gpuErrchk(cudaDeviceGetStreamPriorityRange(&minPriority, &maxPriority));",
+                      "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){",
+                      "    int adjusted_max = maxPriority - i; priority = adjusted_max > minPriority ? adjusted_max : minPriority;",
+                      "    gpuErrchk(cudaStreamCreateWithPriority(&(streams[i]),cudaStreamNonBlocking,priority));",
+                      "}", "return streams;"]
         self.gen_add_code_lines(init_lines)
         self.gen_add_end_function()
         # free the streams and all allocated data
@@ -899,7 +940,9 @@ class GRiDCodeGenerator:
                 ["Adapted from https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api"], \
                 [],None)
         self.gen_add_code_line("__host__")
-        self.gen_add_code_line("void gpuAssert(cudaError_t code, const char *file, const int line, bool abort=true){", True)
+        # `inline` is required so the per-algo TU split (multiple .o files all
+        # including grid.cuh) doesn't trip ODR multiple-definition errors at link.
+        self.gen_add_code_line("inline void gpuAssert(cudaError_t code, const char *file, const int line, bool abort=true){", True)
         self.gen_add_code_line("if (code != cudaSuccess){", True)
         # note that below we need to escape the \n and "" to get it to print to a string or file correctly
         self.gen_add_code_line("fprintf(stderr,\"GPUassert: %s %s %d\\n\", cudaGetErrorString(code), file, line);")
@@ -1049,6 +1092,14 @@ class GRiDCodeGenerator:
         self.gen_add_code_line(
             "#define GRID_HAS_IDSVA_SO_WORLD_FRAME " + str(int(getattr(self, "generate_idsva_so_world_frame", False)))
         )
+        # GRID_HAS_IDSVA_SO gates the dispatching `grid::idsva_so` host wrapper.
+        # Emitted whenever the chosen variant for this robot's base type is
+        # available: body_frame for fixed-base (always), world_frame for
+        # floating-base (opt-in via enable_idsva_so_world_frame).
+        has_idsva_so = getattr(self, "generate_idsva_so_body_frame", True) and (
+            (not self.robot.floating_base) or getattr(self, "generate_idsva_so_world_frame", False)
+        )
+        self.gen_add_code_line("#define GRID_HAS_IDSVA_SO " + str(int(has_idsva_so)))
         self.gen_add_code_line("")
         # then open our namespace
         self.gen_add_func_doc("All functions are kept in this namespace")
@@ -1113,6 +1164,11 @@ class GRiDCodeGenerator:
                 # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame_host`.
                 if enable_idsva_so_world_frame:
                     self.gen_idsva_so_world_frame(use_thread_group)
+                # Emit the dispatching `idsva_so` host wrapper. For floating-base
+                # robots, requires world_frame to be enabled (it forwards there).
+                # For fixed-base, forwards to body_frame.
+                if (not self.robot.floating_base) or enable_idsva_so_world_frame:
+                    self.gen_idsva_so_dispatcher()
             if "fdsva_so" in algorithms:
                 self.gen_fdsva_so(use_thread_group)
         self.gen_combination_functions(algorithms, fixed_target_name)
