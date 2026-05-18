@@ -3235,10 +3235,26 @@ def gen_idsva_so_world_frame(self, use_thread_group = False):
 def gen_idsva_so_dispatcher_host(self, mode = 0):
     """Emit `grid::idsva_so` — a host wrapper that calls the perf-winning
     variant for this robot's base type. Picked at codegen time: body_frame
-    for fixed-base (~30× faster), world_frame for floating-base (2-4× faster).
-    Both inners produce numerically equivalent output; this is purely a perf
-    optimization. Body/world host wrappers remain individually callable for
-    direct comparison.
+    for fixed-base, world_frame for floating-base. Both inners produce
+    numerically equivalent output; this is purely a perf optimization.
+    Body/world host wrappers remain individually callable for direct
+    comparison.
+
+    Measured on sm_120 / RTX 5090 (2026-05-18 sweep):
+      - iiwa14 (NV=7,  fixed):    body 7-9x   faster than world
+      - go2    (NV=12, fixed):    body 7-10x  faster than world
+      - g1     (NV=29, fixed):    world 6-15% faster than body
+      - iiwa14 (NV=6,  floating): world 7x   faster than body
+      - go2    (NV=18, floating): world 7x   faster than body
+      - g1     (NV=35, floating): world 20x  faster than body
+
+    The "body for fixed, world for floating" rule is the safe choice — it
+    preserves the large wins at the common low-DOF fixed-base case
+    (iiwa14, go2) and the large wins on every floating-base case. The
+    g1_fixed regression is small (~15%) and isolated to a single
+    high-DOF data point; refining the dispatcher with a NV threshold is a
+    worthwhile follow-up once more high-DOF fixed-base robots exist in
+    the manifest.
 
     Regular and compute_only modes forward to the underlying host wrapper.
     Single-timing mode inlines its own clock_gettime + kernel launch so the

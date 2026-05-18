@@ -336,22 +336,26 @@ class GRiDCodeGenerator:
         self.d2ee_use_workspace_d2xhom = self.d2ee_spill_tier >= 2
         d2ee_t_count = [d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count][self.d2ee_spill_tier]
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
-        # would exceed the target, recompute with the gravity-shim's dX/a/da/f/df
-        # spilled into d_workspace alongside d2X/d2a/d2f. Saves 50-60 KB on g1-class
-        # robots without changing iiwa14/go2 behavior.
+        # would exceed the target, set self.idsva_so_body_frame_grav_full_spill and
+        # let gen_idsva_so_body_frame_inner_temp_mem_size() return the smaller value
+        # (the gravity shim's dX/a/da/f/df spill into d_workspace alongside
+        # d2X/d2a/d2f). Saves 50-60 KB on g1-class robots without changing
+        # iiwa14/go2 behavior.
+        def _compute_idsva_body_t_count():
+            inner = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+            base = (2*nv + n) + inner + XI_size
+            full = base + 4*nv**3
+            use_global_output = py_arena_bytes(full) > self.cuda_target_shared_mem_bytes
+            return base if use_global_output else full, use_global_output
+
         self.idsva_so_body_frame_grav_full_spill = False
-        idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-        idsva_so_body_frame_base_t_count = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
-        idsva_so_body_frame_full_t_count = idsva_so_body_frame_base_t_count + 4*nv**3
-        self.idsva_so_body_frame_use_global_output = py_arena_bytes(idsva_so_body_frame_full_t_count) > self.cuda_target_shared_mem_bytes
-        idsva_so_body_frame_t_count = idsva_so_body_frame_base_t_count if self.idsva_so_body_frame_use_global_output else idsva_so_body_frame_full_t_count
+        idsva_so_body_frame_t_count, self.idsva_so_body_frame_use_global_output = _compute_idsva_body_t_count()
         if self.robot.floating_base and py_arena_bytes(idsva_so_body_frame_t_count) > self.cuda_target_shared_mem_bytes:
             self.idsva_so_body_frame_grav_full_spill = True
-            idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-            idsva_so_body_frame_base_t_count = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
-            idsva_so_body_frame_full_t_count = idsva_so_body_frame_base_t_count + 4*nv**3
-            self.idsva_so_body_frame_use_global_output = py_arena_bytes(idsva_so_body_frame_full_t_count) > self.cuda_target_shared_mem_bytes
-            idsva_so_body_frame_t_count = idsva_so_body_frame_base_t_count if self.idsva_so_body_frame_use_global_output else idsva_so_body_frame_full_t_count
+            idsva_so_body_frame_t_count, self.idsva_so_body_frame_use_global_output = _compute_idsva_body_t_count()
+        # After the spill decision is final, capture the inner temp count for use
+        # downstream (world-frame fallback for fixed-base + FDSVA-SO inner sizing).
+        idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
 
         # world-frame path has its own (smaller) scratch — no gravity-shim shared, no
         # main-sweep extras. Sized via gen_idsva_so_world_frame_temp_mem_size.
