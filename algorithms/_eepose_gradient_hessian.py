@@ -525,7 +525,17 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 # so the shared-A `gemm_strided_batched_1d` doesn't apply. Could
                 # batch via `gemm_batched_1d` with explicit pointer arrays in a
                 # future refactor; not pursued here.
+                #
+                # SYNC FUSION (2026-05-18): pass TRAILING_SYNC=false on every
+                # GEMM call so the GLASS function returns without syncing —
+                # batches are disjoint so there's no in-batch race, and the
+                # SIMT parallel_loop below ends with its own __syncthreads()
+                # which covers the whole GEMM+gradient pass at once. Saves
+                # ~1 block-wide sync per BFS level (≈10 on g1_fixed).
                 self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
+                _no_sync_tail = ("16,16,glass::nvidia::layout::col_major,"
+                                 "glass::nvidia::layout::col_major,"
+                                 "glass::nvidia::layout::col_major,false")
                 for run_start, run_len, parent_jid in packed_parent_runs:
                     batch = n * run_len
                     # TC = threads per batch element. Must satisfy TC*BATCH ≤
@@ -539,12 +549,12 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                     src_off = tempSrcOffset + 16 * n * run_start
                     dst_off = tempDstOffset + 16 * n * run_start
                     self.gen_add_code_line(
-                        f"glass::nvidia::gemm_strided_batched_1d<T,4,4,4,{batch},{tc}>("
+                        f"glass::nvidia::gemm_strided_batched_1d<T,4,4,4,{batch},{tc},"
+                        f"{_no_sync_tail}>("
                         f"static_cast<T>(1), &s_Xhom[{16*parent_jid}], "
                         f"&s_eeTemp[{src_off}], static_cast<T>(0), "
                         f"&s_eeTemp[{dst_off}]);"
                     )
-                self.gen_add_sync(use_thread_group)
                 self.gen_add_code_line("#endif")
                 # SIMT parallel_loop: computes s_deeTemp (always) + s_eeTemp
                 # (only on the glass-only build; nvidia build already wrote it
