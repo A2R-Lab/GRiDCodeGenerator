@@ -73,16 +73,24 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
 
     # 2Dx3D tensor computation defined as iL,Ljk->ijk
     self.gen_add_code_line('// Multiply by -Minv to finish algorithm')
-    # PERF FOLLOW-UP (2026-05-18): this 4*n^3 parallel_loop is the hot path
-    # for fdsva_so single-call cost (g1_floating: ~6987us at n=35). Each
-    # thread does a serial n-element dot_prod, so total FMAs ~ 4*n^4. The
-    # iL,Ljk->ijk structure IS a batched gemm — rewriting this to call
-    # glass::nvidia::gemm<T,n,n,n,sm_120> (or gemm_batched_1d) would expose
-    # the larger gemm shape where the sm_120 autotune table measures
-    # cuBLASDx 73% faster at n>=32. Blocked on a real (not heuristic)
-    # cuBLASDx-vs-SIMT measurement at the relevant n×n×n shapes — once a
-    # per-host tuning override is in place (`bench/tuning/<host>.cuh`), this
-    # is the refactor that would actually exercise cuBLASDx in GRiD.
+    # PERF EXPERIMENT CANDIDATE (2026-05-18): this 4*n^3 parallel_loop has the
+    # highest FMA count in fdsva_so_inner (g1_floating: ~6M FMAs out of ~9M
+    # total). Each thread does a serial n-element dot_prod, so total FMAs ~
+    # 4*n^4. Structurally an iL,Ljk->ijk tensor contraction — could be
+    # rewritten as 4*n batched n×n×n gemms or 4 large n × n² × n gemms.
+    #
+    # Standalone autotune on sm_120 says cuBLASDx wins 2.4-5.2× at 24-48
+    # size range, BUT standalone-gemm wins do NOT directly translate into
+    # hot-kernel wins. In-kernel concerns: register pressure with all SO
+    # state live, shared-mem layout cost (current iL,Ljk strides aren't
+    # gemm-friendly), tier pressure (g1_floating already in spill tier and
+    # cuBLASDx wants more shared-mem), per-block-per-timestep sync overhead.
+    #
+    # First step before any refactor: profile this loop in-context (ptxas
+    # occupancy / nsight compute trace) to confirm it really is the
+    # bottleneck — could equally be memory-bandwidth or sync-bound, in
+    # which case cuBLASDx won't help. Then prototype on a single robot
+    # before generalizing.
     self.gen_add_parallel_loop("ind",str(4*n**3),use_thread_group)
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
     self.gen_add_code_line(f'if (ind < {n**3}) d2a_dqdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_dq[j + k*{n}]);')
