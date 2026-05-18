@@ -2829,29 +2829,43 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("T *Sd_p    = &Sd_vel[vel_i*6];")
     self.gen_add_code_line("T *psid_p  = &psid_v[vel_i*6];")
     self.gen_add_code_line("T *psidd_p = &psidd_v[vel_i*6];")
-    # Helpers — small (6-vec each), thread-0 + sync.
-    self.gen_add_serial_ops(use_thread_group)
+    # Helpers — small (6-vec each). Parallel over 7 "helper_id" × 6 "r" = 42 elements.
+    # Each thread computes one element of one helper. A5_vec/A7_vec depend on
+    # other helpers so they're emitted in a second parallel_loop after a sync.
+    self.gen_add_parallel_loop("h_idx", "42", use_thread_group)
     self.gen_add_code_lines([
-        "for (int r = 0; r < 6; ++r) S_ICi_S[r]   = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], S_p);",
-        "for (int r = 0; r < 6; ++r) S_ICi_psid[r] = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], psid_p);",
-        "for (int r = 0; r < 6; ++r) S_ICi_psidd[r] = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], psidd_p);",
-        "for (int r = 0; r < 6; ++r) S_BCi_S[r]   = dot_prod<T, 6, 6, 1>(&BC[i*36 + r], S_p);",
-        "for (int r = 0; r < 6; ++r) S_BCi_psid[r] = dot_prod<T, 6, 6, 1>(&BC[i*36 + r], psid_p);",
-        "for (int r = 0; r < 6; ++r) S_BCiT_S[r]  = dot_prod<T, 6, 1, 1>(&BC[i*36 + 6*r], S_p);",
-        "for (int r = 0; r < 6; ++r) {",
+        "int helper_id = h_idx / 6;",
+        "int r = h_idx % 6;",
+        "switch (helper_id) {",
+        "  case 0: S_ICi_S[r]   = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], S_p); break;",
+        "  case 1: S_ICi_psid[r] = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], psid_p); break;",
+        "  case 2: S_ICi_psidd[r] = dot_prod<T, 6, 6, 1>(&IC[i*36 + r], psidd_p); break;",
+        "  case 3: S_BCi_S[r]   = dot_prod<T, 6, 6, 1>(&BC[i*36 + r], S_p); break;",
+        "  case 4: S_BCi_psid[r] = dot_prod<T, 6, 6, 1>(&BC[i*36 + r], psid_p); break;",
+        "  case 5: S_BCiT_S[r]  = dot_prod<T, 6, 1, 1>(&BC[i*36 + 6*r], S_p); break;",
+        "  case 6: {",
         "    T crf_S_row[6]; for (int kk = 0; kk < 6; ++kk) crf_S_row[kk] = -crm<T>(kk + 6*r, S_p);",
         "    S_crf_S_f_i[r] = dot_prod<T, 6, 1, 1>(crf_S_row, &f_w[i*6]);",
+        "    break;",
+        "  }",
         "}",
-        "for (int r = 0; r < 6; ++r) S_A5_vec[r] = S_BCi_psid[r] + S_ICi_psidd[r] + S_crf_S_f_i[r];",
-        "T IC_psid_Sd_local[6];",
-        "for (int r = 0; r < 6; ++r) {",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # A5_vec depends on S_BCi_psid + S_ICi_psidd + S_crf_S_f_i; A7_vec depends on S_BCi_S + IC@(psid+Sd).
+    # Parallel over 12 = 6 (A5_vec) + 6 (A7_vec).
+    self.gen_add_parallel_loop("v_idx", "12", use_thread_group)
+    self.gen_add_code_lines([
+        "int r = v_idx % 6;",
+        "if (v_idx < 6) {",
+        "    S_A5_vec[r] = S_BCi_psid[r] + S_ICi_psidd[r] + S_crf_S_f_i[r];",
+        "} else {",
         "    T s_sum = static_cast<T>(0);",
         "    for (int kk = 0; kk < 6; ++kk) s_sum += IC[i*36 + r + 6*kk] * (psid_p[kk] + Sd_p[kk]);",
-        "    IC_psid_Sd_local[r] = s_sum;",
+        "    S_A7_vec[r] = S_BCi_S[r] + s_sum;",
         "}",
-        "for (int r = 0; r < 6; ++r) S_A7_vec[r] = S_BCi_S[r] + IC_psid_Sd_local[r];",
     ])
-    self.gen_add_end_control_flow()  # close thread-0 guard for helpers
+    self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
     # Parallel build of A0/A1/Bphi/Bpsid (each over idx ∈ [0, 36)).
     self.gen_add_parallel_loop("idx", "36", use_thread_group)
@@ -3032,15 +3046,24 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
 
     self.gen_add_end_control_flow()  # end pp loop
 
-    # Aggregate IC, BC, f into parent — thread 0, then sync.
-    self.gen_add_serial_ops(use_thread_group)
-    self.gen_add_code_line("// Bubble subtree-aggregated IC/BC/f up.")
+    # Aggregate IC, BC, f into parent — parallel over 78 elements (36 IC + 36 BC + 6 f).
+    self.gen_add_code_line("// Bubble subtree-aggregated IC/BC/f up — parallel over 78 elements per body.")
     self.gen_add_code_line("int parent = wf_parent[i];")
     self.gen_add_code_line("if (parent >= 0) {", True)
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) { IC[parent*36 + idx] += IC[i*36 + idx]; BC[parent*36 + idx] += BC[i*36 + idx]; }")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) f_w[parent*6 + r] += f_w[i*6 + r];")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()  # close thread-0 guard for aggregate
+    self.gen_add_parallel_loop("agg_idx", "78", use_thread_group)
+    self.gen_add_code_lines([
+        "if (agg_idx < 36) {",
+        "    IC[parent*36 + agg_idx] += IC[i*36 + agg_idx];",
+        "} else if (agg_idx < 72) {",
+        "    int b = agg_idx - 36;",
+        "    BC[parent*36 + b] += BC[i*36 + b];",
+        "} else {",
+        "    int r = agg_idx - 72;",
+        "    f_w[parent*6 + r] += f_w[i*6 + r];",
+        "}",
+    ])
+    self.gen_add_end_control_flow()  # end parallel_loop agg_idx
+    self.gen_add_end_control_flow()  # end if (parent >= 0)
     self.gen_add_sync(use_thread_group)
     self.gen_add_end_control_flow()  # end i loop
 

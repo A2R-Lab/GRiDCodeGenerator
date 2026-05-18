@@ -361,44 +361,38 @@ class GRiDCodeGenerator:
         self.idsva_so_world_frame_use_global_output = py_arena_bytes(idsva_so_world_frame_full_t_count) > self.cuda_target_shared_mem_bytes
         idsva_so_world_frame_t_count = idsva_so_world_frame_base_t_count if self.idsva_so_world_frame_use_global_output else idsva_so_world_frame_full_t_count
 
+        # ----- FDSVA_SO shared-mem tier selection -----
+        # Four nested tiers, ordered from least-spill to most-spill. Pick the
+        # lowest-spill tier whose shared-arena bytes fit cuda_target_shared_mem.
+        # Each tier sets three orthogonal state flags read by gen_fdsva_so_*:
+        #   - use_global_tensors:  s_idsva_so + s_df2 (8*nv³ outputs) -> d_workspace
+        #   - use_workspace_temp:  s_fdsva_temp (4*nv³ inner) -> d_workspace
+        #   - fd_grad_use_spill:   fd_grad_inline's da_dq..fxvi band -> d_workspace grad section
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
         fdsva_so_inner_temp_count = 4*nv**3
         fdsva_so_fd_gradient_inline_temp_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
+        fdsva_so_fd_gradient_inline_spilled_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled()
         # fdsva_so dispatches to world_frame_inner for floating-base (smaller
         # footprint + no grav-shim spill) and body_frame_inner for fixed-base.
         fdsva_so_inner_idsva_so_temp_count = (
             idsva_so_world_frame_inner_temp_count if self.robot.floating_base
             else idsva_so_body_frame_inner_temp_count
         )
-        fdsva_so_shared_temp_count = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
-        fdsva_so_full_t_count = fdsva_so_base_t_count + 8*nv**3 + fdsva_so_shared_temp_count
-        fdsva_so_global_t_count = fdsva_so_base_t_count + fdsva_so_shared_temp_count
-        self.fdsva_so_use_global_tensors = py_arena_bytes(fdsva_so_full_t_count) > self.cuda_target_shared_mem_bytes
-        self.fdsva_so_use_workspace_temp = (
-            self.fdsva_so_use_global_tensors and
-            py_arena_bytes(fdsva_so_global_t_count) > self.cuda_target_shared_mem_bytes
+        _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _temp_no_inner = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _temp_spilled  = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
+        # (name, shared_count, use_global_tensors, use_workspace_temp, fd_grad_use_spill)
+        _fdsva_so_tiers = [
+            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False),
+            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False),
+            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False),
+            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True),
+        ]
+        _chosen = next(
+            (t for t in _fdsva_so_tiers if py_arena_bytes(t[1]) <= self.cuda_target_shared_mem_bytes),
+            _fdsva_so_tiers[-1],  # fallback: most-spill tier even if it still exceeds (runtime SKIP handles that)
         )
-        # MEM1: fd_grad_inline's id_du_gradient_inner can spill its da_dq..fxvi
-        # band into d_workspace's grad section (same pattern id_du_kernel uses).
-        # Triggers ON ROBOT SIZE — whenever the kernel without spill would
-        # exceed the target shared-mem cap. Decoupled from use_workspace_temp
-        # so it's a generic size-based pattern reusable for other algos.
-        fdsva_so_fd_gradient_inline_spilled_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled()
-        no_spill_t_count = fdsva_so_base_t_count + max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
-        if self.fdsva_so_use_workspace_temp:
-            no_spill_t_count_workspace_tier = no_spill_t_count
-        else:
-            # in the global-tensors-but-not-workspace tier, fdsva_so_inner also lives in shared
-            no_spill_t_count_workspace_tier = no_spill_t_count + fdsva_so_inner_temp_count
-        self.fdsva_so_fd_grad_use_spill = (
-            py_arena_bytes(no_spill_t_count_workspace_tier) > self.cuda_target_shared_mem_bytes
-        )
-        spilled_t_count = fdsva_so_base_t_count + max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
-        fdsva_so_workspace_temp_t_count = spilled_t_count if self.fdsva_so_fd_grad_use_spill else no_spill_t_count
-        if self.fdsva_so_use_global_tensors:
-            fdsva_so_t_count = fdsva_so_workspace_temp_t_count if self.fdsva_so_use_workspace_temp else fdsva_so_global_t_count
-        else:
-            fdsva_so_t_count = fdsva_so_full_t_count
+        _, fdsva_so_t_count, self.fdsva_so_use_global_tensors, self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill = _chosen
         grad_spill_workspace_t_count = max(id_du_temp_layout["spill_count"],
                                            id_du_temp_count,
                                            fd_du_temp_count,
