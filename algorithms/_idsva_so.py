@@ -2297,7 +2297,6 @@ def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
@@ -3118,7 +3117,6 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
     self.gen_add_func_doc("Computes IDSVA-SO via the world-frame single-pass formulation", func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]
     if not use_global_output:

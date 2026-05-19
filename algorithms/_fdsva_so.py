@@ -311,7 +311,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
                             func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables — NUM_POS for q, NUM_VEL (n) for everything else

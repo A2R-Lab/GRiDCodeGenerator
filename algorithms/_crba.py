@@ -363,7 +363,6 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
                             func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
 
     # add shared memory variables

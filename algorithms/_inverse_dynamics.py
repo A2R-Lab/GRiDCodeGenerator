@@ -384,7 +384,6 @@ def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = 
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     extra_t_buffers = [("s_q_qd", 2*n), ("s_c", n), ("s_vaf", 18*n)]
