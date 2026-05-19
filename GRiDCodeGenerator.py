@@ -915,8 +915,15 @@ class GRiDCodeGenerator:
 
     # finally generate all of the code
     def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
-                     codegen_profile = "all", algorithm_list = None, enable_floating_second_order = False,
-                     enable_idsva_so_world_frame = False):
+                     codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
+                     enable_idsva_so_world_frame = None):
+        # Default-pick the SO variant that wins per the 2026-05 perf sweeps:
+        # body-frame for fixed-base robots (multi-pass amortizes — ~30× faster),
+        # world-frame for floating-base robots (single-pass + no gravity shim,
+        # 2-4× faster). Callers can override with enable_idsva_so_world_frame=
+        # True/False to force a specific variant for testing.
+        if enable_idsva_so_world_frame is None:
+            enable_idsva_so_world_frame = self.robot.floating_base
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
@@ -928,6 +935,17 @@ class GRiDCodeGenerator:
         self.generate_idsva_so_body_frame = ("idsva_so_body_frame" in algorithms) and allow_second_order
         self.generate_fdsva_so = ("fdsva_so" in algorithms) and allow_second_order
         self.generate_idsva_so_world_frame = bool(enable_idsva_so_world_frame) and self.generate_idsva_so_body_frame
+        # fdsva_so on floating-base's body calls idsva_so_world_frame_inner<T>(...)
+        # unconditionally — without world_frame emission we'd produce a header
+        # that fails at link time. Catch the misconfiguration early so the
+        # error points at the cause, not a downstream nvcc undefined-symbol.
+        if self.generate_fdsva_so and self.robot.floating_base and not self.generate_idsva_so_world_frame:
+            raise ValueError(
+                "Cannot emit fdsva_so on floating-base without idsva_so_world_frame. "
+                "fdsva_so's floating-base body calls idsva_so_world_frame_inner. "
+                "Either keep enable_idsva_so_world_frame at its default (None → "
+                "True for floating-base) or remove fdsva_so from algorithms."
+            )
         include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
         include_homogenous_transforms = include_homogenous_transforms or include_any_kinematics
         # first generate the file info
