@@ -917,11 +917,22 @@ class GRiDCodeGenerator:
     def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
                      enable_idsva_so_world_frame = None):
-        # Default-pick the SO variant that wins per the 2026-05 perf sweeps:
-        # body-frame for fixed-base robots (multi-pass amortizes — ~30× faster),
-        # world-frame for floating-base robots (single-pass + no gravity shim,
-        # 2-4× faster). Callers can override with enable_idsva_so_world_frame=
-        # True/False to force a specific variant for testing.
+        # Default-pick the SO variant that wins per the 2026-05 perf sweep
+        # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
+        # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
+        #
+        #   Robot          body-frame µs   world-frame µs   winner   margin
+        #   iiwa14_fixed       26.5             805         body      30.3×
+        #   go2_fixed          36.0            1338         body      37.1×
+        #   g1_fixed         1301              5804         body       4.5×
+        #   iiwa14_floating  2642              1652         world      1.6×
+        #   go2_floating     3951              2830         world      1.4×
+        #   g1_floating     28222              8451         world      3.3×
+        #
+        # body-frame multi-pass amortizes well for fixed-base; world-frame's
+        # single-pass + no gravity shim wins floating-base. Callers can
+        # override with enable_idsva_so_world_frame=True/False to force a
+        # specific variant (the bench harness exercises both for comparison).
         if enable_idsva_so_world_frame is None:
             enable_idsva_so_world_frame = self.robot.floating_base
         self.include_fixed_kinematic_targets = fixed_target_name != ""
