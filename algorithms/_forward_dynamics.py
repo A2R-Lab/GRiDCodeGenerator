@@ -162,6 +162,7 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size()

@@ -218,6 +218,7 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
@@ -619,6 +620,7 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
@@ -1181,6 +1183,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = not use_workspace_temp)
