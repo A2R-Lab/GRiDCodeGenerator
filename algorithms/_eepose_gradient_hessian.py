@@ -503,62 +503,14 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 even = bfs_level % 2
                 tempDstOffset = 16*n*num_ees*(even)
                 tempSrcOffset = 16*n*num_ees*(not even)
-                packed_parent_runs = []
-                run_start = 0
-                while run_start < num_ees:
-                    parent_jid = curr_parents[run_start]
-                    run_end = run_start + 1
-                    while run_end < num_ees and curr_parents[run_end] == parent_jid:
-                        run_end += 1
-                    if parent_jid != -1:
-                        packed_parent_runs.append((run_start, run_end - run_start, parent_jid))
-                    run_start = run_end
-                # glass-nvidia path: emit a batched GEMM per parent-run for the
-                # position chain `s_eeTemp`. Each run shares parent A=s_Xhom[parent_jid]
-                # across n_djids × run_len_ees independent 4×4×4 GEMMs (BATCH = n*run_len).
-                # Default strides (N*K=16, M*K=16) match the tightly-packed
-                # [ee][djid][rc] layout, so no overrides are needed.
-                #
-                # The gradient chain `s_deeTemp` stays in the SIMT parallel_loop
-                # below because its A pointer is djid-dependent
-                # (`grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, parent_jid)`),
-                # so the shared-A `gemm_strided_batched_1d` doesn't apply. Could
-                # batch via `gemm_batched_1d` with explicit pointer arrays in a
-                # future refactor; not pursued here.
-                #
-                # SYNC FUSION (2026-05-18): pass TRAILING_SYNC=false on every
-                # GEMM call so the GLASS function returns without syncing —
-                # batches are disjoint so there's no in-batch race, and the
-                # SIMT parallel_loop below ends with its own __syncthreads()
-                # which covers the whole GEMM+gradient pass at once. Saves
-                # ~1 block-wide sync per BFS level (≈10 on g1_fixed).
-                self.gen_add_code_line("#if GRID_CUDA_USE_GLASS_NVIDIA")
-                _no_sync_tail = ("16,16,glass::nvidia::layout::col_major,"
-                                 "glass::nvidia::layout::col_major,"
-                                 "glass::nvidia::layout::col_major,false")
-                for run_start, run_len, parent_jid in packed_parent_runs:
-                    batch = n * run_len
-                    # TC = threads per batch element. Must satisfy TC*BATCH ≤
-                    # SUGGESTED_THREADS (the runtime check inside
-                    # gemm_strided_batched_1d — if violated, some batches never
-                    # run). The inner gemm_impl_ct loop handles being given any
-                    # positive TC: excess threads idle, too few threads stride
-                    # through C cells sequentially. Per-cell perf is fine even
-                    # at low TC since each 4×4×4 GEMM is only 16 cells.
-                    tc = max(1, self.suggested_threads // batch)
-                    src_off = tempSrcOffset + 16 * n * run_start
-                    dst_off = tempDstOffset + 16 * n * run_start
-                    self.gen_add_code_line(
-                        f"glass::nvidia::gemm_strided_batched_1d<T,4,4,4,{batch},{tc},"
-                        f"{_no_sync_tail}>("
-                        f"static_cast<T>(1), &s_Xhom[{16*parent_jid}], "
-                        f"&s_eeTemp[{src_off}], static_cast<T>(0), "
-                        f"&s_eeTemp[{dst_off}]);"
-                    )
-                self.gen_add_code_line("#endif")
-                # SIMT parallel_loop: computes s_deeTemp (always) + s_eeTemp
-                # (only on the glass-only build; nvidia build already wrote it
-                # above via the batched GEMMs).
+                # SIMT parallel_loop computes s_eeTemp (the 4×4 chain product
+                # against parent_jid's homogeneous transform) and s_deeTemp
+                # (the gradient version) per (djid, ee, row, col) cell.
+                # Pre-v2.0 had an opt-in `glass::nvidia::gemm_strided_batched_1d`
+                # path for s_eeTemp on cuBLASDx builds; the 2026-05-18
+                # autotune + sweep showed cuBLASDx loses to SIMT on 4×4×4 by
+                # 2.6× so the dispatch was removed (see
+                # docs/source/user_guide/concepts/cublasdx_removal_design.rst).
                 self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
                 self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
                 self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
@@ -567,10 +519,8 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
                 if (-1 in curr_parents):
                     self.gen_add_code_line("if(parent_jid == -1){continue;}")
-                self.gen_add_code_line("#if !GRID_CUDA_USE_GLASS_NVIDIA")
                 self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_code_line("#endif")
                 self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, parent_jid);")
                 self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
