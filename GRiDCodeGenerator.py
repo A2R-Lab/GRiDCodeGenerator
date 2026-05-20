@@ -308,7 +308,19 @@ class GRiDCodeGenerator:
         self.fd_du_t_count_per_tier = tuple(_fd_du_arenas[i] for i in self.fd_du_spill_tier_3way)
         aba_input_t_count = n + 2*nv
         crba_input_t_count = n + nv
-        aba_t_count = nv + aba_input_t_count + 12*NJ + self.gen_aba_inner_temp_mem_size() + XI_size
+        # Phase 3c (ABA): the 140*NJ+138 interleaved scratch band is the bulk
+        # of ABA's smem. Level 0 = scratch in smem (current); Level 1 =
+        # scratch redirected to L2-pinned workspace.
+        _aba_inner_temp_count = self.gen_aba_inner_temp_mem_size()
+        _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size
+        _aba_t_count_full      = _aba_base_count + _aba_inner_temp_count
+        _aba_t_count_workspace = _aba_base_count
+        self.aba_spill_tier_3way = select_shared_tier_3way(_aba_t_count_full, _aba_t_count_workspace)
+        self.aba_use_workspace_temp = self.aba_spill_tier_3way[0] == 1
+        aba_t_count = _aba_t_count_full if not self.aba_use_workspace_temp else _aba_t_count_workspace
+        self.aba_t_count_per_tier = tuple(
+            (_aba_t_count_full, _aba_t_count_workspace)[i] for i in self.aba_spill_tier_3way
+        )
         crba_t_count = nv*nv + crba_input_t_count + self.gen_crba_inner_temp_mem_size() + XI_size
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         dee_t_count = n + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_inner_temp_mem_size() + XHom_size + dXhom_size
@@ -528,7 +540,11 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(aba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
                                  "template <typename T> __host__ __device__ inline size_t CRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(crba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ constexpr size_t GRID_EE_LINALG_SHARED_BYTES() { return static_cast<size_t>(0); }",
                                  "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
@@ -784,9 +800,9 @@ class GRiDCodeGenerator:
         ]),
         ("aba", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("aba_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("aba_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("crba", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("crba_kernel<T>",

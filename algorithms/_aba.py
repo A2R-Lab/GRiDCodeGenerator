@@ -716,55 +716,34 @@ def gen_aba_device(self, use_thread_group = False):
     self.gen_aba_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
-def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
-    nq = self.robot.get_num_pos()
-    nv = self.robot.get_num_vel()
-    n = self.robot.get_num_joints()
-    input_count = nq + 2 * nv
-    # define function def and params
-    func_params = ["d_q_qd_tau is the vector of joint positions and velocities", \
-                    "stride_q_qd is the stride between each q, qd", \
-                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                    "d_tau is the vector of joint torques", \
-                    "gravity is the gravity constant", \
-                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_notes = []
-    func_def_start = "void aba_kernel(T *d_qdd, const T *d_q_qd_tau, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    
-    # then generate the code
-    self.gen_add_func_doc("Compute the ABA (Articulated Body Algorithm)", \
-                            func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
-
-    # add shared memory variables
-    shared_mem_size = self.gen_aba_inner_temp_mem_size()
+def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing, use_thread_group):
+    """Emit aba_kernel body for one tier's spill flag.
+    use_workspace_temp=False: s_temp in smem (full arena); Level 0 / current.
+    use_workspace_temp=True:  s_temp redirected to L2-pinned workspace; smem arena holds only extra_t_buffers."""
+    shared_mem_size = 0 if use_workspace_temp else self.gen_aba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", nv), ("s_q_qd_tau", input_count), ("s_va", 12*n)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(nq + nv) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(input_count),use_thread_group)
-        # compute
+        if use_workspace_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_aba_inner_function_call(use_thread_group)
         self.gen_add_sync(use_thread_group)
-        # save to global
         self.gen_kernel_save_result("qdd",str(nv),str(nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
-        # repurpose NUM_TIMESTEPS for number of timing reps
         self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
-        # then compute in loop for timing
+        if use_workspace_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_tau",str(input_count),use_thread_group,feedback_from="qdd")
@@ -772,8 +751,47 @@ def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
         self.gen_aba_inner_function_call(use_thread_group)
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
-        # save to global
         self.gen_kernel_save_result_single_timing("qdd",str(nv),use_thread_group)
+
+
+def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    n = self.robot.get_num_joints()
+    input_count = nq + 2 * nv
+    func_params = ["d_qdd is the vector of joint accelerations (output)", \
+                    "d_workspace is the L2-pinned global spill buffer (used at LITE/MINIMAL on h1_2-scale)", \
+                    "d_q_qd_tau is the vector of joint positions, velocities, torques", \
+                    "stride_q_qd is the stride between each q, qd", \
+                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                    "gravity is the gravity constant", \
+                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_notes = []
+    func_def_start = "void aba_kernel(T *d_qdd, unsigned char *d_workspace, const T *d_q_qd_tau, const int stride_q_qd, "
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Compute the ABA (Articulated Body Algorithm)", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    # Phase 3c: 3-way pick dispatch. ABA's inner scratch (140*NJ + 138) is
+    # heavily interleaved across the recursion, so we spill the whole arena
+    # as one band rather than surgically per-buffer. Level 0 = arena in smem
+    # (current); Level 1 = redirected to L2-pinned workspace.
+    picks = getattr(self, "aba_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing, use_thread_group)
+    else:
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_aba_host(self, mode = 0):
@@ -805,7 +823,7 @@ def gen_aba_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"aba requires all-data or dynamics gridData\");")
 
-    func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_q_qd_u,stride_q_qd,"
+    func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd = NUM_JOINTS + 2*NUM_VEL;")
     if single_call_timing:
