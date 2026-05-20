@@ -50,7 +50,7 @@ class GRiDCodeGenerator:
                             gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
                             gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \
                             gen_idsva_so_world_frame_host, gen_idsva_so_world_frame, \
-                            gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
+                            gen_idsva_so_device, gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
@@ -474,13 +474,13 @@ class GRiDCodeGenerator:
                                  "        : grid_shared_arena_bytes<T>(" + str(id_du_device_t_count - id_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(id_du_temp_count) + "); }",
-                                 "// Per-tier sizes for idsva_so_body_frame_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(idsva_so_body_frame_inner_temp_count) + "*sizeof(T) bytes of smem.",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_BODY_FRAME_DEVICE_INLINE_SMEM_BYTES() {",
+                                 "// Per-tier sizes for idsva_so_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "*sizeof(T) bytes of smem. Frame picked at codegen time: " + ("world_frame" if self.robot.floating_base else "body_frame") + ".",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
-                                 "        ? grid_shared_arena_bytes<T>(" + str(idsva_so_body_frame_inner_temp_count + XI_size) + ", TOPOLOGY_HELPERS_COUNT)",
+                                 "        ? grid_shared_arena_bytes<T>(" + str((idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + XI_size) + ", TOPOLOGY_HELPERS_COUNT)",
                                  "        : grid_shared_arena_bytes<T>(" + str(XI_size) + ", TOPOLOGY_HELPERS_COUNT);",
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_BODY_FRAME_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(idsva_so_body_frame_inner_temp_count) + "); }",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(so_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_WORKSPACE_BYTES_PER_TIMESTEP() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
