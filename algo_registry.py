@@ -55,6 +55,14 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("id_du",                "ID_DU (∂ID/∂q,v)",                  "Gradients"),
     AlgoEntry("fd_du",                "FD_DU (∂FD/∂q,v)",                  "Gradients"),
 
+    # Integrators
+    AlgoEntry("integrator",           "Integrator (x_{k+1})",              "Integrators"),
+    AlgoEntry("integrator_gradient",  "Integrator_Gradient (∂x_{k+1}/∂x,u)",
+              "Integrators"),
+    AlgoEntry("integrator_with_gradient",
+              "Integrator_With_Gradient (x_{k+1} + ∂x_{k+1}/∂x,u)",
+              "Integrators"),
+
     # Kinematics
     AlgoEntry("ee_pose",              "EE_POSE",                           "Kinematics",
               legacy_labels=("eepos",)),

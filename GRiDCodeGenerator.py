@@ -54,7 +54,13 @@ class GRiDCodeGenerator:
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
-                            gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host 
+                            gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host, \
+                            gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
+                            gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
+                            gen_integrator_kernel, gen_integrator_host, gen_integrator, \
+                            gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
+                            gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, gen_integrator_gradient_device, \
+                            gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -78,15 +84,19 @@ class GRiDCodeGenerator:
         all_algorithms = {
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
+            "integrator", "integrator_gradient", "integrator_with_gradient",
         }
         profile_algorithms = {
             "all": all_algorithms,
-            "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so"},
+            "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
+                         "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"id", "minv", "fd"},
             "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du"},
             "kinematics": {"ee_pose"},
             "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
             "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame", "fdsva_so"},
+            "integrators": {"id", "minv", "fd", "id_du", "fd_du", "integrator", "integrator_gradient",
+                            "integrator_with_gradient"},
         }
         aliases = {
             "all-dynamics": "dynamics",
@@ -108,6 +118,10 @@ class GRiDCodeGenerator:
             "end-effector-pose-gradient": "ee_pose_gradient",
             "ee-pose-hessian": "ee_pose_hessian",
             "end-effector-pose-hessian": "ee_pose_hessian",
+            "euler": "integrator",
+            "integrator-euler": "integrator",
+            "integrator-gradient": "integrator_gradient",
+            "integrator-with-gradient": "integrator_with_gradient",
         }
 
         def canonicalize(name):
@@ -146,6 +160,11 @@ class GRiDCodeGenerator:
             algorithms.add("id")
             if self.robot.floating_base:
                 algorithms.add("id_du")
+        # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
+        if "integrator" in algorithms:
+            algorithms.update({"id", "minv", "fd"})
+        if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
+            algorithms.update({"id", "minv", "fd", "id_du", "fd_du"})
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -227,6 +246,32 @@ class GRiDCodeGenerator:
         id_t_count = 2*n + n + 18*n + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
         minv_t_count = n + n*n + self.gen_direct_minv_inner_temp_mem_size() + XI_size
         fd_t_count = 3*nv + int(self.robot.floating_base) + nv + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
+        # Integrator: kernel-shared t-count layout is
+        #   s_q_qd_u (3nv+fb) + s_qdd (nv) + s_stage_qdd ((max_stages-1)*nv)
+        #   + s_stage_point ((max_stages-1)*2nv) + s_x_kp1 (2nv) + s_temp (= FD inner)
+        # max_stages = 4 (RK4) — see _integrator._max_stages_in_use().
+        _max_stages = 4
+        integrator_t_count = ((3*nv + int(self.robot.floating_base)) + nv
+                              + (_max_stages - 1) * nv
+                              + (_max_stages - 1) * 2 * nv
+                              + 2*nv
+                              + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size)
+        # Integrator gradient: kernel-shared t-count layout is
+        #   s_q_qd_u (3nv+fb) + s_dAB (2nv*3nv) + s_df_du (nv*2nv) + s_dc_du (nv*2nv) +
+        #   s_vaf (18nv) + s_Minv (nv*nv) + s_qdd (nv)
+        #   + multi-stage scratch: s_q_orig (nv) + s_qd_orig (nv)
+        #     + s_stage_grad_qdd (max_stages*nv) + s_D_qdd_stage (max_stages*nv*3nv)
+        #   + s_temp (= FD-grad inner)
+        # max_stages = 4 (RK4) — see _integrator._max_stages_in_use().
+        # The multi-stage scratch is always allocated even for single-stage IT;
+        # cost is small relative to total (~12*nv² for iiwa14 ≈ 588 floats).
+        _max_stages = 4
+        integrator_du_t_count = ((3*nv + int(self.robot.floating_base)) + 2*nv*3*nv + 2*(nv*2*nv)
+                                 + 18*nv + nv*nv + nv
+                                 + 2*nv + _max_stages * nv + _max_stages * nv * 3*nv
+                                 + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
+        # The "with x_kp1" variant adds s_x_kp1 (2nv) on top.
+        integrator_du_with_x_kp1_t_count = integrator_du_t_count + 2*nv
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
         id_du_temp_count = id_du_temp_layout["full_count"]
         id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
@@ -391,6 +436,8 @@ class GRiDCodeGenerator:
                                  "const int FD_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(fd_t_count)) + ";", \
                                  "const int ID_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(id_du_t_count)) + ";", \
                                  "const int FD_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(fd_du_t_count)) + ";", \
+                                 "const int INTEGRATOR_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(integrator_t_count)) + ";", \
+                                 "const int INTEGRATOR_DU_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(max(integrator_du_t_count, integrator_du_with_x_kp1_t_count))) + ";", \
                                  "const int ABA_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(aba_t_count)) + ";", \
                                  "const int CRBA_SHARED_MEM_COUNT = " + str(legacy_arena_count(crba_t_count)) + ";", \
                                  "const int ID_DU_MAX_SHARED_MEM_COUNT = " + str(legacy_arena_count(id_du_t_count_full)) + ";", \
@@ -435,6 +482,8 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_du_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(integrator_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -558,6 +607,9 @@ class GRiDCodeGenerator:
                                  "    T *d_idsva_so;", \
                                  # fdsva_so - d2a_dq2, d2a_dv2, d2a_dvdq, d2a_dtdq
                                  "    T *d_df2;", \
+                                 # integrator outputs
+                                 "    T *d_x_kp1;", \
+                                 "    T *d_dAB;", \
                                  "    // CPU OUTPUTS", \
                                  "    T *h_c;", \
                                  "    T *h_Minv;", \
@@ -572,6 +624,9 @@ class GRiDCodeGenerator:
                                  "    T *h_idsva_so;", \
                                  # fdsva_so - d2a_dq2, d2a_dv2, d2a_dvdq, d2a_dtdq
                                  "    T *h_df2;", \
+                                 # integrator outputs
+                                 "    T *h_x_kp1;", \
+                                 "    T *h_dAB;", \
                                  "};"])
 
     def gen_init_gridData(self):
@@ -608,6 +663,10 @@ class GRiDCodeGenerator:
                       "    hd_data->h_df_du = (T *)malloc(NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_idsva_so = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_df2 = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_x_kp1, 2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dAB, 2*NUM_JOINTS*3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_x_kp1 = (T *)malloc(2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_dAB = (T *)malloc(2*NUM_JOINTS*3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "// kinematics outputs", \
                       "if (needs_kinematics) {", \
@@ -744,6 +803,24 @@ class GRiDCodeGenerator:
             ("fdsva_so_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
         ]),
+        ("integrator", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("integrator_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            ("integrator_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+        ]),
+        ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("integrator_gradient_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            ("integrator_gradient_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+        ]),
+        ("integrator_gradient_with_x_kp1", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("integrator_gradient_with_x_kp1_kernel<T>",
+             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            ("integrator_gradient_with_x_kp1_kernel_single_timing<T>",
+             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+        ]),
         # ee_pose_hessian is special: only emitted when its shared-mem fits the
         # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime
         # guard wraps the cudaFuncSetAttribute call.
@@ -852,6 +929,8 @@ class GRiDCodeGenerator:
                                  "free(hd_data->h_c); free(hd_data->h_Minv); free(hd_data->h_qdd); free(hd_data->h_M);", \
                                  "free(hd_data->h_dc_du); free(hd_data->h_df_du);",\
                                  "free(hd_data->h_eePos); free(hd_data->h_deePos); free(hd_data->h_d2eePos);", \
+                                 "gpuErrchk(cudaFree(hd_data->d_x_kp1)); gpuErrchk(cudaFree(hd_data->d_dAB));", \
+                                 "free(hd_data->h_x_kp1); free(hd_data->h_dAB);", \
                                  "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){gpuErrchk(cudaStreamDestroy(streams[i]));} free(streams);"])
         self.gen_add_end_function()
         
@@ -1173,6 +1252,10 @@ class GRiDCodeGenerator:
             self.gen_aba(use_thread_group)
         if "crba" in algorithms:
             self.gen_crba(use_thread_group)
+        if "integrator" in algorithms:
+            self.gen_integrator(use_thread_group)
+        if ("integrator_gradient" in algorithms) or ("integrator_with_gradient" in algorithms):
+            self.gen_integrator_gradient(use_thread_group)
         if not self.robot.floating_base or enable_floating_second_order:
             if "idsva_so_body_frame" in algorithms:
                 self.gen_idsva_so_body_frame(use_thread_group)
