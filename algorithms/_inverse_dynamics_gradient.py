@@ -913,15 +913,17 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
 
 def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd_input = False):
     n = self.robot.get_num_vel()
+    inner_temp_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     # construct the boilerplate and function definition
     func_params = ["s_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "gravity is the gravity constant"]
+                   "gravity is the gravity constant", \
+                   "s_workspace is the global scratch buffer; size ID_DU_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
     func_def_start = "void inverse_dynamics_gradient_device(T *s_dc_du, const T *s_q, const T *s_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    func_notes = []
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *s_workspace = nullptr) {"
+    func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the temp scratch arena moves from s_temp to s_workspace, freeing shared memory for the caller's outer kernel"]
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -932,12 +934,11 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
         func_notes.append("optimized for qdd = 0")
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
-    shared_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_vaf", 18*n)], include_linalg_scratch=True)
+    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, extra_t_buffers = [("s_vaf", 18*n)], include_linalg_scratch=True, tier_workspace_expr="s_workspace")
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
