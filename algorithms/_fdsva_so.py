@@ -262,7 +262,12 @@ def gen_fdsva_so_device(self, use_thread_group = False):
 
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_direct_minv_inner_function_call(use_thread_group)
+    # Phase 3a: Minv inner takes s_F + s_temp separately. fdsva_so device path
+    # keeps F in smem (no surgical spill at this layer); pack F at start of s_temp.
+    self.gen_add_code_line("T *minv_s_F = s_temp;")
+    self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
+    self.gen_direct_minv_inner_function_call(use_thread_group,
+        updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
     self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, gravity);")
     self.gen_add_sync(use_thread_group)
     self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
@@ -326,7 +331,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group)
+        # Phase 3a: Minv inner takes s_F + s_temp separately (pack F at offset 0 of s_temp).
+        self.gen_add_code_line("T *minv_s_F = s_temp;")
+        self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
+        self.gen_direct_minv_inner_function_call(use_thread_group,
+            updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(
@@ -357,7 +366,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if fd_grad_use_spill:
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group)
+        # Phase 3a: Minv inner takes s_F + s_temp separately.
+        self.gen_add_code_line("T *minv_s_F = s_temp;")
+        self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
+        self.gen_direct_minv_inner_function_call(use_thread_group,
+            updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(

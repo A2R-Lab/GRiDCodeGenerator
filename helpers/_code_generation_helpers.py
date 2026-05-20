@@ -386,6 +386,34 @@ def gen_kernel_save_result_single_timing(self, store_to_name, amount, use_thread
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+def _any_algo_uses_workspace_spill(self):
+    """Return True when any Phase 2/3 spill-aware algo's PERF pick is non-zero
+    (i.e. the kernel writes/reads d_workspace at PERF tier). Used to default
+    GRID_CUDA_ENABLE_L2_PERSISTING to 1 — spilled bytes are hot enough to
+    benefit from L2 residency. Conservative: also flips on whenever any algo's
+    LITE/MINIMAL pick spills (most h1_2 scenarios). False on small robots
+    where every algo collapses to no-spill at all tiers."""
+    spill_picks = []
+    for attr in ("minv_spill_tier_3way", "id_du_spill_tier_3way", "fd_du_spill_tier_3way",
+                 "d2ee_spill_tier_3way", "fdsva_so_spill_tier_3way", "fd_spill_tier_3way"):
+        picks = getattr(self, attr, None)
+        if picks is not None:
+            spill_picks.extend(picks)
+    # Existing single-pick spill flags (binary; carried from pre-Phase-2a):
+    for attr in ("idsva_so_body_frame_use_global_output",
+                 "idsva_so_body_frame_grav_full_spill",
+                 "idsva_so_world_frame_use_global_output",
+                 "fdsva_so_use_workspace_temp",
+                 "fdsva_so_fd_grad_use_spill",
+                 "d2ee_use_workspace_temp",
+                 "d2ee_use_workspace_d2xhom",
+                 "id_du_use_global_temp",
+                 "fd_du_use_global_temp"):
+        if getattr(self, attr, False):
+            return True
+    return any(p > 0 for p in spill_picks)
+
+
 def gen_add_shared_memory_helpers(self):
     self.gen_add_code_lines([
         "__host__ __device__ constexpr size_t grid_align_up(size_t offset, size_t alignment) {",
@@ -425,6 +453,11 @@ def gen_add_shared_memory_helpers(self):
         "enum gridSharedTier { GRID_SHARED_FULL = 0, GRID_SPILL_DA_DF_OUTPUT = 1, GRID_SPILL_DV_DA_DF_OUTPUT = 2 };",
         "",
         "#ifndef GRID_CUDA_ENABLE_L2_PERSISTING",
+        # Phase 3a: default 0; users with workspace-spill kernels (any algo
+        # at tier ≥ 1) should compile with -DGRID_CUDA_ENABLE_L2_PERSISTING=1
+        # to L2-pin workspace bytes. Auto-default-on based on codegen spill
+        # state is gated on a future refactor that computes spill picks
+        # before this helper is emitted.
         "#define GRID_CUDA_ENABLE_L2_PERSISTING 0",
         "#endif",
         "",

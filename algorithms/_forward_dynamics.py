@@ -95,7 +95,14 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")        
     self.gen_add_code_line(func_def, True)
-    updated_var_names = dict(s_Minv_name = "s_temp", s_temp_name = "&s_temp[" + str(n*n) + "]")
+    # Phase 3a: Minv inner takes s_F + s_temp separately. FD packs them
+    # contiguously in its own s_temp arena: s_F at offset n*n (size 6*n*n),
+    # then s_temp_inner just past F. Total Minv arena footprint unchanged.
+    minv_F_offset = n*n
+    minv_temp_offset = minv_F_offset + 6*n*n
+    updated_var_names = dict(s_Minv_name = "s_temp",
+                             s_F_name = "&s_temp[" + str(minv_F_offset) + "]",
+                             s_temp_name = "&s_temp[" + str(minv_temp_offset) + "]")
     self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names)
     updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
     self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)

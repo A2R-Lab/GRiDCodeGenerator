@@ -1,20 +1,42 @@
-def gen_direct_minv_inner_temp_mem_size(self):
+def gen_direct_minv_inner_F_size(self):
+    """Size of the F-region buffer used by direct_minv_inner (6 * NV * NV
+    floats). Phase 3a splits this out as a separate `s_F` parameter so
+    callers can surgically spill it to L2-pinned workspace on humanoid-scale
+    robots while keeping IA / U / Dinv / Ia / IaTemp in shared memory."""
+    n = self.robot.get_num_vel()
+    return 6 * n * n
+
+def gen_direct_minv_inner_no_F_size(self):
+    """Size of the s_temp arena passed to direct_minv_inner — IA + U + Dinv
+    + Ia + IaTemp (everything except the F-region, which moved to s_F)."""
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
     max_bfs_width = self.robot.get_max_bfs_width()
     d_inv_count = NJ + 36 if self.robot.floating_base else n
-    return 6*n*n+36*n+6*n+d_inv_count + 36*2*max_bfs_width
+    return 36*n + 6*n + d_inv_count + 36*2*max_bfs_width
+
+def gen_direct_minv_inner_temp_mem_size(self):
+    """Legacy: full inner-temp size = F-region + everything else. Callers
+    that pre-date Phase 3a allocate this much smem and pass it as both s_F
+    (at offset 0) and s_temp (at offset 6*NV*NV) to direct_minv_inner."""
+    return self.gen_direct_minv_inner_F_size() + self.gen_direct_minv_inner_no_F_size()
 
 def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_var_names = None):
     var_names = dict( \
         s_Minv_name = "s_Minv", \
+        s_F_name = "s_F", \
         s_q_name = "s_q", \
         s_temp_name = "s_temp", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    minv_code_start = "direct_minv_inner<T>(" + var_names["s_Minv_name"] + ", " + var_names["s_q_name"] + ", "
+    # Phase 3a: direct_minv_inner takes s_F (6*NV*NV) as a separate arg so callers
+    # can surgically spill it to workspace. Pre-Phase-3a callers that pass a single
+    # `s_temp` arena should ALSO declare s_F = &s_temp[0] and bump s_temp to
+    # &s_temp[6*NV*NV] (current callers are updated in this commit).
+    minv_code_start = "direct_minv_inner<T>(" + var_names["s_Minv_name"] + ", " + \
+                      var_names["s_F_name"] + ", " + var_names["s_q_name"] + ", "
     minv_code_end = var_names["s_temp_name"] + ");"
     minv_code_middle = self.gen_insert_helpers_function_call()
     if use_thread_group:
@@ -29,11 +51,12 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     max_bfs_width = self.robot.get_max_bfs_width()
     # construct the boilerplate and function definition
     func_params = ["s_Minv is a pointer to memory for the final result", \
+                   "s_F is a pointer to the 6*NV*NV F-region scratch (Phase 3a: separate so callers can surgically spill to L2-pinned workspace)", \
                    "s_q is the vector of joint positions", \
-                   "s_temp is a pointer to helper shared memory of size " + str(self.gen_direct_minv_inner_temp_mem_size())]
+                   "s_temp is a pointer to helper shared memory of size " + str(self.gen_direct_minv_inner_no_F_size()) + " (Phase 3a: F-region is now in s_F)"]
     func_notes = ["Assumes the XI matricies have already been updated for the given q", \
                   "Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
-    func_def_start = "void direct_minv_inner(T *s_Minv, const T *s_q, "
+    func_def_start = "void direct_minv_inner(T *s_Minv, T *s_F, const T *s_q, "
     func_def_end = "T *s_temp) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -1)
     func_def = func_def_start + func_def_end
@@ -45,20 +68,24 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    temp_size = self.gen_direct_minv_inner_temp_mem_size()
+    # Phase 3a: linalg_smem_setup expects the temp-region size that the
+    # function's emitted body indexes into s_temp. F is in s_F (separate),
+    # so the s_temp arena holds only IA/U/Dinv/Ia/IaTemp.
+    temp_size = self.gen_direct_minv_inner_no_F_size()
     self.gen_linalg_smem_setup(temp_size)
 
-    # add shared memory note
-    FOffset = 0
-    IAOffset = FOffset + 6*n*n
+    # Phase 3a layout: F is in s_F (always; caller decides smem vs workspace).
+    # s_temp holds the rest, with IA at offset 0 (was 6*NV*NV in pre-Phase-3a layout).
+    FOffset = 0   # within s_F
+    IAOffset = 0  # within s_temp
     UOffset = IAOffset + 36*n
     DinvOffset = UOffset + 6*n
     IaOffset = DinvOffset + NJ
-    if self.robot.floating_base: 
+    if self.robot.floating_base:
         fb_DinvOffset = IaOffset
         IaOffset += 36 # fb_dinv is a 6x6 matrix
     IaTempOffset = IaOffset + 36*max_bfs_width
-    self.gen_add_code_line("// T *s_F = &s_temp[" + str(FOffset) + "]; T *s_IA = &s_temp[" + str(IAOffset) + "]; T *s_U = &s_temp[" + str(UOffset) + "];" + \
+    self.gen_add_code_line("// T *s_F (param) [size 6*NV*NV]; T *s_IA = &s_temp[" + str(IAOffset) + "]; T *s_U = &s_temp[" + str(UOffset) + "];" + \
                              " T *s_Dinv = &s_temp[" + str(DinvOffset) + "]; T *s_Ia = &s_temp[" + str(IaOffset) + "]; T *s_IaTemp = &s_temp[" + str(IaTempOffset) + "];")
 
     # set initial IA to I and zero Minv/F
@@ -68,7 +95,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_code_line("// Zero Minv and F")
     self.gen_add_parallel_loop("ind",str(n*n*7),use_thread_group)
-    self.gen_add_code_line("if(ind < " + str(6*n*n) + "){s_temp[" + str(FOffset) + " + ind] = static_cast<T>(0);}")
+    self.gen_add_code_line("if(ind < " + str(6*n*n) + "){s_F[" + str(FOffset) + " + ind] = static_cast<T>(0);}")
     self.gen_add_code_line("else{s_Minv[ind - " + str(6*n*n) + "] = static_cast<T>(0);}")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
@@ -170,7 +197,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         if self.robot.floating_base and bfs_level == 0:
             self.gen_add_parallel_loop("ind", str((NJ-1)*6), use_thread_group)
             self.gen_add_code_line(f"int row = ind % 6, col = ind / 6;")
-            self.gen_add_code_line(f"s_Minv[(6+col)*{n}+row] -= dot_prod<T,6,1,1>(&s_temp[{fb_DinvOffset}+6*row], &s_temp[{FOffset+6*n*5+36}+6*col]);") # offset to 7th dof (past fb) in fb F matrix
+            self.gen_add_code_line(f"s_Minv[(6+col)*{n}+row] -= dot_prod<T,6,1,1>(&s_temp[{fb_DinvOffset}+6*row], &s_F[{FOffset+6*n*5+36}+6*col]);") # offset to 7th dof (past fb) in fb F matrix
             self.gen_add_end_control_flow()
         else:
             if bfs_level != 0:
@@ -209,10 +236,10 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                     jid_subtreeN = str(subId*n)
 
             self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + \
-                                                    "(" + S_sign_cpp + ") * s_temp[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
+                                                    "(" + S_sign_cpp + ") * s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
             if bfs_level != 0:
                 self.gen_add_code_line("for(int row = 0; row < 6; row++) {", True)
-                self.gen_add_code_line("s_temp[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + row] += " + \
+                self.gen_add_code_line("s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + row] += " + \
                                             "s_temp[" + str(UOffset) + " + 6*" + jid + " + row] * s_Minv[" + jid_subtreeN + " + " + dof_id + "];")
                 self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
@@ -223,7 +250,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line("printf(\"Minv after subtree updates\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");")
             if bfs_level != 0:
                 for ind in inds:
-                    self.gen_add_code_line("printf(\"F Temp += U*Minv[" + str(ind) + "]\\n\"); printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + n*6*ind) + "],6);")
+                    self.gen_add_code_line("printf(\"F Temp += U*Minv[" + str(ind) + "]\\n\"); printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + n*6*ind) + "],6);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -289,8 +316,8 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             # do the standard comps first
             if self.robot.floating_base: parent_ind_cpp_adj = f'(5 + {parent_ind_cpp})'
             else: parent_ind_cpp_adj = parent_ind_cpp
-            self.gen_add_code_lines(["T *src = &s_temp[" + str(FOffset) + " + " + str(6*n) + "*" + str(dof_id) + " + 6*" + jid_subtree + "]; " + \
-                                        "T *dst = &s_temp[" + str(FOffset) + " + " + str(6*n) + "*" + parent_ind_cpp_adj + " + 6*" + jid_subtree + "];"])
+            self.gen_add_code_lines(["T *src = &s_F[" + str(FOffset) + " + " + str(6*n) + "*" + str(dof_id) + " + 6*" + jid_subtree + "]; " + \
+                                        "T *dst = &s_F[" + str(FOffset) + " + " + str(6*n) + "*" + parent_ind_cpp_adj + " + 6*" + jid_subtree + "];"])
             # adjust for temp comps
             self.gen_add_code_line("// adjust for temp comps")
             self.gen_add_code_line("if (col >= " + str(len(ind_subtree_inds)) + ") {",True)
@@ -311,7 +338,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_serial_ops(use_thread_group)
                 for i in range(len(inds)):
                     self.gen_add_code_lines(["printf(\"F[" + str(self.robot.get_parent_id(inds[i])) + "] = X^T F[" + str(inds[i]) + "]\\n\");",
-                                             "printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + n*6*self.robot.get_parent_id(inds[i])) + "],6);",
+                                             "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + n*6*self.robot.get_parent_id(inds[i])) + "],6);",
                                              "printf(\"Ia*X[" + str(inds[i]) + "]\\n\");",
                                              "printMat<T,6,6>(&s_temp[" + str(IaTempOffset + 36*i) + "],6);"])
                 self.gen_add_end_control_flow()
@@ -359,7 +386,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                                  "printf(\"U\\n\"); printMat<T,6," + str(n) + ">(&s_temp[" + str(UOffset + 6*i) + "],6);", \
                                  "printf(\"Dinv\\n\"); printMat<T,1," + str(n) + ">(&s_temp[" + str(DinvOffset) + "],1);"])
         for i in range(n):
-            self.gen_add_code_line("printf(\"F[%d]\\n\"," + str(i) + "); printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + 6*n*i) + "],6);")
+            self.gen_add_code_line("printf(\"F[%d]\\n\"," + str(i) + "); printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + 6*n*i) + "],6);")
         self.gen_add_code_line("printf(\"Minv\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");")
         self.gen_add_code_line("printf(\"-------------------\\n\");")
         self.gen_add_end_control_flow()
@@ -399,9 +426,9 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line("//   Start this step with F[i,:,i:] = Xmat*F[parent,:,i:] and")
             self.gen_add_parallel_loop("ind",str(6*len(dof_cols)),use_thread_group)
             self.gen_add_code_line("int row = ind % 6; int col_ind = ind - row + " + str(6*jid) + ";")
-            self.gen_add_code_line("s_temp[" + str(FOffset + 6*n*jid) + " + col_ind + row] = " + \
+            self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid) + " + col_ind + row] = " + \
                                     "dot_prod<T,6,6,1>(&s_XImats[" + str(36*jid) + " + row], " + \
-                                    "&s_temp[" + str(FOffset + 6*n*jid_parent) + " + col_ind]);")
+                                    "&s_F[" + str(FOffset + 6*n*jid_parent) + " + col_ind]);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
@@ -409,7 +436,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_sync(use_thread_group)
                 self.gen_add_serial_ops(use_thread_group)
                 self.gen_add_code_lines(["printf(\"F[i,:,i:] = Xmat*F[parent,:,i:] for i[" + str(jid) + "]\\n\");", \
-                                         "printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset) + " + " + str(6*n*jid) + "],6);"])
+                                         "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset) + " + " + str(6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
 
@@ -419,7 +446,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line("//     and then update F[i,:,i:] += S*Minv[i,i:]")
             self.gen_add_parallel_loop("ind",str(len(jid_cols)),use_thread_group)
             self.gen_add_code_line("int col_ind = ind + " + str(dof_id) + ";")
-            self.gen_add_code_line("T *s_Fcol = &s_temp[" + str(FOffset + 6*n*jid) + " + 6*col_ind];");
+            self.gen_add_code_line("T *s_Fcol = &s_F[" + str(FOffset + 6*n*jid) + " + 6*col_ind];");
             self.gen_add_code_line("s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "] -= " + \
                                    "s_temp[" + str(DinvOffset + jid) + "] * " + \
                                    "dot_prod<T,6,1,1>(s_Fcol,&s_temp[" + str(UOffset + 6*jid) + "]);")
@@ -435,7 +462,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                                          "printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");"])
                 if jid < n-1: # redundant comp on last loop
                     self.gen_add_code_lines(["printf(\"F[i,:,i:] += S*Minv[i,i:]\");", \
-                                             "printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + 6*n*jid) + "],6);"])
+                                             "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + 6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
 
@@ -443,9 +470,9 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line("// F[i,:,i:] = S * Minv[i,i:] as parent is base so rest is skipped")
             self.gen_add_parallel_loop("ind",str(6*len(dof_cols)),use_thread_group)
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
-            if self.robot.floating_base: self.gen_add_code_line(f"s_temp[ind] = s_Minv[row + {n} * col];") # update F[0]
+            if self.robot.floating_base: self.gen_add_code_line(f"s_F[ind] = s_Minv[row + {n} * col];") # update F[0] (Phase 3a: F is in s_F)
             else:
-                self.gen_add_code_line("s_temp[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = (row == " + SInd + ") * " + \
+                self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = (row == " + SInd + ") * " + \
                                             "(" + SSign + ") * s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
@@ -454,7 +481,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_sync(use_thread_group)
                 self.gen_add_serial_ops(use_thread_group)
                 self.gen_add_code_lines(["printf(\"F[i,:,i:] += S*Minv[i,i:] for i = %d\\n\"," + str(jid) + ");", \
-                                         "printMat<T,6," + str(n) + ">(&s_temp[" + str(FOffset + 6*n*jid) + "],6);"])
+                                         "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + 6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
     if self.robot.floating_base:
@@ -470,11 +497,15 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         self.gen_add_code_line("int read_col = src_row <= src_col ? src_col : src_row;")
         self.gen_add_code_line("val = s_Minv[read_col * " + str(n) + " + read_row];")
         self.gen_add_end_control_flow()
-        self.gen_add_code_line("s_temp[ind] = val;")
+        # Phase 3a: reuse s_F as permutation scratch — F is no longer needed at
+        # this point, and s_F is sized 6*NV*NV which always exceeds NV*NV.
+        # (Post-Phase-3a s_temp holds only IA/U/Dinv/Ia/IaTemp, which can be
+        # smaller than NV*NV on humanoid-scale floating-base robots.)
+        self.gen_add_code_line("s_F[ind] = val;")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
         self.gen_add_parallel_loop("ind", str(n*n), use_thread_group)
-        self.gen_add_code_line("s_Minv[ind] = s_temp[ind];")
+        self.gen_add_code_line("s_Minv[ind] = s_F[ind];")
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()
@@ -494,61 +525,102 @@ def gen_direct_minv_device(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
+    # add the shared memory variables (full smem layout: F + no_F packed contiguously)
+    n = self.robot.get_num_vel()
+    F_size = self.gen_direct_minv_inner_F_size()
+    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()  # F + no_F
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
+    # Phase 3a: split the arena — s_F at offset 0 (size 6*NV*NV),
+    # s_temp_inner at offset 6*NV*NV. Inner-callable device path keeps F in
+    # smem (no surgical spill at this layer).
+    self.gen_add_code_line("T *minv_s_F = s_temp;")
+    self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_direct_minv_inner_function_call(use_thread_group)
+    self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
     self.gen_add_end_function()
 
+def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, use_thread_group):
+    """Emit direct_minv_kernel body for one tier's spill flag.
+    spill_F=False: s_F lives at &s_temp[0]; s_temp_inner at &s_temp[6*NV*NV]; smem holds everything.
+    spill_F=True:  s_F lives at &d_workspace[...]; s_temp_inner at &s_temp[0]; saves 6*NV*NV from smem."""
+    n_pos = self.robot.get_num_pos()  # NUM_POS (= NV for fixed, NV+1 for floating quaternion)
+    F_size = self.gen_direct_minv_inner_F_size()
+    if spill_F:
+        shared_mem_size = self.gen_direct_minv_inner_no_F_size()
+    else:
+        shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n_pos), ("s_Minv", n*n)], include_linalg_scratch=True)
+    if use_thread_group:
+        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_kernel_load_inputs("q","stride_q",str(n_pos),use_thread_group)
+        if spill_F:
+            # L2-pinned workspace slot for Minv-F. Per-timestep offset matches the
+            # shared workspace layout (Minv-F lives at offset GRID_MINV_F_WORKSPACE_OFFSET).
+            self.gen_add_code_line("T *minv_s_F = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *minv_s_temp = s_temp;")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
+            self.gen_add_code_line("T *minv_s_F = s_temp;")
+            self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
+        self.gen_add_code_line("// compute")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_add_sync(use_thread_group)
+        self.gen_kernel_save_result("Minv",str(n*n),str(n*n),use_thread_group)
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs_single_timing("q",str(n_pos),use_thread_group)
+        if spill_F:
+            self.gen_add_code_line("T *minv_s_F = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *minv_s_temp = s_temp;")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
+            self.gen_add_code_line("T *minv_s_F = s_temp;")
+            self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q",str(n_pos),use_thread_group,feedback_from="Minv")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_anti_licm_output_write("Minv")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result_single_timing("Minv",str(n*n),use_thread_group)
+
+
 def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = False):
-    n = self.robot.get_num_pos()
-    # define function def and params
+    n_pos = self.robot.get_num_pos()
+    n_vel = self.robot.get_num_vel()
     func_params = ["d_Minv is a pointer to memory for the final result", \
+                   "d_workspace is the L2-pinned global spill buffer (used when Minv-F overflows smem)", \
                    "d_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_def = "void direct_minv_kernel(T *d_Minv, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS){"
+    func_def = "void direct_minv_kernel(T *d_Minv, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS){"
     func_notes = ["Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    # then generate the code
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # add shared memory variables
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_Minv", n*n)], include_linalg_scratch=True)
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
-        # compute
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group)
-        self.gen_add_sync(use_thread_group)
-        # save to global
-        self.gen_kernel_save_result("Minv",str(n*n),str(n*n),use_thread_group)
-        self.gen_add_end_control_flow()
+    # 3-way pick: (perf_pick, lite_pick, minimal_pick). Each pick is 0 (no spill)
+    # or 1 (surgical F-to-workspace). When picks collapse, emit a single body
+    # (current behavior); when they diverge, emit if-constexpr branches.
+    picks = getattr(self, "minv_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(picks[0]), single_call_timing, use_thread_group)
     else:
-        #repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
-        # then compute in loop for timing
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="Minv")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group)
-        self.gen_anti_licm_output_write("Minv")
-        self.gen_add_end_control_flow()
-        # save to global
-        self.gen_kernel_save_result_single_timing("Minv",str(n*n),use_thread_group)
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_direct_minv_host(self, mode = 0):
@@ -577,7 +649,7 @@ def gen_direct_minv_host(self, mode = 0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"direct_minv requires all-data or dynamics gridData\");")
-    func_call_start = "direct_minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_q,stride_q,"
+    func_call_start = "direct_minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
