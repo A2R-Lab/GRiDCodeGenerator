@@ -283,15 +283,18 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 _FDSVA_SO_PICK_FLAGS = [
-    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill)
-    (False, False, False),   # pick 0: full smem
-    (True,  False, False),   # pick 1: outputs to global
-    (True,  True,  False),   # pick 2: + inner temp to global
-    (True,  True,  True),    # pick 3: + fd_grad da_df band to global
+    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv)
+    (False, False, False, False, False),   # pick 0: full smem
+    (True,  False, False, False, False),   # pick 1: outputs to global
+    (True,  True,  False, False, False),   # pick 2: + inner temp to global
+    (True,  True,  True,  False, False),   # pick 3: + fd_grad da_df band to global
+    (True,  True,  True,  True,  False),   # pick 4 (Phase 3e): + s_df_du to global
+    (True,  True,  True,  True,  True),    # pick 5 (Phase 3e): + s_Minv to global
 ]
 
 def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, use_workspace_temp,
-                                         fd_grad_use_spill, single_call_timing, use_thread_group):
+                                         fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv,
+                                         single_call_timing, use_thread_group):
     """Emit fdsva_so kernel body for one tier's spill flags."""
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base
@@ -304,12 +307,19 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
     if not use_workspace_temp:
         shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
-    extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_Minv", n*n), ("s_qdd", n), ("s_df_du", 2*n*n)]
+    # Phase 3e: s_df_du and s_Minv can now be in workspace too. Drop them from
+    # extra_t_buffers when spilled; declare workspace pointers in the body.
+    extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_qdd", n)]
+    if not use_workspace_Minv:
+        extra_t_buffers.append(("s_Minv", n*n))
+    if not use_workspace_df_du:
+        extra_t_buffers.append(("s_df_du", 2*n*n))
     if not use_global_tensors:
         extra_t_buffers.append(("s_idsva_so", n*n*n*4))
         extra_t_buffers.append(("s_df2", 4*n*n*n))
     self.gen_XImats_helpers_temp_shared_memory_code(shared_temp_size, extra_t_buffers = extra_t_buffers)
-    if not use_workspace_temp:
+    needs_d_workspace = use_workspace_temp or fd_grad_use_spill or use_workspace_df_du or use_workspace_Minv
+    if not needs_d_workspace:
         self.gen_add_code_line("(void)d_workspace;")
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
@@ -335,6 +345,13 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
+        if use_workspace_df_du:
+            # Phase 3e: s_df_du in L2-pinned workspace, in its own dedicated section
+            # past grad + SO (avoids conflict with fd_grad_spill which is at offset 0).
+            self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
+        if use_workspace_Minv:
+            # Phase 3e: s_Minv lives just past s_df_du in the FDSVA_SO spill section.
+            self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         # Phase 3a: Minv inner takes s_F + s_temp separately (pack F at offset 0 of s_temp).
@@ -371,6 +388,10 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
+        if use_workspace_df_du:
+            self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
+        if use_workspace_Minv:
+            self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         # Phase 3a: Minv inner takes s_F + s_temp separately.
         self.gen_add_code_line("T *minv_s_F = s_temp;")
@@ -418,18 +439,18 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    picks = getattr(self, "fdsva_so_spill_tier_3way", (3, 3, 3))
+    picks = getattr(self, "fdsva_so_spill_tier_3way", (5, 5, 5))
     if picks[0] == picks[1] == picks[2]:
-        ugt, uwt, fgs = _FDSVA_SO_PICK_FLAGS[picks[0]]
-        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, single_call_timing, use_thread_group)
+        ugt, uwt, fgs, uwdfdu, uwminv = _FDSVA_SO_PICK_FLAGS[picks[0]]
+        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            ugt, uwt, fgs = _FDSVA_SO_PICK_FLAGS[pick]
+            ugt, uwt, fgs, uwdfdu, uwminv = _FDSVA_SO_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, single_call_timing, use_thread_group)
+            _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 

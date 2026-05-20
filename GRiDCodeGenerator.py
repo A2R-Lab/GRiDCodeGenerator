@@ -399,17 +399,28 @@ class GRiDCodeGenerator:
         _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         _temp_no_inner = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         _temp_spilled  = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
-        # (name, shared_count, use_global_tensors, use_workspace_temp, fd_grad_use_spill)
+        # Phase 3e: extend to 6 levels. Each level pushes an additional buffer
+        # to L2-pinned workspace. Tuple is
+        # (name, shared_count, use_global_tensors, use_workspace_temp,
+        #  fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv).
+        # Levels 0-3 unchanged from pre-Phase-3e. Level 4 pushes s_df_du
+        # (2*NV²); Level 5 also pushes s_Minv (NV²).
+        fdsva_so_base_no_df_du = fdsva_so_base_t_count - 2*nv*nv
+        fdsva_so_base_no_df_du_no_Minv = fdsva_so_base_no_df_du - nv*nv
         _fdsva_so_tiers = [
-            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False),
-            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False),
-            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False),
-            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True),
+            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False),
+            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False),
+            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False, False, False),
+            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False),
+            ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False),
+            ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True),
         ]
         _fdsva_so_arenas = tuple(t[1] for t in _fdsva_so_tiers)
         self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
         _chosen = _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]]
-        _, fdsva_so_t_count, self.fdsva_so_use_global_tensors, self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill = _chosen
+        (_, fdsva_so_t_count, self.fdsva_so_use_global_tensors,
+         self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill,
+         self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv) = _chosen
         self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before id_du_grad / fd_grad in any kernel that
@@ -599,7 +610,12 @@ class GRiDCodeGenerator:
                                  "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(so_workspace_t_count) + "); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_WORKSPACE_BYTES_PER_TIMESTEP() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
+                                 # Phase 3e: sized for MINIMAL tier's spill (max across PERF/LITE/MINIMAL).
+                                 # Even if PERF doesn't spill df_du/Minv, MINIMAL might — the workspace
+                                 # allocation has to cover MINIMAL's needs at all times.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(3*nv*nv if any(p >= 4 for p in getattr(self, 'fdsva_so_spill_tier_3way', (0, 0, 0))) else 0) + "); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_WORKSPACE_BYTES_PER_TIMESTEP() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP<T>(); }",
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_ID_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_ID_DU_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_FD_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FD_DU_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
