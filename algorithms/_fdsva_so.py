@@ -1,26 +1,29 @@
 MEMORY_THRESHOLD = 8 # Max num joints for shared mem allocation of result
 
 
-def gen_fdsva_so_inner(self, use_thread_group = False): 
+def gen_fdsva_so_inner(self, use_thread_group = False):
 	# construct the boilerplate and function definition
+    n = self.robot.get_num_vel()
+    inner_arena_size = 4 * n**3
     func_params = ["s_df2 are the second derivatives of forward dynamics WRT q,qd,tau", \
                 "s_idsva_so are the second derivative tensors of inverse dynamics", \
                 "s_Minv is the inverse mass matrix", \
                 "s_df_du is the gradient of the forward dynamics", \
-                "s_temp is the pointer to the shared memory needed of size: " + \
-                            str(self.gen_fdsva_so_inner_temp_mem_size()), \
+                "s_temp is the (shared) scratch buffer; size FDSVA_SO_INNER_SMEM_BYTES<T, RESOURCE_TIER>() bytes (= " + str(inner_arena_size) + "*sizeof(T) at TIER_PERF, 0 at TIER_LITE+)", \
+                "s_workspace is the global scratch buffer; size FDSVA_SO_INNER_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_arena_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF", \
                 "gravity is the gravity constant"]
     func_def_start = "void fdsva_so_inner("
     func_def_middle = "T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, "
-    func_def_end = "T *s_temp, const T gravity) {"
-    func_notes = ["Assumes works with IDSVA"]
+    func_def_end = "T *s_temp, T *s_workspace, const T gravity) {"
+    func_notes = ["Assumes works with IDSVA",
+                  "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the 4*NV^3 scratch arena moves from s_temp to s_workspace, freeing shared memory for the caller's outer kernel"]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
-    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -3)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Second Order of Forward Dynamics with Spatial Vector Algebra", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
@@ -42,8 +45,19 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     self.gen_add_code_line('T *d2a_dvdv = &s_df2[' + str(2*n*n*n) + '];')
     self.gen_add_code_line('T *d2a_dtdq = &s_df2[' + str(3*n*n*n) + '];')
     self.gen_add_code_line('\n\n')
-    self.gen_add_code_line('// Temporary Variables')
-    self.gen_add_code_line(f'T *inner_dq = s_temp; // Inner term for d2a_dqdq (d2tau_dqdq + dM_dq*da_dq + (dM_dq*da_dq)^R)')
+    self.gen_add_code_line('// Temporary Variables. The 4*n^3 scratch arena lives in s_temp at TIER_PERF')
+    self.gen_add_code_line('// (current behavior) and in s_workspace at TIER_LITE+ (frees shared memory for')
+    self.gen_add_code_line('// inline-CUDA callers whose outer kernels are smem-pressured).')
+    self.gen_add_code_line('T *inner_arena;')
+    self.gen_add_code_line('if constexpr (RESOURCE_TIER == TIER_PERF) {', True)
+    self.gen_add_code_line('(void)s_workspace;')
+    self.gen_add_code_line('inner_arena = s_temp;')
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line('else {', True)
+    self.gen_add_code_line('(void)s_temp;')
+    self.gen_add_code_line('inner_arena = s_workspace;')
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line(f'T *inner_dq = inner_arena; // Inner term for d2a_dqdq')
     self.gen_add_code_line(f'T *inner_cross = inner_dq + {n**3}; // Inner term for d2a_dvdq (dM_dq*Minv)')
     self.gen_add_code_line(f'T *inner_tau = inner_cross + {n**3}; // Inner term for d2a_dtdq (d2tau_dvdq + dM_dq*da_dv)')
     self.gen_add_code_line(f'T *rot_dq = inner_tau + {n**3}; // Rotated (dM_dq*da_dq)^R term used to compute inner_dq')
@@ -193,13 +207,14 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
         s_Minv_name = "s_Minv", \
         s_df_du_name = "s_df_du", \
         s_temp_name = "s_temp", \
+        s_workspace_name = "nullptr", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     fdsva_so_code_start = "fdsva_so_inner<T>(" + var_names["s_df2_name"] + ", " + var_names["s_idsva_so_name"] + ", " + var_names["s_Minv_name"] + ", " + var_names["s_df_du_name"] + ", "
-    fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
     fdsva_so_code_middle = self.gen_insert_helpers_function_call()
