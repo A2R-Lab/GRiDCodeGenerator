@@ -504,23 +504,40 @@ def gen_add_shared_memory_helpers(self):
 def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_helpers = True,
                              ximat_name = "s_XImats", ximat_size = 0,
                              temp_name = "s_temp", topology_name = "s_topology_helpers",
-                             extra_byte_regions = None):
+                             extra_byte_regions = None,
+                             tier_workspace_expr = None):
+    """Emit the shared-memory arena layout.
+
+    When ``tier_workspace_expr`` is non-None, the ``s_temp`` slot becomes
+    tier-aware: at TIER_PERF the slot is allocated from the arena as usual;
+    at TIER_LITE+/MINIMAL the slot is sourced from the supplied workspace
+    pointer expression (e.g. ``"s_workspace"``) and the arena allocation
+    skips the temp slot entirely, freeing that smem for the caller's outer
+    kernel. The arena_offset variable accumulates conditionally so trailing
+    slots (topology, linalg, etc.) shift up at LITE+/MINIMAL.
+
+    The caller must declare ``RESOURCE_TIER`` as a template parameter and
+    expose ``tier_workspace_expr`` as a function argument.
+    """
     if extra_byte_regions is None:
         extra_byte_regions = []
     topology_count = self.gen_topology_helpers_size() if include_topology_helpers else 0
-    t_region_count = sum(int(count) for _, count in t_buffers)
+    fixed_t_region_count = sum(int(count) for _, count in t_buffers)
     if ximat_size:
-        t_region_count += int(ximat_size)
-    if temp_mem_size is not None:
-        t_region_count += int(temp_mem_size)
+        fixed_t_region_count += int(ximat_size)
+    temp_size_int = int(temp_mem_size) if temp_mem_size is not None else 0
+    t_region_count = fixed_t_region_count + temp_size_int
     extra_byte_expr = " + ".join(str(count) for _, count in extra_byte_regions) if extra_byte_regions else "0"
     self.gen_add_code_line("// GRID shared arena layout")
     for name, count in t_buffers:
         self.gen_add_code_line("//   T " + name + "[" + str(count) + "]")
     if ximat_size:
         self.gen_add_code_line("//   T " + ximat_name + "[" + str(ximat_size) + "]")
-    if temp_mem_size is not None and int(temp_mem_size) != 0:
-        self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "]")
+    if temp_size_int != 0:
+        if tier_workspace_expr is not None:
+            self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "] (TIER_PERF only; LITE/MINIMAL route to " + tier_workspace_expr + ")")
+        else:
+            self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "]")
     if topology_count > 0:
         self.gen_add_code_line("//   int " + topology_name + "[" + str(topology_count) + "]")
     for name, count in extra_byte_regions:
@@ -535,10 +552,22 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
         self.gen_add_code_line("T *" + ximat_name + " = grid_arena_ptr<T>(s_arena, s_arena_offset);")
         self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(ximat_size) + ");")
-    if temp_mem_size is not None and int(temp_mem_size) != 0:
-        self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
-        self.gen_add_code_line("T *" + temp_name + " = grid_arena_ptr<T>(s_arena, s_arena_offset);")
-        self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(temp_mem_size) + ");")
+    if temp_size_int != 0:
+        if tier_workspace_expr is not None:
+            self.gen_add_code_line("T *" + temp_name + ";")
+            self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
+            self.gen_add_code_line("(void)" + tier_workspace_expr + ";")
+            self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
+            self.gen_add_code_line(temp_name + " = grid_arena_ptr<T>(s_arena, s_arena_offset);")
+            self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(temp_mem_size) + ");")
+            self.gen_add_end_control_flow()
+            self.gen_add_code_line("else {", True)
+            self.gen_add_code_line(temp_name + " = " + tier_workspace_expr + ";")
+            self.gen_add_end_control_flow()
+        else:
+            self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
+            self.gen_add_code_line("T *" + temp_name + " = grid_arena_ptr<T>(s_arena, s_arena_offset);")
+            self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(temp_mem_size) + ");")
     else:
         self.gen_add_code_line("T *" + temp_name + " = nullptr;")
     if topology_count > 0:
@@ -553,7 +582,16 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("s_arena_offset += static_cast<size_t>(" + str(count) + ");")
         self.gen_add_end_control_flow()
     self.gen_add_code_line("#ifdef GRID_CUDA_DEBUG_LAYOUT")
-    self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
+    if tier_workspace_expr is not None and temp_size_int != 0:
+        # Different t_region_count per tier: PERF includes temp; LITE+ excludes it
+        self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
+        self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(fixed_t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
     self.gen_add_code_line("#endif")
     self.gen_add_code_line("(void)s_arena_offset;")
 
