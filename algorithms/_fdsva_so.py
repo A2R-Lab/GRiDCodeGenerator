@@ -268,7 +268,10 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
     self.gen_direct_minv_inner_function_call(use_thread_group,
         updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
-    self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, gravity);")
+    # Phase 3b: forward_dynamics_inner takes s_minv_F as a separate arg. Reuse
+    # minv_s_F (the slot we just declared for the standalone Minv call above —
+    # FD will overwrite it as part of its internal Minv re-computation).
+    self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, minv_s_F, s_XImats, s_temp, gravity);")
     self.gen_add_sync(use_thread_group)
     self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
     if self.robot.floating_base:
@@ -314,7 +317,10 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    fd_start = "forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, "
+    # Phase 3b: forward_dynamics_inner now takes s_minv_F as a separate arg.
+    # In the FDSVA_SO kernel body, minv_s_F is declared just above (the same
+    # slot used for the standalone Minv call); FD will overwrite it.
+    fd_start = "forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, minv_s_F, "
     fd_end = "s_temp, gravity);"
     fd_start, _ = self.gen_insert_helpers_func_def_params(fd_start, [], -2)
     if 'T *' in fd_start: fd_start = fd_start.replace("T *","")

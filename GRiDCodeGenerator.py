@@ -23,7 +23,7 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_kernel, gen_inverse_dynamics_host, gen_inverse_dynamics, \
                             gen_direct_minv_inner_temp_mem_size, gen_direct_minv_inner_F_size, gen_direct_minv_inner_no_F_size, gen_direct_minv_inner_function_call, gen_direct_minv_inner, \
                             gen_direct_minv_device, gen_direct_minv_kernel, gen_direct_minv_host, gen_direct_minv, \
-                            gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
+                            gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_inner_F_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
                             gen_forward_dynamics_inner_function_call, gen_forward_dynamics_inner, gen_forward_dynamics_device, \
                             gen_forward_dynamics_kernel, gen_forward_dynamics_host, gen_forward_dynamics, \
                             gen_inverse_dynamics_gradient_inner_temp_mem_size, gen_inverse_dynamics_gradient_temp_layout, \
@@ -257,7 +257,20 @@ class GRiDCodeGenerator:
         self.minv_t_count_per_tier = tuple(
             (_minv_t_count_full, _minv_t_count_surgical)[i] for i in self.minv_spill_tier_3way
         )
-        fd_t_count = 3*nv + int(self.robot.floating_base) + nv + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
+        # Phase 3b (FD surgical): FD inner now takes s_minv_F as a separate
+        # 6*NV*NV scratch. Level 0 = F in smem (extra slot ahead of FD's
+        # s_temp arena); Level 1 = F in L2-pinned workspace.
+        _fd_F_count = self.gen_forward_dynamics_inner_F_size()
+        _fd_inner_temp_count = self.gen_forward_dynamics_inner_temp_mem_size()  # Phase 3b: already excludes F
+        _fd_base = 3*nv + int(self.robot.floating_base) + nv + XI_size
+        _fd_t_count_full      = _fd_base + _fd_F_count + _fd_inner_temp_count
+        _fd_t_count_surgical  = _fd_base               + _fd_inner_temp_count
+        self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
+        self.fd_use_workspace_F = self.fd_spill_tier_3way[0] == 1
+        fd_t_count = _fd_t_count_full if not self.fd_use_workspace_F else _fd_t_count_surgical
+        self.fd_t_count_per_tier = tuple(
+            (_fd_t_count_full, _fd_t_count_surgical)[i] for i in self.fd_spill_tier_3way
+        )
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
         id_du_temp_count = id_du_temp_layout["full_count"]
         id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
@@ -495,7 +508,11 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
                                  "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -761,9 +778,9 @@ class GRiDCodeGenerator:
         ]),
         ("forward_dynamics", "fd", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("forward_dynamics_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("aba", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("aba_kernel<T>",
@@ -1127,9 +1144,9 @@ class GRiDCodeGenerator:
             "    __global__ direct_minv_Kernel<T>(T *d_Minv, unsigned char *d_workspace, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   direct_minv<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ forward_dynamics_inner<T>(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, T *s_XImats, int *s_topology_helpers, T *s_temp, const T gravity)",\
+            "    __device__ forward_dynamics_inner<T>(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, T *s_minv_F, T *s_XImats, int *s_topology_helpers, T *s_temp, const T gravity)",\
             "    __device__ forward_dynamics_device<T>(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, const robotModel<T> *d_robotModel, const T gravity)", \
-            "    __global__ forward_dynamics_kernel<T>(T *d_qdd, const T *d_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
+            "    __global__ forward_dynamics_kernel<T>(T *d_qdd, unsigned char *d_workspace, const T *d_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   forward_dynamics<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ inverse_dynamics_gradient_inner<T>(T *s_dc_du, const T *s_q, const T *s_qd, const T *s_vaf, T *s_XImats, int *s_topology_helpers, T *s_temp, const T gravity)",\
