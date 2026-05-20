@@ -479,7 +479,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         ("s_D_qdd_stage", max_stages * n * 3 * n),
     ]
     if compute_x_kp1:
-        extra_t_buffers.append(("s_x_kp1", 2 * n))
+        extra_t_buffers.append(("s_x_kp1", 2 * n + fb))  # = nq + nv
     self.gen_XImats_helpers_temp_shared_memory_code(
         inner_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True,
     )
@@ -517,7 +517,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("dAB", str(2 * n * 3 * n), str(2 * n * 3 * n), use_thread_group)
         if compute_x_kp1:
-            self.gen_kernel_save_result("x_kp1", str(2 * n), str(2 * n), use_thread_group)
+            self.gen_kernel_save_result("x_kp1", str(2 * n + fb), str(2 * n + fb), use_thread_group)
         self.gen_add_end_control_flow()
     else:
         input_count = 3 * n + fb
@@ -531,7 +531,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result_single_timing("dAB", str(2 * n * 3 * n), use_thread_group)
         if compute_x_kp1:
-            self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n), use_thread_group)
+            self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n + fb), use_thread_group)
     self.gen_add_end_function()
 
 
@@ -594,7 +594,7 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
         ])
         if compute_x_kp1:
             self.gen_add_code_lines([
-                "gpuErrchk(cudaMemcpy(hd_data->h_x_kp1,hd_data->d_x_kp1,2*NUM_JOINTS*" +
+                "gpuErrchk(cudaMemcpy(hd_data->h_x_kp1,hd_data->d_x_kp1,(NUM_POS + NUM_VEL)*" +
                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                 "gpuErrchkKernel();",
             ])

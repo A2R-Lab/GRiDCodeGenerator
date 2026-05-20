@@ -57,7 +57,7 @@ class GRiDCodeGenerator:
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host, \
                             gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
-                            gen_integrator_kernel, gen_integrator_host, gen_integrator, \
+                            gen_integrator_kernel, gen_integrator_host, gen_integrator, gen_lie_group_helpers, \
                             gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
                             gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, gen_integrator_gradient_device, \
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient
@@ -248,13 +248,17 @@ class GRiDCodeGenerator:
         fd_t_count = 3*nv + int(self.robot.floating_base) + nv + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
         # Integrator: kernel-shared t-count layout is
         #   s_q_qd_u (3nv+fb) + s_qdd (nv) + s_stage_qdd ((max_stages-1)*nv)
-        #   + s_stage_point ((max_stages-1)*2nv) + s_x_kp1 (2nv) + s_temp (= FD inner)
-        # max_stages = 4 (RK4) — see _integrator._max_stages_in_use().
+        #   + s_stage_point ((max_stages-1)*(2nv+fb)) + s_x_kp1 (2nv+fb)
+        #   + s_temp (= FD inner)
+        # The "+fb" terms account for the floating-base quaternion (q has 1
+        # more element than v).  max_stages = 4 (RK4) — see
+        # _integrator._max_stages_in_use().
         _max_stages = 4
-        integrator_t_count = ((3*nv + int(self.robot.floating_base)) + nv
+        _fb = int(self.robot.floating_base)
+        integrator_t_count = ((3*nv + _fb) + nv
                               + (_max_stages - 1) * nv
-                              + (_max_stages - 1) * 2 * nv
-                              + 2*nv
+                              + (_max_stages - 1) * (2 * nv + _fb)
+                              + (2 * nv + _fb)
                               + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size)
         # Integrator gradient: kernel-shared t-count layout is
         #   s_q_qd_u (3nv+fb) + s_dAB (2nv*3nv) + s_df_du (nv*2nv) + s_dc_du (nv*2nv) +
