@@ -453,12 +453,14 @@ def gen_add_shared_memory_helpers(self):
         "enum gridSharedTier { GRID_SHARED_FULL = 0, GRID_SPILL_DA_DF_OUTPUT = 1, GRID_SPILL_DV_DA_DF_OUTPUT = 2 };",
         "",
         "#ifndef GRID_CUDA_ENABLE_L2_PERSISTING",
-        # Phase 3a: default 0; users with workspace-spill kernels (any algo
-        # at tier ≥ 1) should compile with -DGRID_CUDA_ENABLE_L2_PERSISTING=1
-        # to L2-pin workspace bytes. Auto-default-on based on codegen spill
-        # state is gated on a future refactor that computes spill picks
-        # before this helper is emitted.
-        "#define GRID_CUDA_ENABLE_L2_PERSISTING 0",
+        # Phase 3a/b/c spill design: workspace bytes are HOT (recursion-internal
+        # buffers like Minv-F, ABA's interleaved scratch, FDSVA_SO's df_du/Minv)
+        # touched many times per kernel. L2 pinning narrows the smem→HBM penalty
+        # to smem→L2 (~few-cycle hit instead of 100s of cycles). Default-ON
+        # because every codegen target we emit either doesn't spill (= no-op)
+        # or spills hot data (= L2 is the right cache). Niche concurrent-kernel
+        # workloads can override with -DGRID_CUDA_ENABLE_L2_PERSISTING=0.
+        "#define GRID_CUDA_ENABLE_L2_PERSISTING 1",
         "#endif",
         "",
         "__host__ inline cudaError_t grid_get_max_dynamic_shared_memory_bytes(size_t *bytes) {",
