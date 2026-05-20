@@ -398,7 +398,7 @@ def gen_add_shared_memory_helpers(self):
         "}",
         "",
         "template <typename T>",
-        "__host__ __device__ inline size_t grid_shared_arena_bytes(size_t t_count, size_t int_count = 0, size_t extra_byte_count = 0) {",
+        "__host__ __device__ constexpr size_t grid_shared_arena_bytes(size_t t_count, size_t int_count = 0, size_t extra_byte_count = 0) {",
         "    size_t offset = 0;",
         "    offset = grid_align_up(offset, alignof(T));",
         "    offset += sizeof(T) * t_count;",
