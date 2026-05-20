@@ -323,7 +323,23 @@ class GRiDCodeGenerator:
         )
         crba_t_count = nv*nv + crba_input_t_count + self.gen_crba_inner_temp_mem_size() + XI_size
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
-        dee_t_count = n + 6*n*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_gradient_inner_temp_mem_size() + XHom_size + dXhom_size
+        # Phase 3d (EE_POSE_GRAD): three-tier spill, mirrors D2EE.
+        # Level 0 = full smem (inner_temp + s_deePos + dXmatsHom). Level 1 =
+        # inner_temp + s_deePos -> workspace/global. Level 2 = also
+        # dXmatsHom -> workspace. inner_temp is recursion-hot but L2-pinned at
+        # the host wrapper for spill tiers; s_deePos is write-once output.
+        _ee_grad_num_ees = self.robot.get_total_leaf_nodes()
+        _ee_grad_inner_temp_count = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
+        _ee_grad_full_t_count        = n + 6*n*_ee_grad_num_ees + _ee_grad_inner_temp_count + XHom_size + dXhom_size
+        _ee_grad_spill_temp_t_count  = n                                                    + XHom_size + dXhom_size
+        _ee_grad_spill_dxhom_t_count = n                                                    + XHom_size
+        _ee_grad_arenas = (_ee_grad_full_t_count, _ee_grad_spill_temp_t_count, _ee_grad_spill_dxhom_t_count)
+        self.ee_grad_spill_tier_3way = select_shared_tier_3way(*_ee_grad_arenas)
+        self.ee_grad_spill_tier = self.ee_grad_spill_tier_3way[0]
+        self.ee_grad_use_workspace_temp = self.ee_grad_spill_tier >= 1
+        self.ee_grad_use_workspace_dxhom = self.ee_grad_spill_tier >= 2
+        dee_t_count = _ee_grad_arenas[self.ee_grad_spill_tier]
+        self.ee_grad_t_count_per_tier = tuple(_ee_grad_arenas[i] for i in self.ee_grad_spill_tier_3way)
         d2ee_inner_temp_count_full = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
         d2ee_inner_temp_count_shared = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp=False)
         d2ee_workspace_temp_count = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()
@@ -436,10 +452,18 @@ class GRiDCodeGenerator:
             d2ee_workspace_t_count += d2ee_workspace_temp_count
         if self.d2ee_use_workspace_d2xhom:
             d2ee_workspace_t_count += d2Xhom_size
+        # Phase 3d: max workspace required by EE_POSE_GRAD across any tier (PERF
+        # may pick 0, but the workspace allocation must cover what LITE/MINIMAL
+        # need at runtime when the user switches tier via the kernel template).
+        ee_grad_workspace_t_count = 0
+        if any(p >= 1 for p in self.ee_grad_spill_tier_3way):
+            ee_grad_workspace_t_count += _ee_grad_inner_temp_count
+        if any(p >= 2 for p in self.ee_grad_spill_tier_3way):
+            ee_grad_workspace_t_count += dXhom_size
         # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
         # tensors live in d_workspace instead of shared memory for larger robots.
         idsva_so_body_frame_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, idsva_so_body_frame_grav_spill_t_count)
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, ee_grad_workspace_t_count, idsva_so_body_frame_grav_spill_t_count)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -476,6 +500,9 @@ class GRiDCodeGenerator:
                                  "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_temp)) + ";", \
                                  "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = " + str(int(self.d2ee_use_workspace_d2xhom)) + ";", \
                                  "const int GRID_D2EE_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
+                                 "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP = " + str(int(self.ee_grad_use_workspace_temp)) + ";", \
+                                 "const int GRID_EE_GRAD_USES_WORKSPACE_DXHOM = " + str(int(self.ee_grad_use_workspace_dxhom)) + ";", \
+                                 "const int GRID_EE_GRAD_SHARED_TIER_VALUE = " + str(self.ee_grad_spill_tier) + ";", \
                                  "const int GRID_ID_DU_SHARED_TIER_VALUE = " + str(self.id_du_spill_tier) + ";", \
                                  "const int GRID_FD_DU_SHARED_TIER_VALUE = " + str(self.fd_du_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(id_du_temp_layout["spill_start"]) + ";", \
@@ -559,7 +586,14 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t CRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(crba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ constexpr size_t GRID_EE_LINALG_SHARED_BYTES() { return static_cast<size_t>(0); }",
                                  "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 # Phase 3d: tier-aware. PERF/LITE/MINIMAL each report the smem
+                                 # bytes their picked spill level needs. Collapsed picks (small
+                                 # robots) return identical values across branches.
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "}",
                                  # Tier-aware: TIER_PERF/LITE/MINIMAL each report the smem bytes their
                                  # picked spill level needs. When the picks collapse (small robots) the
                                  # three branches return identical values. Default TIER = TIER_PERF
@@ -626,6 +660,11 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>() + (GRID_D2EE_USES_WORKSPACE_D2XHOM ? sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT) : 0); }",
+                                 # Phase 3d: EE_POSE_GRAD reuses the SO section (the kernels don't
+                                 # run concurrently — d_workspace bytes are safely repurposed). When
+                                 # the MINIMAL tier spills dXmatsHom, it sits before the temp arena.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>() + (GRID_EE_GRAD_USES_WORKSPACE_DXHOM ? sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT) : 0); }",
                                  "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_D2EE || D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_IDSVA_SO_BODY_FRAME || IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
                                  "// __forceinline__ used throughout the xhom helper chain so ptxas folds these into the",
                                  "// inner kernels at all opt levels. For fixed-base the body of grid_q_index_affects_joint is",
@@ -754,7 +793,7 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    if (GRID_D2EE_USES_WORKSPACE_TEMP && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
+                      "    if ((GRID_D2EE_USES_WORKSPACE_TEMP || GRID_EE_GRAD_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
@@ -838,9 +877,9 @@ class GRiDCodeGenerator:
         ]),
         ("end_effector_pose_gradient", "ee_pose_gradient", None, "DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("end_effector_pose_gradient_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_gradient_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("inverse_dynamics_gradient", "id_du", "generate_id_du", "ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_gradient_kernel<T>",
@@ -1207,7 +1246,7 @@ class GRiDCodeGenerator:
             "",\
             "    __device__ end_effector_pose_gradient_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
             "    __device__ end_effector_pose_gradient_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ end_effector_pose_gradient_hessian_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \

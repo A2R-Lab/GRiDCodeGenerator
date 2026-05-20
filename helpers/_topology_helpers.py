@@ -417,6 +417,7 @@ def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = Fals
 
 def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_gradients = False,
                                                  include_hessians = False, extra_t_buffers = None,
+                                                 include_dxhom_shared = True,
                                                  include_d2xhom_shared = True,
                                                  include_linalg_scratch = False,
                                                  linalg_scratch_bytes = "GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()"):
@@ -425,7 +426,7 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
     if extra_t_buffers is None:
         extra_t_buffers = []
     hom_buffers = [("s_XmatsHom", Xhom_size)]
-    if include_gradients:
+    if include_gradients and include_dxhom_shared:
         hom_buffers.append(("s_dXmatsHom", dXhom_size))
     if include_hessians and include_d2xhom_shared:
         hom_buffers.append(("s_d2XmatsHom", d2Xhom_size))

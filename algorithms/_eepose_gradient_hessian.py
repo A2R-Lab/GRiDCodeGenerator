@@ -600,75 +600,110 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
     self.gen_add_end_function()
 
+_EE_GRAD_PICK_FLAGS = [
+    # (use_workspace_temp, use_workspace_dxhom)
+    (False, False),   # pick 0: full smem (PERF)
+    (True,  False),   # pick 1: inner_temp + s_deePos -> workspace/global (LITE)
+    (True,  True),    # pick 2: also dXmatsHom -> workspace (MINIMAL)
+]
+
+def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
+                                            use_workspace_temp, use_workspace_dxhom,
+                                            single_call_timing, use_thread_group):
+    """Emit the EE_POSE_GRAD kernel body specialized for one tier's spill flags.
+    Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
+    Used by gen_end_effector_pose_gradient_kernel to emit either a single body
+    (collapsed picks) or three branched bodies (divergent picks). Mirrors
+    _emit_d2ee_kernel_body_for_flags."""
+    shared_mem_size = 0 if use_workspace_temp else self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
+    extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_deePos", 6*n*num_ees)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True,
+                                                      extra_t_buffers = extra_t_buffers,
+                                                      include_dxhom_shared = not use_workspace_dxhom,
+                                                      include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
+    if not use_workspace_temp:
+        self.gen_add_code_line("(void)d_workspace;")
+    if use_thread_group:
+        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        if use_workspace_dxhom:
+            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
+        if use_workspace_temp:
+            self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
+            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_code_line("// compute")
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        updated = {}
+        if use_workspace_temp:
+            updated["s_temp_name"] = "s_eegrad_temp"
+        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name, updated_var_names = updated if updated else None)
+        self.gen_add_sync(use_thread_group)
+        if not use_workspace_temp:
+            self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        if use_workspace_dxhom:
+            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
+        if use_workspace_temp:
+            self.gen_add_code_line("T *s_deePos = d_deePos;")
+            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        # TODO(licm-eepose-grad): sm_86-specific, deprioritized. See pre-Phase-3d note in git history.
+        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        updated = {}
+        if use_workspace_temp:
+            updated["s_temp_name"] = "s_eegrad_temp"
+        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name, updated_var_names = updated if updated else None)
+        self.gen_anti_licm_output_write("deePos")
+        self.gen_add_end_control_flow()
+        if not use_workspace_temp:
+            self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
+
+
 def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single_call_timing = False, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
-    # define function def and params
     func_params = ["d_deePos is the vector of end effector positions gradients", \
+                   "d_workspace is the generated global spill workspace", \
                    "d_q is the vector of joint positions", \
                    "stride_q is the stide between each q", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(T *d_deePos, const T *d_q, const int stride_q, "
+    func_def_start = "void end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("(", "_single_timing(")
-    # then generate the code
     self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # add shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True,
-                                                      extra_t_buffers = [("s_q", n), ("s_deePos", 6*n*num_ees)],
-                                                      include_linalg_scratch = True,
-                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
-        # compute
-        self.gen_add_code_line("// compute")
-        # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
-        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
-        self.gen_add_sync(use_thread_group)
-        # save to global
-        self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
-        self.gen_add_end_control_flow()
+    # Tier dispatch: when the 3 picks collapse, emit one body. When they
+    # diverge, emit three if-constexpr branches — each specialized for that
+    # tier's spill flags. DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T, TIER>() is
+    # tier-aware.
+    picks = getattr(self, "ee_grad_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        uwt, uwd = _EE_GRAD_PICK_FLAGS[picks[0]]
+        _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing, use_thread_group)
     else:
-        #repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
-        # then compute in loop for timing
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        # TODO(licm-eepose-grad): sm_86-specific, deprioritized. The
-        # rep-stomp + output→input feedback in gen_anti_licm_input_reload
-        # works for every other algorithm. ee_pose_gradient floating-base
-        # on sm_86 / CUDA 12.6 still measures ~0 µs in single_timing — kernel
-        # SASS has the rep loop and 2 CALLs to non-empty inner functions,
-        # but ptxas appears to find some path to optimize the body away.
-        # Confirmed sm_120 / Blackwell is fine (iiwa14_fixed 1.78 µs,
-        # iiwa14_floating 306 µs, g1_floating 322 µs single-call, all real;
-        # smoke 2026-05-16). If/when someone needs to fix on sm_86, do a
-        # SASS diff vs ee_pose (which does measure correctly) and consider
-        # a stronger defense (write rep into multiple slots, or have the
-        # inner-fn read the feedback value directly).
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
-        # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
-        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
-        self.gen_anti_licm_output_write("deePos")
-        self.gen_add_end_control_flow()
-        # save to global
-        self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            uwt, uwd = _EE_GRAD_PICK_FLAGS[pick]
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
@@ -698,7 +733,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient requires all-data or kinematics gridData\");")
-    func_call_start = "end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_deePos,hd_data->d_q,stride_q,"
+    func_call_start = "end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T><<<block_dimms,thread_dimms,DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_deePos,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -728,7 +763,10 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient\", DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
+    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
