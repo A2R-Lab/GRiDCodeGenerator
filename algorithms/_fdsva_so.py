@@ -274,26 +274,17 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_fdsva_so_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
-def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = False):
-    # NUM_VEL is the SO tensor dimension (rank-3 nv*nv*nv) and the Minv /
-    # df_du / qdd dimension; NUM_POS is only the q-vector size (differs from
-    # NUM_VEL for floating-base because of the quaternion). fdsva_so_inner
-    # itself already uses NUM_VEL for all math; matching here is what fixes
-    # the floating-base OOB writes to s_df2 and s_idsva_so.
-    n = self.robot.get_num_vel()
-    NUM_POS = self.robot.get_num_pos()
-    use_global_tensors = getattr(self, "fdsva_so_use_global_tensors", n > MEMORY_THRESHOLD)
-    use_workspace_temp = getattr(self, "fdsva_so_use_workspace_temp", False)
-    # MEM1: have fd_grad_inline's id_du_gradient_inner spill its da_dq..fxvi
-    # band to d_workspace's grad section. The flag is computed in
-    # GRiDCodeGenerator.gen_all_code based on whether the kernel would
-    # exceed the shared-mem target without spill — a size-based gate that
-    # generalises beyond fdsva_so once we extract the pattern (M1).
-    fd_grad_use_spill = getattr(self, "fdsva_so_fd_grad_use_spill", False)
-    # Dispatch: body_frame inner wins ~30× for fixed-base; world_frame inner wins
-    # 2-4× for floating-base AND has no gravity-shim spill pointer, sidestepping
-    # the use_workspace_temp / s_temp_spill collision that previously crashed
-    # go2_floating.
+_FDSVA_SO_PICK_FLAGS = [
+    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill)
+    (False, False, False),   # pick 0: full smem
+    (True,  False, False),   # pick 1: outputs to global
+    (True,  True,  False),   # pick 2: + inner temp to global
+    (True,  True,  True),    # pick 3: + fd_grad da_df band to global
+]
+
+def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, use_workspace_temp,
+                                         fd_grad_use_spill, single_call_timing, use_thread_group):
+    """Emit fdsva_so kernel body for one tier's spill flags."""
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base
         else self.gen_idsva_so_body_frame_inner_temp_mem_size()
@@ -305,31 +296,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
     if not use_workspace_temp:
         shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
-    # define function def and params
-    func_params = ["d_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
-                    "d_q_qd_u is the vector of joint positions, velocities, torques", \
-                    "stride_q_qd_u is the stride between each q, qd, qdd", \
-                    "d_workspace is the generated global spill workspace", \
-                    "d_idsva_so is the pointer to the idsva_so output tensor in global memory", \
-                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                    "gravity is the gravity constant", \
-                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_notes = []
-    func_def_start = "void fdsva_so_kernel(T *d_df2, const T *d_q_qd_u, const int stride_q_qd_u, unsigned char *d_workspace, T *d_idsva_so, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    
-    # then generate the code
-    self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)", \
-                            func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
-
-    # add shared memory variables — NUM_POS for q, NUM_VEL (n) for everything else
     extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_Minv", n*n), ("s_qdd", n), ("s_df_du", 2*n*n)]
     if not use_global_tensors:
         extra_t_buffers.append(("s_idsva_so", n*n*n*4))
@@ -340,11 +306,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
-    # idsva_so_body_frame_inner takes a gravity-shim spill pointer when
-    # floating-base, but we now dispatch to idsva_so_world_frame_inner for
-    # floating (world-frame bakes gravity into the main sweep — no shim, no
-    # spill). For fixed-base, body_frame_inner doesn't dereference the spill
-    # either. So this stays nullptr for both code paths.
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
@@ -354,7 +315,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if 'T *' in fd_start: fd_start = fd_start.replace("T *","")
     if 'int *' in fd_start: fd_start = fd_start.replace("int *","")
     if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(NUM_POS + 2*n),use_thread_group)
         if use_global_tensors:
@@ -363,13 +323,9 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
-            # MEM1: id_du_gradient_inner spills its da_dq..fxvi band into the
-            # grad section of workspace (same offset id_du_kernel uses).
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
-        # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        # Need Minv, FD Gradient, IDSVA-SO
         self.gen_direct_minv_inner_function_call(use_thread_group)
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
@@ -379,7 +335,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
             spill_ptr_expr="s_fd_grad_spill" if fd_grad_use_spill else "nullptr",
         )
         if self.robot.floating_base:
-            # World-frame inner: faster on floating AND no gravity-shim spill.
             self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
         else:
             self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
@@ -387,13 +342,10 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_sync(use_thread_group)
-        # save to global
         if not use_global_tensors: self.gen_kernel_save_result("df2",f"{4*n**3}",str(4*n*n*n),use_thread_group)
         self.gen_add_end_control_flow()
     else:
-        # repurpose NUM_TIMESTEPS for number of timing reps
         self.gen_kernel_load_inputs_single_timing("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
-        # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
@@ -403,7 +355,6 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
-            # MEM1 (single-timing path): see non-timing branch above for details.
             self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_direct_minv_inner_function_call(use_thread_group)
@@ -422,8 +373,45 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
         fdsva_updates = dict(s_temp_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates)
         self.gen_add_end_control_flow()
-        # save to global
         if not use_global_tensors: self.gen_kernel_save_result_single_timing("df2",str(4*n*n*n),use_thread_group)
+
+
+def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = False):
+    # NUM_VEL is the SO tensor dimension (rank-3 nv*nv*nv); NUM_POS is q-vector size.
+    n = self.robot.get_num_vel()
+    NUM_POS = self.robot.get_num_pos()
+    func_params = ["d_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
+                    "d_q_qd_u is the vector of joint positions, velocities, torques", \
+                    "stride_q_qd_u is the stride between each q, qd, qdd", \
+                    "d_workspace is the generated global spill workspace", \
+                    "d_idsva_so is the pointer to the idsva_so output tensor in global memory", \
+                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                    "gravity is the gravity constant", \
+                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_notes = []
+    func_def_start = "void fdsva_so_kernel(T *d_df2, const T *d_q_qd_u, const int stride_q_qd_u, unsigned char *d_workspace, T *d_idsva_so, "
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    picks = getattr(self, "fdsva_so_spill_tier_3way", (3, 3, 3))
+    if picks[0] == picks[1] == picks[2]:
+        ugt, uwt, fgs = _FDSVA_SO_PICK_FLAGS[picks[0]]
+        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, single_call_timing, use_thread_group)
+    else:
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            ugt, uwt, fgs = _FDSVA_SO_PICK_FLAGS[pick]
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_fdsva_so_host(self, mode = 0):

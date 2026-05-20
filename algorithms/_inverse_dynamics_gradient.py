@@ -951,12 +951,77 @@ def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
     temp_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
+_ID_DU_PICK_FLAGS = [
+    # (use_selective_spill, use_global_temp)
+    (False, False),   # pick 0: full smem
+    (True,  False),   # pick 1: selective spill (da_df band to workspace)
+    (False, True),    # pick 2: global temp (entire s_temp to workspace)
+]
+
+def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
+                                      use_qdd_input, single_call_timing, use_thread_group):
+    """Emit the id_du kernel body for one tier's spill flags."""
+    extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", 18*n)]
+    if use_qdd_input:
+        extra_t_buffers.append(("s_qdd", n))
+    shared_mem_size = 0 if use_global_temp else (
+        self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
+        if use_selective_spill else self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    )
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
+    if use_thread_group:
+        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        if use_qdd_input:
+            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
+        else:
+            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        elif use_global_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        self.gen_add_code_line("// compute")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
+        self.gen_inverse_dynamics_gradient_inner_function_call(
+            use_thread_group,
+            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+        )
+        self.gen_add_sync(use_thread_group)
+        self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
+        self.gen_add_end_control_flow()
+    else:
+        if use_qdd_input:
+            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
+        else:
+            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group)
+        if use_selective_spill:
+            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(d_workspace);")
+        elif use_global_temp:
+            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        if use_qdd_input:
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),feedback_from="dc_du")
+        else:
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,feedback_from="dc_du")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
+        self.gen_inverse_dynamics_gradient_inner_function_call(
+            use_thread_group,
+            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+        )
+        self.gen_anti_licm_output_write("dc_du")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)
+
+
 def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
-    NJ = self.robot.get_num_joints()
-    compute_c = True
-    # define function def and params
     func_params = ["d_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
@@ -974,77 +1039,26 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    # then generate the code
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # add shared memory variables
-    use_selective_spill = getattr(self, "id_du_use_selective_spill", False)
-    use_global_temp = getattr(self, "id_du_use_global_temp", False)
-    extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", 18*n)]
-    if use_qdd_input:
-        extra_t_buffers.append(("s_qdd", n))
-    shared_mem_size = 0 if use_global_temp else (
-        self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
-        if use_selective_spill else self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-    )
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
-    self.gen_add_code_line("T *s_temp_spill = nullptr;")
-    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        if use_qdd_input:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
-        else:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group)
-        if use_selective_spill:
-            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
-        elif use_global_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
-        # compute
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(
-            use_thread_group,
-            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
-        )
-        self.gen_add_sync(use_thread_group)
-        # save to global
-        self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
-        self.gen_add_end_control_flow()
+    # Tier dispatch: collapsed picks → single body (current behavior);
+    # divergent picks → 3 if-constexpr branches.
+    picks = getattr(self, "id_du_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        uss, ugt = _ID_DU_PICK_FLAGS[picks[0]]
+        _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing, use_thread_group)
     else:
-        #repurpose NUM_TIMESTEPS for number of timing reps
-        if use_qdd_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
-        else:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group)
-        if use_selective_spill:
-            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(d_workspace);")
-        elif use_global_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
-        # then compute in loop for timing
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        if use_qdd_input:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),feedback_from="dc_du")
-        else:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,feedback_from="dc_du")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(
-            use_thread_group,
-            dict(s_temp_spill_name = "s_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
-        )
-        self.gen_anti_licm_output_write("dc_du")
-        self.gen_add_end_control_flow()
-        # save to global
-        self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            uss, ugt = _ID_DU_PICK_FLAGS[pick]
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_host(self, mode = 0):

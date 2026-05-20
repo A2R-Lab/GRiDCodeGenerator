@@ -476,8 +476,16 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_du_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t FD_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FD_DU_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
                                  "template <typename T> __host__ __device__ inline size_t ID_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -488,10 +496,22 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ constexpr size_t GRID_EE_LINALG_SHARED_BYTES() { return static_cast<size_t>(0); }",
                                  "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(dee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(d2ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 # Tier-aware: TIER_PERF/LITE/MINIMAL each report the smem bytes their
+                                 # picked spill level needs. When the picks collapse (small robots) the
+                                 # three branches return identical values. Default TIER = TIER_PERF
+                                 # preserves all existing single-arg call sites.
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "}",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_body_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_world_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fdsva_so_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "}",
                                  "// Per-tier scratch sizes for fdsva_so_inner (inline-CUDA users only — the host launchers always use TIER_PERF).",
                                  "// At TIER_PERF the 4*NV^3 inner scratch lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing shared memory for the caller's outer kernel.",
                                  "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t FDSVA_SO_INNER_SMEM_BYTES() { return (TIER == TIER_PERF) ? sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + ") : static_cast<size_t>(0); }",
