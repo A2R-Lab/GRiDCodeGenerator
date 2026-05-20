@@ -23,7 +23,7 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -3)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Second Order of Forward Dynamics with Spatial Vector Algebra", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
@@ -435,7 +435,7 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

@@ -536,6 +536,16 @@ class GRiDCodeGenerator:
                                  "constexpr int TIER_LITE    = 1;",
                                  "constexpr int TIER_MINIMAL = 2;",
                                  "",
+                                 "// Compile-time override for the default RESOURCE_TIER baked into every",
+                                 "// emitted kernel template. Defaults to TIER_PERF so existing callsites",
+                                 "// (kernel<T>, host wrappers that call kernel<T><<<...>>>) keep their",
+                                 "// current best-perf semantics. Bench harness sets this via",
+                                 "// -DGRID_DEFAULT_RESOURCE_TIER=TIER_LITE (or TIER_MINIMAL) to sweep",
+                                 "// per-tier perf without modifying host-wrapper template signatures.",
+                                 "#ifndef GRID_DEFAULT_RESOURCE_TIER",
+                                 "#define GRID_DEFAULT_RESOURCE_TIER TIER_PERF",
+                                 "#endif",
+                                 "",
                                  "// Per-tier launch_bounds upper-bound (= max threads per block nvcc must",
                                  "// budget registers for). sm_120 has 65536 regs/block; nvcc enforces",
                                  "// regs_per_thread * max_threads <= regs_per_block, so a larger max_threads",
@@ -553,22 +563,22 @@ class GRiDCodeGenerator:
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t FD_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t ID_DU_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.id_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FD_DU_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t FD_DU_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -578,7 +588,7 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -589,7 +599,7 @@ class GRiDCodeGenerator:
                                  # Phase 3d: tier-aware. PERF/LITE/MINIMAL each report the smem
                                  # bytes their picked spill level needs. Collapsed picks (small
                                  # robots) return identical values across branches.
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t DEE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.ee_grad_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
@@ -598,50 +608,50 @@ class GRiDCodeGenerator:
                                  # picked spill level needs. When the picks collapse (small robots) the
                                  # three branches return identical values. Default TIER = TIER_PERF
                                  # preserves all existing single-arg call sites.
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t D2EE_POS_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "}",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_body_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
                                  "template <typename T> __host__ __device__ inline size_t IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_world_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "}",
                                  "// Per-tier scratch sizes for fdsva_so_inner (inline-CUDA users only — the host launchers always use TIER_PERF).",
                                  "// At TIER_PERF the 4*NV^3 inner scratch lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing shared memory for the caller's outer kernel.",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t FDSVA_SO_INNER_SMEM_BYTES() { return (TIER == TIER_PERF) ? sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + ") : static_cast<size_t>(0); }",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t FDSVA_SO_INNER_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FDSVA_SO_INNER_SMEM_BYTES() { return (TIER == TIER_PERF) ? sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + ") : static_cast<size_t>(0); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FDSVA_SO_INNER_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + "); }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count - fd_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(fd_du_temp_count) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(fd_du_temp_count) + "); }",
                                  "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_PERF d2eeTemp lives in the shared arena; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(d2ee_workspace_temp_count) + "*sizeof(T) bytes of smem.",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_SMEM_BYTES() {",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + d2ee_workspace_temp_count + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(d2ee_workspace_temp_count) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(d2ee_workspace_temp_count) + "); }",
                                  "// Per-tier sizes for inverse_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(id_du_temp_count) + "*sizeof(T) bytes of smem.",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_SMEM_BYTES() {",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(id_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(id_du_device_t_count - id_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(id_du_temp_count) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(id_du_temp_count) + "); }",
                                  "// Per-tier sizes for idsva_so_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "*sizeof(T) bytes of smem. Frame picked at codegen time: " + ("world_frame" if self.robot.floating_base else "body_frame") + ".",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_SMEM_BYTES() {",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str((idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + XI_size) + ", TOPOLOGY_HELPERS_COUNT)",
                                  "        : grid_shared_arena_bytes<T>(" + str(XI_size) + ", TOPOLOGY_HELPERS_COUNT);",
                                  "}",
-                                 "template <typename T, int TIER = TIER_PERF> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(grad_spill_workspace_t_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(so_workspace_t_count) + "); }",
                                  # Phase 3e: sized for MINIMAL tier's spill (max across PERF/LITE/MINIMAL).

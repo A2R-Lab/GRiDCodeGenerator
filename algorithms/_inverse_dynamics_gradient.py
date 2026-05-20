@@ -934,7 +934,7 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
         func_notes.append("optimized for qdd = 0")
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables
@@ -1040,7 +1040,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
