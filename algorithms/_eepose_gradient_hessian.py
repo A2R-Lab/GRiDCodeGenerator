@@ -1129,15 +1129,18 @@ def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
 def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
+    inner_no_d2_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)
+    d2_temp_size = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()
     # construct the boilerplate and function definition
     func_params = ["s_d2eePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
                    "s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
                    "s_q is the vector of joint positions", \
-                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
-    func_notes = []
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "s_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(d2_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+    func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the d2eeTemp scratch (~" + str(d2_temp_size) + "*sizeof(T) bytes) moves from shared memory to s_workspace, freeing smem for the caller's outer kernel"]
     func_def_start = "void end_effector_pose_gradient_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
-    func_def_end = "const robotModel<T> *d_robotModel) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *s_workspace = nullptr) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -1145,15 +1148,25 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables
-    shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_hessians = True,
+    # Smem arena: s_temp is the inner-no-d2 size always (in smem at every tier).
+    # s_d2eeTemp is tier-conditional: at TIER_PERF it extends the arena past
+    # linalg/topology; at TIER_LITE+ it comes from s_workspace.
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_no_d2_size, include_gradients = True, include_hessians = True,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
-    self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")
+    self.gen_add_code_line("T *s_d2eeTemp;")
+    self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
+    self.gen_add_code_line("(void)s_workspace;")
+    self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
+    self.gen_add_code_line("s_d2eeTemp = grid_arena_ptr<T>(s_arena, s_arena_offset);")
+    self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(d2_temp_size) + ");")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("s_d2eeTemp = s_workspace;")
+    self.gen_add_end_control_flow()
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
     self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
