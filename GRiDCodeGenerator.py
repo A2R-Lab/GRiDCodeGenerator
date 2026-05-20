@@ -72,6 +72,10 @@ class GRiDCodeGenerator:
         # check for the file/namespace name
         self.file_namespace = FILE_NAMESPACE
         self.cuda_target_shared_mem_bytes = int(os.environ.get("GRID_CUDA_TARGET_SHARED_MEM_BYTES", "98304"))
+        # LITE tier: pick the lowest-spill level whose arena ≤ this target.
+        # 48 KB is roughly half the sm_120 ~100 KB per-block cap, so inline-CUDA
+        # callers retain ~48 KB for their own outer-kernel scratch.
+        self.cuda_target_lite_shared_mem_bytes = int(os.environ.get("GRID_CUDA_TARGET_LITE_SHARED_MEM_BYTES", "49152"))
         self.cuda_shared_mem_type_size_bytes = int(os.environ.get("GRID_CUDA_SHARED_MEM_TYPE_SIZE_BYTES", "4"))
 
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
@@ -224,6 +228,22 @@ class GRiDCodeGenerator:
                 return 1
             return 2
 
+        def select_shared_tier_3way(*t_counts):
+            """Pick the (perf, lite, minimal) spill-level indices for one algo.
+            `t_counts` is the ordered list of arena t_counts at each spill level,
+            least-spill first. PERF picks the lowest index whose arena fits
+            cuda_target_shared_mem_bytes; LITE picks the lowest index whose
+            arena fits cuda_target_lite_shared_mem_bytes (clamped to be ≥ PERF
+            pick — LITE can't be less spill than PERF); MINIMAL is always the
+            last (most-spill) index."""
+            last = len(t_counts) - 1
+            perf = next((i for i, t in enumerate(t_counts)
+                         if py_arena_bytes(t) <= self.cuda_target_shared_mem_bytes), last)
+            lite = next((i for i, t in enumerate(t_counts)
+                         if py_arena_bytes(t) <= self.cuda_target_lite_shared_mem_bytes), last)
+            lite = max(perf, lite)
+            return (perf, lite, last)
+
         id_t_count = 2*n + n + 18*n + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
         minv_t_count = n + n*n + self.gen_direct_minv_inner_temp_mem_size() + XI_size
         fd_t_count = 3*nv + int(self.robot.floating_base) + nv + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
@@ -243,14 +263,25 @@ class GRiDCodeGenerator:
         fd_du_t_count_selective = fd_du_t_count_full - fd_du_temp_count + fd_du_selective_temp_count
         id_du_t_count_emergency = id_du_t_count_full - id_du_temp_count
         fd_du_t_count_emergency = fd_du_t_count_full - fd_du_temp_count
-        self.id_du_spill_tier = select_shared_tier(id_du_t_count_full, id_du_t_count_selective)
-        self.fd_du_spill_tier = select_shared_tier(fd_du_t_count_full, fd_du_t_count_selective)
+        # Per-tier picks (perf, lite, minimal). The existing single-pick flags
+        # (id_du_spill_tier etc.) are kept = perf pick so today's emit paths
+        # are byte-for-byte unchanged; the lite/minimal indices are exposed
+        # only as metadata until the per-tier emit work lands.
+        _id_du_arenas = (id_du_t_count_full, id_du_t_count_selective, id_du_t_count_emergency)
+        _fd_du_arenas = (fd_du_t_count_full, fd_du_t_count_selective, fd_du_t_count_emergency)
+        self.id_du_spill_tier_3way = select_shared_tier_3way(*_id_du_arenas)
+        self.fd_du_spill_tier_3way = select_shared_tier_3way(*_fd_du_arenas)
+        self.id_du_spill_tier = self.id_du_spill_tier_3way[0]
+        self.fd_du_spill_tier = self.fd_du_spill_tier_3way[0]
         self.id_du_use_selective_spill = self.id_du_spill_tier == 1
         self.fd_du_use_selective_spill = self.fd_du_spill_tier == 1
         self.id_du_use_global_temp = self.id_du_spill_tier == 2
         self.fd_du_use_global_temp = self.fd_du_spill_tier == 2
-        id_du_t_count = [id_du_t_count_full, id_du_t_count_selective, id_du_t_count_emergency][self.id_du_spill_tier]
-        fd_du_t_count = [fd_du_t_count_full, fd_du_t_count_selective, fd_du_t_count_emergency][self.fd_du_spill_tier]
+        id_du_t_count = _id_du_arenas[self.id_du_spill_tier]
+        fd_du_t_count = _fd_du_arenas[self.fd_du_spill_tier]
+        # Per-tier t_counts exposed for tier-aware constexpr metadata.
+        self.id_du_t_count_per_tier = tuple(_id_du_arenas[i] for i in self.id_du_spill_tier_3way)
+        self.fd_du_t_count_per_tier = tuple(_fd_du_arenas[i] for i in self.fd_du_spill_tier_3way)
         aba_input_t_count = n + 2*nv
         crba_input_t_count = n + nv
         aba_t_count = nv + aba_input_t_count + 12*NJ + self.gen_aba_inner_temp_mem_size() + XI_size
@@ -263,13 +294,16 @@ class GRiDCodeGenerator:
         d2ee_full_t_count = n + 6*n*n*self.robot.get_total_leaf_nodes() + 6*n*self.robot.get_total_leaf_nodes() + d2ee_inner_temp_count_full + XHom_size + dXhom_size + d2Xhom_size
         d2ee_spill_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size
         d2ee_spill_d2xhom_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size
-        self.d2ee_spill_tier = 0
+        _d2ee_arenas = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count)
         if "ee_pose_hessian" in getattr(self, "generated_algorithms", set()):
-            if py_arena_bytes(d2ee_full_t_count) > self.cuda_target_shared_mem_bytes:
-                self.d2ee_spill_tier = 1 if py_arena_bytes(d2ee_spill_t_count) <= self.cuda_target_shared_mem_bytes else 2
+            self.d2ee_spill_tier_3way = select_shared_tier_3way(*_d2ee_arenas)
+        else:
+            self.d2ee_spill_tier_3way = (0, 0, 0)
+        self.d2ee_spill_tier = self.d2ee_spill_tier_3way[0]
         self.d2ee_use_workspace_temp = self.d2ee_spill_tier >= 1
         self.d2ee_use_workspace_d2xhom = self.d2ee_spill_tier >= 2
-        d2ee_t_count = [d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count][self.d2ee_spill_tier]
+        d2ee_t_count = _d2ee_arenas[self.d2ee_spill_tier]
+        self.d2ee_t_count_per_tier = tuple(_d2ee_arenas[i] for i in self.d2ee_spill_tier_3way)
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
         # would exceed the target, set self.idsva_so_body_frame_grav_full_spill and
         # let gen_idsva_so_body_frame_inner_temp_mem_size() return the smaller value
@@ -288,6 +322,15 @@ class GRiDCodeGenerator:
         if self.robot.floating_base and py_arena_bytes(idsva_so_body_frame_t_count) > self.cuda_target_shared_mem_bytes:
             self.idsva_so_body_frame_grav_full_spill = True
             idsva_so_body_frame_t_count, self.idsva_so_body_frame_use_global_output = _compute_idsva_body_t_count()
+        # 3-way pick stub: spill flags here depend on whether
+        # `gen_idsva_so_body_frame_inner_temp_mem_size()` honors a separate
+        # grav-spill, which is currently a single self-flag. Approximate as
+        # (perf, lite=perf, minimal=perf) until the per-tier emit lands;
+        # captured here so metadata emission has a consistent surface.
+        _idsva_so_bf_perf_t = idsva_so_body_frame_t_count
+        self.idsva_so_body_frame_t_count_per_tier = (_idsva_so_bf_perf_t,
+                                                     _idsva_so_bf_perf_t,
+                                                     _idsva_so_bf_perf_t)
         # After the spill decision is final, capture the inner temp count for use
         # downstream (world-frame fallback for fixed-base + FDSVA-SO inner sizing).
         idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
@@ -327,11 +370,11 @@ class GRiDCodeGenerator:
             ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False),
             ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True),
         ]
-        _chosen = next(
-            (t for t in _fdsva_so_tiers if py_arena_bytes(t[1]) <= self.cuda_target_shared_mem_bytes),
-            _fdsva_so_tiers[-1],  # fallback: most-spill tier even if it still exceeds (runtime SKIP handles that)
-        )
+        _fdsva_so_arenas = tuple(t[1] for t in _fdsva_so_tiers)
+        self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
+        _chosen = _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]]
         _, fdsva_so_t_count, self.fdsva_so_use_global_tensors, self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill = _chosen
+        self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
         grad_spill_workspace_t_count = max(id_du_temp_layout["spill_count"],
                                            id_du_temp_count,
                                            fd_du_temp_count,
