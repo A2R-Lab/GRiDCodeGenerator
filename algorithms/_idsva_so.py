@@ -2295,9 +2295,9 @@ def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     # then generate the code
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
@@ -3116,9 +3116,9 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes IDSVA-SO via the world-frame single-pass formulation", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]
     if not use_global_output:

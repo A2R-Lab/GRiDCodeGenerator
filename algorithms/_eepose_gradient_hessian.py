@@ -216,9 +216,9 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
     # then generate the code
     self.gen_add_func_doc("Compute the End Effector Position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)
@@ -618,9 +618,9 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
@@ -1181,9 +1181,9 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     shared_mem_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = not use_workspace_temp)

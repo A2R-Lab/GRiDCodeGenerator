@@ -975,9 +975,9 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     # then generate the code
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     # add shared memory variables
     use_selective_spill = getattr(self, "id_du_use_selective_spill", False)

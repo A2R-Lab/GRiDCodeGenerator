@@ -400,7 +400,23 @@ class GRiDCodeGenerator:
                                  "const int D2EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(d2ee_t_count)) + ";", \
                                  f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(idsva_so_body_frame_t_count)};", \
                                  f"const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(fdsva_so_t_count)};", \
-                                 "const int SUGGESTED_THREADS = " + str(self.suggested_threads) + ";"]) # max of 512 to avoid exceeding available registers
+                                 "const int SUGGESTED_THREADS = " + str(self.suggested_threads) + ";", \
+                                 "",
+                                 "// Resource-tier API (v2.0): each emitted kernel/_device/_inner takes a",
+                                 "// `RESOURCE_TIER` template parameter that picks the (launch_bounds, smem,",
+                                 "// register-footprint) profile. TIER_PERF is the default and is the",
+                                 "// current-best perf; TIER_LITE keeps the same launch_bounds but reduces",
+                                 "// smem footprint (some intermediates moved to workspace global mem);",
+                                 "// TIER_MINIMAL drops launch_bounds to 1024 for maximum block-size flexibility",
+                                 "// at the cost of register slack. Inline-CUDA power users with tight outer",
+                                 "// kernels pick LITE/MINIMAL to fit GRiD primitives in their resource budget.",
+                                 "constexpr int TIER_PERF    = 0;",
+                                 "constexpr int TIER_LITE    = 1;",
+                                 "constexpr int TIER_MINIMAL = 2;",
+                                 "",
+                                 "template <int TIER> __host__ __device__ constexpr int tier_max_threads() {",
+                                 "    return (TIER == TIER_MINIMAL) ? 1024 : SUGGESTED_THREADS;",
+                                 "}"]) # max of 512 to avoid exceeding available registers
         self.gen_add_code_lines([
                                  "#define GRID_GENERATED_NUM_JOINTS " + str(n),
                                  "#define GRID_GENERATED_NUM_EES " + str(self.robot.get_total_leaf_nodes()),
