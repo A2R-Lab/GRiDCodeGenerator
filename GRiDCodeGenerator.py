@@ -414,9 +414,17 @@ class GRiDCodeGenerator:
                                  "constexpr int TIER_LITE    = 1;",
                                  "constexpr int TIER_MINIMAL = 2;",
                                  "",
+                                 "// Per-tier launch_bounds upper-bound (= max threads per block nvcc must",
+                                 "// budget registers for). sm_120 has 65536 regs/block; nvcc enforces",
+                                 "// regs_per_thread * max_threads <= regs_per_block, so a larger max_threads",
+                                 "// directly caps regs_per_thread. PERF=SUGGESTED keeps current best perf;",
+                                 "// LITE=min(2*SUGGESTED, 768) gives ~85 regs/thread cap (mid-budget);",
+                                 "// MINIMAL=1024 gives ~64 regs/thread cap (maximum block-size flexibility).",
                                  "template <int TIER> __host__ __device__ constexpr int tier_max_threads() {",
-                                 "    return (TIER == TIER_MINIMAL) ? 1024 : SUGGESTED_THREADS;",
-                                 "}"]) # max of 512 to avoid exceeding available registers
+                                 "    return (TIER == TIER_MINIMAL) ? 1024",
+                                 "         : (TIER == TIER_LITE)    ? ((SUGGESTED_THREADS * 2 < 768) ? SUGGESTED_THREADS * 2 : 768)",
+                                 "         :                          SUGGESTED_THREADS;",
+                                 "}"])
         self.gen_add_code_lines([
                                  "#define GRID_GENERATED_NUM_JOINTS " + str(n),
                                  "#define GRID_GENERATED_NUM_EES " + str(self.robot.get_total_leaf_nodes()),
