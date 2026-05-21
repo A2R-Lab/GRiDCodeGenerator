@@ -21,23 +21,24 @@ def gen_direct_minv_inner_temp_mem_size(self):
     (at offset 0) and s_temp (at offset 6*NV*NV) to direct_minv_inner."""
     return self.gen_direct_minv_inner_F_size() + self.gen_direct_minv_inner_no_F_size()
 
-def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+                                        f_in_smem_expr = "true"):
     var_names = dict( \
         s_Minv_name = "s_Minv", \
-        s_F_name = "s_F", \
         s_q_name = "s_q", \
         s_temp_name = "s_temp", \
+        s_workspace_name = "nullptr", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    # Phase 3a: direct_minv_inner takes s_F (6*NV*NV) as a separate arg so callers
-    # can surgically spill it to workspace. Pre-Phase-3a callers that pass a single
-    # `s_temp` arena should ALSO declare s_F = &s_temp[0] and bump s_temp to
-    # &s_temp[6*NV*NV] (current callers are updated in this commit).
-    minv_code_start = "direct_minv_inner<T>(" + var_names["s_Minv_name"] + ", " + \
-                      var_names["s_F_name"] + ", " + var_names["s_q_name"] + ", "
-    minv_code_end = var_names["s_temp_name"] + ");"
+    # Inner-controlled placement (design rollout): direct_minv_inner is keyed on
+    # bool F_IN_SMEM and decides at the top of the fn whether the 6*NV*NV F-region
+    # lives in s_temp (smem) or s_workspace (L2-pinned global). The caller just
+    # passes both arenas + the placement; sizes come from
+    # MINV_INNER_{SMEM,WORKSPACE}_BYTES<T, F_IN_SMEM>().
+    minv_code_start = "direct_minv_inner<T, " + f_in_smem_expr + ">(" + var_names["s_Minv_name"] + ", " + var_names["s_q_name"] + ", "
+    minv_code_end = var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ");"
     minv_code_middle = self.gen_insert_helpers_function_call()
     if use_thread_group:
         minv_code_start = minv_code_start.replace("(","(tgrp, ")
@@ -50,14 +51,21 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     max_bfs_levels = self.robot.get_max_bfs_level()
     max_bfs_width = self.robot.get_max_bfs_width()
     # construct the boilerplate and function definition
+    no_F_size = self.gen_direct_minv_inner_no_F_size()
+    F_size = self.gen_direct_minv_inner_F_size()
     func_params = ["s_Minv is a pointer to memory for the final result", \
-                   "s_F is a pointer to the 6*NV*NV F-region scratch (Phase 3a: separate so callers can surgically spill to L2-pinned workspace)", \
                    "s_q is the vector of joint positions", \
-                   "s_temp is a pointer to helper shared memory of size " + str(self.gen_direct_minv_inner_no_F_size()) + " (Phase 3a: F-region is now in s_F)"]
+                   "s_temp is the (shared) scratch; size MINV_INNER_SMEM_BYTES<T, F_IN_SMEM>() (= " + str(no_F_size) + " always, plus the " + str(F_size) + "-float F-region when F_IN_SMEM)", \
+                   "s_workspace is the global scratch; size MINV_INNER_WORKSPACE_BYTES<T, F_IN_SMEM>() (= " + str(F_size) + " when !F_IN_SMEM, else 0). Pass nullptr when F_IN_SMEM"]
     func_notes = ["Assumes the XI matricies have already been updated for the given q", \
-                  "Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
-    func_def_start = "void direct_minv_inner(T *s_Minv, T *s_F, const T *s_q, "
-    func_def_end = "T *s_temp) {"
+                  "Outputs a SYMMETRIC_UPPER triangular matrix for Minv", \
+                  "Inner-controlled placement: F_IN_SMEM selects where the 6*NV*NV F-region lives.", \
+                  "  true  -> tail of s_temp (shared; fastest, default).  false -> s_workspace (global).", \
+                  "The choice is made at the top of this fn so the caller just sizes both arenas from", \
+                  "the MINV_INNER_*_BYTES constants and hands both pointers in. Codegen maps each", \
+                  "RESOURCE_TIER to an F_IN_SMEM value per robot (MINV_F_IN_SMEM<TIER>())."]
+    func_def_start = "void direct_minv_inner(T *s_Minv, const T *s_q, "
+    func_def_end = "T *s_temp, T *s_workspace) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -1)
     func_def = func_def_start + func_def_end
     if use_thread_group:
@@ -65,17 +73,21 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Compute the inverse of the mass matrix",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool F_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # Phase 3a: linalg_smem_setup expects the temp-region size that the
-    # function's emitted body indexes into s_temp. F is in s_F (separate),
-    # so the s_temp arena holds only IA/U/Dinv/Ia/IaTemp.
-    temp_size = self.gen_direct_minv_inner_no_F_size()
+    # linalg_smem_setup expects the temp-region size that the function's emitted
+    # body indexes into s_temp (IA/U/Dinv/Ia/IaTemp). The F-region is sliced
+    # separately below.
+    temp_size = no_F_size
     self.gen_linalg_smem_setup(temp_size)
 
-    # Phase 3a layout: F is in s_F (always; caller decides smem vs workspace).
-    # s_temp holds the rest, with IA at offset 0 (was 6*NV*NV in pre-Phase-3a layout).
+    # Inner-controlled F placement: F lives at the tail of s_temp (after the
+    # no_F region) when F_IN_SMEM, else in s_workspace. Keeping no_F at offset 0
+    # leaves every s_temp[...] body reference below unchanged.
+    self.gen_add_code_line("T *s_F;")
+    self.gen_add_code_line("if constexpr (F_IN_SMEM) { s_F = &s_temp[" + str(no_F_size) + "]; (void)s_workspace; }")
+    self.gen_add_code_line("else { s_F = s_workspace; }")
     FOffset = 0   # within s_F
     IAOffset = 0  # within s_temp
     UOffset = IAOffset + 36*n
@@ -525,19 +537,14 @@ def gen_direct_minv_device(self, use_thread_group = False):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables (full smem layout: F + no_F packed contiguously)
+    # add the shared memory variables (full smem layout: no_F + F packed contiguously)
     n = self.robot.get_num_vel()
-    F_size = self.gen_direct_minv_inner_F_size()
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()  # F + no_F
+    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()  # no_F + F
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
-    # Phase 3a: split the arena — s_F at offset 0 (size 6*NV*NV),
-    # s_temp_inner at offset 6*NV*NV. Inner-callable device path keeps F in
-    # smem (no surgical spill at this layer).
-    self.gen_add_code_line("T *minv_s_F = s_temp;")
-    self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
-    # then load/update XI and run the algo
+    # then load/update XI and run the algo. Inner-callable device path keeps F in
+    # smem (F_IN_SMEM=true); the inner slices s_F from the tail of s_temp itself.
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+    self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
     self.gen_add_end_function()
 
 def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, use_thread_group):
@@ -557,34 +564,31 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, u
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q","stride_q",str(n_pos),use_thread_group)
         if spill_F:
-            # L2-pinned workspace slot for Minv-F. Per-timestep offset matches the
-            # shared workspace layout (Minv-F lives at offset GRID_MINV_F_WORKSPACE_OFFSET).
-            self.gen_add_code_line("T *minv_s_F = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
-            self.gen_add_code_line("T *minv_s_temp = s_temp;")
+            # L2-pinned workspace slot for Minv-F (inner picks it via F_IN_SMEM=false).
+            self.gen_add_code_line("T *minv_s_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
-            self.gen_add_code_line("T *minv_s_F = s_temp;")
-            self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_direct_minv_inner_function_call(use_thread_group,
+            updated_var_names = (dict(s_workspace_name = "minv_s_workspace") if spill_F else None),
+            f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("Minv",str(n*n),str(n*n),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs_single_timing("q",str(n_pos),use_thread_group)
         if spill_F:
-            self.gen_add_code_line("T *minv_s_F = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
-            self.gen_add_code_line("T *minv_s_temp = s_temp;")
+            self.gen_add_code_line("T *minv_s_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
-            self.gen_add_code_line("T *minv_s_F = s_temp;")
-            self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(F_size) + "];")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q",str(n_pos),use_thread_group,feedback_from="Minv")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_direct_minv_inner_function_call(use_thread_group,
+            updated_var_names = (dict(s_workspace_name = "minv_s_workspace") if spill_F else None),
+            f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_anti_licm_output_write("Minv")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result_single_timing("Minv",str(n*n),use_thread_group)

@@ -24,23 +24,25 @@ def gen_aba_inner_floating(self, use_thread_group = False):
                 "s_q is the vector of joint positions", \
                 "s_qd is the vector of joint velocities", \
                 "s_tau is the vector of generalized forces", \
-                "s_temp is the pointer to the shared memory needed of size: " + \
-                            str(self.gen_aba_inner_temp_mem_size()), \
+                "s_temp is the (shared) scratch; size ABA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the band when TEMP_IN_SMEM, else 0)", \
+                "s_workspace is the global scratch; size ABA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *s_workspace, const T gravity) {"
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
-                  "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly."]
+                  "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly.",
+                  "Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs s_workspace), decided at the top."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Floating-Base Articulated Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = s_workspace; } else { (void)s_workspace; }")
     temp_size = self.gen_aba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
     self.gen_add_code_line("// Recursive floating ABA root-port.")
@@ -261,22 +263,27 @@ def gen_aba_inner(self, use_thread_group = False):
                 "s_q is the vector of joint positions", \
                 "s_qd is the vector of joint velocities", \
                 "s_tau is the vector of joint torques", \
-                "s_temp is the pointer to the shared memory needed of size: " + \
-                            str(self.gen_forward_dynamics_inner_temp_mem_size()), \
+                "s_temp is the (shared) scratch; size ABA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the 140*NJ+ band when TEMP_IN_SMEM, else 0)", \
+                "s_workspace is the global scratch; size ABA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, const T gravity) {"
-    func_notes = ["Assumes the XI matricies have already been updated for the given q"]
+    func_def_end = "T *s_temp, T *s_workspace, const T gravity) {"
+    func_notes = ["Assumes the XI matricies have already been updated for the given q",
+                  "Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs s_workspace). Decided at the top; caller sizes both arenas from ABA_INNER_*_BYTES."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Articulated Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch-band placement: the whole band moves to
+    # s_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps every
+    # s_temp[...] reference below unchanged.
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = s_workspace; } else { (void)s_workspace; }")
     temp_size = self.gen_aba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
 
@@ -657,10 +664,11 @@ def gen_aba_inner(self, use_thread_group = False):
 def gen_aba_inner_temp_mem_size(self):
     n = self.robot.get_num_joints()
     if self.robot.floating_base:
-        return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size())
+        return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
     return 140 * n
 
-def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+                                temp_in_smem_expr = "true"):
     var_names = dict( \
         s_va_name = "s_va", \
         s_q_name = "s_q", \
@@ -668,13 +676,14 @@ def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_name
         s_qdd_name = "s_qdd", \
         s_tau_name = "s_tau", \
         s_temp_name = "s_temp", \
+        s_workspace_name = "nullptr", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    aba_code_start = "aba_inner<T>(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
-    aba_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
+    aba_code_end = var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
     aba_code_middle = self.gen_insert_helpers_function_call()
@@ -729,26 +738,30 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(input_count),use_thread_group)
         if use_workspace_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+            self.gen_add_code_line("T *aba_s_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_aba_inner_function_call(use_thread_group)
+        self.gen_aba_inner_function_call(use_thread_group,
+            updated_var_names = (dict(s_workspace_name = "aba_s_workspace") if use_workspace_temp else None),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("qdd",str(nv),str(nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
         if use_workspace_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
+            self.gen_add_code_line("T *aba_s_workspace = reinterpret_cast<T *>(d_workspace);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_tau",str(input_count),use_thread_group,feedback_from="qdd")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_aba_inner_function_call(use_thread_group)
+        self.gen_aba_inner_function_call(use_thread_group,
+            updated_var_names = (dict(s_workspace_name = "aba_s_workspace") if use_workspace_temp else None),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result_single_timing("qdd",str(nv),use_thread_group)

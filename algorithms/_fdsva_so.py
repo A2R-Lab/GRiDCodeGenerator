@@ -268,18 +268,12 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     # dereference the spill, so nullptr is safe for both paths.
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
 
-    # then load/update XI and run the algo
+    # then load/update XI and run the algo. Inner-controlled placement: Minv and
+    # FD each slice their own F-region from s_temp (this device path keeps F in
+    # smem — no surgical spill at this layer).
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    # Phase 3a: Minv inner takes s_F + s_temp separately. fdsva_so device path
-    # keeps F in smem (no surgical spill at this layer); pack F at start of s_temp.
-    self.gen_add_code_line("T *minv_s_F = s_temp;")
-    self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
-    self.gen_direct_minv_inner_function_call(use_thread_group,
-        updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
-    # Phase 3b: forward_dynamics_inner takes s_minv_F as a separate arg. Reuse
-    # minv_s_F (the slot we just declared for the standalone Minv call above —
-    # FD will overwrite it as part of its internal Minv re-computation).
-    self.gen_add_code_line(f"forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, minv_s_F, s_XImats, s_temp, gravity);")
+    self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
+    self.gen_add_code_line(f"forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, nullptr, gravity);")
     self.gen_add_sync(use_thread_group)
     self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
     if self.robot.floating_base:
@@ -335,11 +329,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    # Phase 3b: forward_dynamics_inner now takes s_minv_F as a separate arg.
-    # In the FDSVA_SO kernel body, minv_s_F is declared just above (the same
-    # slot used for the standalone Minv call); FD will overwrite it.
-    fd_start = "forward_dynamics_inner<T>(s_qdd, s_q, s_qd, s_u, minv_s_F, "
-    fd_end = "s_temp, gravity);"
+    # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F
+    # from s_temp (smem; this kernel does not surgically spill Minv/FD-F — its
+    # tiers spill the SO outputs / df_du / Minv instead).
+    fd_start = "forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, "
+    fd_end = "s_temp, nullptr, gravity);"
     fd_start, _ = self.gen_insert_helpers_func_def_params(fd_start, [], -2)
     if 'T *' in fd_start: fd_start = fd_start.replace("T *","")
     if 'int *' in fd_start: fd_start = fd_start.replace("int *","")
@@ -363,10 +357,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         # Phase 3a: Minv inner takes s_F + s_temp separately (pack F at offset 0 of s_temp).
-        self.gen_add_code_line("T *minv_s_F = s_temp;")
-        self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
-        self.gen_direct_minv_inner_function_call(use_thread_group,
-            updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(
@@ -407,10 +398,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         # Phase 3a: Minv inner takes s_F + s_temp separately.
-        self.gen_add_code_line("T *minv_s_F = s_temp;")
-        self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
-        self.gen_direct_minv_inner_function_call(use_thread_group,
-            updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
         self.gen_add_code_line(fd_start + fd_end)
         self.gen_add_sync(use_thread_group)
         self.gen_fdsva_so_fd_gradient_inline(

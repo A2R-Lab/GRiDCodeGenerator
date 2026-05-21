@@ -15,13 +15,11 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
         #       but that requires a custom function to be written
         #
         self.gen_add_code_line("//TODO: there is a slightly faster way as s_v does not change -- thus no recompute needed")
-        # Phase 3a: Minv inner takes s_F + s_temp separately. FD_DU packs them
-        # at the start of its shared s_temp arena; after Minv returns, ID_DU
-        # reuses the same bytes (the two run sequentially).
-        self.gen_add_code_line("T *minv_s_F = s_temp;")
-        self.gen_add_code_line("T *minv_s_temp = &s_temp[" + str(6*n*n) + "];")
-        self.gen_direct_minv_inner_function_call(use_thread_group,
-            updated_var_names = dict(s_F_name = "minv_s_F", s_temp_name = "minv_s_temp"))
+        # Inner-controlled placement: direct_minv_inner slices its own F-region
+        # from the tail of s_temp (FD_DU keeps Minv-F in smem; its surgical spill
+        # is the id_du da_df band, handled separately). After Minv returns, the
+        # c+vaf/ID code reuses these bytes (the steps run sequentially).
+        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
         # updated_var_names = dict(s_c_name = "s_temp", s_vaf_name = "&s_temp[" + str(n) + "]", s_temp_name = "&s_temp[" + str(19*n) + "]")
         updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]")
         self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)

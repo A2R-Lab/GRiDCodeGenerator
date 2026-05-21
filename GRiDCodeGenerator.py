@@ -257,14 +257,14 @@ class GRiDCodeGenerator:
         self.minv_t_count_per_tier = tuple(
             (_minv_t_count_full, _minv_t_count_surgical)[i] for i in self.minv_spill_tier_3way
         )
-        # Phase 3b (FD surgical): FD inner now takes s_minv_F as a separate
-        # 6*NV*NV scratch. Level 0 = F in smem (extra slot ahead of FD's
-        # s_temp arena); Level 1 = F in L2-pinned workspace.
-        _fd_F_count = self.gen_forward_dynamics_inner_F_size()
-        _fd_inner_temp_count = self.gen_forward_dynamics_inner_temp_mem_size()  # Phase 3b: already excludes F
+        # FD inner-controlled placement: forward_dynamics_inner slices its own
+        # Minv-F. The inner-temp size now bundles F (or not) per MINV_F_IN_SMEM,
+        # so the full vs surgical kernel arenas come straight from the sized
+        # helper (no separate F term — avoids double-counting). Level 0 = F in
+        # smem; Level 1 = F in L2-pinned workspace.
         _fd_base = 3*nv + int(self.robot.floating_base) + nv + XI_size
-        _fd_t_count_full      = _fd_base + _fd_F_count + _fd_inner_temp_count
-        _fd_t_count_surgical  = _fd_base               + _fd_inner_temp_count
+        _fd_t_count_full      = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
+        _fd_t_count_surgical  = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
         self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
         self.fd_use_workspace_F = self.fd_spill_tier_3way[0] == 1
         fd_t_count = _fd_t_count_full if not self.fd_use_workspace_F else _fd_t_count_surgical
@@ -630,6 +630,26 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool SCRATCH_IN_SMEM = true> __host__ __device__ constexpr size_t FDSVA_SO_INNER_WORKSPACE_BYTES() { return SCRATCH_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + "); }",
                                  "// Per-robot tier->placement map: scratch stays in smem at spill levels < 2 (the use_workspace_temp threshold).",
                                  "template <int TIER> __host__ __device__ constexpr bool FDSVA_SO_SCRATCH_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.fdsva_so_spill_tier_3way[0] < 2 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fdsva_so_spill_tier_3way[1] < 2 else "false") + " : " + ("true" if self.fdsva_so_spill_tier_3way[2] < 2 else "false") + "; }",
+                                 "// Inner-controlled placement API (design rollout): each inline inner is keyed on a",
+                                 "// placement bool and decides arena pointers itself. *_INNER_{SMEM,WORKSPACE}_BYTES<T, IN_SMEM>",
+                                 "// give the two arena sizes; *_<...>_IN_SMEM<TIER>() give the per-robot tier->placement",
+                                 "// map codegen assigned (multiple tiers may share a placement on small robots).",
+                                 "// --- direct_minv_inner (F-region) ---",
+                                 "template <typename T, bool F_IN_SMEM = true> __host__ __device__ constexpr size_t MINV_INNER_SMEM_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self.gen_direct_minv_inner_no_F_size()) + (" + " + str(6*nv*nv) + " * (F_IN_SMEM ? 1 : 0)") + "); }",
+                                 "template <typename T, bool F_IN_SMEM = true> __host__ __device__ constexpr size_t MINV_INNER_WORKSPACE_BYTES() { return F_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(6*nv*nv) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool MINV_F_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.minv_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.minv_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.minv_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- forward_dynamics_inner (internal Minv F-region) ---",
+                                 "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t FD_INNER_SMEM_BYTES() { return MINV_F_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)) + ") : sizeof(T) * static_cast<size_t>(" + str(self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)) + "); }",
+                                 "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t FD_INNER_WORKSPACE_BYTES() { return MINV_F_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(6*nv*nv) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool FD_MINV_F_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.fd_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fd_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.fd_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- aba_inner (scratch band) ---",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool ABA_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.aba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.aba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.aba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- end_effector_pose_gradient_inner (chain workspace) ---",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.ee_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ee_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ee_grad_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
