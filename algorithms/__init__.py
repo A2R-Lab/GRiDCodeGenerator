@@ -8,3 +8,5 @@ from ._aba import *
 from ._crba import *
 from ._idsva_so import *
 from ._fdsva_so import *
+from ._integrator import *
+from ._integrator_gradient import *
