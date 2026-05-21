@@ -510,7 +510,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
     self.gen_add_func_doc("Computes the gradient of the integrator step per timestep" +
                           (" and the next state x_{k+1}" if compute_x_kp1 else ""),
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
