@@ -1212,6 +1212,14 @@ class GRiDCodeGenerator:
             (not self.robot.floating_base) or getattr(self, "generate_idsva_so_world_frame", False)
         )
         self.gen_add_code_line("#define GRID_HAS_IDSVA_SO " + str(int(has_idsva_so)))
+        # Integrator availability gates. The value kernel is emitted whenever
+        # `integrator` is requested (fixed or floating). The gradient kernels
+        # are emitted only for fixed-base (see _normalize_codegen_algorithms),
+        # so consumers must #if-guard gradient calls.
+        self.gen_add_code_line(
+            "#define GRID_HAS_INTEGRATOR " + str(int("integrator" in algorithms)))
+        self.gen_add_code_line(
+            "#define GRID_HAS_INTEGRATOR_GRADIENT " + str(int("integrator_gradient" in algorithms)))
         self.gen_add_code_line("")
         # then open our namespace
         self.gen_add_func_doc("All functions are kept in this namespace")
