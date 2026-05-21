@@ -55,12 +55,30 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     Address: s_dAB[col * 2n + row].
     """
     n = self.robot.get_num_vel()
+    fb = self.robot.floating_base
     twoN = 2 * n
     nn = n * n
     self.gen_add_parallel_loop("ind", str(twoN * 3 * n), use_thread_group)
     self.gen_add_code_line("int row = ind % " + str(twoN) + ";")
     self.gen_add_code_line("int col = ind / " + str(twoN) + ";")
     tok = _integrator_type_token(integrator_type)
+    if fb:
+        # Floating-base integrator GRADIENT is not yet wired up in CUDA. The
+        # Python reference (RBDReference.integrator_grad) is implemented and
+        # validated bit-perfectly against pin.dIntegrate, but the CUDA kernel
+        # has an unresolved discrepancy in the free-flyer spatial block, so we
+        # gate it off behind a template-dependent static_assert (fires only
+        # when a floating-base gradient kernel is actually instantiated).
+        # Floating-base VALUE (integrator) works for all 5 integrators.
+        # Template-parameter-dependent always-false (IT enum values are 0..4,
+        # so `< 0` never holds) so the assert only fires at instantiation.
+        self.gen_add_code_line(
+            "static_assert(static_cast<int>(" + tok + ") < 0,")
+        self.gen_add_code_line(
+            "              \"Floating-base integrator gradient is not yet implemented in CUDA; \"")
+        self.gen_add_code_line(
+            "              \"use the value-only integrator kernel, or the Python RBDReference.integrator_grad.\");")
+        return
     # ----- EULER -----
     self.gen_add_code_line("if constexpr (" + tok + " == IntegratorType::EULER) {", True)
     self.gen_add_code_line("T val = static_cast<T>(0);")
@@ -106,6 +124,14 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     #   d(qd_kp1)/dqd = I + dt * dqdd/dqd
     #   d(qd_kp1)/du  = dt * dqdd/du = dt * Minv
     self.gen_add_code_line("else if constexpr (" + tok + " == IntegratorType::SEMI_IMPLICIT_EULER) {", True)
+    if fb:
+        # Floating-base SI Euler gradient needs an extra matmul through
+        # ∂v_new/∂(q,v,u) — not yet wired up. Emit a static_assert that
+        # fires only if someone tries to instantiate this combination.
+        self.gen_add_code_line(
+            "static_assert(" + tok + " != IntegratorType::SEMI_IMPLICIT_EULER,")
+        self.gen_add_code_line(
+            "              \"Semi-Implicit Euler gradient is not yet implemented for floating-base; use Euler.\");")
     self.gen_add_code_line("T val = static_cast<T>(0);")
     self.gen_add_code_line("T dt2 = dt * dt;")
     self.gen_add_code_line("if (col < " + str(n) + ") {")
@@ -173,6 +199,19 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     re-derived from the freshly-mutated s_q).
     """
     n = self.robot.get_num_vel()
+    fb = self.robot.floating_base
+    if fb:
+        # Multi-stage floating-base gradient needs the dIntegrate Jacobians at
+        # each stage's intermediate v_dt — not yet wired up. Emit a
+        # template-parameter-dependent static_assert so it only fires when
+        # someone actually instantiates the multi-stage IT branch under
+        # floating-base (C++17 if-constexpr-discarded statements are not
+        # instantiated when the condition references the template parameter).
+        self.gen_add_code_line(
+            "static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER,")
+        self.gen_add_code_line(
+            "              \"Multi-stage integrator gradient (Midpoint/RK3/RK4) is not yet implemented for floating-base; use Euler.\");")
+        return
     max_stages = _max_stages_in_use()
     three_n = 3 * n
     nn = n * n
@@ -360,21 +399,32 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
                                           s_x_kp1_name="s_x_kp1"):
     """Compose: FD gradient (sets s_Minv, s_qdd, s_dc_du, s_df_du) → dAB assembly.
 
-    Mirrors the FD-gradient inner_python with default (non-spill) arguments —
-    spill machinery for ID_DU is not exercised by the integrator path on
-    typical fixed-base robots (iiwa14 / kuka). If a future large robot
-    triggers the spill, copy the spill-aware variant here and pass through.
+    For floating-base, additionally compute the 6x6 SE(3) dIntegrate
+    blocks once (s_dInt_q_6x6, s_dInt_v_6x6) and read them in the dAB
+    top-nv rows. Currently supports Euler only for floating-base; SI Euler
+    on floating still falls through to the static_assert below (the chain
+    rule for q_new = integrate(q, dt*v_new) needs an extra matmul through
+    the v_new partials and is not yet wired up).
     """
+    fb = self.robot.floating_base
     n = self.robot.get_num_vel()
-    # Run FD gradient, which writes s_df_du (n*2n) and leaves s_Minv, s_qdd in shared.
-    # use_qdd_Minv_input=False → we compute Minv/qdd inline (we always want both fresh).
     self.gen_forward_dynamics_gradient_inner_python(
         use_thread_group=use_thread_group,
         use_qdd_Minv_input=False,
         s_df_du_name="s_df_du",
     )
     self.gen_add_sync(use_thread_group)
-    # Assemble dAB.
+    if fb:
+        # Precompute the SE(3) dIntegrate blocks at v_dt = dt * qd (Euler).
+        # SI Euler / multi-stage would need different v_dt — the static_assert
+        # in the dAB assembly catches that case.
+        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_code_line(f"T v_dt_for_dInt[{n}];")
+        self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * s_qd[i];")
+        self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_for_dInt, s_dInt_q_6x6);")
+        self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_for_dInt, s_dInt_v_6x6);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     self.gen_integrator_gradient_dAB_assembly(
         integrator_type=integrator_type,
         use_thread_group=use_thread_group,
@@ -419,7 +469,9 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
     # Allocate the per-call shared scratch (mirrors FD-gradient device).
     inner_temp_size = self.gen_integrator_gradient_inner_temp_mem_size()
     extra_t_buffers = [("s_vaf", 18 * n), ("s_dc_du", n * 2 * n), ("s_df_du", n * 2 * n),
-                       ("s_Minv", n * n), ("s_qdd", n)]
+                       ("s_Minv", n * n), ("s_qdd", n),
+                       # Floating-base SE(3) dIntegrate blocks (unused for fixed-base).
+                       ("s_dInt_q_6x6", 36), ("s_dInt_v_6x6", 36)]
     self.gen_XImats_helpers_temp_shared_memory_code(
         inner_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True,
     )
@@ -477,6 +529,10 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         ("s_qd_orig", n),
         ("s_stage_grad_qdd", max_stages * n),
         ("s_D_qdd_stage", max_stages * n * 3 * n),
+        # Floating-base 6x6 SE(3) dIntegrate blocks (Euler single-stage path).
+        # For fixed-base these stay unused.
+        ("s_dInt_q_6x6", 36),
+        ("s_dInt_v_6x6", 36),
     ]
     if compute_x_kp1:
         extra_t_buffers.append(("s_x_kp1", 2 * n + fb))  # = nq + nv

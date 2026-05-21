@@ -161,6 +161,15 @@ class GRiDCodeGenerator:
             if self.robot.floating_base:
                 algorithms.add("id_du")
         # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
+        # The integrator GRADIENT kernels are not yet implemented for
+        # floating-base (the value kernels are), so drop them from the set on
+        # floating-base robots — this keeps the kernel-attr manifest and
+        # gen_all_code consistent (no dangling references to ungenerated
+        # kernels). The Python RBDReference.integrator_grad still supports
+        # floating-base for CPU reference use.
+        if self.robot.floating_base:
+            algorithms.discard("integrator_gradient")
+            algorithms.discard("integrator_with_gradient")
         if "integrator" in algorithms:
             algorithms.update({"id", "minv", "fd"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
@@ -270,12 +279,15 @@ class GRiDCodeGenerator:
         # The multi-stage scratch is always allocated even for single-stage IT;
         # cost is small relative to total (~12*nv² for iiwa14 ≈ 588 floats).
         _max_stages = 4
+        # +72 for the two 6x6 SE(3) dIntegrate blocks (floating-base gradient;
+        # allocated for fixed-base too but unused there).
         integrator_du_t_count = ((3*nv + int(self.robot.floating_base)) + 2*nv*3*nv + 2*(nv*2*nv)
                                  + 18*nv + nv*nv + nv
                                  + 2*nv + _max_stages * nv + _max_stages * nv * 3*nv
+                                 + 72
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
-        # The "with x_kp1" variant adds s_x_kp1 (2nv) on top.
-        integrator_du_with_x_kp1_t_count = integrator_du_t_count + 2*nv
+        # The "with x_kp1" variant adds s_x_kp1 (nq+nv = 2nv+fb) on top.
+        integrator_du_with_x_kp1_t_count = integrator_du_t_count + 2*nv + int(self.robot.floating_base)
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
         id_du_temp_count = id_du_temp_layout["full_count"]
         id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
