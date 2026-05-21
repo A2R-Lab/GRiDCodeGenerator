@@ -161,31 +161,23 @@ class GRiDCodeGenerator:
             if self.robot.floating_base:
                 algorithms.add("id_du")
         # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
-        # The integrator GRADIENT kernels are not yet implemented for
-        # floating-base (the value kernels are), so drop them from the set on
-        # floating-base robots — this keeps the kernel-attr manifest and
-        # gen_all_code consistent (no dangling references to ungenerated
-        # kernels). The Python RBDReference.integrator_grad still supports
-        # floating-base for CPU reference use.
-        # Floating-base integrator GRADIENT is gated off pending a fix to the
-        # upstream CUDA `forward_dynamics_gradient`, which has a STRUCTURAL bug
-        # in the dqdd/dqd (J_qv) spatial 6x6 block for floating-base robots:
-        # it drops the linear<->angular velocity-coupling (Coriolis/gyroscopic)
-        # terms. Verified on go2-floating: ~0.48 abs error vs RBDReference AND
-        # Pinocchio (which agree to 1e-13). CUDA gives ~0.0045 where the
-        # reference gives 0.30. NOT a precision issue — the error is identical
-        # (to 11 digits) in float32 and double, so it is not Minv-amplified
-        # float32 noise. J_qq (dqdd/dq) is correct (~2e-11 in double).
-        # The integrator-gradient ASSEMBLY itself is verified correct: its
-        # SE(3) dIntegrate q-gradient (top nv rows) matches RBDReference to
-        # ~1e-7; only the velocity-gradient (bottom nv rows), which consume
-        # s_df_du directly, inherit the FD-gradient bug. Once
-        # forward_dynamics_gradient is fixed for floating-base, drop this gate
-        # (and the static_asserts in _integrator_gradient.py) to enable the
-        # floating gradient with no further integrator-side work.
-        if self.robot.floating_base:
-            algorithms.discard("integrator_gradient")
-            algorithms.discard("integrator_with_gradient")
+        # Floating-base integrator gradient (EULER) is emitted and is
+        # implementation-correct: its SE(3) dIntegrate q-gradient (top nv rows)
+        # matches RBDReference to ~1e-7. Its velocity-gradient (bottom nv rows)
+        # consume `forward_dynamics_gradient`'s dqdd/dqd directly, which has a
+        # SEPARATE pre-existing structural bug for floating-base (drops the
+        # linear<->angular velocity-coupling terms in the dqdd/dqd spatial 6x6
+        # block — verified on go2-floating: ~0.48 abs error vs RBDReference AND
+        # Pinocchio, which agree to 1e-13; identical error in float32 and
+        # double, so NOT Minv-amplified float32 noise). So the floating
+        # integrator gradient is exactly as correct as the `fd_du` it builds
+        # on — both are emitted; both inherit that one upstream bug. Fixing
+        # forward_dynamics_gradient for floating-base makes BOTH correct, at
+        # which point the xfail in test_cuda_integrator_equivalence flips to
+        # pass. (SI-Euler / Midpoint / RK3 / RK4 floating gradients remain
+        # future work — they need additional dIntegrate chain-rule wiring
+        # beyond the FD-grad fix — and stay behind static_asserts in
+        # _integrator_gradient.py.)
         if "integrator" in algorithms:
             algorithms.update({"id", "minv", "fd"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
@@ -1228,10 +1220,12 @@ class GRiDCodeGenerator:
             (not self.robot.floating_base) or getattr(self, "generate_idsva_so_world_frame", False)
         )
         self.gen_add_code_line("#define GRID_HAS_IDSVA_SO " + str(int(has_idsva_so)))
-        # Integrator availability gates. The value kernel is emitted whenever
-        # `integrator` is requested (fixed or floating). The gradient kernels
-        # are emitted only for fixed-base (see _normalize_codegen_algorithms),
-        # so consumers must #if-guard gradient calls.
+        # Integrator availability gates. Both value and gradient kernels are
+        # emitted whenever requested, for fixed- and floating-base. (Floating
+        # gradient is currently Euler-only and inherits the upstream
+        # forward_dynamics_gradient dqdd/dqd bug; see _normalize_codegen_algorithms.)
+        # Consumers must #if-guard gradient calls so a build that omits
+        # integrator_gradient still compiles.
         self.gen_add_code_line(
             "#define GRID_HAS_INTEGRATOR " + str(int("integrator" in algorithms)))
         self.gen_add_code_line(
