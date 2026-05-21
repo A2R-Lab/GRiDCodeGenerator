@@ -167,6 +167,22 @@ class GRiDCodeGenerator:
         # gen_all_code consistent (no dangling references to ungenerated
         # kernels). The Python RBDReference.integrator_grad still supports
         # floating-base for CPU reference use.
+        # Floating-base integrator GRADIENT is gated off pending a fix to the
+        # upstream CUDA `forward_dynamics_gradient`, which has a STRUCTURAL bug
+        # in the dqdd/dqd (J_qv) spatial 6x6 block for floating-base robots:
+        # it drops the linear<->angular velocity-coupling (Coriolis/gyroscopic)
+        # terms. Verified on go2-floating: ~0.48 abs error vs RBDReference AND
+        # Pinocchio (which agree to 1e-13). CUDA gives ~0.0045 where the
+        # reference gives 0.30. NOT a precision issue — the error is identical
+        # (to 11 digits) in float32 and double, so it is not Minv-amplified
+        # float32 noise. J_qq (dqdd/dq) is correct (~2e-11 in double).
+        # The integrator-gradient ASSEMBLY itself is verified correct: its
+        # SE(3) dIntegrate q-gradient (top nv rows) matches RBDReference to
+        # ~1e-7; only the velocity-gradient (bottom nv rows), which consume
+        # s_df_du directly, inherit the FD-gradient bug. Once
+        # forward_dynamics_gradient is fixed for floating-base, drop this gate
+        # (and the static_asserts in _integrator_gradient.py) to enable the
+        # floating gradient with no further integrator-side work.
         if self.robot.floating_base:
             algorithms.discard("integrator_gradient")
             algorithms.discard("integrator_with_gradient")

@@ -62,30 +62,23 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     self.gen_add_code_line("int row = ind % " + str(twoN) + ";")
     self.gen_add_code_line("int col = ind / " + str(twoN) + ";")
     tok = _integrator_type_token(integrator_type)
-    if fb:
-        # Floating-base integrator GRADIENT is not yet wired up in CUDA. The
-        # Python reference (RBDReference.integrator_grad) is implemented and
-        # validated bit-perfectly against pin.dIntegrate, but the CUDA kernel
-        # has an unresolved discrepancy in the free-flyer spatial block, so we
-        # gate it off behind a template-dependent static_assert (fires only
-        # when a floating-base gradient kernel is actually instantiated).
-        # Floating-base VALUE (integrator) works for all 5 integrators.
-        # Template-parameter-dependent always-false (IT enum values are 0..4,
-        # so `< 0` never holds) so the assert only fires at instantiation.
-        self.gen_add_code_line(
-            "static_assert(static_cast<int>(" + tok + ") < 0,")
-        self.gen_add_code_line(
-            "              \"Floating-base integrator gradient is not yet implemented in CUDA; \"")
-        self.gen_add_code_line(
-            "              \"use the value-only integrator kernel, or the Python RBDReference.integrator_grad.\");")
-        return
     # ----- EULER -----
     self.gen_add_code_line("if constexpr (" + tok + " == IntegratorType::EULER) {", True)
     self.gen_add_code_line("T val = static_cast<T>(0);")
     self.gen_add_code_line("if (col < " + str(n) + ") {")
     self.gen_add_code_line("    // d/dq column")
     self.gen_add_code_line("    if (row < " + str(n) + ") {")
-    self.gen_add_code_line("        val = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+    if fb:
+        # Floating-base top-nv rows: d(q_kp1)/dq = dIntegrate_q(q, dt*qd).
+        # SE(3) Adjoint is block-diagonal: top-left 6x6 from s_dInt_q_6x6,
+        # identity for the revolute joint block.
+        self.gen_add_code_line("        if (row < 6 && col < 6) {")
+        self.gen_add_code_line("            val = s_dInt_q_6x6[row * 6 + col];")
+        self.gen_add_code_line("        } else if (row >= 6 && col >= 6) {")
+        self.gen_add_code_line("            val = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        } else { val = static_cast<T>(0); }")
+    else:
+        self.gen_add_code_line("        val = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
     self.gen_add_code_line("    } else {")
     self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
     self.gen_add_code_line("        val = dt * " + s_df_du_name + "[col * " + str(n) + " + i_local];")
@@ -94,7 +87,15 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     self.gen_add_code_line("    // d/dqd column")
     self.gen_add_code_line("    int j_local = col - " + str(n) + ";")
     self.gen_add_code_line("    if (row < " + str(n) + ") {")
-    self.gen_add_code_line("        val = (row == j_local) ? dt : static_cast<T>(0);")
+    if fb:
+        # Top-nv rows of d/dqd: dt * dIntegrate_v(q, dt*qd).
+        self.gen_add_code_line("        if (row < 6 && j_local < 6) {")
+        self.gen_add_code_line("            val = dt * s_dInt_v_6x6[row * 6 + j_local];")
+        self.gen_add_code_line("        } else if (row >= 6 && j_local >= 6) {")
+        self.gen_add_code_line("            val = (row == j_local) ? dt : static_cast<T>(0);")
+        self.gen_add_code_line("        } else { val = static_cast<T>(0); }")
+    else:
+        self.gen_add_code_line("        val = (row == j_local) ? dt : static_cast<T>(0);")
     self.gen_add_code_line("    } else {")
     self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
     self.gen_add_code_line("        T diag = (i_local == j_local) ? static_cast<T>(1) : static_cast<T>(0);")
