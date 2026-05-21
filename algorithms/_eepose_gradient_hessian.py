@@ -1186,7 +1186,7 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Smem arena: s_temp is the inner-no-d2 size always (in smem at every tier).

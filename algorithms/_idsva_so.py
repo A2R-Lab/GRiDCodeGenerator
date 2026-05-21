@@ -3267,7 +3267,7 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics (frame picked at codegen time)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables (s_temp routes to s_workspace at LITE+)
