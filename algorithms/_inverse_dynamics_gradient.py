@@ -434,29 +434,59 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     _ , S_ind_cpp , _ , _ , _ , _ , dva_col_offset_for_jidp1_cpp, _ = self.gen_topology_helpers_pointers_for_cpp(list(range(n)), OFFSET=False)
     S_sign_cpp = self.gen_topology_S_sign_for_cpp(OFFSET=False)
     add_col_for_jid = "(" + dva_col_offset_for_jidp1_cpp + " - 1)"
-    if self.robot.floating_base: 
+    if self.robot.floating_base:
         # set da/du = 0
         self.gen_add_code_line("// First zero da/du")
         self.gen_add_parallel_loop('ind',str(2*n*NJ*6),use_thread_group)
         self.gen_add_code_line(f"s_temp[{Offset_da_dq} + ind] = static_cast<T>(0);")
         self.gen_add_end_control_flow()
-        # get the jid
+        # Sync before the += accumulation below: the zeroing loop and the
+        # MxS(dv/du)*qd accumulation write the same s_temp[Offset_da_dq] region
+        # from different threads. Without this barrier the result is correct
+        # only within a single warp (<=32 threads) and races at larger blocks.
+        self.gen_add_sync(use_thread_group)
+        if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
+        if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
+        # Axis-indexed S helpers for the serialized root accumulation below.
+        S_ind_ax = S_ind_cpp.replace('dof_id', 'ax')
+        S_sign_ax = S_sign_cpp.replace('dof_id', 'ax')
         self.gen_add_parallel_loop("col",str(2*n*n),use_thread_group)
         self.gen_add_code_line(f"int dof = col % {n};") # column within each joint that is being focused
         self.gen_add_code_line(f"int dof_id = (col / {n}) % {n}; int jid = dof_id < 6 ? 0 : dof_id - 5;") # dof_id being applied with S, to jid
         self.gen_add_code_line(f"bool dq_flag = col < {n*n}; int dqd_offset = !dq_flag * {6*dva_cols_per_partial};")
-        if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
-        if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
+        # Floating root (jid==0): all 6 root axes (dof_id 0..5) accumulate into
+        # the SAME da/du column, but mxX_peq_scaled assumes a single writer per
+        # destination. Run the whole accumulation for the root on one lane
+        # (dof_id==0), summing over the 6 axes, so there is no multi-thread +=
+        # race. (Correct only within one warp otherwise -> wrong J_qv at
+        # SUGGESTED_THREADS.) Non-root joints have a unique axis per lane.
+        self.gen_add_code_line("if (jid == 0 && dof_id == 0) {", True)
+        self.gen_add_code_line(f"T *root_dst = &s_temp[{Offset_da_dq} + dof*6 + dqd_offset];")
+        self.gen_add_code_line(f"const T *root_src = &s_temp[{Offset_dv_dq} + dof*6 + dqd_offset];")
+        self.gen_add_code_line("for (int ax = 0; ax < 6; ax++) {", True)
+        self.gen_mx_func_call_for_cpp(PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = dict(
+            S_ind_name = S_ind_ax, s_dst_name = "root_dst", s_src_name = "root_src",
+            s_scale_name = "(" + S_sign_ax + ") * s_qd[ax]"))
+        self.gen_add_end_control_flow()  # for ax
+        # The {MxXa, Mxv} add applies to root columns dof in [0,6) (axis == column).
+        self.gen_add_code_line("if (dof < 6) {", True)
+        self.gen_add_code_line(f"int src_offset = dq_flag * {Offset_MxXa} + !dq_flag * {Offset_Mxv} + 6*dof;")
+        self.gen_add_code_line("for (int row = 0; row < 6; row++) { root_dst[row] += s_temp[src_offset + row]; }")
+        self.gen_add_end_control_flow()  # if dof < 6
+        self.gen_add_end_control_flow()  # if jid == 0 && dof_id == 0
+        # Non-root joints: one lane per (jid, dof), no collision.
+        self.gen_add_code_line("if (jid != 0) {", True)
         updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = f"&s_temp[{Offset_da_dq} + jid*{6*n} + dof*6 + dqd_offset]", \
                                  s_src_name = f"&s_temp[{Offset_dv_dq} + jid*{6*n} + dof*6 + dqd_offset]", s_scale_name = "(" + S_sign_cpp + ") * s_qd[dof_id]")
-        # call the mx func
         self.gen_mx_func_call_for_cpp(PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
-        # then add to the add col
         self.gen_add_code_line("// then add {MxXa, Mxv} to the appropriate column")
         self.gen_add_code_line("if (dof == dof_id) {", True)
         self.gen_add_code_line(f"int src_offset = dq_flag * {Offset_MxXa} + !dq_flag * {Offset_Mxv} + 6*dof_id;")
-        self.gen_add_code_line("for (int row = 0; row < 6; row++) {", True)
-        self.gen_add_code_line(f"s_temp[{Offset_da_dq} + 6*dof + row + jid*{6*n} + dqd_offset] += s_temp[src_offset + row];")
+        self.gen_add_code_line(f"for (int row = 0; row < 6; row++) {{ s_temp[{Offset_da_dq} + 6*dof + row + jid*{6*n} + dqd_offset] += s_temp[src_offset + row]; }}")
+        self.gen_add_end_control_flow()  # if dof == dof_id
+        self.gen_add_end_control_flow()  # if jid != 0
+        self.gen_add_end_control_flow()  # parallel loop
+        self.gen_add_sync(use_thread_group)
     else:
         self.gen_add_parallel_loop("col",str(2*dva_cols_per_partial),use_thread_group)
         self.gen_add_code_line("int col_du = col % " + str(dva_cols_per_partial) + ";") # signifies col of corresponding du
@@ -472,10 +502,10 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line("if(col_du == " + add_col_for_jid + "){", True)
         self.gen_add_code_line("for(int row = 0; row < 6; row++){", True)
         self.gen_add_code_line("s_temp[" + str(Offset_da_dq) + " + 6*col + row] += s_temp[src_offset + row];")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
 
     if self.DEBUG_MODE:
         self.gen_add_sync(use_thread_group)
