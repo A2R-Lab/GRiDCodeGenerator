@@ -617,11 +617,16 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         "num_timesteps is the length of the trajectory (or overloaded as test_iters for timing)",
     ]
     sig_x_kp1 = "T *d_x_kp1, " if compute_x_kp1 else ""
-    func_def_start = "void integrator_gradient" + suffix + "_kernel(T *d_dAB, " + sig_x_kp1 + "const T *d_q_qd_u, const int stride_q_qd_u, "
+    # d_workspace holds the L2-pinned scratch the s_D_qdd_stage buffer spills to
+    # at LITE/MINIMAL (mirrors forward_dynamics_gradient_kernel's d_workspace).
+    func_def_start = ("void integrator_gradient" + suffix + "_kernel(T *d_dAB, " + sig_x_kp1 +
+                      "unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, ")
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    func_params.insert(1 if not compute_x_kp1 else 2,
+                       "d_workspace is the L2-pinned global scratch for the spilled s_D_qdd_stage (LITE/MINIMAL tiers)")
     self.gen_add_func_doc("Computes the gradient of the integrator step per timestep" +
                           (" and the next state x_{k+1}" if compute_x_kp1 else ""),
                           [], func_params, None)
@@ -632,79 +637,111 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
     inner_temp_size = self.gen_integrator_gradient_inner_temp_mem_size()
     fb = self.robot.floating_base
     max_stages = _max_stages_in_use()
-    extra_t_buffers = [
-        ("s_q_qd_u", 3 * n + fb),
-        ("s_dAB", 2 * n * 3 * n),
-        ("s_df_du", n * 2 * n),
-        ("s_dc_du", n * 2 * n),
-        ("s_vaf", 18 * n),
-        ("s_Minv", n * n),
-        ("s_qdd", n),
-        # Multi-stage scratch — allocated for every IT (single-stage just doesn't use it).
-        # s_q_orig holds the full nq pose (floating-base adds the quaternion slot).
-        ("s_q_orig", n + fb),
-        ("s_qd_orig", n),
-        ("s_stage_grad_qdd", max_stages * n),
-        ("s_D_qdd_stage", max_stages * n * 3 * n),
-        # Floating-base 6x6 SE(3) dIntegrate blocks (Euler single-stage path).
-        # For fixed-base these stay unused.
-        ("s_dInt_q_6x6", 36),
-        ("s_dInt_v_6x6", 36),
-    ]
-    if compute_x_kp1:
-        extra_t_buffers.append(("s_x_kp1", 2 * n + fb))  # = nq + nv
-    self.gen_XImats_helpers_temp_shared_memory_code(
-        inner_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True,
-    )
-    self.gen_add_code_line(
-        "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
-    )
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    def _emit_body():
-        # Dispatch single-stage vs multi-stage at compile time on IT.
-        self.gen_add_code_line(
-            "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
-        )
-        self.gen_integrator_gradient_inner_python(
-            use_thread_group=use_thread_group,
-            compute_x_kp1=compute_x_kp1,
-            integrator_type="IT",
-            s_dAB_name="s_dAB",
-            s_x_kp1_name="s_x_kp1",
-        )
-        self.gen_add_end_control_flow()
-        self.gen_add_code_line("else {", True)
-        self.gen_integrator_gradient_multistage(
-            use_thread_group=use_thread_group,
-            compute_x_kp1=compute_x_kp1,
-        )
-        self.gen_add_end_control_flow()
+    d_qdd_count = max_stages * n * 3 * n
 
-    if not single_call_timing:
-        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
-        self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        _emit_body()
-        self.gen_add_sync(use_thread_group)
-        self.gen_kernel_save_result("dAB", str(2 * n * 3 * n), str(2 * n * 3 * n), use_thread_group)
+    def _emit_body(d_qdd_in_smem):
+        # Per-tier body. s_D_qdd_stage (max_stages*nv*3nv) is the dominant cold
+        # buffer: in smem when d_qdd_in_smem, else spilled to the grad section of
+        # d_workspace (per-timestep slot). Everything else stays in smem.
+        extra_t_buffers = [
+            ("s_q_qd_u", 3 * n + fb),
+            ("s_dAB", 2 * n * 3 * n),
+            ("s_df_du", n * 2 * n),
+            ("s_dc_du", n * 2 * n),
+            ("s_vaf", 18 * n),
+            ("s_Minv", n * n),
+            ("s_qdd", n),
+            # Multi-stage scratch — allocated for every IT (single-stage just doesn't use it).
+            # s_q_orig holds the full nq pose (floating-base adds the quaternion slot).
+            ("s_q_orig", n + fb),
+            ("s_qd_orig", n),
+            ("s_stage_grad_qdd", max_stages * n),
+        ]
+        if d_qdd_in_smem:
+            extra_t_buffers.append(("s_D_qdd_stage", d_qdd_count))
+        extra_t_buffers += [
+            # Floating-base 6x6 SE(3) dIntegrate blocks (Euler single-stage path).
+            # For fixed-base these stay unused.
+            ("s_dInt_q_6x6", 36),
+            ("s_dInt_v_6x6", 36),
+        ]
         if compute_x_kp1:
-            self.gen_kernel_save_result("x_kp1", str(2 * n + fb), str(2 * n + fb), use_thread_group)
-        self.gen_add_end_control_flow()
+            extra_t_buffers.append(("s_x_kp1", 2 * n + fb))  # = nq + nv
+        self.gen_XImats_helpers_temp_shared_memory_code(
+            inner_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True,
+        )
+        self.gen_add_code_line(
+            "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
+        )
+        if use_thread_group:
+            self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+
+        def _emit_dispatch():
+            # Dispatch single-stage vs multi-stage at compile time on IT.
+            self.gen_add_code_line(
+                "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
+            )
+            self.gen_integrator_gradient_inner_python(
+                use_thread_group=use_thread_group,
+                compute_x_kp1=compute_x_kp1,
+                integrator_type="IT",
+                s_dAB_name="s_dAB",
+                s_x_kp1_name="s_x_kp1",
+            )
+            self.gen_add_end_control_flow()
+            self.gen_add_code_line("else {", True)
+            self.gen_integrator_gradient_multistage(
+                use_thread_group=use_thread_group,
+                compute_x_kp1=compute_x_kp1,
+            )
+            self.gen_add_end_control_flow()
+
+        if not single_call_timing:
+            self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
+            self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
+            self.gen_add_code_line("// compute")
+            if not d_qdd_in_smem:
+                self.gen_add_code_line(
+                    "T *s_D_qdd_stage = reinterpret_cast<T *>(&d_workspace[k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);"
+                )
+            self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+            _emit_dispatch()
+            self.gen_add_sync(use_thread_group)
+            self.gen_kernel_save_result("dAB", str(2 * n * 3 * n), str(2 * n * 3 * n), use_thread_group)
+            if compute_x_kp1:
+                self.gen_kernel_save_result("x_kp1", str(2 * n + fb), str(2 * n + fb), use_thread_group)
+            self.gen_add_end_control_flow()
+        else:
+            input_count = 3 * n + fb
+            self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
+            if not d_qdd_in_smem:
+                self.gen_add_code_line(
+                    "T *s_D_qdd_stage = reinterpret_cast<T *>(d_workspace);"
+                )
+            self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+            self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+            self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="dAB")
+            self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+            _emit_dispatch()
+            self.gen_anti_licm_output_write("dAB")
+            self.gen_add_end_control_flow()
+            self.gen_kernel_save_result_single_timing("dAB", str(2 * n * 3 * n), use_thread_group)
+            if compute_x_kp1:
+                self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n + fb), use_thread_group)
+
+    # Per-tier spill placement (perf, lite, minimal) — 0 = s_D_qdd_stage in smem,
+    # 1 = spilled to d_workspace. When all three agree (small robots that fit in
+    # smem), emit a single body; otherwise gate per tier on RESOURCE_TIER.
+    picks = getattr(self, "integrator_du_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        _emit_body(d_qdd_in_smem=(picks[0] == 0))
     else:
-        input_count = 3 * n + fb
-        self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="dAB")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        _emit_body()
-        self.gen_anti_licm_output_write("dAB")
-        self.gen_add_end_control_flow()
-        self.gen_kernel_save_result_single_timing("dAB", str(2 * n * 3 * n), use_thread_group)
-        if compute_x_kp1:
-            self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n + fb), use_thread_group)
+        for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
+            head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
+                   ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
+            self.gen_add_code_line(head, True)
+            _emit_body(d_qdd_in_smem=(picks[tier_idx] == 0))
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -739,7 +776,7 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"" + base_name + " requires all-data or dynamics gridData\");")
     kernel_args_x_kp1 = "hd_data->d_x_kp1," if compute_x_kp1 else ""
     func_call_start = (base_name + "_kernel<T, IT><<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(" +
-                       "hd_data->d_dAB," + kernel_args_x_kp1 + "hd_data->d_q_qd_u,stride_q_qd_u,")
+                       "hd_data->d_dAB," + kernel_args_x_kp1 + "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,")
     func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T, IT>", "kernel_single_timing<T, IT>")
@@ -757,7 +794,11 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"" + base_name + "\", INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    workspace_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                       else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (GRID_INTEGRATOR_DU_USES_WORKSPACE) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_INTEGRATOR_DU_USES_WORKSPACE) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         self.gen_add_code_lines([
             "// finally transfer the result back",

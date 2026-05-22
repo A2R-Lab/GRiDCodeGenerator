@@ -330,6 +330,22 @@ class GRiDCodeGenerator:
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
         # The "with x_kp1" variant adds s_x_kp1 (nq+nv = 2nv+fb) on top.
         integrator_du_with_x_kp1_t_count = integrator_du_t_count + 2*nv + int(self.robot.floating_base)
+        # Integrator-gradient inner-controlled spill. The dominant cold buffer is
+        # s_D_qdd_stage (max_stages*nv*3nv ≈ 59 KB float for g1-floating). Level 0
+        # keeps it in smem; level 1 spills it to the grad section of d_workspace
+        # (the integrator-gradient kernel never runs concurrently with id_du/fd_du,
+        # so it safely reuses those bytes). PERF picks level 0 when the full arena
+        # fits the smem target; LITE/MINIMAL spill when it doesn't. The kernel is
+        # emitted per-tier (like fd_du); INTEGRATOR_DU_D_QDD_IN_SMEM<TIER>() gives
+        # the placement and the byte constant reports each tier's smem arena.
+        _integrator_du_D_qdd_count = _max_stages * nv * 3 * nv
+        _integrator_du_full = max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)
+        _integrator_du_arenas = (_integrator_du_full, _integrator_du_full - _integrator_du_D_qdd_count)
+        self.integrator_du_spill_tier_3way = select_shared_tier_3way(*_integrator_du_arenas)
+        self.integrator_du_t_count_per_tier = tuple(_integrator_du_arenas[i] for i in self.integrator_du_spill_tier_3way)
+        # d_workspace must cover the spilled buffer if ANY tier spills (the kernel
+        # is templated on RESOURCE_TIER and the user may compile at LITE/MINIMAL).
+        self.integrator_du_D_qdd_workspace_count = _integrator_du_D_qdd_count if any(p == 1 for p in self.integrator_du_spill_tier_3way) else 0
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
         id_du_temp_count = id_du_temp_layout["full_count"]
         id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
@@ -505,7 +521,8 @@ class GRiDCodeGenerator:
                                            id_du_temp_count,
                                            fd_du_temp_count,
                                            2*nv*nv,
-                                           _minv_F_workspace_count)
+                                           _minv_F_workspace_count,
+                                           self.integrator_du_D_qdd_workspace_count)
         d2ee_workspace_t_count = 0
         if self.d2ee_use_workspace_temp:
             d2ee_workspace_t_count += d2ee_workspace_temp_count
@@ -550,6 +567,7 @@ class GRiDCodeGenerator:
                                  "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
                                  "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
+                                 "const int GRID_INTEGRATOR_DU_USES_WORKSPACE = " + str(int(any(p == 1 for p in self.integrator_du_spill_tier_3way))) + ";", \
                                  "const int GRID_GENERATES_IDSVA_SO_BODY_FRAME = " + str(int(getattr(self, "generate_idsva_so_body_frame", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
                                  "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
@@ -645,7 +663,17 @@ class GRiDCodeGenerator:
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
                                  "template <typename T> __host__ __device__ inline size_t INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(integrator_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 # Tier-aware: at LITE/MINIMAL the s_D_qdd_stage buffer (max_stages*nv*3nv)
+                                 # spills to d_workspace, so the smem arena shrinks. Default TIER keeps the
+                                 # existing single-arg call sites working.
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.integrator_du_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.integrator_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.integrator_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 # Per-robot tier->placement map for the integrator gradient's s_D_qdd_stage
+                                 # buffer: in smem at spill level 0, in d_workspace (grad section) at level 1.
+                                 "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_DU_D_QDD_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.integrator_du_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.integrator_du_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.integrator_du_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -1046,13 +1074,13 @@ class GRiDCodeGenerator:
         ]),
         ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_gradient_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         ("integrator_gradient_with_x_kp1", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_gradient_with_x_kp1_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
