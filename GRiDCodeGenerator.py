@@ -165,23 +165,13 @@ class GRiDCodeGenerator:
             if self.robot.floating_base:
                 algorithms.add("id_du")
         # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
-        # Floating-base integrator gradient (EULER) is emitted and is
-        # implementation-correct: its SE(3) dIntegrate q-gradient (top nv rows)
-        # matches RBDReference to ~1e-7. Its velocity-gradient (bottom nv rows)
-        # consume `forward_dynamics_gradient`'s dqdd/dqd directly, which has a
-        # SEPARATE pre-existing structural bug for floating-base (drops the
-        # linear<->angular velocity-coupling terms in the dqdd/dqd spatial 6x6
-        # block — verified on go2-floating: ~0.48 abs error vs RBDReference AND
-        # Pinocchio, which agree to 1e-13; identical error in float32 and
-        # double, so NOT Minv-amplified float32 noise). So the floating
-        # integrator gradient is exactly as correct as the `fd_du` it builds
-        # on — both are emitted; both inherit that one upstream bug. Fixing
-        # forward_dynamics_gradient for floating-base makes BOTH correct, at
-        # which point the xfail in test_cuda_integrator_equivalence flips to
-        # pass. (SI-Euler / Midpoint / RK3 / RK4 floating gradients remain
-        # future work — they need additional dIntegrate chain-rule wiring
-        # beyond the FD-grad fix — and stay behind static_asserts in
-        # _integrator_gradient.py.)
+        # Floating-base integrator gradients are emitted for all five types
+        # (Euler / SI-Euler / Midpoint / RK3 / RK4) and validated against
+        # RBDReference. The earlier "forward_dynamics_gradient drops floating
+        # linear<->angular velocity coupling" story was a MISDIAGNOSIS: the real
+        # defect was a CUDA thread-count race in inverse_dynamics_gradient
+        # (missing __syncthreads + a 6-way root accumulation), correct at 32
+        # threads and racing above one warp. Fixed; see INTEGRATOR_HANDOFF.md §3.
         if "integrator" in algorithms:
             algorithms.update({"id", "minv", "fd"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
@@ -1042,23 +1032,29 @@ class GRiDCodeGenerator:
             ("fdsva_so_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
         ]),
+        # Integrator kernels are templated on IntegratorType IT (a non-type param
+        # that does not change the function signature). Each IT is a distinct
+        # __global__ instantiation, so cudaFuncSetAttribute must run for ALL of
+        # them — otherwise a non-Euler IT whose floating-base arena exceeds the
+        # 48 KB device default launches with cudaErrorInvalidValue while Euler
+        # (the only one historically registered) succeeds.
         ("integrator", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("integrator_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
-            ("integrator_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            (f"integrator_kernel{suffix}<T, IntegratorType::{it}>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+            for suffix in ("", "_single_timing")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("integrator_gradient_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
-            ("integrator_gradient_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            (f"integrator_gradient_kernel{suffix}<T, IntegratorType::{it}>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+            for suffix in ("", "_single_timing")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         ("integrator_gradient_with_x_kp1", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("integrator_gradient_with_x_kp1_kernel<T>",
-             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
-            ("integrator_gradient_with_x_kp1_kernel_single_timing<T>",
-             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)"),
+            (f"integrator_gradient_with_x_kp1_kernel{suffix}<T, IntegratorType::{it}>",
+             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+            for suffix in ("", "_single_timing")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         # ee_pose_hessian is special: only emitted when its shared-mem fits the
         # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime

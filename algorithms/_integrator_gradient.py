@@ -125,48 +125,90 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     #   d(qd_kp1)/dqd = I + dt * dqdd/dqd
     #   d(qd_kp1)/du  = dt * dqdd/du = dt * Minv
     self.gen_add_code_line("else if constexpr (" + tok + " == IntegratorType::SEMI_IMPLICIT_EULER) {", True)
-    if fb:
-        # Floating-base SI Euler gradient needs an extra matmul through
-        # ∂v_new/∂(q,v,u) — not yet wired up. Emit a static_assert that
-        # fires only if someone tries to instantiate this combination.
-        self.gen_add_code_line(
-            "static_assert(" + tok + " != IntegratorType::SEMI_IMPLICIT_EULER,")
-        self.gen_add_code_line(
-            "              \"Semi-Implicit Euler gradient is not yet implemented for floating-base; use Euler.\");")
     self.gen_add_code_line("T val = static_cast<T>(0);")
-    self.gen_add_code_line("T dt2 = dt * dt;")
-    self.gen_add_code_line("if (col < " + str(n) + ") {")
-    self.gen_add_code_line("    // d/dq column")
-    self.gen_add_code_line("    if (row < " + str(n) + ") {")
-    self.gen_add_code_line("        T diag = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
-    self.gen_add_code_line("        val = diag + dt2 * " + s_df_du_name + "[col * " + str(n) + " + row];")
-    self.gen_add_code_line("    } else {")
-    self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
-    self.gen_add_code_line("        val = dt * " + s_df_du_name + "[col * " + str(n) + " + i_local];")
-    self.gen_add_code_line("    }")
-    self.gen_add_code_line("} else if (col < " + str(2 * n) + ") {")
-    self.gen_add_code_line("    // d/dqd column")
-    self.gen_add_code_line("    int j_local = col - " + str(n) + ";")
-    self.gen_add_code_line("    if (row < " + str(n) + ") {")
-    self.gen_add_code_line("        T diag = (row == j_local) ? dt : static_cast<T>(0);")
-    self.gen_add_code_line("        val = diag + dt2 * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + row];")
-    self.gen_add_code_line("    } else {")
-    self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
-    self.gen_add_code_line("        T diag = (i_local == j_local) ? static_cast<T>(1) : static_cast<T>(0);")
-    self.gen_add_code_line("        val = diag + dt * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + i_local];")
-    self.gen_add_code_line("    }")
-    self.gen_add_code_line("} else {")
-    self.gen_add_code_line("    // d/du column   (dqdd/du = Minv)")
-    self.gen_add_code_line("    int j_local = col - " + str(2 * n) + ";")
-    self.gen_add_code_line("    if (row < " + str(n) + ") {")
-    self.gen_add_code_line("        int midx = (row <= j_local) * (j_local * " + str(n) + " + row) + (row > j_local) * (row * " + str(n) + " + j_local);")
-    self.gen_add_code_line("        val = dt2 * " + s_Minv_name + "[midx];")
-    self.gen_add_code_line("    } else {")
-    self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
-    self.gen_add_code_line("        int midx = (i_local <= j_local) * (j_local * " + str(n) + " + i_local) + (i_local > j_local) * (i_local * " + str(n) + " + j_local);")
-    self.gen_add_code_line("        val = dt * " + s_Minv_name + "[midx];")
-    self.gen_add_code_line("    }")
-    self.gen_add_code_line("}")
+    if fb:
+        # Floating-base SI-Euler: v_new = qd + dt*qdd; q_new = integrate(q, dt*v_new).
+        #   bottom rows  = [dvdq | dvdv | dvdu] = [dt*J_qq | I + dt*J_qv | dt*Minv]
+        #   top rows     = [dInt_q + dt*dInt_v@dvdq | dt*dInt_v@dvdv | dt*dInt_v@dvdu]
+        # dInt_q / dInt_v are evaluated at v_dt = dt*v_new (precomputed into the
+        # 6x6 blocks by gen_integrator_gradient_inner_python). dInt is block-diag:
+        # the 6x6 free-flyer block plus identity on the revolute joints, so the
+        # dInt_v @ dvdX matmul only mixes rows < 6.
+        self.gen_add_code_line("if (col < " + str(n) + ") {")
+        self.gen_add_code_line("    // d/dq column. dvdq[k,c] = dt*J_qq[k,c] = dt*s_df_du[c*n + k].")
+        self.gen_add_code_line("    int c = col;")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T dInt_q_term = (row < 6 && c < 6) ? s_dInt_q_6x6[row * 6 + c]")
+        self.gen_add_code_line("                       : ((row >= 6 && c >= 6) ? ((row == c) ? static_cast<T>(1) : static_cast<T>(0)) : static_cast<T>(0));")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) mm += s_dInt_v_6x6[row * 6 + k] * (dt * " + s_df_du_name + "[c * " + str(n) + " + k]); }")
+        self.gen_add_code_line("        else { mm = dt * " + s_df_du_name + "[c * " + str(n) + " + row]; }")
+        self.gen_add_code_line("        val = dInt_q_term + dt * mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        val = dt * " + s_df_du_name + "[c * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else if (col < " + str(2 * n) + ") {")
+        self.gen_add_code_line("    // d/dqd column. dvdv[k,c] = (k==c) + dt*J_qv[k,c].")
+        self.gen_add_code_line("    int c = col - " + str(n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) { T dvdv_k = ((k == c) ? static_cast<T>(1) : static_cast<T>(0)) + dt * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + k]; mm += s_dInt_v_6x6[row * 6 + k] * dvdv_k; } }")
+        self.gen_add_code_line("        else { mm = ((row == c) ? static_cast<T>(1) : static_cast<T>(0)) + dt * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + row]; }")
+        self.gen_add_code_line("        val = dt * mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        T diag = (i_local == c) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else {")
+        self.gen_add_code_line("    // d/du column. dvdu[k,c] = dt*Minv[k,c] (SYMMETRIC_UPPER).")
+        self.gen_add_code_line("    int c = col - " + str(2 * n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) { int midx = (k <= c) * (c * " + str(n) + " + k) + (k > c) * (k * " + str(n) + " + c); mm += s_dInt_v_6x6[row * 6 + k] * (dt * " + s_Minv_name + "[midx]); } }")
+        self.gen_add_code_line("        else { int midx = (row <= c) * (c * " + str(n) + " + row) + (row > c) * (row * " + str(n) + " + c); mm = dt * " + s_Minv_name + "[midx]; }")
+        self.gen_add_code_line("        val = dt * mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        int midx = (i_local <= c) * (c * " + str(n) + " + i_local) + (i_local > c) * (i_local * " + str(n) + " + c);")
+        self.gen_add_code_line("        val = dt * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("}")
+    else:
+        self.gen_add_code_line("T dt2 = dt * dt;")
+        self.gen_add_code_line("if (col < " + str(n) + ") {")
+        self.gen_add_code_line("    // d/dq column")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T diag = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt2 * " + s_df_du_name + "[col * " + str(n) + " + row];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        val = dt * " + s_df_du_name + "[col * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else if (col < " + str(2 * n) + ") {")
+        self.gen_add_code_line("    // d/dqd column")
+        self.gen_add_code_line("    int j_local = col - " + str(n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T diag = (row == j_local) ? dt : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt2 * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + row];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        T diag = (i_local == j_local) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else {")
+        self.gen_add_code_line("    // d/du column   (dqdd/du = Minv)")
+        self.gen_add_code_line("    int j_local = col - " + str(2 * n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        int midx = (row <= j_local) * (j_local * " + str(n) + " + row) + (row > j_local) * (row * " + str(n) + " + j_local);")
+        self.gen_add_code_line("        val = dt2 * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        int midx = (i_local <= j_local) * (j_local * " + str(n) + " + i_local) + (i_local > j_local) * (i_local * " + str(n) + " + j_local);")
+        self.gen_add_code_line("        val = dt * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("}")
     self.gen_add_code_line(s_dAB_name + "[ind] = val;")
     self.gen_add_end_control_flow()  # end if constexpr SI_EULER
     self.gen_add_code_line("else {", True)
@@ -200,27 +242,19 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     re-derived from the freshly-mutated s_q).
     """
     n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
     fb = self.robot.floating_base
-    if fb:
-        # Multi-stage floating-base gradient needs the dIntegrate Jacobians at
-        # each stage's intermediate v_dt — not yet wired up. Emit a
-        # template-parameter-dependent static_assert so it only fires when
-        # someone actually instantiates the multi-stage IT branch under
-        # floating-base (C++17 if-constexpr-discarded statements are not
-        # instantiated when the condition references the template parameter).
-        self.gen_add_code_line(
-            "static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER,")
-        self.gen_add_code_line(
-            "              \"Multi-stage integrator gradient (Midpoint/RK3/RK4) is not yet implemented for floating-base; use Euler.\");")
-        return
     max_stages = _max_stages_in_use()
     three_n = 3 * n
     nn = n * n
 
-    # Save original q, qd so we can rebuild p_{i+1} on later stages.
+    # Save original q (nq entries — floating-base carries the 7-element pose
+    # prefix), qd (n) so we can rebuild p_{i+1} on later stages.
     self.gen_add_code_line("// --- multi-stage gradient: save original q, qd ---")
-    self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(nq), use_thread_group)
     self.gen_add_code_line("s_q_orig[ind] = s_q[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_parallel_loop("ind", str(n), use_thread_group)
     self.gen_add_code_line("s_qd_orig[ind] = s_qd[ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
@@ -248,17 +282,41 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
             self.gen_add_code_line(
                 "constexpr T c_offset = " + " : ".join(offset_branches) + " : static_cast<T>(0);"
             )
-            # Build p.q = q_orig + c*dt*qd_orig, p.qd = qd_orig + c*dt*qdd_{prev}.
+            # Build p.q = integrate(q_orig, c*dt*qd_orig), p.qd = qd_orig + c*dt*qdd_{prev}.
             # Prior stage's qdd lives in s_stage_grad_qdd at offset (stage_idx - 1) * n.
             prev_offset = (stage_idx - 1) * n
-            self.gen_add_parallel_loop("ind", str(n), use_thread_group)
-            self.gen_add_code_line(f"s_q[ind] = s_q_orig[ind] + c_offset * dt * s_qd_orig[ind];")
-            self.gen_add_code_line(f"s_qd[ind] = s_qd_orig[ind] + c_offset * dt * s_stage_grad_qdd[{prev_offset} + ind];")
-            self.gen_add_end_control_flow()
+            if fb:
+                # Floating-base q-update is the SE(3) Lie retract over the full
+                # nq layout; the velocity update is the plain Euler add.
+                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_code_line(f"T v_scaled[{n}];")
+                self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = c_offset * dt * s_qd_orig[i];")
+                self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q_orig, v_scaled, s_q);")
+                self.gen_add_end_control_flow()
+                self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+                self.gen_add_code_line(f"s_qd[ind] = s_qd_orig[ind] + c_offset * dt * s_stage_grad_qdd[{prev_offset} + ind];")
+                self.gen_add_end_control_flow()
+            else:
+                self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+                self.gen_add_code_line(f"s_q[ind] = s_q_orig[ind] + c_offset * dt * s_qd_orig[ind];")
+                self.gen_add_code_line(f"s_qd[ind] = s_qd_orig[ind] + c_offset * dt * s_stage_grad_qdd[{prev_offset} + ind];")
+                self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             # Update XImats for the new s_q.
             self.gen_load_update_XImats_helpers_function_call(use_thread_group)
             self.gen_add_sync(use_thread_group)
+            if fb:
+                # Per-stage SE(3) dIntegrate blocks at v_dt = c*dt*qd_orig (the
+                # q-perturbation increment for p.q = integrate(q_orig, c*dt*qd_orig)).
+                # Reused buffers s_dInt_*_6x6 — consumed in this stage's D_qdd loop
+                # below before the next stage overwrites them.
+                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_code_line(f"T v_dt_stage[{n}];")
+                self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_stage[i] = c_offset * dt * s_qd_orig[i];")
+                self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_stage, s_dInt_q_6x6);")
+                self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_stage, s_dInt_v_6x6);")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync(use_thread_group)
 
         # Run FD-gradient at this stage's (s_q, s_qd, s_u).
         # After this call: s_qdd, s_Minv, s_df_du = stage `stage_num` values.
@@ -304,13 +362,34 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
         self.gen_add_parallel_loop("ind", str(n * three_n), use_thread_group)
         self.gen_add_code_line(f"int r = ind % {n};")
         self.gen_add_code_line(f"int c = ind / {n};")
-        # base term per block.
+        # base term per block. For floating-base on stage > 1 the J_qq columns
+        # are projected through the SE(3) dIntegrate blocks (block-diagonal: 6x6
+        # free-flyer block + identity joints), mirroring J_qq_i @ dInt in Python.
+        project = fb and stage_idx > 0
         self.gen_add_code_line("T base = static_cast<T>(0);")
         self.gen_add_code_line(f"if (c < {n}) {{")
-        self.gen_add_code_line(f"    base = s_df_du[c * {n} + r];                       // J_qq[r, c]")
+        if project:
+            self.gen_add_code_line("    // (J_qq @ dInt_q)[r, c]")
+            self.gen_add_code_line("    if (c < 6) {")
+            self.gen_add_code_line(f"        for (int k = 0; k < 6; ++k) base += s_df_du[k * {n} + r] * s_dInt_q_6x6[k * 6 + c];")
+            self.gen_add_code_line("    } else {")
+            self.gen_add_code_line(f"        base = s_df_du[c * {n} + r];")
+            self.gen_add_code_line("    }")
+        else:
+            self.gen_add_code_line(f"    base = s_df_du[c * {n} + r];                       // J_qq[r, c]")
         self.gen_add_code_line(f"}} else if (c < {2 * n}) {{")
         self.gen_add_code_line(f"    int cc = c - {n};")
-        self.gen_add_code_line(f"    base = c_prev_s{stage_num} * dt * s_df_du[cc * {n} + r] + s_df_du[{nn} + cc * {n} + r];  // c*dt*J_qq + J_qv")
+        if project:
+            self.gen_add_code_line("    // c*dt*(J_qq @ dInt_v)[r, cc] + J_qv[r, cc]")
+            self.gen_add_code_line("    T proj = static_cast<T>(0);")
+            self.gen_add_code_line("    if (cc < 6) {")
+            self.gen_add_code_line(f"        for (int k = 0; k < 6; ++k) proj += s_df_du[k * {n} + r] * s_dInt_v_6x6[k * 6 + cc];")
+            self.gen_add_code_line("    } else {")
+            self.gen_add_code_line(f"        proj = s_df_du[cc * {n} + r];")
+            self.gen_add_code_line("    }")
+            self.gen_add_code_line(f"    base = c_prev_s{stage_num} * dt * proj + s_df_du[{nn} + cc * {n} + r];")
+        else:
+            self.gen_add_code_line(f"    base = c_prev_s{stage_num} * dt * s_df_du[cc * {n} + r] + s_df_du[{nn} + cc * {n} + r];  // c*dt*J_qq + J_qv")
         self.gen_add_code_line("} else {")
         self.gen_add_code_line(f"    int cc = c - {2 * n};")
         # s_Minv is SYMMETRIC_UPPER triangular n × n.
@@ -337,20 +416,44 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
         self.gen_add_end_control_flow()  # close `if constexpr (gating)`
 
     # ----- Final assembly of dAB and optional x_kp1 -----
+    # q_{k+1} = integrate(q, dt*qd) (Euler-style for every RK variant), so the
+    # top rows are [dInt_q | dt*dInt_v | 0] at v_dt = dt*qd. For fixed-base these
+    # reduce to [I | dt*I | 0].
+    if fb:
+        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_code_line(f"T v_dt_final[{n}];")
+        self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_final[i] = dt * s_qd_orig[i];")
+        self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_final, s_dInt_q_6x6);")
+        self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_final, s_dInt_v_6x6);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
     self.gen_add_code_line("// --- multi-stage gradient: assemble final dAB ---")
     self.gen_add_parallel_loop("ind", str(2 * n * three_n), use_thread_group)
     self.gen_add_code_line(f"int row = ind % {2 * n};")
     self.gen_add_code_line(f"int col = ind / {2 * n};")
     self.gen_add_code_line("T val = static_cast<T>(0);")
     self.gen_add_code_line(f"if (row < {n}) {{")
-    # Top half: q_{k+1} = q + dt*qd (same as Euler).
-    self.gen_add_code_line(f"    if (col < {n}) {{")
-    self.gen_add_code_line("        val = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
-    self.gen_add_code_line(f"    }} else if (col < {2 * n}) {{")
-    self.gen_add_code_line(f"        val = (row == col - {n}) ? dt : static_cast<T>(0);")
-    self.gen_add_code_line("    } else {")
-    self.gen_add_code_line("        val = static_cast<T>(0);")
-    self.gen_add_code_line("    }")
+    if fb:
+        self.gen_add_code_line(f"    if (col < {n}) {{")
+        self.gen_add_code_line("        if (row < 6 && col < 6) { val = s_dInt_q_6x6[row * 6 + col]; }")
+        self.gen_add_code_line("        else if (row >= 6 && col >= 6) { val = (row == col) ? static_cast<T>(1) : static_cast<T>(0); }")
+        self.gen_add_code_line("        else { val = static_cast<T>(0); }")
+        self.gen_add_code_line(f"    }} else if (col < {2 * n}) {{")
+        self.gen_add_code_line(f"        int j = col - {n};")
+        self.gen_add_code_line("        if (row < 6 && j < 6) { val = dt * s_dInt_v_6x6[row * 6 + j]; }")
+        self.gen_add_code_line("        else if (row >= 6 && j >= 6) { val = (row == j) ? dt : static_cast<T>(0); }")
+        self.gen_add_code_line("        else { val = static_cast<T>(0); }")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        val = static_cast<T>(0);")
+        self.gen_add_code_line("    }")
+    else:
+        self.gen_add_code_line(f"    if (col < {n}) {{")
+        self.gen_add_code_line("        val = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line(f"    }} else if (col < {2 * n}) {{")
+        self.gen_add_code_line(f"        val = (row == col - {n}) ? dt : static_cast<T>(0);")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        val = static_cast<T>(0);")
+        self.gen_add_code_line("    }")
     self.gen_add_code_line("} else {")
     self.gen_add_code_line(f"    int r = row - {n};")
     self.gen_add_code_line("    // bottom half: qd_{k+1} = qd + dt * sum(b_i * qdd_i)")
@@ -374,24 +477,31 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     # Optionally also assemble x_{k+1}.
     if compute_x_kp1:
         self.gen_add_code_line("// --- multi-stage gradient: assemble x_{k+1} ---")
-        self.gen_add_parallel_loop("ind", str(2 * n), use_thread_group)
-        self.gen_add_code_line(f"if (ind < {n}) {{")
-        self.gen_add_code_line(f"    s_x_kp1[ind] = s_q_orig[ind] + dt * s_qd_orig[ind];")
-        self.gen_add_code_line("} else {")
-        self.gen_add_code_line(f"    int j = ind - {n};")
-        self.gen_add_code_line("    T accel = static_cast<T>(0);")
+        # v_{k+1} = qd + dt * sum(b_i * qdd_i); stage qdds live in s_stage_grad_qdd.
+        self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+        self.gen_add_code_line("T accel = static_cast<T>(0);")
         for name, (cnt, _, b_list) in _INTEGRATOR_BUTCHER.items():
-            self.gen_add_code_line(f"    if constexpr (IT == IntegratorType::{name}) {{")
+            self.gen_add_code_line(f"if constexpr (IT == IntegratorType::{name}) {{")
             for i, b in enumerate(b_list):
                 if b == 0:
                     continue
-                # All stage qdd's now live in s_stage_grad_qdd[i*n..(i+1)*n].
-                src = f"s_stage_grad_qdd[{i * n} + j]"
-                self.gen_add_code_line(f"        accel += static_cast<T>({b}) * {src};")
-            self.gen_add_code_line("    }")
-        self.gen_add_code_line(f"    s_x_kp1[ind] = s_qd_orig[j] + dt * accel;")
-        self.gen_add_code_line("}")
+                self.gen_add_code_line(f"    accel += static_cast<T>({b}) * s_stage_grad_qdd[{i * n} + ind];")
+            self.gen_add_code_line("}")
+        v_out_index = f"{nq} + ind" if fb else f"{n} + ind"
+        self.gen_add_code_line(f"s_x_kp1[{v_out_index}] = s_qd_orig[ind] + dt * accel;")
         self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+        # q_{k+1} = integrate(q, dt*qd) (Euler-style q-update for every RK variant).
+        if fb:
+            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_code_line(f"T v_scaled_x[{n}];")
+            self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled_x[i] = dt * s_qd_orig[i];")
+            self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q_orig, v_scaled_x, s_x_kp1);")
+            self.gen_add_end_control_flow()
+        else:
+            self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+            self.gen_add_code_line("s_x_kp1[ind] = s_q_orig[ind] + dt * s_qd_orig[ind];")
+            self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 
 
@@ -416,12 +526,17 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
     )
     self.gen_add_sync(use_thread_group)
     if fb:
-        # Precompute the SE(3) dIntegrate blocks at v_dt = dt * qd (Euler).
-        # SI Euler / multi-stage would need different v_dt — the static_assert
-        # in the dAB assembly catches that case.
+        # Precompute the SE(3) dIntegrate blocks at the q-update increment v_dt.
+        # Euler:    q_new = integrate(q, dt*qd)            -> v_dt = dt*qd
+        # SI-Euler: q_new = integrate(q, dt*v_new), where  -> v_dt = dt*(qd + dt*qdd)
+        #           v_new = qd + dt*qdd  (s_qdd holds qdd after the FD gradient).
         self.gen_add_serial_ops(use_thread_group)
         self.gen_add_code_line(f"T v_dt_for_dInt[{n}];")
-        self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * s_qd[i];")
+        self.gen_add_code_line("if constexpr (" + _integrator_type_token(integrator_type) + " == IntegratorType::SEMI_IMPLICIT_EULER) {")
+        self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * (s_qd[i] + dt * s_qdd[i]);")
+        self.gen_add_code_line("} else {")
+        self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * s_qd[i];")
+        self.gen_add_code_line("}")
         self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_for_dInt, s_dInt_q_6x6);")
         self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_for_dInt, s_dInt_v_6x6);")
         self.gen_add_end_control_flow()
@@ -526,7 +641,8 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         ("s_Minv", n * n),
         ("s_qdd", n),
         # Multi-stage scratch — allocated for every IT (single-stage just doesn't use it).
-        ("s_q_orig", n),
+        # s_q_orig holds the full nq pose (floating-base adds the quaternion slot).
+        ("s_q_orig", n + fb),
         ("s_qd_orig", n),
         ("s_stage_grad_qdd", max_stages * n),
         ("s_D_qdd_stage", max_stages * n * 3 * n),
