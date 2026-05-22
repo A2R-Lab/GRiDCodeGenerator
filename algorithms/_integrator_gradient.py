@@ -213,7 +213,7 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     self.gen_add_end_control_flow()  # end if constexpr SI_EULER
     self.gen_add_code_line("else {", True)
     self.gen_add_code_line("static_assert(" + tok + " == IntegratorType::EULER || " + tok + " == IntegratorType::SEMI_IMPLICIT_EULER,")
-    self.gen_add_code_line("              \"Integrator gradient type not yet implemented (Midpoint/RK3/RK4 need multi-stage chain rule).\");")
+    self.gen_add_code_line("              \"dAB assembly handles single-stage IT only; Midpoint/RK3/RK4 are routed through gen_integrator_gradient_multistage.\");")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # end parallel loop
 
@@ -510,12 +510,13 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
                                           s_x_kp1_name="s_x_kp1"):
     """Compose: FD gradient (sets s_Minv, s_qdd, s_dc_du, s_df_du) → dAB assembly.
 
-    For floating-base, additionally compute the 6x6 SE(3) dIntegrate
-    blocks once (s_dInt_q_6x6, s_dInt_v_6x6) and read them in the dAB
-    top-nv rows. Currently supports Euler only for floating-base; SI Euler
-    on floating still falls through to the static_assert below (the chain
-    rule for q_new = integrate(q, dt*v_new) needs an extra matmul through
-    the v_new partials and is not yet wired up).
+    This is the single-stage path (Euler / SI-Euler). For floating-base it also
+    computes the 6x6 SE(3) dIntegrate blocks (s_dInt_q_6x6, s_dInt_v_6x6) at the
+    q-update increment — dt*qd for Euler, dt*v_new for SI-Euler — and reads them
+    in the dAB top-nv rows. The SI-Euler floating top rows additionally fold in
+    the dInt_v @ dv/dX matmul (see the SEMI_IMPLICIT_EULER branch in
+    gen_integrator_gradient_dAB_assembly). Multi-stage (Midpoint/RK3/RK4) goes
+    through gen_integrator_gradient_multistage instead.
     """
     fb = self.robot.floating_base
     n = self.robot.get_num_vel()
