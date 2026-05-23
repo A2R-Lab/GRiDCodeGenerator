@@ -332,11 +332,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F
     # from s_temp (smem; this kernel does not surgically spill Minv/FD-F — its
     # tiers spill the SO outputs / df_du / Minv instead).
-    fd_start = "forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, "
+    # Canonical: build the shared helper ARGS via gen_insert_helpers_function_call
+    # (was a bespoke "make a def-params string then .replace() the types out" hack,
+    # which silently dropped/duplicated args when the helper signature changed).
+    fd_start = "forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call()
     fd_end = "s_temp, nullptr, gravity);"
-    fd_start, _ = self.gen_insert_helpers_func_def_params(fd_start, [], -2)
-    if 'T *' in fd_start: fd_start = fd_start.replace("T *","")
-    if 'int *' in fd_start: fd_start = fd_start.replace("int *","")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(NUM_POS + 2*n),use_thread_group)

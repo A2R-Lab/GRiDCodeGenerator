@@ -187,8 +187,8 @@ def gen_load_update_XImats_helpers_function_call(self, use_thread_group = False,
     code_start = "load_update_XImats_helpers<T>(" + var_names["s_XImats_name"] + ", " + var_names["s_q_name"] + ", "
     code_end = var_names["d_robotModel_name"] + ", " + var_names["s_temp_name"] + ");"
     n = self.robot.get_num_pos()
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        code_start += var_names["s_topology_helpers_name"] + ", "
+    # Always pass s_topology_helpers (uniform signature; nullptr for serial chains).
+    code_start += var_names["s_topology_helpers_name"] + ", "
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
@@ -227,9 +227,11 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
     if use_thread_group:
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
         func_def_start += "cgrps::thread_group tgrp, "
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        func_def_middle += "int *s_topology_helpers, "
-        func_params.insert(-2,"s_topology_helpers is the (shared) memory destination location for the topology_helpers")
+    # Always emit s_topology_helpers for a uniform signature; serial chains with
+    # identical Ss don't read it (they pass nullptr and skip the topology-copy body
+    # below). -Wunused-parameter is off in our builds.
+    func_def_middle += "int *s_topology_helpers, "
+    func_params.insert(-2,"s_topology_helpers is the (shared) memory location for the topology_helpers (nullptr/unused for serial chains with identical Ss)")
     func_def = func_def_start + func_def_middle + func_def_end
     # then genearte the code
     self.gen_add_func_doc("Updates the Xmats in (shared) GPU memory acording to the configuration",[],func_params,None)
@@ -813,8 +815,11 @@ def gen_topology_S_sign_for_cpp(self, inds = None, updated_var_names = None, OFF
         S_id = var_names["s_topology_helpers_name"] + "[" + str(NJ) + " + " + var_names["jid_name"] + "]"
     return "((" + S_id + ") > 0 ? 1 : -1)"
 
-def gen_insert_helpers_function_call(self, updated_var_names = None):
-    n = self.robot.get_num_pos()
+def gen_insert_helpers_function_call(self, updated_var_names = None, NO_XI_FLAG = False):
+    # Canonical builder for the shared helper ARGS of an inner-function call. Mirror
+    # of gen_insert_helpers_func_def_params so def + call can never drift: pass
+    # NO_XI_FLAG=True for inners that take s_Xhom (homogeneous transforms) instead of
+    # s_XImats (e.g. the end_effector_pose family) — same as the def helper.
     var_names = dict( \
         s_XImats_name = "s_XImats", \
         s_topology_helpers_name = "s_topology_helpers", \
@@ -822,9 +827,13 @@ def gen_insert_helpers_function_call(self, updated_var_names = None):
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    func_call = var_names["s_XImats_name"] + ", "
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        func_call += var_names["s_topology_helpers_name"] + ", "
+    func_call = ""
+    if not NO_XI_FLAG:
+        func_call += var_names["s_XImats_name"] + ", "
+    # Always pass s_topology_helpers for a uniform inner-function signature across
+    # robots; it is nullptr (and unused) for serial chains with identical Ss, where
+    # the topology is hardcoded into the generated indices.
+    func_call += var_names["s_topology_helpers_name"] + ", "
     return func_call
 
 def gen_insert_helpers_func_def_params(self, func_def, func_params, param_insert_position = -1, updated_var_names = None, NO_XI_FLAG = False):
@@ -840,9 +849,11 @@ def gen_insert_helpers_func_def_params(self, func_def, func_params, param_insert
     if not NO_XI_FLAG:
         func_def += "T *" + var_names["s_XImats_name"] + ", "
         func_params.insert(param_insert_position,"s_XImats is the (shared) memory holding the updated XI matricies for the given s_q")
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        func_def += "int *" + var_names["s_topology_helpers_name"] + ", "
-        func_params.insert(param_insert_position,"s_topology_helpers is the (shared) memory destination location for the topology_helpers")
+    # Always emit s_topology_helpers for a uniform signature across robots. It is
+    # nullptr and unused for serial chains with identical Ss (they hardcode the
+    # topology into the generated indices); -Wunused-parameter is off in our builds.
+    func_def += "int *" + var_names["s_topology_helpers_name"] + ", "
+    func_params.insert(param_insert_position,"s_topology_helpers is the (shared) memory location for the topology_helpers (nullptr/unused for serial chains with identical Ss)")
     return func_def, func_params
 
 def gen_init_robotModel(self):

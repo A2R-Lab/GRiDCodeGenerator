@@ -613,6 +613,10 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(int));")
         self.gen_add_code_line("int *" + topology_name + " = grid_arena_ptr<int>(s_arena, s_arena_offset);")
         self.gen_add_code_line("s_arena_offset += sizeof(int) * static_cast<size_t>(" + str(topology_count) + ");")
+    else:
+        # Always declare the pointer (nullptr) so inner-function call sites can pass
+        # it uniformly even when this robot allocates no topology helpers.
+        self.gen_add_code_line("int *" + topology_name + " = nullptr;")
     for name, count in extra_byte_regions:
         self.gen_add_code_line("unsigned char *" + name + " = nullptr;")
         self.gen_add_code_line("if (static_cast<size_t>(" + str(count) + ") > 0) {", True)

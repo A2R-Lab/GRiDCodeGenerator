@@ -25,9 +25,10 @@ def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, up
     # account for thread group and serial chains
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    n = self.robot.get_num_pos()
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        code_middle += var_names["s_topology_helpers_name"] + ", "
+    # Canonical: append the shared topology-helper arg via the central helper
+    # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
+    # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
+    code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_name = ""):
@@ -354,9 +355,10 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    n = self.robot.get_num_pos()
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        code_middle += var_names["s_topology_helpers_name"] + ", "
+    # Canonical: append the shared topology-helper arg via the central helper
+    # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
+    # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
+    code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_target_name = ""):
@@ -818,9 +820,10 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
-    n = self.robot.get_num_pos()
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        code_middle += var_names["s_topology_helpers_name"] + ", "
+    # Canonical: append the shared topology-helper arg via the central helper
+    # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
+    # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
+    code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False):
