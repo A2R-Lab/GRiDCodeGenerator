@@ -342,7 +342,7 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
-        s_workspace_name = "nullptr", \
+        d_workspace_name = "nullptr", \
         s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
@@ -350,7 +350,7 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
             var_names[key] = value
     code_start = "end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T, " + temp_in_smem_expr + ">(" + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -378,7 +378,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
     func_def_start = "void end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, "
-    func_def_end = "T *s_temp, T *s_workspace, unsigned char *s_linalg_smem) {"
+    func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -391,9 +391,9 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Inner-controlled scratch placement: the double-buffered chain workspace
-    # moves to s_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps
+    # moves to d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps
     # every s_temp[...] reference below unchanged.
-    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = s_workspace; } else { (void)s_workspace; }")
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     #
     # Initial Debug Prints if Requested
     #
@@ -644,7 +644,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
         # Inner-controlled: pass both arenas + placement; the inner picks where
         # the chain workspace lives via TEMP_IN_SMEM.
-        updated = {"s_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
+        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync(use_thread_group)
@@ -663,7 +663,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         # TODO(licm-eepose-grad): sm_86-specific, deprioritized. See pre-Phase-3d note in git history.
         self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
-        updated = {"s_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
+        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("deePos")
@@ -1180,11 +1180,11 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
                    "s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
                    "s_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "s_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(d2_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
-    func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the d2eeTemp scratch (~" + str(d2_temp_size) + "*sizeof(T) bytes) moves from shared memory to s_workspace, freeing smem for the caller's outer kernel"]
+                   "d_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(d2_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+    func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the d2eeTemp scratch (~" + str(d2_temp_size) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel"]
     func_def_start = "void end_effector_pose_gradient_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
-    func_def_end = "const robotModel<T> *d_robotModel, T *s_workspace = nullptr) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -1197,19 +1197,19 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     self.gen_add_code_line(func_def, True)
     # Smem arena: s_temp is the inner-no-d2 size always (in smem at every tier).
     # s_d2eeTemp is tier-conditional: at TIER_PERF it extends the arena past
-    # linalg/topology; at TIER_LITE+ it comes from s_workspace.
+    # linalg/topology; at TIER_LITE+ it comes from d_workspace.
     self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_no_d2_size, include_gradients = True, include_hessians = True,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     self.gen_add_code_line("T *s_d2eeTemp;")
     self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
-    self.gen_add_code_line("(void)s_workspace;")
+    self.gen_add_code_line("(void)d_workspace;")
     self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
     self.gen_add_code_line("s_d2eeTemp = grid_arena_ptr<T>(s_arena, s_arena_offset);")
     self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(d2_temp_size) + ");")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("else {", True)
-    self.gen_add_code_line("s_d2eeTemp = s_workspace;")
+    self.gen_add_code_line("s_d2eeTemp = d_workspace;")
     self.gen_add_end_control_flow()
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)

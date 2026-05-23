@@ -550,7 +550,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
     When ``tier_workspace_expr`` is non-None, the ``s_temp`` slot becomes
     tier-aware: at TIER_PERF the slot is allocated from the arena as usual;
     at TIER_LITE+/MINIMAL the slot is sourced from the supplied workspace
-    pointer expression (e.g. ``"s_workspace"``) and the arena allocation
+    pointer expression (e.g. ``"d_workspace"``) and the arena allocation
     skips the temp slot entirely, freeing that smem for the caller's outer
     kernel. The arena_offset variable accumulates conditionally so trailing
     slots (topology, linalg, etc.) shift up at LITE+/MINIMAL.

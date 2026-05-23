@@ -10,7 +10,7 @@ def gen_forward_dynamics_inner_temp_mem_size(self, minv_f_in_smem = True):
         """s_temp arena = s_Minv (n*n, persistent) + max(Minv footprint during
         the Minv call, c+vaf+ID-inner after Minv). Inner-controlled placement:
         when minv_f_in_smem the Minv F-region (6*NV*NV) lives at the tail of the
-        Minv sub-arena (so it's included here); when spilled it's in s_workspace
+        Minv sub-arena (so it's included here); when spilled it's in d_workspace
         and excluded. Caller sizes s_temp from FD_INNER_SMEM_BYTES<MINV_F_IN_SMEM>."""
         n = self.robot.get_num_pos()
         nv = self.robot.get_num_vel()
@@ -73,7 +73,7 @@ def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, upd
         s_qdd_name = "s_qdd", \
         s_u_name = "s_u", \
         s_temp_name = "s_temp", \
-        s_workspace_name = "nullptr", \
+        d_workspace_name = "nullptr", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
@@ -81,11 +81,11 @@ def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, upd
             var_names[key] = value
     # Inner-controlled placement: forward_dynamics_inner is keyed on bool
     # MINV_F_IN_SMEM and slices the internal Minv F-region from s_temp (smem) or
-    # s_workspace (global) itself. The caller passes both arenas + the placement;
+    # d_workspace (global) itself. The caller passes both arenas + the placement;
     # sizes come from FD_INNER_{SMEM,WORKSPACE}_BYTES<T, MINV_F_IN_SMEM>().
     fd_code_start = "forward_dynamics_inner<T, " + minv_f_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_q_name"] + ", " + \
                                                    var_names["s_qd_name"] + ", " + var_names["s_u_name"] + ", "
-    fd_code_end = var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ", " + var_names["gravity_name"] + ");"
+    fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     fd_code_middle = self.gen_insert_helpers_function_call()
     if use_thread_group:
         fd_code_start = fd_code_start.replace("(","(tgrp, ")
@@ -101,14 +101,14 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
                    "s_qd is the vector of joint velocities", \
                    "s_u is the vector of joint input torques", \
                    "s_temp is the (shared) scratch; size FD_INNER_SMEM_BYTES<T, MINV_F_IN_SMEM>()", \
-                   "s_workspace is the global scratch; size FD_INNER_WORKSPACE_BYTES<T, MINV_F_IN_SMEM>() (= 6*NV*NV when !MINV_F_IN_SMEM, else 0). Pass nullptr when MINV_F_IN_SMEM", \
+                   "d_workspace is the global scratch; size FD_INNER_WORKSPACE_BYTES<T, MINV_F_IN_SMEM>() (= 6*NV*NV when !MINV_F_IN_SMEM, else 0). Pass nullptr when MINV_F_IN_SMEM", \
                    "gravity is the gravity constant"]
     func_def_start = "void forward_dynamics_inner(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "T *s_temp, T *s_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values",
-                  "Inner-controlled placement: MINV_F_IN_SMEM selects where the internal Minv 6*NV*NV F-region lives (s_temp tail vs s_workspace). Decided here; caller sizes both arenas from FD_INNER_*_BYTES and hands both pointers in."]
+                  "Inner-controlled placement: MINV_F_IN_SMEM selects where the internal Minv 6*NV*NV F-region lives (s_temp tail vs d_workspace). Decided here; caller sizes both arenas from FD_INNER_*_BYTES and hands both pointers in."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(","(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -119,12 +119,12 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # s_temp[0..n*n] = s_Minv (persistent). The internal Minv call gets the
-    # sub-arena &s_temp[n*n] (its no_F region) + s_workspace; Minv slices its own
-    # F-region (tail of the sub-arena when MINV_F_IN_SMEM, else s_workspace).
+    # sub-arena &s_temp[n*n] (its no_F region) + d_workspace; Minv slices its own
+    # F-region (tail of the sub-arena when MINV_F_IN_SMEM, else d_workspace).
     # After Minv, &s_temp[n*n..] is reused for c+vaf+ID_inner.
     updated_var_names = dict(s_Minv_name = "s_temp",
                              s_temp_name = "&s_temp[" + str(n*n) + "]",
-                             s_workspace_name = "s_workspace")
+                             d_workspace_name = "d_workspace")
     self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
     updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
     self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
@@ -179,7 +179,7 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
     spill_minv_F=False: s_minv_F lives in extra smem (at start of s_temp);
     spill_minv_F=True:  s_minv_F lives in L2-pinned workspace."""
     # Inner-controlled: forward_dynamics_inner slices the Minv F itself from
-    # s_temp (smem) or s_workspace (global) per MINV_F_IN_SMEM. The arena size
+    # s_temp (smem) or d_workspace (global) per MINV_F_IN_SMEM. The arena size
     # already reflects that choice.
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem = not spill_minv_F)
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", 3*n+self.robot.floating_base), ("s_qdd", n)], include_linalg_scratch=True)
@@ -191,13 +191,13 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)
         if spill_minv_F:
-            self.gen_add_code_line("T *fd_s_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group,
-            updated_var_names = (dict(s_workspace_name = "fd_s_workspace") if spill_minv_F else None),
+            updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("qdd",str(n),str(n),use_thread_group)
@@ -206,7 +206,7 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
         input_count = 3*n + self.robot.floating_base
         self.gen_kernel_load_inputs_single_timing("q_qd_u",str(input_count))
         if spill_minv_F:
-            self.gen_add_code_line("T *fd_s_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
@@ -214,7 +214,7 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
         self.gen_anti_licm_input_reload("q_qd_u",str(input_count),use_thread_group,feedback_from="qdd")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group,
-            updated_var_names = (dict(s_workspace_name = "fd_s_workspace") if spill_minv_F else None),
+            updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()

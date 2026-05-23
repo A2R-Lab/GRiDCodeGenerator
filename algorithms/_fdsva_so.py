@@ -10,15 +10,15 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
                 "s_Minv is the inverse mass matrix", \
                 "s_df_du is the gradient of the forward dynamics", \
                 "s_temp is the (shared) scratch buffer; size FDSVA_SO_INNER_SMEM_BYTES<T, SCRATCH_IN_SMEM>() bytes (= " + str(inner_arena_size) + "*sizeof(T) when SCRATCH_IN_SMEM, else 0)", \
-                "s_workspace is the global scratch buffer; size FDSVA_SO_INNER_WORKSPACE_BYTES<T, SCRATCH_IN_SMEM>() bytes (= " + str(inner_arena_size) + "*sizeof(T) when !SCRATCH_IN_SMEM, else 0). Pass nullptr when SCRATCH_IN_SMEM", \
+                "d_workspace is the global scratch buffer; size FDSVA_SO_INNER_WORKSPACE_BYTES<T, SCRATCH_IN_SMEM>() bytes (= " + str(inner_arena_size) + "*sizeof(T) when !SCRATCH_IN_SMEM, else 0). Pass nullptr when SCRATCH_IN_SMEM", \
                 "gravity is the gravity constant"]
     func_def_start = "void fdsva_so_inner("
     func_def_middle = "T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, "
-    func_def_end = "T *s_temp, T *s_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_notes = ["Assumes works with IDSVA",
                   "Inline-CUDA users: SCRATCH_IN_SMEM selects where the 4*NV^3 scratch arena lives.",
                   "  true  -> s_temp (shared memory; fastest, current default).",
-                  "  false -> s_workspace (global; frees shared memory for the caller's outer kernel).",
+                  "  false -> d_workspace (global; frees shared memory for the caller's outer kernel).",
                   "The placement is the INNER's choice (made at the top of this function) so the",
                   "kernel/device caller just sizes both arenas from the exposed *_BYTES constants",
                   "and hands both pointers in. Codegen maps each RESOURCE_TIER to a SCRATCH_IN_SMEM",
@@ -52,17 +52,17 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     self.gen_add_code_line('T *d2a_dtdq = &s_df2[' + str(3*n*n*n) + '];')
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Temporary Variables. The 4*n^3 scratch arena placement is the INNER\'s')
-    self.gen_add_code_line('// choice, keyed on SCRATCH_IN_SMEM: s_temp (shared) when true, s_workspace')
+    self.gen_add_code_line('// choice, keyed on SCRATCH_IN_SMEM: s_temp (shared) when true, d_workspace')
     self.gen_add_code_line('// (global) when false. A surgical-spill change is local here: repoint a')
     self.gen_add_code_line('// sub-buffer + update FDSVA_SO_INNER_{SMEM,WORKSPACE}_BYTES.')
     self.gen_add_code_line('T *inner_arena;')
     self.gen_add_code_line('if constexpr (SCRATCH_IN_SMEM) {', True)
-    self.gen_add_code_line('(void)s_workspace;')
+    self.gen_add_code_line('(void)d_workspace;')
     self.gen_add_code_line('inner_arena = s_temp;')
     self.gen_add_end_control_flow()
     self.gen_add_code_line('else {', True)
     self.gen_add_code_line('(void)s_temp;')
-    self.gen_add_code_line('inner_arena = s_workspace;')
+    self.gen_add_code_line('inner_arena = d_workspace;')
     self.gen_add_end_control_flow()
     self.gen_add_code_line(f'T *inner_dq = inner_arena; // Inner term for d2a_dqdq')
     self.gen_add_code_line(f'T *inner_cross = inner_dq + {n**3}; // Inner term for d2a_dvdq (dM_dq*Minv)')
@@ -215,14 +215,14 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
         s_Minv_name = "s_Minv", \
         s_df_du_name = "s_df_du", \
         s_temp_name = "s_temp", \
-        s_workspace_name = "nullptr", \
+        d_workspace_name = "nullptr", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     fdsva_so_code_start = "fdsva_so_inner<T, " + scratch_in_smem_expr + ">(" + var_names["s_df2_name"] + ", " + var_names["s_idsva_so_name"] + ", " + var_names["s_Minv_name"] + ", " + var_names["s_df_du_name"] + ", "
-    fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["s_workspace_name"] + ", " + var_names["gravity_name"] + ");"
+    fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
     fdsva_so_code_middle = self.gen_insert_helpers_function_call()
@@ -371,10 +371,10 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
             self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         # Inner-controlled scratch placement: pass both arenas (s_temp = smem,
-        # s_workspace = the L2-pinned spill slot when this tier spills) and let
+        # d_workspace = the L2-pinned spill slot when this tier spills) and let
         # fdsva_so_inner pick via SCRATCH_IN_SMEM. The kernel no longer aims a
         # single pointer — it just provides both, sized from the constants.
-        fdsva_updates = dict(s_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
+        fdsva_updates = dict(d_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates,
                                               scratch_in_smem_expr = "false" if use_workspace_temp else "true")
         self.gen_add_sync(use_thread_group)
@@ -411,7 +411,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         else:
             self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
             self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-        fdsva_updates = dict(s_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
+        fdsva_updates = dict(d_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
         self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates,
                                               scratch_in_smem_expr = "false" if use_workspace_temp else "true")
         self.gen_add_end_control_flow()

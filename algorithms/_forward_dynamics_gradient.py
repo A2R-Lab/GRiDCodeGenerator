@@ -78,11 +78,11 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
                    "s_qd is the vector of joint velocities", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "gravity is the gravity constant", \
-                   "s_workspace is the global scratch buffer; size FD_DU_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+                   "d_workspace is the global scratch buffer; size FD_DU_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
     func_def_start = "void forward_dynamics_gradient_device(T *s_df_du, const T *s_q, const T *s_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *s_workspace = nullptr) {"
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
     func_notes = ["Uses the fd/du = -Minv*id/du trick as described in Carpentier and Mansrud 'Analytical Derivatives of Rigid Body Dynamics Algorithms'",
-                  "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the temp scratch arena moves from s_temp to s_workspace, freeing shared memory for the caller's outer kernel"]
+                  "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the temp scratch arena moves from s_temp to d_workspace, freeing shared memory for the caller's outer kernel"]
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -103,7 +103,7 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     extra_t_buffers = [("s_vaf", 18*n), ("s_dc_du", n*2*n)]
     if not use_qdd_Minv_input:
         extra_t_buffers += [("s_Minv", n*n), ("s_qdd", n)]
-    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True, tier_workspace_expr="s_workspace")
+    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True, tier_workspace_expr="d_workspace")
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     # then run the computation
