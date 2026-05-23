@@ -553,7 +553,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     # containing hundreds of `static_cast<T>(expr)` writes (esp. when the
     # Hessian is included — O(NJ × n²) entries × 16 cells each) pushes
     # peak per-thread register usage above the __launch_bounds__ cap that
-    # bigger robots impose (140+ regs vs cap of 128 at SUGGESTED_THREADS=512).
+    # bigger robots impose (140+ regs vs cap of 128 at MAX_PERF_LEVEL_THREADS=512).
     # Three smaller serial sections drop peak per-thread reg usage to a
     # function of the largest individual matrix group, not the sum.
     # NOTE on future work: the entire serial section can be parallelized

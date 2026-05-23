@@ -459,7 +459,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         # destination. Run the whole accumulation for the root on one lane
         # (dof_id==0), summing over the 6 axes, so there is no multi-thread +=
         # race. (Correct only within one warp otherwise -> wrong J_qv at
-        # SUGGESTED_THREADS.) Non-root joints have a unique axis per lane.
+        # MAX_PERF_LEVEL_THREADS.) Non-root joints have a unique axis per lane.
         self.gen_add_code_line("if (jid == 0 && dof_id == 0) {", True)
         self.gen_add_code_line(f"T *root_dst = &s_temp[{Offset_da_dq} + dof*6 + dqd_offset];")
         self.gen_add_code_line(f"const T *root_src = &s_temp[{Offset_dv_dq} + dof*6 + dqd_offset];")

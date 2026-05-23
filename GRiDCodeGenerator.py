@@ -229,10 +229,10 @@ class GRiDCodeGenerator:
         XHom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
         dva_cols_per_partial = self.robot.get_total_ancestor_count() + self.robot.get_num_joints()
         max_threads_in_comp_loop = 6*2*dva_cols_per_partial
-        suggested_threads = 32 * int(np.ceil(max_threads_in_comp_loop/32.0))
+        max_perf_level_threads = 32 * int(np.ceil(max_threads_in_comp_loop/32.0))
         # cap to 512 mirrors the constant we emit further down; expose on self so
         # _lin_alg_helpers can pin cuBLASDx's BlockDim<TC,1,1> to the same value.
-        self.suggested_threads = min(suggested_threads, 512)
+        self.max_perf_level_threads = min(max_perf_level_threads, 512)
         topology_count = self.gen_topology_helpers_size()
         def py_align_up(offset, alignment):
             return ((offset + alignment - 1) // alignment) * alignment
@@ -647,7 +647,7 @@ class GRiDCodeGenerator:
                                  "const int D2EE_POS_DYNAMIC_SHARED_MEM_COUNT = " + str(legacy_arena_count(d2ee_t_count)) + ";", \
                                  f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(idsva_so_body_frame_t_count)};", \
                                  f"const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(fdsva_so_t_count)};", \
-                                 "const int SUGGESTED_THREADS = " + str(self.suggested_threads) + ";", \
+                                 "const int MAX_PERF_LEVEL_THREADS = " + str(self.max_perf_level_threads) + ";", \
                                  "",
                                  "// Resource-tier API (v2.0): each emitted kernel/_device/_inner takes a",
                                  "// `RESOURCE_TIER` template parameter that picks the (launch_bounds, smem,",
@@ -679,8 +679,8 @@ class GRiDCodeGenerator:
                                  "// MINIMAL=1024 gives ~64 regs/thread cap (maximum block-size flexibility).",
                                  "template <int TIER> __host__ __device__ constexpr int tier_max_threads() {",
                                  "    return (TIER == TIER_MINIMAL) ? 1024",
-                                 "         : (TIER == TIER_LITE)    ? ((SUGGESTED_THREADS * 2 < 768) ? SUGGESTED_THREADS * 2 : 768)",
-                                 "         :                          SUGGESTED_THREADS;",
+                                 "         : (TIER == TIER_LITE)    ? ((MAX_PERF_LEVEL_THREADS * 2 < 768) ? MAX_PERF_LEVEL_THREADS * 2 : 768)",
+                                 "         :                          MAX_PERF_LEVEL_THREADS;",
                                  "}"])
         self.gen_add_code_lines([
                                  "#define GRID_GENERATED_NUM_JOINTS " + str(n),

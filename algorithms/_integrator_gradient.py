@@ -633,11 +633,11 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                           [], func_params, None)
     self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
-    # Pin launch_bounds to SUGGESTED_THREADS (PERF cap), NOT tier_max_threads: the
+    # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (PERF cap), NOT tier_max_threads: the
     # integrator gradient is register-bound by its RBD callees, so the LITE/MINIMAL
     # thread bump starves them and ptxas errors under -rdc=true. Tier behavior here
     # is the s_D_qdd_stage smem spill, which is independent of launch_bounds.
-    self.gen_add_code_line("__launch_bounds__(SUGGESTED_THREADS)")
+    self.gen_add_code_line("__launch_bounds__(MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line(func_def, True)
     inner_temp_size = self.gen_integrator_gradient_inner_temp_mem_size()
     fb = self.robot.floating_base
