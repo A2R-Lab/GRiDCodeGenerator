@@ -449,26 +449,72 @@ class GRiDCodeGenerator:
         if self.robot.floating_base and py_arena_bytes(idsva_so_body_frame_t_count) > self.cuda_target_shared_mem_bytes:
             self.idsva_so_body_frame_grav_full_spill = True
             idsva_so_body_frame_t_count, self.idsva_so_body_frame_use_global_output = _compute_idsva_body_t_count()
-        # 3-way pick stub: spill flags here depend on whether
-        # `gen_idsva_so_body_frame_inner_temp_mem_size()` honors a separate
-        # grav-spill, which is currently a single self-flag. Approximate as
-        # (perf, lite=perf, minimal=perf) until the per-tier emit lands;
-        # captured here so metadata emission has a consistent surface.
-        _idsva_so_bf_perf_t = idsva_so_body_frame_t_count
-        self.idsva_so_body_frame_t_count_per_tier = (_idsva_so_bf_perf_t,
-                                                     _idsva_so_bf_perf_t,
-                                                     _idsva_so_bf_perf_t)
-        # After the spill decision is final, capture the inner temp count for use
-        # downstream (world-frame fallback for fixed-base + FDSVA-SO inner sizing).
+        # Capture the inner temp count for use downstream (world-frame fallback for
+        # fixed-base + FDSVA-SO inner sizing) and for the per-tier spill ladder below.
         idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+
+        # ----- idsva_so BODY-frame per-tier spill ladder -----
+        # Rungs least->most spill. Flags = (use_global_output, s_temp_in_global, bc_in_global).
+        #   rung0 full:          output + s_temp + BC all in smem
+        #   rung1 global_output: 4*NV^3 output tensor -> d_workspace (cheap; coalesced one-shot)
+        #   rung2 output_bc:     + BC (36*NB cold buffer, dead before hot loops) -> d_workspace
+        #   rung3 output_temp:   + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
+        # Fixed-base is the production overflow case. Floating-base BODY is diagnostic
+        # (the dispatcher routes floating to the WORLD frame) so it keeps the legacy
+        # single-body emit with the gravity shim; its picks are (0,0,0) and unused.
+        _idsva_bf_BC = 36 * self.robot.get_num_bodies()
+        _idsva_bf_base_smem = (2*nv + n) + XI_size                                  # whole s_temp -> global
+        _idsva_bf_full     = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3
+        _idsva_bf_out      = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
+        _idsva_so_body_tiers = [
+            ("full",          _idsva_bf_full,                False, False, False),
+            ("global_output", _idsva_bf_out,                 True,  False, False),
+            ("output_bc",     _idsva_bf_out - _idsva_bf_BC,  True,  False, True),
+            ("output_temp",   _idsva_bf_base_smem,           True,  True,  False),
+        ]
+        self._idsva_so_body_tier_table = _idsva_so_body_tiers
+        if self.robot.floating_base:
+            # Diagnostic path: keep legacy single-body emit + grav shim (no ladder).
+            self.idsva_so_body_frame_spill_tier_3way = (0, 0, 0)
+            self.idsva_so_body_frame_t_count_per_tier = (idsva_so_body_frame_t_count,) * 3
+            self.idsva_so_body_frame_use_ladder = False
+        else:
+            _idsva_so_body_arenas = tuple(t[1] for t in _idsva_so_body_tiers)
+            self.idsva_so_body_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_body_arenas)
+            self.idsva_so_body_frame_t_count_per_tier = tuple(_idsva_so_body_arenas[i] for i in self.idsva_so_body_frame_spill_tier_3way)
+            self.idsva_so_body_frame_use_ladder = True
+            # Keep the const flag accurate to the PERF-tier pick.
+            self.idsva_so_body_frame_use_global_output = _idsva_so_body_tiers[self.idsva_so_body_frame_spill_tier_3way[0]][2]
 
         # world-frame path has its own (smaller) scratch — no gravity-shim shared, no
         # main-sweep extras. Sized via gen_idsva_so_world_frame_temp_mem_size.
         idsva_so_world_frame_inner_temp_count = self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base else idsva_so_body_frame_inner_temp_count
         idsva_so_world_frame_base_t_count = (2*nv + n) + idsva_so_world_frame_inner_temp_count + XI_size
         idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
-        self.idsva_so_world_frame_use_global_output = py_arena_bytes(idsva_so_world_frame_full_t_count) > self.cuda_target_shared_mem_bytes
-        idsva_so_world_frame_t_count = idsva_so_world_frame_base_t_count if self.idsva_so_world_frame_use_global_output else idsva_so_world_frame_full_t_count
+        # ----- idsva_so WORLD-frame per-tier spill ladder -----
+        # Flags = (use_global_output, s_temp_in_global). No surgical buffer rung: the
+        # world inner is not aliased, so a future surgical pass is tractable (see
+        # docs/idsva_so_inner_refactor_notes.md); for now output -> whole-s_temp.
+        _idsva_wf_base_smem = (2*nv + n) + XI_size
+        _idsva_so_world_tiers = [
+            ("full",          idsva_so_world_frame_full_t_count, False, False),
+            ("global_output", idsva_so_world_frame_base_t_count, True,  False),
+            ("output_temp",   _idsva_wf_base_smem,               True,  True),
+        ]
+        self._idsva_so_world_tier_table = _idsva_so_world_tiers
+        _idsva_so_world_arenas = tuple(t[1] for t in _idsva_so_world_tiers)
+        self.idsva_so_world_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_world_arenas)
+        self.idsva_so_world_frame_t_count_per_tier = tuple(_idsva_so_world_arenas[i] for i in self.idsva_so_world_frame_spill_tier_3way)
+        self.idsva_so_world_frame_use_global_output = _idsva_so_world_tiers[self.idsva_so_world_frame_spill_tier_3way[0]][2]
+        idsva_so_world_frame_t_count = self.idsva_so_world_frame_t_count_per_tier[0]
+        # d_workspace floats needed per timestep by the idsva_so spill rungs (for so_workspace sizing).
+        def _idsva_body_ws_floats(pick):
+            return idsva_so_body_frame_inner_temp_count if pick == 3 else (_idsva_bf_BC if pick == 2 else 0)
+        def _idsva_world_ws_floats(pick):
+            return idsva_so_world_frame_inner_temp_count if pick == 2 else 0
+        idsva_so_spill_ws_t_count = max(
+            [_idsva_body_ws_floats(p) for p in self.idsva_so_body_frame_spill_tier_3way] +
+            [_idsva_world_ws_floats(p) for p in self.idsva_so_world_frame_spill_tier_3way] + [0])
 
         # ----- FDSVA_SO shared-mem tier selection -----
         # Four nested tiers, ordered from least-spill to most-spill. Pick the
@@ -539,7 +585,7 @@ class GRiDCodeGenerator:
         # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
         # tensors live in d_workspace instead of shared memory for larger robots.
         idsva_so_body_frame_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, ee_grad_workspace_t_count, idsva_so_body_frame_grav_spill_t_count)
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, ee_grad_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -704,15 +750,23 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "}",
-                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_body_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
-                                 "template <typename T> __host__ __device__ inline size_t IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(idsva_so_world_frame_t_count) + ", TOPOLOGY_HELPERS_COUNT); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "}",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.idsva_so_world_frame_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.idsva_so_world_frame_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.idsva_so_world_frame_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
+                                 "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "}",
                                  "// Per-tier scratch sizes for fdsva_so_inner (inline-CUDA users only — the host launchers always use TIER_PERF).",
-                                 "// At TIER_PERF the 4*NV^3 inner scratch lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing shared memory for the caller's outer kernel.",
+                                 "// At TIER_PERF the 4*NV^3 inner scratch lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing shared memory for the caller's outer kernel.",
                                  "// fdsva_so_inner scratch sizing, keyed on the INNER's placement choice",
                                  "// (SCRATCH_IN_SMEM) rather than a tier — the inner decides placement, the",
                                  "// caller sizes both arenas from these. FDSVA_SO_SCRATCH_IN_SMEM<TIER>()",
@@ -741,28 +795,28 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.ee_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ee_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ee_grad_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
+                                 "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count - fd_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(fd_du_temp_count) + "); }",
-                                 "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_PERF d2eeTemp lives in the shared arena; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(d2ee_workspace_temp_count) + "*sizeof(T) bytes of smem.",
+                                 "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_PERF d2eeTemp lives in the shared arena; at TIER_LITE/MINIMAL it moves to d_workspace, freeing " + str(d2ee_workspace_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + d2ee_workspace_temp_count + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(d2ee_workspace_temp_count) + "); }",
-                                 "// Per-tier sizes for inverse_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(id_du_temp_count) + "*sizeof(T) bytes of smem.",
+                                 "// Per-tier sizes for inverse_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing " + str(id_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str(id_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>())",
                                  "        : grid_shared_arena_bytes<T>(" + str(id_du_device_t_count - id_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(id_du_temp_count) + "); }",
-                                 "// Per-tier sizes for idsva_so_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to s_workspace, freeing " + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "*sizeof(T) bytes of smem. Frame picked at codegen time: " + ("world_frame" if self.robot.floating_base else "body_frame") + ".",
+                                 "// Per-tier sizes for idsva_so_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing " + str(idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + "*sizeof(T) bytes of smem. Frame picked at codegen time: " + ("world_frame" if self.robot.floating_base else "body_frame") + ".",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t IDSVA_SO_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
                                  "        ? grid_shared_arena_bytes<T>(" + str((idsva_so_world_frame_inner_temp_count if self.robot.floating_base else idsva_so_body_frame_inner_temp_count) + XI_size) + ", TOPOLOGY_HELPERS_COUNT)",
@@ -1045,14 +1099,14 @@ class GRiDCodeGenerator:
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         # world-frame single-pass alternative (opt-in via enable_idsva_so_world_frame).
-        # No d_workspace param — gravity is handled in the main sweep, not via shim.
+        # Now takes d_workspace (unified signature; cold buffers spill there at LITE/MINIMAL).
         # Uses its own shared-mem macro (~25 KB for g1 vs shim's ~162 KB).
         ("idsva_so_world_frame", "idsva_so_world_frame", "generate_idsva_so_world_frame",
          "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_world_frame_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("idsva_so_world_frame_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("fdsva_so_kernel<T>",

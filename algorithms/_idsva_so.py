@@ -293,8 +293,8 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
         "// Full-spill layout (size-triggered): dX/a/da/f/df spill to d_workspace; 4*36 scratch is kernel-local."
         if full_spill else
         "// Shared portion (dX / a / da / f / df / 4x36 scratch) lives in s_temp; the\n"
-        "// three O(NV*NV*NB) tensors (d2X / d2a / d2f) spill to s_temp_spill which the\n"
-        "// kernel emitter points into d_workspace per-timestep."
+        "// three O(NV*NV*NB) tensors (d2X / d2a / d2f) spill to d_workspace which the\n"
+        "// kernel emitter points into per-timestep."
     )
     self.gen_add_code_lines([
         "// ===== Gravity-Hessian (Lie-tangent) addition into d2tau_dq2 =====",
@@ -311,7 +311,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
         # The 4*36 scratch buffers become kernel-local stack arrays.
         self.gen_add_code_lines([
             "// Global-memory spill carve (large per-timestep tensors + the previously-shared dX/a/da/f/df).",
-            "T *grav_d2X     = s_temp_spill;",
+            "T *grav_d2X     = d_workspace;",
             "T *grav_d2a     = grav_d2X     + 36*NUM_VEL*NUM_VEL;",
             "T *grav_d2f     = grav_d2a     + 6*NUM_VEL*NUM_VEL*NUM_BODIES;",
             "T *grav_dX      = grav_d2f     + 6*NUM_VEL*NUM_VEL*NUM_BODIES;",
@@ -342,7 +342,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
             "T *grav_tmpB    = grav_tmpA    + 36;",
             "T *grav_tmpC    = grav_tmpB    + 36;",
             "// Global-memory spill carve (large per-timestep tensors).",
-            "T *grav_d2X     = s_temp_spill;",
+            "T *grav_d2X     = d_workspace;",
             "T *grav_d2a     = grav_d2X     + 36*NUM_VEL*NUM_VEL;",
             "T *grav_d2f     = grav_d2a     + 6*NUM_VEL*NUM_VEL*NUM_BODIES;",
         ])
@@ -747,7 +747,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
     self.gen_add_end_control_flow()  # close thread-zero wrap
     self.gen_add_sync(use_thread_group)
 
-def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None):
+def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None):
     var_names = dict( \
         s_idsva_so_name = "s_idsva_so", \
         s_q_name = "s_q", \
@@ -760,13 +760,12 @@ def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, 
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    id_so_code_start = "idsva_so_body_frame_inner<T>(" + var_names["s_idsva_so_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", "
+    template_args = "<T>" if bc_in_smem_expr is None else ("<T, " + bc_in_smem_expr + ">")
+    id_so_code_start = "idsva_so_body_frame_inner" + template_args + "(" + var_names["s_idsva_so_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", "
     id_so_code_middle = self.gen_insert_helpers_function_call()
-    if self.robot.floating_base:
-        # Floating-base inner signature includes the gravity-shim spill pointer.
-        id_so_code_end = var_names["s_temp_name"] + ", " + var_names["s_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
-    else:
-        id_so_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    # Unified signature: both fixed and floating inners take (s_temp, d_workspace, gravity).
+    # `s_temp_spill` is the kernel-local typed view into d_workspace (nullptr for fixed-base).
+    id_so_code_end = var_names["s_temp_name"] + ", " + var_names["s_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_so_code_start = id_so_code_start.replace("(","(tgrp, ")
     id_so_code = id_so_code_start + id_so_code_middle + id_so_code_end
@@ -944,9 +943,9 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
     func_def_end = "T *s_temp, const T gravity) {"
-    func_params.insert(-1, "s_temp_spill is a pointer to global-memory scratch (per-timestep) of size = " + \
+    func_params.insert(-1, "d_workspace is a pointer to global-memory scratch (per-timestep) of size = " + \
                             str(gen_floating_gravity_d2tau_dq_spill_count(self)) + " floats")
-    func_def_end = "T *s_temp, T *s_temp_spill, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "Floating diagnostic path: body-indexed spatial state plus packed velocity-indexed derivative columns.",
@@ -958,7 +957,9 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
     func_def = func_def_start + func_def_end
 
     self.gen_add_func_doc("Computes floating-base second-order inverse dynamics diagnostics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    # BC_IN_SMEM is accepted for signature uniformity with the fixed-base inner but
+    # unused here (the floating diagnostic path is not surgically spilled).
+    self.gen_add_code_line("template <typename T, bool BC_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
@@ -1318,9 +1319,10 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                    "s_qdd is the vector of joint accelerations", \
                    "s_temp is a pointer to helper shared memory of size  = " + \
                             str(self.gen_idsva_so_body_frame_inner_temp_mem_size()), \
+                   "d_workspace is a pointer to per-timestep global-memory scratch (unused at TIER_PERF; cold buffers spill here at LITE/MINIMAL)", \
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q"]
     if use_thread_group:
@@ -1329,7 +1331,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool BC_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
@@ -1365,6 +1367,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     var_offset = len(jids_a)
     vars = [
         '// Relevant Tensors in the order they appear',
+        '(void)d_workspace;  // unused at TIER_PERF; cold buffers repoint here at LITE/MINIMAL',
         'T *I = s_XImats + XIMAT_SIZE*NUM_BODIES;', # Inertia Matrices (6x6 for each joint)
         f'T *Xup = s_temp + 11*XIMAT_SIZE*NUM_BODIES;', # Spatial Transforms from parent to child (6x6 for each joint)
         'T *IC = s_temp + XIMAT_SIZE*NUM_BODIES;', # Centroidal Inertia (6x6 for each joint)
@@ -1429,6 +1432,11 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     ]
     
     self.gen_add_code_lines(vars)
+
+    # Surgical spill: BC (36*NB) is a cold buffer (write-once, dead before the t1-t9/
+    # p1-p6 hot loops, and not read by reference_order_output_repair), so at a spill
+    # tier it can move to global d_workspace while the hot buffers stay in smem.
+    self.gen_add_code_line("if constexpr (!BC_IN_SMEM) { BC = d_workspace; }")
 
     self.gen_add_code_line("// Initialize output tensor; optimized assembly paths only write structurally nonzero entries.")
     self.gen_add_parallel_loop('i', '4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS', use_thread_group)
@@ -2265,94 +2273,74 @@ def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
     # then load/update XI and run the algo
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
     self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
     self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
     self.gen_add_end_function()
 
-def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
-    NUM_POS = self.robot.get_num_pos()
-    n = self.robot.get_num_vel()
-    NJ = self.robot.get_num_joints()
-    use_global_output = getattr(self, "idsva_so_body_frame_use_global_output", NJ > SHARED_MEMORY_JOINT_THRESHOLD)
-    # define function def and params
-    func_params = ["d_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*n**3), \
-                   "d_q_dq_u is the vector of joint positions, velocities, and accelerations", \
-                   "stride_q_qd_u is the stide between each q, qd, u", \
-                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "gravity is the gravity constant", \
-                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_notes = []
-    # Floating-base SO kernels take a global-memory workspace pointer for the
-    # gravity-shim's d2X/d2a/d2f spill (Phase D). Fixed-base SO doesn't need it
-    # but we still emit the parameter so the kernel signature is uniform across
-    # base modes and host launchers don't fork.
-    func_def_start = "void idsva_so_body_frame_kernel(T *d_idsva_so, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
-    func_params.insert(1, "d_workspace is a per-timestep global-memory scratch buffer of " + \
-                          str(gen_floating_gravity_d2tau_dq_spill_count(self)) + " floats per timestep " + \
-                          "(only used when robot.floating_base is True)")
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    if use_qdd_input: # TODO
-        func_def_start += "const T *d_qdd, "
-        func_params.insert(-2,"d_qdd is the vector of joint accelerations")
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    # then generate the code
-    self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
-    # add shared memory variables
+def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
+                                                    use_thread_group, use_global_output, s_temp_in_global, bc_in_global):
+    """Emit the idsva_so body-frame kernel body for one tier's spill flags.
+
+    Flags (see the per-tier ladder in GRiDCodeGenerator.py):
+      - use_global_output: 4*NV^3 output tensor lives in d_idsva_so (global) vs s_idsva_so (smem).
+      - s_temp_in_global:  the whole inner s_temp arena routes to d_workspace (guaranteed-fit fallback).
+      - bc_in_global:      surgical — only the cold BC buffer routes to d_workspace (inner BC_IN_SMEM=false).
+    Floating-base (diagnostic) uses the gravity-shim spill at the SO offset regardless of flags.
+    """
     extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
     if use_qdd_input:
         extra_t_buffers.append(("s_qdd", n))
-    shared_mem_size = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers)
-    spill_floats = gen_floating_gravity_d2tau_dq_spill_count(self) if self.robot.floating_base else 0
-    # `s_temp_spill` is always declared so the inner-function call site has a uniform
-    # shape; for fixed-base SO it stays nullptr (inner doesn't dereference it).
+    inner_temp = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+    smem_temp = 0 if s_temp_in_global else inner_temp
+    self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers = extra_t_buffers)
+    # `s_temp_spill` is the typed view into d_workspace (gravity shim for floating; the
+    # BC offset for the surgical rung; nullptr otherwise). When s_temp routes to global
+    # the helper above declared `T *s_temp = nullptr;` which we repoint in-loop.
     self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    needs_workspace = self.robot.floating_base or s_temp_in_global or bc_in_global
+    if not needs_workspace:
+        self.gen_add_code_line("(void)d_workspace;")
     if use_qdd_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}];")
     else:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
+    bc_in_smem_expr = "false" if bc_in_global else "true"
+    so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
+    ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
+
+    def _emit_spill_ptrs():
+        if self.robot.floating_base:
+            self.gen_add_code_line(f"s_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+        elif bc_in_global:
+            self.gen_add_code_line(f"s_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+        if s_temp_in_global:
+            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+
     if not single_call_timing:
-        # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         if use_qdd_input: # TODO
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
         else:
             self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(2*n + NUM_POS),use_thread_group)
-        if self.robot.floating_base:
-            # Per-timestep spill region for the gravity-Hessian helper. The workspace
-            # is shared with the gradient kernels, so SO lives at the SO offset within
-            # each timestep slot (see `GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES` in grid.cuh).
-            self.gen_add_code_line(
-                "s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);"
-            )
-        # compute
+        _emit_spill_ptrs()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
         self.gen_add_end_control_flow()
     else:
-        #repurpose NUM_TIMESTEPS for number of timing reps
         if use_qdd_input: # TODO
             self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n))
         else:
             self.gen_kernel_load_inputs_single_timing("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
-        if self.robot.floating_base:
-            # Single-timing path reuses one slot in the workspace across all reps.
-            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
-        # then compute in loop for timing
+        _emit_spill_ptrs()
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
@@ -2363,11 +2351,62 @@ def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         self.gen_add_end_control_flow()
-        # save to global
         if not use_global_output: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
+
+
+def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
+    NUM_POS = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    # define function def and params
+    func_params = ["d_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*n**3), \
+                   "d_q_dq_u is the vector of joint positions, velocities, and accelerations", \
+                   "stride_q_qd_u is the stide between each q, qd, u", \
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "gravity is the gravity constant", \
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_notes = []
+    # The kernel takes a per-timestep global-memory workspace pointer. It is used by
+    # the floating-base gravity shim and by the LITE/MINIMAL spill rungs (whole-s_temp
+    # and surgical BC); at TIER_PERF for a robot that fits, it is unused.
+    func_def_start = "void idsva_so_body_frame_kernel(T *d_idsva_so, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
+    func_params.insert(1, "d_workspace is a per-timestep global-memory scratch buffer (gravity shim + LITE/MINIMAL spill rungs)")
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    if use_qdd_input: # TODO
+        func_def_start += "const T *d_qdd, "
+        func_params.insert(-2,"d_qdd is the vector of joint accelerations")
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+
+    table = self._idsva_so_body_tier_table  # [(name, t_count, use_global_output, s_temp_in_global, bc_in_global), ...]
+    if not getattr(self, "idsva_so_body_frame_use_ladder", False):
+        # Floating-base diagnostic path: single body, legacy gravity-shim spill.
+        ugo = getattr(self, "idsva_so_body_frame_use_global_output", False)
+        _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
+                                                             use_thread_group, ugo, False, False)
+    else:
+        picks = self.idsva_so_body_frame_spill_tier_3way
+        if picks[0] == picks[1] == picks[2]:
+            _, _, ugo, stg, bcg = table[picks[0]]
+            _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
+                                                                 use_thread_group, ugo, stg, bcg)
+        else:
+            for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
+                _, _, ugo, stg, bcg = table[picks[tier_idx]]
+                head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
+                       ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
+                self.gen_add_code_line(head, True)
+                _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
+                                                                     use_thread_group, ugo, stg, bcg)
+                self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_idsva_so_body_frame_host(self, mode = 0):
@@ -2520,10 +2559,11 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "s_qd is the vector of joint velocities",
         "s_qdd is the vector of joint accelerations",
         "s_temp is a pointer to helper shared memory of size = " + str(self.gen_idsva_so_world_frame_temp_mem_size()),
+        "d_workspace is a pointer to per-timestep global-memory scratch (unused at TIER_PERF; cold buffers spill here at LITE/MINIMAL)",
         "gravity is the gravity constant",
     ]
     func_def_start = "void idsva_so_world_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "world-frame propagation, gravity baked into main sweep.",
@@ -2545,6 +2585,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
 
     self.gen_add_code_lines([
         "// world-frame IDSVA-SO shared-memory layout.",
+        "(void)d_workspace;  // unused at TIER_PERF; cold buffers repoint here at LITE/MINIMAL",
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
         "T *Xup     = s_temp;",
         "T *Xdown   = Xup     + 36*NUM_BODIES;",
@@ -3091,49 +3132,42 @@ def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False)
     """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper."""
     id_so_code_start = "idsva_so_world_frame_inner<T>(s_idsva_so, s_q, s_qd, s_qdd, "
     id_so_code_middle = self.gen_insert_helpers_function_call()
-    id_so_code_end = "s_temp, gravity);"
+    # Unified signature: world inner takes (s_temp, d_workspace, gravity). `s_temp_spill`
+    # is the kernel-local typed view into d_workspace (nullptr until tier-spill wires it).
+    id_so_code_end = "s_temp, s_temp_spill, gravity);"
     if use_thread_group:
         id_so_code_start = id_so_code_start.replace("(", "(tgrp, ")
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
-def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_timing = False):
-    NUM_POS = self.robot.get_num_pos()
-    n = self.robot.get_num_vel()
-    NJ = self.robot.get_num_joints()
-    # sv2 has its own smaller shared-mem budget (`IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES`).
-    # Use its own use_global_output flag — typically False even for g1 since sv2 is much smaller.
-    use_global_output = getattr(self, "idsva_so_world_frame_use_global_output",
-                                getattr(self, "idsva_so_body_frame_use_global_output", NJ > SHARED_MEMORY_JOINT_THRESHOLD))
-    func_params = [
-        "d_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*n**3),
-        "d_q_dq_u is the vector of joint positions, velocities, and accelerations",
-        "stride_q_qd_u is the stride between each q, qd, u",
-        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
-        "gravity is the gravity constant",
-        "num_timesteps is the length of the trajectory points",
-    ]
-    func_notes = ["world-frame IDSVA-SO kernel: clean single-pass reference path."]
-    func_def_start = "void idsva_so_world_frame_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    self.gen_add_func_doc("Computes IDSVA-SO via the world-frame single-pass formulation", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
+def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group,
+                                                     use_global_output, s_temp_in_global):
+    """Emit the idsva_so world-frame kernel body for one tier's spill flags.
+
+    Flags: use_global_output (4*NV^3 output -> d_idsva_so global) and
+    s_temp_in_global (whole world inner s_temp arena -> d_workspace; guaranteed-fit
+    fallback). No surgical rung here (the world inner is un-aliased; a surgical pass
+    is tractable future work — see docs/idsva_so_inner_refactor_notes.md).
+    """
     extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
-    # sv2 uses its own (smaller) inner temp size.
-    shared_mem_size = gen_idsva_so_world_frame_temp_mem_size(self) if self.robot.floating_base else self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers=extra_t_buffers)
+    inner_temp = gen_idsva_so_world_frame_temp_mem_size(self) if self.robot.floating_base else self.gen_idsva_so_body_frame_inner_temp_mem_size()
+    smem_temp = 0 if s_temp_in_global else inner_temp
+    self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers=extra_t_buffers)
+    # `s_temp_spill` keeps the world inner call shape uniform (the world inner (void)s
+    # its d_workspace param); nullptr always for the world frame.
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    if not s_temp_in_global:
+        self.gen_add_code_line("(void)d_workspace;")
     self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
+    so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
+    ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
         self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(2*n + NUM_POS), use_thread_group)
+        if s_temp_in_global:
+            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         if use_global_output:
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
@@ -3143,6 +3177,8 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs_single_timing("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
+        if s_temp_in_global:
+            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
@@ -3153,6 +3189,45 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
         self.gen_add_end_control_flow()
         if not use_global_output:
             self.gen_kernel_save_result_single_timing("idsva_so", str(4*n**3), use_thread_group)
+
+
+def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_timing = False):
+    NUM_POS = self.robot.get_num_pos()
+    n = self.robot.get_num_vel()
+    func_params = [
+        "d_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*n**3),
+        "d_workspace is a per-timestep global-memory scratch buffer (unused at TIER_PERF; cold buffers spill here at LITE/MINIMAL)",
+        "d_q_dq_u is the vector of joint positions, velocities, and accelerations",
+        "stride_q_qd_u is the stride between each q, qd, u",
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+        "gravity is the gravity constant",
+        "num_timesteps is the length of the trajectory points",
+    ]
+    func_notes = ["world-frame IDSVA-SO kernel: clean single-pass reference path."]
+    func_def_start = "void idsva_so_world_frame_kernel(T *d_idsva_so, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Computes IDSVA-SO via the world-frame single-pass formulation", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+
+    table = self._idsva_so_world_tier_table  # [(name, t_count, use_global_output, s_temp_in_global), ...]
+    picks = self.idsva_so_world_frame_spill_tier_3way
+    if picks[0] == picks[1] == picks[2]:
+        _, _, ugo, stg = table[picks[0]]
+        _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg)
+    else:
+        for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
+            _, _, ugo, stg = table[picks[tier_idx]]
+            head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
+                   ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
+            self.gen_add_code_line(head, True)
+            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -3181,7 +3256,7 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_world_frame_host requires all-data or dynamics gridData\");")
     func_call_start = "idsva_so_world_frame_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
-        "hd_data->d_q_qd_u,stride_q_qd,"
+        "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -3242,7 +3317,7 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
     for floating-base (mirrors the host-level idsva_so dispatcher; same body /
     world perf wins documented there).
 
-    Inline-CUDA users call this from their own kernel. The s_workspace ptr
+    Inline-CUDA users call this from their own kernel. The d_workspace ptr
     is required at TIER_LITE/MINIMAL (size IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES);
     at TIER_PERF it is unused and can be nullptr (default).
     """
@@ -3257,11 +3332,11 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
                    "s_qdd is the vector of joint accelerations", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "gravity is the gravity constant", \
-                   "s_workspace is the global scratch buffer; size IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+                   "d_workspace is the global scratch buffer; size IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
     func_def_start = "void idsva_so_device(T *s_idsva_so, const T *s_q, const T *s_qd, const T *s_qdd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *s_workspace = nullptr) {"
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
     func_notes = ["Dispatches to " + frame_label + "_inner at codegen time (" + ("world for floating-base" if self.robot.floating_base else "body for fixed-base") + ").",
-                  "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the inner scratch moves from s_temp to s_workspace, freeing shared memory for the caller's outer kernel"]
+                  "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the inner scratch moves from s_temp to d_workspace, freeing shared memory for the caller's outer kernel"]
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -3270,9 +3345,12 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables (s_temp routes to s_workspace at LITE+)
-    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, tier_workspace_expr="s_workspace")
+    # add the shared memory variables (s_temp routes to d_workspace at LITE+)
+    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, tier_workspace_expr="d_workspace")
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr above, so the
+    # inner's per-buffer spill pointer is unused here (pass nullptr).
+    self.gen_add_code_line("T *s_temp_spill = nullptr;")
     if self.robot.floating_base:
         self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
     else:
@@ -3345,10 +3423,10 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         # (rather than the underlying body_frame/world_frame label that the
         # delegate's _single_timing wrapper would print). Mirrors the structure
         # of `gen_idsva_so_body_frame_host(mode=1)`.
-        # body_frame_kernel takes d_workspace (grav-shim spill); world_frame_kernel
-        # does not (no spill needed). Match the underlying signature.
+        # Both body_frame_kernel and world_frame_kernel now take d_workspace
+        # (unified signature; cold buffers spill there at LITE/MINIMAL).
         kernel_name = f"idsva_so_{frame_suffix}_kernel_single_timing"
-        kernel_workspace_arg = "" if self.robot.floating_base else "hd_data->d_workspace,"
+        kernel_workspace_arg = "hd_data->d_workspace,"
         self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so requires all-data or dynamics gridData\");")
         self.gen_add_code_line("int stride_q_qd = Q_QD_U_STRIDE;")
         self.gen_add_code_lines([
