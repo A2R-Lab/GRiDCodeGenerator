@@ -1181,30 +1181,25 @@ class GRiDCodeGenerator:
                 continue
             if gate_attr is None and generated_set is not None and algo_short not in generated_set:
                 continue
-            # Kernels whose shared-mem may exceed the compile target for some
-            # robots (d2ee + fdsva_so on large floating-base) get wrapped in a
-            # compile-time-resolvable size guard so init_grid doesn't fail
-            # registration when the kernel literally can't fit on a device
-            # even with cudaFuncSetAttribute. idsva_so / world_frame are not
-            # guarded — their runtime `grid_check_dynamic_shared_memory_bytes`
-            # picks up the actual per-device cap (which can exceed the codegen
-            # target on some GPUs), and we want them registered so that the
-            # check + attribute setup happens in lockstep.
-            guarded = algo_label in {
-                "end_effector_pose_gradient_hessian",
-                "fdsva_so",
-            }
-            indent = "    " if guarded else ""
-            if guarded:
-                attr_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
-            attr_lines.append(f"{indent}gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
+            # Wrap EVERY kernel's attribute registration in a compile-time-
+            # resolvable size guard so init_grid never hard-aborts when a kernel
+            # literally can't fit a device even with cudaFuncSetAttribute (e.g.
+            # the floating-base idsva_so_body_frame *diagnostic* frame on h1_2 at
+            # ~168 KB, or the integrator value/gradient kernels at ~103-228 KB on
+            # big floating-base robots). Such kernels simply go unregistered;
+            # they aren't the dispatched production path, and any code that DOES
+            # launch them still runs `grid_check_dynamic_shared_memory_bytes` at
+            # the host wrapper, so the fit check + attribute setup stay in
+            # lockstep at the actual use site. Small kernels are always under the
+            # target, so the guard is a no-op for them.
+            attr_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
+            attr_lines.append(f"    gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
             for kernel_name, signature in kernels:
                 alias = f"_grid_kern_alias_{alias_counter}"
                 alias_counter += 1
-                attr_lines.append(f"{indent}auto {alias} = static_cast<{signature}>(&{kernel_name});")
-                attr_lines.append(f"{indent}gpuErrchk(cudaFuncSetAttribute({alias}, cudaFuncAttributeMaxDynamicSharedMemorySize, {bytes_macro}));")
-            if guarded:
-                attr_lines.append("}")
+                attr_lines.append(f"    auto {alias} = static_cast<{signature}>(&{kernel_name});")
+                attr_lines.append(f"    gpuErrchk(cudaFuncSetAttribute({alias}, cudaFuncAttributeMaxDynamicSharedMemorySize, {bytes_macro}));")
+            attr_lines.append("}")
         self.gen_add_code_lines(attr_lines)
         self.gen_add_end_function()
 
