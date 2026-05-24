@@ -219,7 +219,7 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
 
 
 def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_kp1=False,
-                                       s_temp_spill_name="nullptr", temp_spill_flag_name="false"):
+                                       d_temp_spill_name="nullptr", temp_spill_flag_name="false"):
     """Emit the multi-stage gradient body inline.
 
     Drives N stages of forward-dynamics-gradient at intermediate states with
@@ -325,7 +325,7 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
             use_thread_group=use_thread_group,
             use_qdd_Minv_input=False,
             s_df_du_name="s_df_du",
-            s_temp_spill_name=s_temp_spill_name,
+            d_temp_spill_name=d_temp_spill_name,
             temp_spill_flag_name=temp_spill_flag_name,
         )
         self.gen_add_sync(use_thread_group)
@@ -511,7 +511,7 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
 def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x_kp1=False,
                                           integrator_type="IT", s_dAB_name="s_dAB",
                                           s_x_kp1_name="s_x_kp1",
-                                          s_temp_spill_name="nullptr", temp_spill_flag_name="false"):
+                                          d_temp_spill_name="nullptr", temp_spill_flag_name="false"):
     """Compose: FD gradient (sets s_Minv, s_qdd, s_dc_du, s_df_du) → dAB assembly.
 
     This is the single-stage path (Euler / SI-Euler). For floating-base it also
@@ -528,7 +528,7 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
         use_thread_group=use_thread_group,
         use_qdd_Minv_input=False,
         s_df_du_name="s_df_du",
-        s_temp_spill_name=s_temp_spill_name,
+        d_temp_spill_name=d_temp_spill_name,
         temp_spill_flag_name=temp_spill_flag_name,
     )
     self.gen_add_sync(use_thread_group)
@@ -698,12 +698,12 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         # da_df-band selective spill buffer (set per-timestep below when inner_level==1).
         spill_flag = "GRID_INTEGRATOR_DU_USES_DA_DF_SPILL" if inner_level == 1 else "false"
         if inner_level == 1:
-            self.gen_add_code_line("T *s_temp_spill = nullptr;")
+            self.gen_add_code_line("T *d_temp_spill = nullptr;")
         if use_thread_group:
             self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
 
         def _emit_dispatch():
-            spill_name = "s_temp_spill" if inner_level == 1 else "nullptr"
+            spill_name = "d_temp_spill" if inner_level == 1 else "nullptr"
             # Dispatch single-stage vs multi-stage at compile time on IT.
             self.gen_add_code_line(
                 "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
@@ -714,7 +714,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                 integrator_type="IT",
                 s_dAB_name="s_dAB",
                 s_x_kp1_name="s_x_kp1",
-                s_temp_spill_name=spill_name,
+                d_temp_spill_name=spill_name,
                 temp_spill_flag_name=spill_flag,
             )
             self.gen_add_end_control_flow()
@@ -722,7 +722,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             self.gen_integrator_gradient_multistage(
                 use_thread_group=use_thread_group,
                 compute_x_kp1=compute_x_kp1,
-                s_temp_spill_name=spill_name,
+                d_temp_spill_name=spill_name,
                 temp_spill_flag_name=spill_flag,
             )
             self.gen_add_end_control_flow()
@@ -745,7 +745,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                 )
             elif inner_level == 1:
                 self.gen_add_code_line(
-                    "s_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
+                    "d_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
                 )
 
         if not single_call_timing:

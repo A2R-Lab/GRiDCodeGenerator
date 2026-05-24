@@ -6,7 +6,7 @@ def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input =
 
 def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, use_qdd_Minv_input = False,
                                                s_df_du_name = "s_df_du",
-                                               s_temp_spill_name = "nullptr",
+                                               d_temp_spill_name = "nullptr",
                                                temp_spill_flag_name = "false"):
     n = self.robot.get_num_vel()
     if not use_qdd_Minv_input:
@@ -32,7 +32,7 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
     # then run the gradient code
     self.gen_inverse_dynamics_gradient_inner_function_call(
         use_thread_group,
-        dict(s_temp_spill_name = s_temp_spill_name, temp_spill_flag_name = temp_spill_flag_name)
+        dict(d_temp_spill_name = d_temp_spill_name, temp_spill_flag_name = temp_spill_flag_name)
     )
 
     if self.DEBUG_MODE:
@@ -138,7 +138,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
-    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr;")
     if use_qdd_Minv_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
     else:
@@ -153,7 +153,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
         if use_selective_spill:
             self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(n*2*n) + "];")
-            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+            self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         elif use_global_temp:
             self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(n*2*n) + "];")
             self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
@@ -163,7 +163,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             use_thread_group,
             use_qdd_Minv_input,
             "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
-            "s_temp_spill",
+            "d_temp_spill",
             "GRID_FD_DU_USES_DA_DF_SPILL"
         )
         if not (use_global_temp or use_selective_spill):
@@ -176,7 +176,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
         if use_selective_spill:
             self.gen_add_code_line("T *d_df_du_k = d_df_du;")
-            self.gen_add_code_line("s_temp_spill = reinterpret_cast<T *>(d_workspace);")
+            self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(d_workspace);")
         elif use_global_temp:
             self.gen_add_code_line("T *d_df_du_k = d_df_du;")
             self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
@@ -191,7 +191,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             use_thread_group,
             use_qdd_Minv_input,
             "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
-            "s_temp_spill",
+            "d_temp_spill",
             "GRID_FD_DU_USES_DA_DF_SPILL"
         )
         self.gen_add_code_line(

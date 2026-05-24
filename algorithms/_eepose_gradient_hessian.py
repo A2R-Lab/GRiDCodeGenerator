@@ -1001,7 +1001,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
             if bfs_level == 0:
                 self.gen_add_code_line("// First set the leaf transforms")
                 self.gen_add_parallel_loop("ind",str(16*n*n),use_thread_group)
-                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + "; int eeIndStart = 16*" + str(all_ees[0]) + ";")
+                self.gen_add_code_line("int djid_ij = ind / 16; int rc = ind % 16; int djid_i = djid_ij / " + str(n) + "; int djid_j = djid_ij % " + str(n) + ";")
                 self.gen_add_code_line("const T *s_Xhom_dXhom_d2Xhom = grid_xhom_or_dxhom_or_d2xhom_ptr<T>(s_Xhom, s_dXhom, s_d2Xhom, djid_i, djid_j, " + str(all_ees[0]) + ");")
                 self.gen_add_code_line("s_d2eeTemp[ind] = s_Xhom_dXhom_d2Xhom[rc];")
                 self.gen_add_end_control_flow()

@@ -191,7 +191,7 @@ def gen_fdsva_so_fd_gradient_inline(self, use_thread_group = False, use_spill = 
             s_q_name = "s_q",
             s_qd_name = "s_qd",
             s_temp_name = "s_fd_temp",
-            s_temp_spill_name = spill_ptr_expr if use_spill else "nullptr",
+            d_temp_spill_name = spill_ptr_expr if use_spill else "nullptr",
             temp_spill_flag_name = "true" if use_spill else "false",
             gravity_name = "gravity",
         ),
@@ -264,9 +264,9 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
     # body_frame_inner takes a grav-shim spill on floating; world_frame_inner
     # doesn't need it. Floating-base now dispatches to world_frame, so
-    # s_temp_spill is unused there. Fixed-base body_frame_inner also doesn't
+    # d_temp_spill is unused there. Fixed-base body_frame_inner also doesn't
     # dereference the spill, so nullptr is safe for both paths.
-    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr;")
 
     # then load/update XI and run the algo. Inner-controlled placement: Minv and
     # FD each slice their own F-region from s_temp (this device path keeps F in
@@ -326,7 +326,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
-    self.gen_add_code_line("T *s_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F
@@ -346,7 +346,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
-            self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
+            self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
         if use_workspace_df_du:
             # Phase 3e: s_df_du in L2-pinned workspace, in its own dedicated section
             # past grad + SO (avoids conflict with fd_grad_spill which is at offset 0).
@@ -363,7 +363,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_fdsva_so_fd_gradient_inline(
             use_thread_group,
             use_spill=fd_grad_use_spill,
-            spill_ptr_expr="s_fd_grad_spill" if fd_grad_use_spill else "nullptr",
+            spill_ptr_expr="d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
         )
         if self.robot.floating_base:
             self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
@@ -391,7 +391,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if use_workspace_temp:
             self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
-            self.gen_add_code_line('T *s_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
+            self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
         if use_workspace_df_du:
             self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
         if use_workspace_Minv:
@@ -404,7 +404,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_fdsva_so_fd_gradient_inline(
             use_thread_group,
             use_spill=fd_grad_use_spill,
-            spill_ptr_expr="s_fd_grad_spill" if fd_grad_use_spill else "nullptr",
+            spill_ptr_expr="d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
         )
         if self.robot.floating_base:
             self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
