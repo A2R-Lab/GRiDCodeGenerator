@@ -236,7 +236,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
     # then genearte the code
     self.gen_add_func_doc("Updates the Xmats in (shared) GPU memory acording to the configuration",[],func_params,None)
     self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # test to see if we need to compute any trig functions
     Xmats = self.robot.get_Xmats_ordered_by_id()
@@ -471,7 +471,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     # then genearte the code
     self.gen_add_func_doc("Updates the (d)XmatsHom in (shared) GPU memory acording to the configuration",[],func_params,None)
     self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # test to see if we need to compute any trig functions
     Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id(include_fixed_joints = self.include_fixed_kinematic_targets)
