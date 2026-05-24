@@ -171,7 +171,7 @@ class GRiDCodeGenerator:
         # linear<->angular velocity coupling" story was a MISDIAGNOSIS: the real
         # defect was a CUDA thread-count race in inverse_dynamics_gradient
         # (missing __syncthreads + a 6-way root accumulation), correct at 32
-        # threads and racing above one warp. Fixed; see INTEGRATOR_HANDOFF.md §3.
+        # threads and racing above one warp. Fixed; see HANDOFF.md §3.
         if "integrator" in algorithms:
             algorithms.update({"id", "minv", "fd"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
