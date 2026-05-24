@@ -328,9 +328,13 @@ class GRiDCodeGenerator:
         # Integrator gradient: kernel-shared t-count layout is
         #   s_q_qd_u (3nv+fb) + s_dAB (2nv*3nv) + s_df_du (nv*2nv) + s_dc_du (nv*2nv) +
         #   s_vaf (18nv) + s_Minv (nv*nv) + s_qdd (nv)
-        #   + multi-stage scratch: s_q_orig (nv) + s_qd_orig (nv)
+        #   + multi-stage scratch: s_q_orig (nv+fb) + s_qd_orig (nv)
         #     + s_stage_grad_qdd (max_stages*nv) + s_D_qdd_stage (max_stages*nv*3nv)
         #   + s_temp (= FD-grad inner)
+        # s_q_orig holds the FULL nq pose (floating-base adds the quaternion slot),
+        # so it is nv+fb — must match _emit_body's ("s_q_orig", n+fb) exactly, else
+        # the launched dynamic-smem (this t_count) is fb floats short of the arena
+        # the kernel slices and the tail buffer overruns shared memory (floating only).
         # max_stages = 4 (RK4) — see _integrator._max_stages_in_use().
         # The multi-stage scratch is always allocated even for single-stage IT;
         # cost is small relative to total (~12*nv² for iiwa14 ≈ 588 floats).
@@ -339,7 +343,7 @@ class GRiDCodeGenerator:
         # allocated for fixed-base too but unused there).
         integrator_du_t_count = ((3*nv + int(self.robot.floating_base)) + 2*nv*3*nv + 2*(nv*2*nv)
                                  + 18*nv + nv*nv + nv
-                                 + 2*nv + _max_stages * nv + _max_stages * nv * 3*nv
+                                 + (2*nv + int(self.robot.floating_base)) + _max_stages * nv + _max_stages * nv * 3*nv
                                  + 72
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
         # The "with x_kp1" variant adds s_x_kp1 (nq+nv = 2nv+fb) on top.
@@ -1233,7 +1237,16 @@ class GRiDCodeGenerator:
         self.gen_add_code_line("template <typename T>")
         self.gen_add_code_line("__host__ __forceinline__")
         self.gen_add_code_line("void init_grid_kernel_attrs(){", True)
-        attr_lines = ["// enable opt-in dynamic shared memory for every algorithm kernel"]
+        attr_lines = ["// enable opt-in dynamic shared memory for every algorithm kernel",
+                      "// Gate registration on the DEVICE opt-in max (not the codegen target):",
+                      "// grid_check_dynamic_shared_memory_bytes and the bench's",
+                      "// grid_kernel_fits_device both use the device cap, so registering only up",
+                      "// to the smaller GRID_CUDA_TARGET_SHARED_MEM_BYTES left kernels in",
+                      "// (target, device-max] checkable+launchable but UNregistered -> launching",
+                      "// them failed with cudaErrorInvalidValue (e.g. the floating idsva_so",
+                      "// body-frame diagnostic ~101 KB on g1). Keying on the device max keeps",
+                      "// registration, the fit-check, and the launch-skip in lockstep.",
+                      "size_t _grid_smem_max = 0; gpuErrchk(grid_get_max_dynamic_shared_memory_bytes(&_grid_smem_max));"]
         generated_set = getattr(self, "generated_algorithms", None)
         alias_counter = 0
         for entry in self.KERNEL_ATTR_MANIFEST:
@@ -1256,7 +1269,7 @@ class GRiDCodeGenerator:
             # the host wrapper, so the fit check + attribute setup stay in
             # lockstep at the actual use site. Small kernels are always under the
             # target, so the guard is a no-op for them.
-            attr_lines.append(f"if ({bytes_macro} <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) {{")
+            attr_lines.append(f"if ({bytes_macro} <= _grid_smem_max) {{")
             attr_lines.append(f"    gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"{algo_label}\", {bytes_macro}));")
             for kernel_name, signature in kernels:
                 alias = f"_grid_kern_alias_{alias_counter}"
