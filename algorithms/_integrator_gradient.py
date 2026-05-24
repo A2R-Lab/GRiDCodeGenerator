@@ -218,7 +218,8 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     self.gen_add_end_control_flow()  # end parallel loop
 
 
-def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_kp1=False):
+def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_kp1=False,
+                                       s_temp_spill_name="nullptr", temp_spill_flag_name="false"):
     """Emit the multi-stage gradient body inline.
 
     Drives N stages of forward-dynamics-gradient at intermediate states with
@@ -324,6 +325,8 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
             use_thread_group=use_thread_group,
             use_qdd_Minv_input=False,
             s_df_du_name="s_df_du",
+            s_temp_spill_name=s_temp_spill_name,
+            temp_spill_flag_name=temp_spill_flag_name,
         )
         self.gen_add_sync(use_thread_group)
 
@@ -507,7 +510,8 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
 
 def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x_kp1=False,
                                           integrator_type="IT", s_dAB_name="s_dAB",
-                                          s_x_kp1_name="s_x_kp1"):
+                                          s_x_kp1_name="s_x_kp1",
+                                          s_temp_spill_name="nullptr", temp_spill_flag_name="false"):
     """Compose: FD gradient (sets s_Minv, s_qdd, s_dc_du, s_df_du) → dAB assembly.
 
     This is the single-stage path (Euler / SI-Euler). For floating-base it also
@@ -524,6 +528,8 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
         use_thread_group=use_thread_group,
         use_qdd_Minv_input=False,
         s_df_du_name="s_df_du",
+        s_temp_spill_name=s_temp_spill_name,
+        temp_spill_flag_name=temp_spill_flag_name,
     )
     self.gen_add_sync(use_thread_group)
     if fb:
@@ -639,18 +645,29 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
     # is the s_D_qdd_stage smem spill, which is independent of launch_bounds.
     self.gen_add_code_line("__launch_bounds__(MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line(func_def, True)
-    inner_temp_size = self.gen_integrator_gradient_inner_temp_mem_size()
+    inner_temp_full = self.gen_integrator_gradient_inner_temp_mem_size()
+    inner_temp_selective = max(self.gen_direct_minv_inner_temp_mem_size(),
+                               self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
     fb = self.robot.floating_base
     max_stages = _max_stages_in_use()
     d_qdd_count = max_stages * n * 3 * n
 
-    def _emit_body(d_qdd_in_smem):
-        # Per-tier body. s_D_qdd_stage (max_stages*nv*3nv) is the dominant cold
-        # buffer: in smem when d_qdd_in_smem, else spilled to the grad section of
-        # d_workspace (per-timestep slot). Everything else stays in smem.
-        extra_t_buffers = [
-            ("s_q_qd_u", 3 * n + fb),
-            ("s_dAB", 2 * n * 3 * n),
+    def _emit_body(dqdd_in_smem, dab_in_smem, inner_level):
+        # Surgical per-tier body. Three buffers spill independently to distinct,
+        # non-aliasing d_workspace sub-offsets (the integrator gradient never runs
+        # concurrently with id_du/fd_du/fdsva_so, so it reuses those sections):
+        #   - s_D_qdd_stage (max_stages*nv*3nv) -> Dqdd region (offset 0) when !dqdd_in_smem
+        #   - s_dAB output (2nv*3nv)            -> dAB region              when !dab_in_smem
+        #   - the FD-grad inner s_temp:
+        #       inner_level 0: full smem; 1: da_df-band SELECTIVE spill (s_temp
+        #       shrinks, only the band leaves smem); 2: whole inner -> inner region.
+        # The hot scaffold (s_dc_du / s_vaf / s_Minv) always stays in smem.
+        inner_temp_size = (inner_temp_full if inner_level == 0
+                           else (inner_temp_selective if inner_level == 1 else 0))
+        extra_t_buffers = [("s_q_qd_u", 3 * n + fb)]
+        if dab_in_smem:
+            extra_t_buffers.append(("s_dAB", 2 * n * 3 * n))
+        extra_t_buffers += [
             ("s_df_du", n * 2 * n),
             ("s_dc_du", n * 2 * n),
             ("s_vaf", 18 * n),
@@ -662,7 +679,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             ("s_qd_orig", n),
             ("s_stage_grad_qdd", max_stages * n),
         ]
-        if d_qdd_in_smem:
+        if dqdd_in_smem:
             extra_t_buffers.append(("s_D_qdd_stage", d_qdd_count))
         extra_t_buffers += [
             # Floating-base 6x6 SE(3) dIntegrate blocks (Euler single-stage path).
@@ -678,10 +695,15 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         self.gen_add_code_line(
             "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
         )
+        # da_df-band selective spill buffer (set per-timestep below when inner_level==1).
+        spill_flag = "GRID_INTEGRATOR_DU_USES_DA_DF_SPILL" if inner_level == 1 else "false"
+        if inner_level == 1:
+            self.gen_add_code_line("T *s_temp_spill = nullptr;")
         if use_thread_group:
             self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
 
         def _emit_dispatch():
+            spill_name = "s_temp_spill" if inner_level == 1 else "nullptr"
             # Dispatch single-stage vs multi-stage at compile time on IT.
             self.gen_add_code_line(
                 "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
@@ -692,23 +714,45 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                 integrator_type="IT",
                 s_dAB_name="s_dAB",
                 s_x_kp1_name="s_x_kp1",
+                s_temp_spill_name=spill_name,
+                temp_spill_flag_name=spill_flag,
             )
             self.gen_add_end_control_flow()
             self.gen_add_code_line("else {", True)
             self.gen_integrator_gradient_multistage(
                 use_thread_group=use_thread_group,
                 compute_x_kp1=compute_x_kp1,
+                s_temp_spill_name=spill_name,
+                temp_spill_flag_name=spill_flag,
             )
             self.gen_add_end_control_flow()
+
+        def _emit_spill_pointers(slot_expr):
+            # Repoint the spilled buffers into d_workspace at their fixed sub-offsets.
+            if not dqdd_in_smem:
+                self.gen_add_code_line(
+                    "T *s_D_qdd_stage = reinterpret_cast<T *>(&d_workspace[" + slot_expr + "]);"
+                )
+            if not dab_in_smem:
+                self.gen_add_code_line(
+                    "T *s_dAB = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_DAB_OFFSET_BYTES<T>()]);"
+                )
+            if inner_level == 2:
+                # s_temp is already declared by the arena helper (size 0 at this
+                # rung) — repoint it, do not redeclare.
+                self.gen_add_code_line(
+                    "s_temp = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
+                )
+            elif inner_level == 1:
+                self.gen_add_code_line(
+                    "s_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
+                )
 
         if not single_call_timing:
             self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
             self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
             self.gen_add_code_line("// compute")
-            if not d_qdd_in_smem:
-                self.gen_add_code_line(
-                    "T *s_D_qdd_stage = reinterpret_cast<T *>(&d_workspace[k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);"
-                )
+            _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             self.gen_load_update_XImats_helpers_function_call(use_thread_group)
             _emit_dispatch()
             self.gen_add_sync(use_thread_group)
@@ -719,10 +763,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         else:
             input_count = 3 * n + fb
             self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
-            if not d_qdd_in_smem:
-                self.gen_add_code_line(
-                    "T *s_D_qdd_stage = reinterpret_cast<T *>(d_workspace);"
-                )
+            _emit_spill_pointers("0")
             self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
             self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
             self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="dAB")
@@ -734,18 +775,21 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             if compute_x_kp1:
                 self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n + fb), use_thread_group)
 
-    # Per-tier spill placement (perf, lite, minimal) — 0 = s_D_qdd_stage in smem,
-    # 1 = spilled to d_workspace. When all three agree (small robots that fit in
-    # smem), emit a single body; otherwise gate per tier on RESOURCE_TIER.
+    # Per-tier surgical placement (perf, lite, minimal). When all three rungs
+    # agree (small robots that fit at PERF), emit a single body; otherwise gate
+    # per tier on RESOURCE_TIER.
     picks = getattr(self, "integrator_du_spill_tier_3way", (0, 0, 0))
+    dqdd_smem = getattr(self, "integrator_du_dqdd_in_smem_per_tier", (True, True, True))
+    dab_smem = getattr(self, "integrator_du_dab_in_smem_per_tier", (True, True, True))
+    inner_lvl = getattr(self, "integrator_du_inner_level_per_tier", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
-        _emit_body(d_qdd_in_smem=(picks[0] == 0))
+        _emit_body(dqdd_smem[0], dab_smem[0], inner_lvl[0])
     else:
         for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
             head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
                    ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
             self.gen_add_code_line(head, True)
-            _emit_body(d_qdd_in_smem=(picks[tier_idx] == 0))
+            _emit_body(dqdd_smem[tier_idx], dab_smem[tier_idx], inner_lvl[tier_idx])
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 

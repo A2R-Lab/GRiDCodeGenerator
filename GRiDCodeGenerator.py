@@ -306,11 +306,25 @@ class GRiDCodeGenerator:
         # _integrator._max_stages_in_use().
         _max_stages = 4
         _fb = int(self.robot.floating_base)
-        integrator_t_count = ((3*nv + _fb) + nv
-                              + (_max_stages - 1) * nv
-                              + (_max_stages - 1) * (2 * nv + _fb)
-                              + (2 * nv + _fb)
-                              + self.gen_forward_dynamics_inner_temp_mem_size() + XI_size)
+        _integrator_base = ((3*nv + _fb) + nv
+                            + (_max_stages - 1) * nv
+                            + (_max_stages - 1) * (2 * nv + _fb)
+                            + (2 * nv + _fb) + XI_size)
+        integrator_t_count = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size()
+        # Integrator VALUE surgical spill. The dominant inner buffer is the FD
+        # inner's Minv F-region (6*NV*NV). Level 0 keeps it in smem; level 1
+        # spills ONLY F to d_workspace (the hot FD path stays in smem), mirroring
+        # the standalone forward_dynamics kernel's MINV_F_IN_SMEM lever. For
+        # h1_2 the value arena overflows by only a few KB, so the surgical F
+        # spill is enough — no whole-arena dump.
+        _integrator_t_count_full   = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
+        _integrator_t_count_Fspill = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
+        self.integrator_spill_tier_3way = select_shared_tier_3way(_integrator_t_count_full, _integrator_t_count_Fspill)
+        self.integrator_t_count_per_tier = tuple(
+            (_integrator_t_count_full, _integrator_t_count_Fspill)[i] for i in self.integrator_spill_tier_3way)
+        # F float-count the value path spills (for grad-section sizing); 0 if no tier spills.
+        self.integrator_minv_F_workspace_count = (self.gen_direct_minv_inner_F_size()
+                                                  if any(p == 1 for p in self.integrator_spill_tier_3way) else 0)
         # Integrator gradient: kernel-shared t-count layout is
         #   s_q_qd_u (3nv+fb) + s_dAB (2nv*3nv) + s_df_du (nv*2nv) + s_dc_du (nv*2nv) +
         #   s_vaf (18nv) + s_Minv (nv*nv) + s_qdd (nv)
@@ -330,22 +344,49 @@ class GRiDCodeGenerator:
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
         # The "with x_kp1" variant adds s_x_kp1 (nq+nv = 2nv+fb) on top.
         integrator_du_with_x_kp1_t_count = integrator_du_t_count + 2*nv + int(self.robot.floating_base)
-        # Integrator-gradient inner-controlled spill. The dominant cold buffer is
-        # s_D_qdd_stage (max_stages*nv*3nv ≈ 59 KB float for g1-floating). Level 0
-        # keeps it in smem; level 1 spills it to the grad section of d_workspace
-        # (the integrator-gradient kernel never runs concurrently with id_du/fd_du,
-        # so it safely reuses those bytes). PERF picks level 0 when the full arena
-        # fits the smem target; LITE/MINIMAL spill when it doesn't. The kernel is
-        # emitted per-tier (like fd_du); INTEGRATOR_DU_D_QDD_IN_SMEM<TIER>() gives
-        # the placement and the byte constant reports each tier's smem arena.
+        # Integrator-gradient surgical spill ladder (4 rungs, least-spill first).
+        # Each rung spills only cold / output / coalesced matrices to d_workspace,
+        # keeping the hot path (s_vaf + the FD-grad scaffold) in smem as long as
+        # it fits. The integrator-gradient kernel never runs concurrently with
+        # id_du/fd_du/fdsva_so, so its spilled buffers safely reuse those sections.
+        #   rung 0: everything in smem.
+        #   rung 1: s_D_qdd_stage (max_stages*nv*3nv) -> d_workspace. (g1_fixed)
+        #   rung 2: + s_dAB output (2nv*3nv) -> d_workspace, + id_du da_df band
+        #           SELECTIVE spill (the FD-grad inner shrinks to the selective
+        #           shared count; only the da_df band leaves smem). (g1_floating)
+        #   rung 3: + the WHOLE FD-grad inner s_temp -> d_workspace (id_du
+        #           global_temp; the inner can't fit a 100 KB box on h1_2). The
+        #           gradient scaffold (s_dc_du / s_vaf / s_Minv) stays in smem.
+        # PERF picks the lowest fitting rung; MINIMAL is the last (always fits).
         _integrator_du_D_qdd_count = _max_stages * nv * 3 * nv
+        _integrator_du_dAB_count = 2 * nv * 3 * nv
+        _integrator_du_inner_full = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
+        _integrator_du_inner_selective = max(self.gen_direct_minv_inner_temp_mem_size(),
+                                             self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         _integrator_du_full = max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)
-        _integrator_du_arenas = (_integrator_du_full, _integrator_du_full - _integrator_du_D_qdd_count)
+        _integrator_du_arenas = (
+            _integrator_du_full,                                                                                  # 0 full
+            _integrator_du_full - _integrator_du_D_qdd_count,                                                     # 1 +Dqdd
+            _integrator_du_full - _integrator_du_D_qdd_count - _integrator_du_dAB_count                           # 2 +dAB+selective
+                - (_integrator_du_inner_full - _integrator_du_inner_selective),
+            _integrator_du_full - _integrator_du_D_qdd_count - _integrator_du_dAB_count - _integrator_du_inner_full,  # 3 +whole inner
+        )
         self.integrator_du_spill_tier_3way = select_shared_tier_3way(*_integrator_du_arenas)
         self.integrator_du_t_count_per_tier = tuple(_integrator_du_arenas[i] for i in self.integrator_du_spill_tier_3way)
-        # d_workspace must cover the spilled buffer if ANY tier spills (the kernel
-        # is templated on RESOURCE_TIER and the user may compile at LITE/MINIMAL).
-        self.integrator_du_D_qdd_workspace_count = _integrator_du_D_qdd_count if any(p == 1 for p in self.integrator_du_spill_tier_3way) else 0
+        _picks = self.integrator_du_spill_tier_3way
+        # Placement booleans per rung index: which buffers leave smem.
+        self.integrator_du_dqdd_in_smem_per_tier  = tuple(p < 1 for p in _picks)  # spilled at rungs >=1
+        self.integrator_du_dab_in_smem_per_tier    = tuple(p < 2 for p in _picks)  # spilled at rungs >=2
+        # FD-grad inner level per tier: 0 full smem, 1 selective (da_df band), 2 global_temp (whole inner).
+        self.integrator_du_inner_level_per_tier = tuple((0 if p < 2 else (1 if p == 2 else 2)) for p in _picks)
+        # d_workspace floats the gradient needs when ANY tier spills: Dqdd + dAB +
+        # the whole inner (rung-3 worst case; the rungs reuse the same regions).
+        self.integrator_du_workspace_count = (
+            (_integrator_du_D_qdd_count + _integrator_du_dAB_count + _integrator_du_inner_full)
+            if any(p >= 1 for p in _picks) else 0)
+        self.integrator_du_uses_da_df_spill = any(p == 2 for p in _picks)
+        self._integrator_du_dqdd_count = _integrator_du_D_qdd_count
+        self._integrator_du_dAB_count = _integrator_du_dAB_count
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
         id_du_temp_count = id_du_temp_layout["full_count"]
         id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
@@ -568,7 +609,8 @@ class GRiDCodeGenerator:
                                            fd_du_temp_count,
                                            2*nv*nv,
                                            _minv_F_workspace_count,
-                                           self.integrator_du_D_qdd_workspace_count)
+                                           self.integrator_minv_F_workspace_count,
+                                           self.integrator_du_workspace_count)
         d2ee_workspace_t_count = 0
         if self.d2ee_use_workspace_temp:
             d2ee_workspace_t_count += d2ee_workspace_temp_count
@@ -592,6 +634,7 @@ class GRiDCodeGenerator:
         # 16-byte alignment padding.
         legacy_count_pad = topology_count + 8
         legacy_arena_count = lambda t_count: int(t_count + legacy_count_pad)
+        _b = lambda flag: "true" if flag else "false"
         # GRID_LINALG_NVIDIA_MAX_HELPER_BYTES is a stub returning 0 (v2.0+).
         # Forward-declared here so the *_DYNAMIC_SHARED_MEM_BYTES helpers
         # below compile before _lin_alg_helpers emits the definition.
@@ -613,7 +656,9 @@ class GRiDCodeGenerator:
                                  "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
                                  "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
-                                 "const int GRID_INTEGRATOR_DU_USES_WORKSPACE = " + str(int(any(p == 1 for p in self.integrator_du_spill_tier_3way))) + ";", \
+                                 "const int GRID_INTEGRATOR_USES_WORKSPACE = " + str(int(any(p == 1 for p in self.integrator_spill_tier_3way))) + ";", \
+                                 "const int GRID_INTEGRATOR_DU_USES_WORKSPACE = " + str(int(any(p >= 1 for p in self.integrator_du_spill_tier_3way))) + ";", \
+                                 "const int GRID_INTEGRATOR_DU_USES_DA_DF_SPILL = " + str(int(self.integrator_du_uses_da_df_spill)) + ";", \
                                  "const int GRID_GENERATES_IDSVA_SO_BODY_FRAME = " + str(int(getattr(self, "generate_idsva_so_body_frame", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
                                  "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
@@ -708,7 +753,17 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_du_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T> __host__ __device__ inline size_t INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(integrator_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 # Tier-aware: at LITE/MINIMAL the FD inner's Minv F-region (6*nv*nv)
+                                 # spills to d_workspace, so the smem arena shrinks. Default TIER keeps
+                                 # the existing single-arg call sites working.
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.integrator_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.integrator_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.integrator_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 # Per-robot tier->placement map for the integrator VALUE path's Minv F-region:
+                                 # in smem at spill level 0, in d_workspace (grad section) at level 1.
+                                 "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_MINV_F_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.integrator_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.integrator_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.integrator_spill_tier_3way[2] == 0 else "false") + "; }",
                                  # Tier-aware: at LITE/MINIMAL the s_D_qdd_stage buffer (max_stages*nv*3nv)
                                  # spills to d_workspace, so the smem arena shrinks. Default TIER keeps the
                                  # existing single-arg call sites working.
@@ -719,7 +774,16 @@ class GRiDCodeGenerator:
                                  "}",
                                  # Per-robot tier->placement map for the integrator gradient's s_D_qdd_stage
                                  # buffer: in smem at spill level 0, in d_workspace (grad section) at level 1.
-                                 "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_DU_D_QDD_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.integrator_du_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.integrator_du_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.integrator_du_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 # Per-robot tier->placement maps for the integrator gradient's surgical
+                                 # spill ladder. Each buffer's IN_SMEM bool is keyed on RESOURCE_TIER;
+                                 # INNER_LEVEL gives the FD-grad inner spill (0 full smem, 1 da_df-band
+                                 # selective, 2 whole inner -> d_workspace).
+                                 "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_DU_D_QDD_IN_SMEM() { return (TIER == TIER_PERF) ? " + _b(self.integrator_du_dqdd_in_smem_per_tier[0]) + " : (TIER == TIER_LITE) ? " + _b(self.integrator_du_dqdd_in_smem_per_tier[1]) + " : " + _b(self.integrator_du_dqdd_in_smem_per_tier[2]) + "; }",
+                                 "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_DU_DAB_IN_SMEM() { return (TIER == TIER_PERF) ? " + _b(self.integrator_du_dab_in_smem_per_tier[0]) + " : (TIER == TIER_LITE) ? " + _b(self.integrator_du_dab_in_smem_per_tier[1]) + " : " + _b(self.integrator_du_dab_in_smem_per_tier[2]) + "; }",
+                                 "template <int TIER> __host__ __device__ constexpr int INTEGRATOR_DU_INNER_LEVEL() { return (TIER == TIER_PERF) ? " + str(self.integrator_du_inner_level_per_tier[0]) + " : (TIER == TIER_LITE) ? " + str(self.integrator_du_inner_level_per_tier[1]) + " : " + str(self.integrator_du_inner_level_per_tier[2]) + "; }",
+                                 # d_workspace sub-offsets (within the per-timestep slot): Dqdd at 0, then dAB, then the inner-spill region.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_DU_DAB_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count) + "); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count + self._integrator_du_dAB_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t ID_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -1122,7 +1186,7 @@ class GRiDCodeGenerator:
         # (the only one historically registered) succeeds.
         ("integrator", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),

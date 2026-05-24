@@ -369,7 +369,8 @@ def gen_integrator_finish(self, use_thread_group=False):
     self.gen_add_end_function()
 
 
-def gen_integrator_inner_function_call(self, integrator_type="IT", use_thread_group=False, updated_var_names=None):
+def gen_integrator_inner_function_call(self, integrator_type="IT", use_thread_group=False, updated_var_names=None,
+                                       minv_f_in_smem_expr="true"):
     var_names = dict(
         s_x_kp1_name="s_x_kp1",
         s_q_name="s_q",
@@ -380,13 +381,14 @@ def gen_integrator_inner_function_call(self, integrator_type="IT", use_thread_gr
         s_stage_point_name="s_stage_point",
         d_robotModel_name="d_robotModel",
         s_temp_name="s_temp",
+        d_workspace_name="nullptr",
         dt_name="dt",
         gravity_name="gravity",
     )
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
             var_names[key] = value
-    code_start = ("integrator_inner<T, " + _integrator_type_token(integrator_type) + ">(" +
+    code_start = ("integrator_inner<T, " + _integrator_type_token(integrator_type) + ", " + minv_f_in_smem_expr + ">(" +
                   var_names["s_x_kp1_name"] + ", " +
                   var_names["s_q_name"] + ", " +
                   var_names["s_qd_name"] + ", " +
@@ -396,6 +398,7 @@ def gen_integrator_inner_function_call(self, integrator_type="IT", use_thread_gr
                   var_names["s_stage_point_name"] + ", ")
     code_end = (var_names["d_robotModel_name"] + ", " +
                 var_names["s_temp_name"] + ", " +
+                var_names["d_workspace_name"] + ", " +
                 var_names["gravity_name"] + ", " +
                 var_names["dt_name"] + ");")
     code_middle = self.gen_insert_helpers_function_call()
@@ -439,21 +442,28 @@ def gen_integrator_inner(self, use_thread_group=False):
                       "T *s_qdd, T *s_stage_qdd, T *s_stage_point, ")
     # d_robotModel is needed by multi-stage integrators to recompute s_XImats
     # at intermediate states. For single-stage (Euler / SI Euler) it's unused.
-    func_def_end = "const robotModel<T> *d_robotModel, T *s_temp, const T gravity, const T dt) {"
+    # d_workspace holds the surgically-spilled Minv F-region (6*NV*NV) at the
+    # LITE/MINIMAL tiers (MINV_F_IN_SMEM=false); nullptr / unused at PERF.
+    func_def_end = "const robotModel<T> *d_robotModel, T *s_temp, T *d_workspace, const T gravity, const T dt) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -3)
+    func_params.append("d_workspace is the L2-pinned global scratch for the spilled Minv F-region (LITE/MINIMAL); nullptr at PERF")
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
+                  "MINV_F_IN_SMEM selects where the FD inner's Minv 6*NV*NV F-region lives (s_temp vs d_workspace)",
                   "For Midpoint/RK3/RK4, re-runs forward_dynamics at intermediate states and weights stage qdd outputs."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ", 1)
         func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Computes a single integrator step (x_{k+1} = integrator(x_k, u_k, dt))",
                           func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT>")
+    self.gen_add_code_line("template <typename T, IntegratorType IT, bool MINV_F_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def_start + func_def_end, True)
 
-    # Stage 1: always run forward dynamics on (q, qd, u).
-    self.gen_forward_dynamics_inner_function_call(use_thread_group)
+    # Stage 1: always run forward dynamics on (q, qd, u). Thread the Minv-F
+    # placement + global scratch through every FD inner call (stages reuse the
+    # same F bytes sequentially).
+    self.gen_forward_dynamics_inner_function_call(use_thread_group,
+        updated_var_names=dict(d_workspace_name="d_workspace"), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync(use_thread_group)
 
     # Single-stage branch — Euler / Semi-Implicit Euler.
@@ -505,8 +515,8 @@ def gen_integrator_inner(self, use_thread_group=False):
     self.gen_add_sync(use_thread_group)
     # FD at p1.
     self.gen_forward_dynamics_inner_function_call(use_thread_group, updated_var_names=dict(
-        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2",
-    ))
+        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2", d_workspace_name="d_workspace",
+    ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync(use_thread_group)
 
     # ----- Stage 3 (RK3 / RK4) -----
@@ -536,8 +546,8 @@ def gen_integrator_inner(self, use_thread_group=False):
         self.gen_load_update_XImats_helpers_function_call(use_thread_group, updated_var_names=dict(s_q_name="s_p2_q"))
         self.gen_add_sync(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group, updated_var_names=dict(
-            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3",
-        ))
+            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3", d_workspace_name="d_workspace",
+        ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync(use_thread_group)
         self.gen_add_end_control_flow()
 
@@ -563,8 +573,8 @@ def gen_integrator_inner(self, use_thread_group=False):
         self.gen_load_update_XImats_helpers_function_call(use_thread_group, updated_var_names=dict(s_q_name="s_p3_q"))
         self.gen_add_sync(use_thread_group)
         self.gen_forward_dynamics_inner_function_call(use_thread_group, updated_var_names=dict(
-            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4",
-        ))
+            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4", d_workspace_name="d_workspace",
+        ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync(use_thread_group)
         self.gen_add_end_control_flow()
 
@@ -641,16 +651,76 @@ def gen_integrator_device(self, use_thread_group=False):
     self.gen_add_end_function()
 
 
+def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, use_thread_group):
+    """Emit integrator_kernel body for one tier's Minv-F spill flag.
+    spill_minv_F=False: the FD inner's Minv F-region lives in smem (s_temp);
+    spill_minv_F=True:  it lives in the L2-pinned d_workspace (surgical spill,
+    keeps the hot FD path in smem)."""
+    fb = self.robot.floating_base  # 0 for fixed-base
+    max_stages = _max_stages_in_use()
+    # Inner-controlled: forward_dynamics_inner slices its own Minv-F from s_temp
+    # (smem) or d_workspace (global). The arena size already reflects the choice.
+    shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=not spill_minv_F)
+    extra_t_buffers = [
+        ("s_q_qd_u", 3 * n + fb),
+        ("s_qdd", n),
+        ("s_stage_qdd", (max_stages - 1) * n),
+        ("s_stage_point", (max_stages - 1) * 2 * n),
+        ("s_x_kp1", 2 * n + fb),  # = nq + nv  (floating-base adds 1 for the quaternion)
+    ]
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_code_line(
+        "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
+    )
+    minv_f_expr = "false" if spill_minv_F else "true"
+    if use_thread_group:
+        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    out_count = 2 * n + fb  # nq + nv
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
+        self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
+        if spill_minv_F:
+            self.gen_add_code_line("T *int_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
+        self.gen_add_code_line("// compute")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_integrator_inner_function_call(integrator_type="IT", use_thread_group=use_thread_group,
+            updated_var_names=(dict(d_workspace_name="int_d_workspace") if spill_minv_F else None),
+            minv_f_in_smem_expr=minv_f_expr)
+        self.gen_add_sync(use_thread_group)
+        self.gen_kernel_save_result("x_kp1", str(out_count), str(out_count), use_thread_group)
+        self.gen_add_end_control_flow()
+    else:
+        input_count = 3 * n + fb
+        self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
+        if spill_minv_F:
+            self.gen_add_code_line("T *int_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="x_kp1")
+        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_integrator_inner_function_call(integrator_type="IT", use_thread_group=use_thread_group,
+            updated_var_names=(dict(d_workspace_name="int_d_workspace") if spill_minv_F else None),
+            minv_f_in_smem_expr=minv_f_expr)
+        self.gen_anti_licm_output_write("x_kp1")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result_single_timing("x_kp1", str(out_count), use_thread_group)
+
+
 def gen_integrator_kernel(self, use_thread_group=False, single_call_timing=False):
     n = self.robot.get_num_vel()
     func_params = ["d_x_kp1 is a pointer to memory for the next state (size 2*NUM_VEL per timestep)",
+                   "d_workspace is the L2-pinned global scratch for the spilled Minv F-region (LITE/MINIMAL tiers)",
                    "d_q_qd_u is the packed joint positions, velocities, and input torques",
                    "stride_q_qd_u is the stride between each (q, qd, u) tuple in d_q_qd_u",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
                    "gravity is the gravity constant",
                    "dt is the integration timestep",
                    "num_timesteps is the length of the trajectory (or overloaded as test_iters for timing)"]
-    func_def_start = "void integrator_kernel(T *d_x_kp1, const T *d_q_qd_u, const int stride_q_qd_u, "
+    func_def_start = "void integrator_kernel(T *d_x_kp1, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -664,47 +734,23 @@ def gen_integrator_kernel(self, use_thread_group=False, single_call_timing=False
     # direct_minv_inner ~92, inverse_dynamics_gradient_inner ~99 regs), so the
     # LITE/MINIMAL thread-count bump (-> fewer regs/thread) starves them and ptxas
     # errors under -rdc=true (callee regcount > caller cap). The integrator's tier
-    # behavior is the gradient kernel's s_D_qdd_stage smem spill, which is
-    # independent of launch_bounds.
+    # behavior is the surgical Minv-F smem spill, which is independent of launch_bounds.
     self.gen_add_code_line("__launch_bounds__(MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line(func_def, True)
-    shared_mem_size = self.gen_integrator_inner_temp_mem_size()
-    fb = self.robot.floating_base  # 0 for fixed-base
-    max_stages = _max_stages_in_use()
-    extra_t_buffers = [
-        ("s_q_qd_u", 3 * n + fb),
-        ("s_qdd", n),
-        ("s_stage_qdd", (max_stages - 1) * n),
-        ("s_stage_point", (max_stages - 1) * 2 * n),
-        ("s_x_kp1", 2 * n + fb),  # = nq + nv  (floating-base adds 1 for the quaternion)
-    ]
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
-    self.gen_add_code_line(
-        "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
-    )
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
-    out_count = 2 * n + fb  # nq + nv
-    if not single_call_timing:
-        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
-        self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_integrator_inner_function_call(integrator_type="IT", use_thread_group=use_thread_group)
-        self.gen_add_sync(use_thread_group)
-        self.gen_kernel_save_result("x_kp1", str(out_count), str(out_count), use_thread_group)
-        self.gen_add_end_control_flow()
+    # Per-tier Minv-F placement (perf, lite, minimal): 0 = F in smem, 1 = F
+    # spilled to d_workspace. When all three agree (robots that fit at PERF),
+    # emit a single body; else gate per tier on RESOURCE_TIER (mirrors fd).
+    picks = getattr(self, "integrator_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        _emit_integrator_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing, use_thread_group)
     else:
-        input_count = 3 * n + fb
-        self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="x_kp1")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_integrator_inner_function_call(integrator_type="IT", use_thread_group=use_thread_group)
-        self.gen_anti_licm_output_write("x_kp1")
-        self.gen_add_end_control_flow()
-        self.gen_kernel_save_result_single_timing("x_kp1", str(out_count), use_thread_group)
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_integrator_kernel_body_for_flags(self, n, bool(pick), single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -732,7 +778,7 @@ def gen_integrator_host(self, mode=0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"integrator requires all-data or dynamics gridData\");")
-    func_call_start = "integrator_kernel<T, IT><<<block_dimms,thread_dimms,INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_x_kp1,hd_data->d_q_qd_u,stride_q_qd_u,"
+    func_call_start = "integrator_kernel<T, IT><<<block_dimms,thread_dimms,INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_x_kp1,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T, IT>", "kernel_single_timing<T, IT>")
@@ -750,7 +796,12 @@ def gen_integrator_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"integrator\", INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    # Pin the spilled Minv-F section in L2 when any tier spills it.
+    workspace_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                       else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (GRID_INTEGRATOR_USES_WORKSPACE) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
+    self.gen_add_code_line("if (GRID_INTEGRATOR_USES_WORKSPACE) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         self.gen_add_code_lines([
             "// finally transfer the result back",
