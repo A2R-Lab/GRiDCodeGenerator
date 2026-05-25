@@ -164,7 +164,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             use_qdd_Minv_input,
             "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
             "d_temp_spill",
-            "GRID_FD_DU_USES_DA_DF_SPILL"
+            ("true" if use_selective_spill else "false")
         )
         if not (use_global_temp or use_selective_spill):
             self.gen_kernel_save_result("df_du",str(n*2*n),str(n*2*n),use_thread_group,"s_temp")
@@ -192,7 +192,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             use_qdd_Minv_input,
             "d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp",
             "d_temp_spill",
-            "GRID_FD_DU_USES_DA_DF_SPILL"
+            ("true" if use_selective_spill else "false")
         )
         self.gen_add_code_line(
             "if ((threadIdx.x | threadIdx.y | threadIdx.z) == 0) { "

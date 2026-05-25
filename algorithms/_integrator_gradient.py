@@ -696,7 +696,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
         )
         # da_df-band selective spill buffer (set per-timestep below when inner_level==1).
-        spill_flag = "GRID_INTEGRATOR_DU_USES_DA_DF_SPILL" if inner_level == 1 else "false"
+        spill_flag = "true" if inner_level == 1 else "false"
         if inner_level == 1:
             self.gen_add_code_line("T *d_temp_spill = nullptr;")
         if use_thread_group:
