@@ -74,7 +74,13 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     self.gen_add_func_doc("Compute the inverse of the mass matrix",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool F_IN_SMEM = true>")
-    self.gen_add_code_line("__device__")
+    # __forceinline__: this inner is the heaviest sub-routine of the dynamics-
+    # gradient / SO orchestrators (~108 regs). Under -rdc (single-call/anti-LICM
+    # build) a separate __device__ callee's regcount must fit the calling kernel's
+    # launch_bounds budget, which at LITE/MINIMAL (more threads) is only ~80/64 ->
+    # ptxas regcount error. Inlining folds it into the kernel ENTRY (which may
+    # spill to local under launch_bounds) instead of being a budget-checked callee.
+    self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # linalg_smem_setup expects the temp-region size that the function's emitted
     # body indexes into s_temp (IA/U/Dinv/Ia/IaTemp). The F-region is sliced

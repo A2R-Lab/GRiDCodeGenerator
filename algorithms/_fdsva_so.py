@@ -292,7 +292,13 @@ def gen_fdsva_so_full_inner(self, use_thread_group = False):
     self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
                           [], func_params, None)
     self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
-    self.gen_add_code_line("__device__")
+    # __forceinline__ so the whole orchestration inlines into the calling kernel.
+    # Under -rdc (single-call/anti-LICM build) a separate __device__ wrapper keeps
+    # its callees (e.g. direct_minv_inner, ~108 regs) as distinct functions whose
+    # regcount must fit the kernel's launch_bounds budget (80 at LITE / 64 at
+    # MINIMAL) -> ptxas regcount error. Inlining folds them into the kernel (as the
+    # pre-refactor inline orchestration did). See HANDOFF.md / "Problem 1".
+    self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # Inner owns the pool placement; the repoint covers every consumer below
     # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
