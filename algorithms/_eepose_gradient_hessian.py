@@ -642,6 +642,9 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
             self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+            # Whole inner arena spilled -> smem s_temp is null. Repoint it at the
+            # spilled workspace so the XmatsHom helper's sincos scratch is backed.
+            self.gen_add_code_line("s_temp = s_eegrad_temp;")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
         # Inner-controlled: pass both arenas + placement; the inner picks where
@@ -660,6 +663,8 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = d_deePos;")
             self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+            # See note above: repoint the null smem s_temp at the spilled workspace.
+            self.gen_add_code_line("s_temp = s_eegrad_temp;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         # TODO(licm-eepose-grad): sm_86-specific, deprioritized. See pre-Phase-3d note in git history.

@@ -739,6 +739,10 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_
         self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(input_count),use_thread_group)
         if use_workspace_temp:
             self.gen_add_code_line("T *aba_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+            # The whole inner arena spilled to global, so the smem s_temp slot is
+            # null. Repoint s_temp at the workspace so the XImats helper's sincos
+            # scratch (and the inner) have a valid backing store, not nullptr.
+            self.gen_add_code_line("s_temp = aba_d_workspace;")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
@@ -753,6 +757,9 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_
         self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
         if use_workspace_temp:
             self.gen_add_code_line("T *aba_d_workspace = reinterpret_cast<T *>(d_workspace);")
+            # See note above: repoint the null smem s_temp at the spilled workspace
+            # so the XImats helper scratch is backed by valid (global) memory.
+            self.gen_add_code_line("s_temp = aba_d_workspace;")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
