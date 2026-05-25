@@ -229,6 +229,97 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
     fdsva_so_code = fdsva_so_code_start + fdsva_so_code_middle + fdsva_so_code_end
     self.gen_add_code_line(fdsva_so_code)
 
+def gen_fdsva_so_full_inner_function_call(self, use_thread_group = False,
+                                          scratch_in_smem_expr = "true",
+                                          fd_grad_use_spill_expr = "false",
+                                          contract_in_smem_expr = "true",
+                                          d_workspace_pool_name = "nullptr",
+                                          d_fd_grad_spill_name = "nullptr",
+                                          s_fdsva_temp_name = "nullptr"):
+    """Emit the call to `fdsva_so_full_inner`. Arg order MUST match the def in
+    gen_fdsva_so_full_inner. Pool/spill regions default to nullptr (unused under
+    the matching if-constexpr); the kernel passes real pointers per tier."""
+    tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + ">"
+    start = "fdsva_so_full_inner" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
+    middle = self.gen_insert_helpers_function_call()
+    end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
+           + s_fdsva_temp_name + ", d_robotModel, gravity);")
+    if use_thread_group:
+        start = start.replace("(", "(tgrp, ")
+    self.gen_add_code_line(start + middle + end)
+
+def gen_fdsva_so_full_inner(self, use_thread_group = False):
+    """Emit `fdsva_so_full_inner` — the whole fdsva_so orchestration as ONE
+    inner that OWNS its scratch (s_temp) placement (inner-owns-placement; see
+    docs/idsva_so_inner_refactor_notes.md). It wraps, in order:
+      load_update_XImats -> direct_minv_inner -> forward_dynamics_inner ->
+      fd-gradient-inline -> idsva_so_{world,body}_inner -> fdsva_so_inner.
+    Because the s_temp repoint happens at the very top, EVERY consumer below —
+    including the XImats helper's sincos scratch — follows the placement, so the
+    kernel never repoints s_temp from the outside.
+
+    Template flags:
+      SCRATCH_IN_SMEM   : the shared s_temp pool lives in smem (true) or routes
+                          to d_workspace (false). This is the dominant lever — on
+                          big floating humanoids the fd-gradient pool (~180 KB)
+                          is what overflows, so false makes it fit.
+      FD_GRAD_USE_SPILL : the fd-gradient inline spills its da_dq..fxvi band to
+                          d_fd_grad_spill (only meaningful when the pool is smem).
+      CONTRACT_IN_SMEM  : the fdsva_so_inner 4*NV^3 contraction scratch placement.
+
+    Pointer params are caller-supplied (the kernel decides where the OUTPUTS and
+    df_du/Minv live — smem, device arrays, or workspace bands — and hands in the
+    spill regions): only the s_temp POOL placement is the inner's call."""
+    n = self.robot.get_num_vel()
+    func_params = [
+        "s_df2/s_idsva_so/s_Minv/s_df_du/s_qdd/s_q/s_qd/s_u are the in/out buffers (caller places)",
+        "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
+        "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
+        "d_fd_grad_spill is the fd-gradient da_df spill band (used when FD_GRAD_USE_SPILL)",
+        "s_fdsva_temp is the 4*NV^3 contraction scratch (smem or workspace per CONTRACT_IN_SMEM)",
+        "d_robotModel holds XImats/topology; gravity is the gravity constant",
+    ]
+    func_def_start = "void fdsva_so_full_inner("
+    func_def_middle = ("T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, "
+                       "const T *s_q, const T *s_qd, const T *s_u, ")
+    func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
+                    "const robotModel<T> *d_robotModel, const T gravity) {")
+    if use_thread_group:
+        func_def_start += "cgrps::thread_group tgrp, "
+        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    # Inner owns the pool placement; the repoint covers every consumer below
+    # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
+    self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_add_code_line("T *d_temp_spill = nullptr;  // idsva uses the (placed) s_temp pool directly")
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
+    self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, gravity);")
+    self.gen_add_sync(use_thread_group)
+    # fd-gradient inline; the band-spill variant is a compile-time choice.
+    self.gen_add_code_line("if constexpr (FD_GRAD_USE_SPILL) {", True)
+    self.gen_fdsva_so_fd_gradient_inline(use_thread_group, use_spill=True, spill_ptr_expr="d_fd_grad_spill")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("(void)d_fd_grad_spill;")
+    self.gen_fdsva_so_fd_gradient_inline(use_thread_group, use_spill=False, spill_ptr_expr="nullptr")
+    self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
+    else:
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
+    self.gen_fdsva_so_inner_function_call(use_thread_group,
+        updated_var_names = dict(d_workspace_name = "s_fdsva_temp"),
+        scratch_in_smem_expr = "CONTRACT_IN_SMEM")
+    self.gen_add_end_function()
+
 def gen_fdsva_so_device(self, use_thread_group = False):
     # NUM_VEL is the SO tensor dimension. See gen_fdsva_so_kernel for details.
     n = self.robot.get_num_vel()
@@ -285,19 +376,25 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     self.gen_add_end_function()
 
 _FDSVA_SO_PICK_FLAGS = [
-    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv)
-    (False, False, False, False, False),   # pick 0: full smem
-    (True,  False, False, False, False),   # pick 1: outputs to global
-    (True,  True,  False, False, False),   # pick 2: + inner temp to global
-    (True,  True,  True,  False, False),   # pick 3: + fd_grad da_df band to global
-    (True,  True,  True,  True,  False),   # pick 4 (Phase 3e): + s_df_du to global
-    (True,  True,  True,  True,  True),    # pick 5 (Phase 3e): + s_Minv to global
+    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv, use_workspace_idsva_temp)
+    (False, False, False, False, False, False),   # pick 0: full smem
+    (True,  False, False, False, False, False),   # pick 1: outputs to global
+    (True,  True,  False, False, False, False),   # pick 2: + inner temp to global
+    (True,  True,  True,  False, False, False),   # pick 3: + fd_grad da_df band to global
+    (True,  True,  True,  True,  False, False),   # pick 4 (Phase 3e): + s_df_du to global
+    (True,  True,  True,  True,  True,  False),   # pick 5 (Phase 3e): + s_Minv to global
+    (True,  True,  False, False, False, True),    # pick 6: pool->global (whole s_temp via full inner SCRATCH_IN_SMEM=false); df_du/Minv stay in smem (small); floating-base only
 ]
 
 def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, use_workspace_temp,
                                          fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv,
-                                         single_call_timing, use_thread_group):
-    """Emit fdsva_so kernel body for one tier's spill flags."""
+                                         single_call_timing, use_thread_group, use_workspace_idsva_temp=False):
+    """Emit fdsva_so kernel body for one tier's spill flags.
+    use_workspace_idsva_temp: route the embedded idsva_so inner's scratch to
+    d_workspace (via the inner's SCRATCH_IN_SMEM=false). The idsva inner is the
+    dominant s_temp consumer on big robots; spilling it drops the smem arena to
+    the next-largest sub-inner (fd_grad / minv / fd). Floating-base only for now
+    (the world inner owns its placement; the body inner does not yet)."""
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base
         else self.gen_idsva_so_body_frame_inner_temp_mem_size()
@@ -306,9 +403,15 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled() if fd_grad_use_spill
         else self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
     )
-    shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
-    if not use_workspace_temp:
-        shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
+    if use_workspace_idsva_temp:
+        # Pool -> global: fdsva_so_full_inner runs with SCRATCH_IN_SMEM=false, so the
+        # WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad + idsva) lives
+        # in d_workspace. The smem s_temp slot is unused -> size 0.
+        shared_temp_size = 0
+    else:
+        shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
+        if not use_workspace_temp:
+            shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
     # Phase 3e: s_df_du and s_Minv can now be in workspace too. Drop them from
     # extra_t_buffers when spilled; declare workspace pointers in the body.
     extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_qdd", n)]
@@ -354,29 +457,16 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if use_workspace_Minv:
             # Phase 3e: s_Minv lives just past s_df_du in the FDSVA_SO spill section.
             self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        # Phase 3a: Minv inner takes s_F + s_temp separately (pack F at offset 0 of s_temp).
-        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
-        self.gen_add_code_line(fd_start + fd_end)
-        self.gen_add_sync(use_thread_group)
-        self.gen_fdsva_so_fd_gradient_inline(
-            use_thread_group,
-            use_spill=fd_grad_use_spill,
-            spill_ptr_expr="d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
-        )
-        if self.robot.floating_base:
-            self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
-        else:
-            self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
-            self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-        # Inner-controlled scratch placement: pass both arenas (s_temp = smem,
-        # d_workspace = the L2-pinned spill slot when this tier spills) and let
-        # fdsva_so_inner pick via SCRATCH_IN_SMEM. The kernel no longer aims a
-        # single pointer — it just provides both, sized from the constants.
-        fdsva_updates = dict(d_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
-        self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates,
-                                              scratch_in_smem_expr = "false" if use_workspace_temp else "true")
+        self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
+        # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
+        # contraction uses the same region in its later phase. See full inner.
+        self.gen_fdsva_so_full_inner_function_call(use_thread_group,
+            scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
+            fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
+            contract_in_smem_expr = "false" if use_workspace_temp else "true",
+            d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
+            d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
+            s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr")
         self.gen_add_sync(use_thread_group)
         if not use_global_tensors: self.gen_kernel_save_result("df2",f"{4*n**3}",str(4*n*n*n),use_thread_group)
         self.gen_add_end_control_flow()
@@ -396,24 +486,13 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
         if use_workspace_Minv:
             self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        # Phase 3a: Minv inner takes s_F + s_temp separately.
-        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
-        self.gen_add_code_line(fd_start + fd_end)
-        self.gen_add_sync(use_thread_group)
-        self.gen_fdsva_so_fd_gradient_inline(
-            use_thread_group,
-            use_spill=fd_grad_use_spill,
-            spill_ptr_expr="d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
-        )
-        if self.robot.floating_base:
-            self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
-        else:
-            self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, updated_var_names = dict(s_mem_name = "s_temp"))
-            self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-        fdsva_updates = dict(d_workspace_name = "s_fdsva_temp") if use_workspace_temp else None
-        self.gen_fdsva_so_inner_function_call(use_thread_group, updated_var_names = fdsva_updates,
-                                              scratch_in_smem_expr = "false" if use_workspace_temp else "true")
+        self.gen_fdsva_so_full_inner_function_call(use_thread_group,
+            scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
+            fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
+            contract_in_smem_expr = "false" if use_workspace_temp else "true",
+            d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
+            d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
+            s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr")
         self.gen_add_end_control_flow()
         if not use_global_tensors: self.gen_kernel_save_result_single_timing("df2",str(4*n*n*n),use_thread_group)
 
@@ -443,16 +522,16 @@ def gen_fdsva_so_kernel(self, use_thread_group = False, single_call_timing = Fal
     self.gen_add_code_line(func_def, True)
     picks = getattr(self, "fdsva_so_spill_tier_3way", (5, 5, 5))
     if picks[0] == picks[1] == picks[2]:
-        ugt, uwt, fgs, uwdfdu, uwminv = _FDSVA_SO_PICK_FLAGS[picks[0]]
-        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group)
+        ugt, uwt, fgs, uwdfdu, uwminv, uwit = _FDSVA_SO_PICK_FLAGS[picks[0]]
+        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group, uwit)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            ugt, uwt, fgs, uwdfdu, uwminv = _FDSVA_SO_PICK_FLAGS[pick]
+            ugt, uwt, fgs, uwdfdu, uwminv, uwit = _FDSVA_SO_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group)
+            _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, use_thread_group, uwit)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -527,6 +606,8 @@ def gen_fdsva_so_host(self, mode = 0):
 def gen_fdsva_so(self, use_thread_group = False):
     # first generate the inner helper
     self.gen_fdsva_so_inner(use_thread_group)
+    # then the orchestration inner (owns s_temp placement; used by the kernel)
+    self.gen_fdsva_so_full_inner(use_thread_group)
     # then generate the device wrapper
     self.gen_fdsva_so_device(use_thread_group)
     # then generate the kernels

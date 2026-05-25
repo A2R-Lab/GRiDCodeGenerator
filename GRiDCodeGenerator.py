@@ -54,6 +54,7 @@ class GRiDCodeGenerator:
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
                             gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
+                            gen_fdsva_so_full_inner, gen_fdsva_so_full_inner_function_call, \
                             gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host, \
                             gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
@@ -589,20 +590,32 @@ class GRiDCodeGenerator:
         # (2*NV²); Level 5 also pushes s_Minv (NV²).
         fdsva_so_base_no_df_du = fdsva_so_base_t_count - 2*nv*nv
         fdsva_so_base_no_df_du_no_Minv = fdsva_so_base_no_df_du - nv*nv
+        # Level 6: pool -> global. fdsva_so_full_inner runs with SCRATCH_IN_SMEM=false,
+        # routing the WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad +
+        # idsva) to d_workspace (reusing the non-concurrent contraction SO-temp region).
+        # Smem then holds only the base: inputs + s_qdd + s_Minv + s_df_du + XI
+        # (~46-54 KB on h1_2 -> fits the ~99 KB cap). Outputs->device arrays and
+        # contraction->global as in levels >=2. Works for BOTH bases because the full
+        # inner repoints s_temp and hands the placed pool to the idsva inner (body or
+        # world) — the sub-inner just uses the pointer it is given (inner-owns-placement).
+        # 8-tuple: (..., use_workspace_idsva_temp == pool->global). Levels 0-5 keep pool in smem.
         _fdsva_so_tiers = [
-            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False),
-            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False),
-            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False, False, False),
-            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False),
-            ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False),
-            ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True),
+            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False),
+            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False, False),
+            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False, False, False, False),
+            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False, False),
+            ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False, False),
+            ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True,  False),
+            # pool->global: smem = base (inputs + qdd + Minv + df_du + XI), no pool/outputs/contraction.
+            ("pool_global",          fdsva_so_base_t_count,                         True,  True,  False, False, False, True),
         ]
         _fdsva_so_arenas = tuple(t[1] for t in _fdsva_so_tiers)
         self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
         _chosen = _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]]
         (_, fdsva_so_t_count, self.fdsva_so_use_global_tensors,
          self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill,
-         self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv) = _chosen
+         self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv,
+         self.fdsva_so_use_workspace_idsva_temp) = _chosen
         self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before id_du_grad / fd_grad in any kernel that

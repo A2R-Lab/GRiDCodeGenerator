@@ -2579,13 +2579,16 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "Computes IDSVA second-order derivatives via the world-frame single-pass formulation",
         func_notes, func_params, None,
     )
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
     self.gen_add_code_lines([
         "// world-frame IDSVA-SO shared-memory layout.",
-        "(void)d_workspace;  // unused at TIER_PERF; cold buffers repoint here at LITE/MINIMAL",
+        "// Inner owns scratch placement: SCRATCH_IN_SMEM picks s_temp (shared) vs",
+        "// d_workspace (global). Repointing s_temp here keeps every layout line below",
+        "// unchanged. See docs/idsva_so_inner_refactor_notes.md (inner-owns-placement).",
+        "if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }",
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
         "T *Xup     = s_temp;",
         "T *Xdown   = Xup     + 36*NUM_BODIES;",
@@ -3128,9 +3131,11 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_end_function()
 
 
-def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False):
-    """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper."""
-    id_so_code_start = "idsva_so_world_frame_inner<T>(s_idsva_so, s_q, s_qd, s_qdd, "
+def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False, scratch_in_smem_expr = "true"):
+    """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper.
+    scratch_in_smem_expr selects the inner's scratch placement (s_temp vs d_workspace);
+    callers spilling the world inner pass "false" + a valid d_temp_spill region."""
+    id_so_code_start = "idsva_so_world_frame_inner<T, " + scratch_in_smem_expr + ">(s_idsva_so, s_q, s_qd, s_qdd, "
     id_so_code_middle = self.gen_insert_helpers_function_call()
     # Unified signature: world inner takes (s_temp, d_workspace, gravity). `d_temp_spill`
     # is the kernel-local typed view into d_workspace (nullptr until tier-spill wires it).
