@@ -1400,7 +1400,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("ee_pose_gradient"))
+        self.gen_add_code_line(single_call_printf_line("ee_pose_hessian"))
     self.gen_add_end_function()
 
 def gen_X_single_thread(self, fixed_target_name = ""):

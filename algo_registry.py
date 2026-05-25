@@ -68,6 +68,7 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               legacy_labels=("eepos",)),
     AlgoEntry("ee_pose_gradient",     "EE_POSE_GRADIENT (Jacobian)",       "Kinematics",
               legacy_labels=("deepos",)),
+    AlgoEntry("ee_pose_hessian",      "EE_POSE_HESSIAN (2nd-order EE Jacobian)", "Kinematics"),
 
     # Second-Order
     AlgoEntry("idsva_so",             "IDSVA_SO (dispatched: body for fixed, world for floating)",
