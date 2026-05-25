@@ -1018,7 +1018,7 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
         self.gen_inverse_dynamics_gradient_inner_function_call(
             use_thread_group,
-            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = ("true" if use_selective_spill else "false"))
         )
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
@@ -1042,7 +1042,7 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
         self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
         self.gen_inverse_dynamics_gradient_inner_function_call(
             use_thread_group,
-            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = "GRID_ID_DU_USES_DA_DF_SPILL")
+            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = ("true" if use_selective_spill else "false"))
         )
         self.gen_anti_licm_output_write("dc_du")
         self.gen_add_end_control_flow()
