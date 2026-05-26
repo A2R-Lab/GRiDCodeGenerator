@@ -359,26 +359,30 @@ def gen_fdsva_so_device(self, use_thread_group = False):
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
-    # body_frame_inner takes a grav-shim spill on floating; world_frame_inner
-    # doesn't need it. Floating-base now dispatches to world_frame, so
-    # d_temp_spill is unused there. Fixed-base body_frame_inner also doesn't
-    # dereference the spill, so nullptr is safe for both paths.
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    # NOTE: the device wrapper no longer declares a d_temp_spill local — the
+    # orchestration (incl. its own d_temp_spill placement) now lives entirely
+    # inside fdsva_so_full_inner below, so a wrapper-local one would be an unused
+    # variable. nvcc's -Werror build treats the resulting #177-D ("declared but
+    # never referenced") as an error, so the declaration is omitted here.
 
-    # then load/update XI and run the algo. Inner-controlled placement: Minv and
-    # FD each slice their own F-region from s_temp (this device path keeps F in
-    # smem — no surgical spill at this layer).
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
-    self.gen_add_code_line(f"forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, s_XImats, s_temp, nullptr, gravity);")
-    self.gen_add_sync(use_thread_group)
-    self.gen_fdsva_so_fd_gradient_inline(use_thread_group)
-    if self.robot.floating_base:
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
-    else:
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
-        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-    self.gen_fdsva_so_inner_function_call(use_thread_group)
+    # The whole orchestration is the all-smem instantiation of the canonical
+    # fdsva_so_full_inner: SCRATCH_IN_SMEM=true (s_temp pool stays in smem),
+    # FD_GRAD_USE_SPILL=false (fd-gradient band stays in smem), CONTRACT_IN_SMEM=
+    # true (the 4*NV^3 contraction scratch stays in smem). The pool/spill device
+    # pointers are unused under these flags, so they pass as nullptr; the
+    # contraction nullptr (s_fdsva_temp_name) also routes through unused. Because
+    # full_inner is __forceinline__, this inlines to the exact code the device
+    # path used to hand-roll inline (load_update_XImats -> direct_minv_inner ->
+    # forward_dynamics_inner -> fd-gradient-inline -> idsva_so_{world,body}_inner
+    # -> fdsva_so_inner), so the emitted device path is byte-identical. The single
+    # call removes the duplicated orchestration this wrapper used to carry.
+    self.gen_fdsva_so_full_inner_function_call(use_thread_group,
+                                               scratch_in_smem_expr = "true",
+                                               fd_grad_use_spill_expr = "false",
+                                               contract_in_smem_expr = "true",
+                                               d_workspace_pool_name = "nullptr",
+                                               d_fd_grad_spill_name = "nullptr",
+                                               s_fdsva_temp_name = "nullptr")
     self.gen_add_end_function()
 
 _FDSVA_SO_PICK_FLAGS = [
