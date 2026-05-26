@@ -418,13 +418,24 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     self.gen_add_code_line("// Forward Pass")
     self.gen_add_code_line("//   Note that due to the i: operation we need to go serially over all n")
     self.gen_add_code_line("//")
+    # PERF (forward-pass fusion): the outer jid loop is loop-carried-serial (F[jid]
+    # feeds children at jid+1..), so it cannot be parallelized across jid. But for a
+    # jid WITH a parent the two per-jid parallel loops below were separated by a
+    # __syncthreads (the F-column matmul, then the U^T reduction that reads that F
+    # column + writes back into it). By making ONE thread own an entire F column we
+    # remove the intra-jid sync: the same thread does the 6-row matmul, then reduces
+    # ITS OWN just-written column against U, updates Minv, and writes back into its
+    # own column. No cross-thread sharing within a jid -> 1 sync per jid instead of
+    # 2, halving the ~NV serial syncs that dominate the forward pass at humanoid n.
+    # Numerically byte-identical: identical ops in identical reduction order, merely
+    # repartitioned (the dot_prod accumulation order is unchanged).
     for jid in range(NJ):
         self.gen_add_code_line("// forward pass for jid: " + str(jid))
         jid_parent = self.robot.get_parent_id(jid)
         jid_cols = list(range(jid,NJ))
         dof_cols = list(range(jid,n))
-  
-        if self.robot.floating_base and jid == 0: 
+
+        if self.robot.floating_base and jid == 0:
             SInd = '-1'
             SSign = '1'
         else:
@@ -434,42 +445,39 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         # Minv[i,i:] -= Dinv*U^T*Xmat*F[parent,:,i:] across cols i...N
         # F[i,:,i:] = S^T * Minv[i,i:] + Xmat*F[parent,:,i:] across cols i...N
         if jid_parent != -1:
-            if self.robot.floating_base: 
+            if self.robot.floating_base:
                 dof_id = jid + 5 # dof offset
-            else: 
+            else:
                 dof_id = jid
             self.gen_add_code_line("// Minv[i,i:] -= Dinv*U^T*Xmat*F[parent,:,i:] across cols i...N")
             self.gen_add_code_line("// F[i,:,i:] = S * Minv[i,i:] + Xmat*F[parent,:,i:] across cols i...N")
-            # note that we can first compute the same temp part used in both
-            self.gen_add_code_line("//   Start this step with F[i,:,i:] = Xmat*F[parent,:,i:] and")
-            self.gen_add_parallel_loop("ind",str(6*len(dof_cols)),use_thread_group)
-            self.gen_add_code_line("int row = ind % 6; int col_ind = ind - row + " + str(6*jid) + ";")
-            self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid) + " + col_ind + row] = " + \
-                                    "dot_prod<T,6,6,1>(&s_XImats[" + str(36*jid) + " + row], " + \
-                                    "&s_F[" + str(FOffset + 6*n*jid_parent) + " + col_ind]);")
+            # Fused per-column pass: one thread per F column owns the whole column,
+            # so the matmul (writes the column), the U^T reduction (reads it) and the
+            # S*Minv writeback (updates it) all happen in-thread with no intra-jid
+            # sync. dof_cols (= range(jid,n)) is the matmul's column set (superset);
+            # the reduction/writeback runs only for columns at/after the diagonal
+            # dof_id (== jid fixed-base; == jid+5 floating, where root-dof columns
+            # jid..jid+4 get only the matmul, exactly as before).
+            self.gen_add_code_line("//   Per column: F[i,:,col]=Xmat*F[parent,:,col], then")
+            self.gen_add_code_line("//   Minv[i,col]-=Dinv*U^T*F[i,:,col] and F[i,Srow,col]+=S*Minv[i,col]")
+            diag_offset = dof_id - jid  # 0 fixed-base, 5 floating-base
+            self.gen_add_parallel_loop("c",str(len(dof_cols)),use_thread_group)
+            self.gen_add_code_line("int col_ind = c + " + str(jid) + ";")
+            self.gen_add_code_line("T *s_Fcol = &s_F[" + str(FOffset + 6*n*jid) + " + 6*col_ind];")
+            self.gen_add_code_line("T *s_Fpcol = &s_F[" + str(FOffset + 6*n*jid_parent) + " + 6*col_ind];")
+            self.gen_add_code_line("for (int row = 0; row < 6; row++) {", True)
+            self.gen_add_code_line("s_Fcol[row] = dot_prod<T,6,6,1>(&s_XImats[" + str(36*jid) + " + row], s_Fpcol);")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
-
-            if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
-                self.gen_add_code_lines(["printf(\"F[i,:,i:] = Xmat*F[parent,:,i:] for i[" + str(jid) + "]\\n\");", \
-                                         "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset) + " + " + str(6*n*jid) + "],6);"])
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-
-            # Then finish it up by summing across the U^T mult and the -= by that times Dinv for Minv
-            # and then taking that balue and adding it to the Srow
-            self.gen_add_code_line("//   Finish this step with Minv[i,i:] -= Dinv*U^T*F[i,:,i:]")
-            self.gen_add_code_line("//     and then update F[i,:,i:] += S*Minv[i,i:]")
-            self.gen_add_parallel_loop("ind",str(len(jid_cols)),use_thread_group)
-            self.gen_add_code_line("int col_ind = ind + " + str(dof_id) + ";")
-            self.gen_add_code_line("T *s_Fcol = &s_F[" + str(FOffset + 6*n*jid) + " + 6*col_ind];");
+            # Reduction + Minv update + writeback only for columns at/after the diagonal.
+            if diag_offset > 0:
+                self.gen_add_code_line("if (c >= " + str(diag_offset) + ") {", True)
             self.gen_add_code_line("s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "] -= " + \
                                    "s_temp[" + str(DinvOffset + jid) + "] * " + \
                                    "dot_prod<T,6,1,1>(s_Fcol,&s_temp[" + str(UOffset + 6*jid) + "]);")
             if jid < n-1: # skip redundant comp on last loop
                 self.gen_add_code_line("s_Fcol[" + SInd + "] += (" + SSign + ") * s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "];")
+            if diag_offset > 0:
+                self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
 
