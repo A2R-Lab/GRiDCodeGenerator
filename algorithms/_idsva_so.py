@@ -747,7 +747,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
     self.gen_add_end_control_flow()  # close thread-zero wrap
     self.gen_add_sync(use_thread_group)
 
-def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None):
+def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None):
     var_names = dict( \
         s_idsva_so_name = "s_idsva_so", \
         s_q_name = "s_q", \
@@ -755,17 +755,28 @@ def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, 
         s_qdd_name = "s_qdd", \
         s_temp_name = "s_temp", \
         d_temp_spill_name = "d_temp_spill", \
+        d_robotModel_name = "d_robotModel", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    template_args = "<T>" if bc_in_smem_expr is None else ("<T, " + bc_in_smem_expr + ">")
+    # Template args: <T> | <T, SCRATCH_IN_SMEM> | <T, SCRATCH_IN_SMEM, BC_IN_SMEM>.
+    # SCRATCH_IN_SMEM defaults true; if a caller only passes bc_in_smem_expr it must
+    # also pass scratch_in_smem_expr ("true") so the positional order stays correct.
+    if scratch_in_smem_expr is None and bc_in_smem_expr is None:
+        template_args = "<T>"
+    elif bc_in_smem_expr is None:
+        template_args = "<T, " + scratch_in_smem_expr + ">"
+    else:
+        scratch_expr = scratch_in_smem_expr if scratch_in_smem_expr is not None else "true"
+        template_args = "<T, " + scratch_expr + ", " + bc_in_smem_expr + ">"
     id_so_code_start = "idsva_so_body_frame_inner" + template_args + "(" + var_names["s_idsva_so_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", "
     id_so_code_middle = self.gen_insert_helpers_function_call()
-    # Unified signature: both fixed and floating inners take (s_temp, d_workspace, gravity).
-    # `d_temp_spill` is the kernel-local typed view into d_workspace (nullptr for fixed-base).
-    id_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
+    # Unified signature: both fixed and floating inners take
+    # (s_temp, d_workspace, d_robotModel, gravity). `d_temp_spill` is the kernel-local
+    # typed view into d_workspace; the inner loads s_XImats from d_robotModel internally.
+    id_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["d_robotModel_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_so_code_start = id_so_code_start.replace("(","(tgrp, ")
     id_so_code = id_so_code_start + id_so_code_middle + id_so_code_end
@@ -942,10 +953,11 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
                             str(self.gen_idsva_so_body_frame_inner_temp_mem_size()), \
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, const T gravity) {"
     func_params.insert(-1, "d_workspace is a pointer to global-memory scratch (per-timestep) of size = " + \
                             str(gen_floating_gravity_d2tau_dq_spill_count(self)) + " floats")
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    # Signature parity with the fixed inner: take d_robotModel and load XImats internally.
+    func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
+    func_params.insert(-1, "d_robotModel holds XImats/topology (the inner loads s_XImats internally)")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "Floating diagnostic path: body-indexed spatial state plus packed velocity-indexed derivative columns.",
@@ -957,11 +969,18 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
     func_def = func_def_start + func_def_end
 
     self.gen_add_func_doc("Computes floating-base second-order inverse dynamics diagnostics",func_notes,func_params,None)
-    # BC_IN_SMEM is accepted for signature uniformity with the fixed-base inner but
-    # unused here (the floating diagnostic path is not surgically spilled).
-    self.gen_add_code_line("template <typename T, bool BC_IN_SMEM = true>")
+    # SCRATCH_IN_SMEM / BC_IN_SMEM are accepted for signature uniformity with the
+    # fixed-base inner but inert here (the floating diagnostic path picks (0,0,0): it is
+    # never surgically spilled and `d_workspace` carries the gravity-Hessian shim, not
+    # the s_temp pool). The repoint below is guarded so it never fires for floating.
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool BC_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-owns-placement parity with the fixed inner: load XImats internally (after the
+    # repoint). For floating SCRATCH_IN_SMEM is always true so s_temp is untouched and
+    # d_workspace keeps its gravity-shim meaning.
+    self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)0; }")
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
 
     self.gen_add_code_lines([
         "// Floating IDSVA-SO split-memory layout.",
@@ -1300,8 +1319,20 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
 
 def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input = False):
     """
-    Generates the inner device function to compute the second order
-    idsva.
+    Generates the inner device function to compute the second order idsva.
+
+    Inner-owns-placement (mirrors fdsva_so_full_inner / crba_inner): two compile-time
+    spill levers select where scratch lives, decided at the very top of the function so
+    every consumer (including the internal load_update_XImats helper's sincos scratch)
+    follows the placement:
+      - SCRATCH_IN_SMEM (whole-arena): the s_temp pool is in smem (true) or routed to
+        d_workspace (false, the guaranteed-fit fallback rung).
+      - BC_IN_SMEM (surgical): only the cold BC slab routes to d_workspace. BC is laid
+        out as the LAST 36*NB slab of the arena and B_IC_S/D3 are anchored on the stable
+        hot buffer S (NOT on BC), so spilling BC truncates only the arena tail and leaves
+        every hot buffer (incl. D3, read by the reference-order repair) in place. This is
+        the de-alias that fixes the surgical-rung g1/h1_2 regression.
+    The inner loads/updates s_XImats from s_q internally, so it takes d_robotModel.
     """
     if self.robot.floating_base:
         self.gen_idsva_so_body_frame_floating_reference_inner(use_thread_group, use_qdd_input)
@@ -1317,23 +1348,39 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                    "s_qdd is the vector of joint accelerations", \
-                   "s_temp is a pointer to helper shared memory of size  = " + \
+                   "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM) of size  = " + \
                             str(self.gen_idsva_so_body_frame_inner_temp_mem_size()), \
-                   "d_workspace is a pointer to per-timestep global-memory scratch (unused at TIER_PERF; cold buffers spill here at LITE/MINIMAL)", \
+                   "d_workspace is the global scratch pool: routes the whole s_temp arena (when !SCRATCH_IN_SMEM) or just the cold BC slab (when !BC_IN_SMEM)", \
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    # The inner now loads/updates XImats internally, so it takes d_robotModel (mirrors
+    # fdsva_so_full_inner). It still receives s_XImats/s_topology_helpers (the smem dest
+    # buffers) via gen_insert_helpers_func_def_params.
+    func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
+    func_params.insert(-1, "d_robotModel holds XImats/topology (the inner loads s_XImats internally)")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
-    func_notes = ["Assumes s_XImats is updated already for the current s_q"]
+    # Inner-owns-placement: the whole s_temp pool placement (and the XImats helper's
+    # sincos scratch, since the helper now runs INSIDE after the repoint) is the inner's
+    # call. Mirrors fdsva_so_full_inner / crba_inner.
+    func_notes = ["Loads/updates s_XImats from s_q internally (helper runs after the SCRATCH_IN_SMEM repoint so its scratch follows the placement)"]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool BC_IN_SMEM = true>")
+    # SCRATCH_IN_SMEM: whole-arena lever (s_temp pool in smem vs routed to d_workspace).
+    # BC_IN_SMEM: surgical lever (only the cold BC slab routes to d_workspace).
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool BC_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner owns the pool placement; the repoint goes FIRST, before the offset-derived
+    # pointer declarations below, so every consumer (incl. the XImats helper's sincos
+    # scratch) follows the placement. Mirrors fdsva_so_full_inner / crba_inner.
+    self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    # Load/update XImats INSIDE the inner, AFTER the repoint, so its s_temp-backed
+    # sincos scratch follows the SCRATCH_IN_SMEM placement (no caller-side repoint).
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
 
 
     # MEMORY LAYOUT (s_temp):
@@ -1352,8 +1399,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
             # T2 (6*NJ)
             # T3 (6*NJ)
             # T4 (6*NJ)
-        # BC (36 * NJ)
-        # B_IC_S (36*NJ)/D3 (36*NJ)
+        # B_IC_S (36*NJ)/D3 (36*NJ)   <- anchored on S (stable), NOT on BC
         # crm_v (36 * NJ)/crm_S (36*NJ)
         # crf_v (36 * NJ)/crf_S (36*NJ)
         # crm_psid (36 * NJ)/crf_S_IC (36*NJ)
@@ -1361,13 +1407,16 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
         # icrf_f (36 * NJ)/D1 (36*NJ)
         # D2 (36*NJ)
         # Xup(36*NJ)/t - t1/t2/t3/t4/t5/t6/t7/t8/t9 [(len(jids_a) * 36]/p1 & p2 & p3 & p4 & p5 & p6 ([len(jids_a) * 6]*6)
+        # BC (36 * NJ)   <- LAST slab (top of arena); overlays Xup (forward-dead) & t/p
+        #                   (backward); surgical BC_IN_SMEM=false truncates exactly this.
 
 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     var_offset = len(jids_a)
     vars = [
         '// Relevant Tensors in the order they appear',
-        '(void)d_workspace;  // unused at TIER_PERF; cold buffers repoint here at LITE/MINIMAL',
+        '// d_workspace: at TIER_PERF unused; at the surgical BC rung only BC repoints here;',
+        '// at the whole-arena rung s_temp was already repointed to it above.',
         'T *I = s_XImats + XIMAT_SIZE*NUM_BODIES;', # Inertia Matrices (6x6 for each joint)
         f'T *Xup = s_temp + 11*XIMAT_SIZE*NUM_BODIES;', # Spatial Transforms from parent to child (6x6 for each joint)
         'T *IC = s_temp + XIMAT_SIZE*NUM_BODIES;', # Centroidal Inertia (6x6 for each joint)
@@ -1383,9 +1432,13 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
         'T *psid = a + 6*NUM_BODIES;', # Time derivative of joint subspace tensor due to each joint's parent moving (6x1 for each joint),
         'T *psidd = S + 6*NUM_BODIES;', # 2nd Time derivative of joint subspace tensor due to each joint's parent moving (6x1 for each joint),
         'T *a_world = psidd + 6*NUM_BODIES;', # Acceleration of the world frame (6x1)',
-        'T *BC = S + 30*NUM_BODIES + 6;', # Composite body-Coriolis Bias tensor (6x6 for each joint)',
         'T *f = vJ;', # Joint Spatial forces (6x1 for each joint),
-        'T *B_IC_S = BC + 36*NUM_BODIES;', # Body coriolis tensor wrt joint subspace (6x6 for each joint)',
+        # De-alias: B_IC_S/D3 anchor on the stable hot buffer S (NOT on BC). This keeps
+        # the whole hot matrix chain (B_IC_S..D2, then the t/p backward region) at fixed
+        # smem offsets that are independent of where BC lives. BC itself is relocated to
+        # the very TOP of the arena (after the t/p region, see below), so the surgical
+        # BC_IN_SMEM=false rung can shrink the smem arena by exactly BC's tail slab.
+        'T *B_IC_S = S + 30*NUM_BODIES + 6;', # Body coriolis tensor wrt joint subspace (6x6 for each joint)',
 
         '\n\n',
         '// Temporary Variables for Computations',
@@ -1421,7 +1474,19 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
         f'T *p5 = p4 + 6*{var_offset};', # Temporary cross product vector for p5 (6x1 for each joint and its ancestors)',
         f'T *p6 = p5 + 6*{var_offset};', # Temporary cross product vector used in computation of d2tau_dqd2[ancestor, joint, joint] (6x1 for each joint and its ancestors)',
         'T *crf_S_IC = crm_psid;', # Cross product of S and IC (6x6 for each joint)',
-        
+        # Composite body-Coriolis Bias tensor (6x6 for each joint). Relocated to the TOP
+        # of the arena (just past the t/p backward region) so it is the LAST 36*NB slab.
+        # BC is cold: written in the forward IC/BC propagation and last read by the
+        # T2/T3/T4/D2 tensors, then dead before the t/p backward loops. The high arena
+        # region it occupies is shared with Xup (forward-dead by the time BC is written)
+        # and the t/p region (backward-only, after BC is dead), so no live-range overlap.
+        # Because BC is the literal top slab, the surgical BC_IN_SMEM=false rung shrinks
+        # the smem arena by exactly 36*NB and truncates only BC's tail; every hot buffer
+        # below keeps its address. Total arena size is unchanged vs. the legacy layout
+        # (BC merely moved from its old mid-arena slot to the top; the hot chain shifted
+        # down by 36*NB to fill the vacated slot).
+        f'T *BC = p6 + 6*{var_offset};',
+
 
         '\n\n',
         '// Final Tensors for Output',
@@ -1435,7 +1500,11 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
 
     # Surgical spill: BC (36*NB) is a cold buffer (write-once, dead before the t1-t9/
     # p1-p6 hot loops, and not read by reference_order_output_repair), so at a spill
-    # tier it can move to global d_workspace while the hot buffers stay in smem.
+    # tier it can move to global d_workspace while the hot buffers stay in smem. BC is
+    # now the LAST (top) 36*NB slab of the arena (anchored on p6, above), so the smem
+    # arena can be allocated 36*NB smaller for this rung (see the kernel body's
+    # smem_temp computation) and only BC's tail is truncated — the hot chain below is
+    # untouched. d_workspace here is the typed BC slab passed by the kernel.
     self.gen_add_code_line("if constexpr (!BC_IN_SMEM) { BC = d_workspace; }")
 
     self.gen_add_code_line("// Initialize output tensor; optimized assembly paths only write structurally nonzero entries.")
@@ -2271,8 +2340,8 @@ def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input
     # add the shared memory variables
     shared_mem_size = self.gen_idsva_so_body_frame_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
-    # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    # The inner loads/updates XImats internally (inner-owns-placement), so no external
+    # XImats call here; this device wrapper keeps s_temp in smem (SCRATCH_IN_SMEM=true).
     self.gen_add_code_line("T *d_temp_spill = nullptr;")
     self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
     self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
@@ -2294,11 +2363,26 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     if use_qdd_input:
         extra_t_buffers.append(("s_qdd", n))
     inner_temp = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    smem_temp = 0 if s_temp_in_global else inner_temp
+    bc_slab = 36 * self.robot.get_num_bodies()
+    # smem s_temp allocation per rung:
+    #   - s_temp_in_global (whole-arena rung): 0 (inner repoints s_temp -> d_workspace).
+    #   - bc_in_global (surgical BC rung): inner_temp - BC. BC is the LAST (top) 36*NB
+    #     slab (see gen_idsva_so_body_frame_inner var layout), so dropping its tail keeps
+    #     every hot buffer below in place. This MUST match the per-tier launch smem bytes
+    #     (GRiDCodeGenerator.py: _idsva_bf_out - _idsva_bf_BC) or the kernel arena and the
+    #     launch disagree and the top slab reads OOB.
+    #   - otherwise (PERF / global_output rungs): full inner_temp.
+    if s_temp_in_global:
+        smem_temp = 0
+    elif bc_in_global:
+        smem_temp = inner_temp - bc_slab
+    else:
+        smem_temp = inner_temp
     self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers = extra_t_buffers)
-    # `d_temp_spill` is the typed view into d_workspace (gravity shim for floating; the
-    # BC offset for the surgical rung; nullptr otherwise). When s_temp routes to global
-    # the helper above declared `T *s_temp = nullptr;` which we repoint in-loop.
+    # `d_temp_spill` is the typed view into d_workspace handed to the inner as its
+    # `d_workspace` arg. The inner does the s_temp/BC repoint itself (inner-owns
+    # placement): whole-arena rung -> inner sets s_temp = d_temp_spill; surgical rung ->
+    # inner sets BC = d_temp_spill; floating shim -> gravity-Hessian uses it directly.
     self.gen_add_code_line("T *d_temp_spill = nullptr;")
     needs_workspace = self.robot.floating_base or s_temp_in_global or bc_in_global
     if not needs_workspace:
@@ -2308,16 +2392,14 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     else:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
     bc_in_smem_expr = "false" if bc_in_global else "true"
+    scratch_in_smem_expr = "false" if s_temp_in_global else "true"
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
 
     def _emit_spill_ptrs():
-        if self.robot.floating_base:
+        # Whichever spill is active routes through d_temp_spill; the inner consumes it.
+        if self.robot.floating_base or bc_in_global or s_temp_in_global:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
-        elif bc_in_global:
-            self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
-        if s_temp_in_global:
-            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
 
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
@@ -2326,12 +2408,11 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         else:
             self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(2*n + NUM_POS),use_thread_group)
         _emit_spill_ptrs()
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        self.gen_add_code_line("// compute (the inner loads/updates XImats internally, after its scratch repoint)")
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
         self.gen_add_end_control_flow()
@@ -2347,11 +2428,11 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
             self.gen_anti_licm_input_reload("q_qd",str(2*n),use_thread_group,"qdd",str(n))
         else:
             self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        # The inner loads/updates XImats internally each rep (after its scratch repoint).
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr)
+        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
         self.gen_add_end_control_flow()
         if not use_global_output: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
@@ -2560,10 +2641,11 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "s_qdd is the vector of joint accelerations",
         "s_temp is a pointer to helper shared memory of size = " + str(self.gen_idsva_so_world_frame_temp_mem_size()),
         "d_workspace is a pointer to per-timestep global-memory scratch (unused at TIER_PERF; cold buffers spill here at LITE/MINIMAL)",
+        "d_robotModel holds XImats/topology; the inner owns the load_update_XImats call (inner-owns-placement)",
         "gravity is the gravity constant",
     ]
     func_def_start = "void idsva_so_world_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "world-frame propagation, gravity baked into main sweep.",
@@ -2579,24 +2661,30 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "Computes IDSVA second-order derivatives via the world-frame single-pass formulation",
         func_notes, func_params, None,
     )
-    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true>")
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool COLD_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-
+    # Inner owns the XImats load too: the s_temp repoint below covers the helper's
+    # sincos scratch, so every consumer (incl. XImats) follows the placement and the
+    # kernel never repoints s_temp. Mirrors fdsva_so_full_inner (the canon).
     self.gen_add_code_lines([
         "// world-frame IDSVA-SO shared-memory layout.",
         "// Inner owns scratch placement: SCRATCH_IN_SMEM picks s_temp (shared) vs",
         "// d_workspace (global). Repointing s_temp here keeps every layout line below",
         "// unchanged. See docs/idsva_so_inner_refactor_notes.md (inner-owns-placement).",
         "if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }",
+    ])
+    # XImats is loaded INSIDE the inner, AFTER the s_temp repoint — so its sincos
+    # scratch (which uses s_temp) follows the same placement. Repoint FIRST, then load.
+    # (load_update_XImats_helpers ends with its own sync, matching fdsva_so_full_inner.)
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_add_code_lines([
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
+        "// --- HOT region (always smem when SCRATCH_IN_SMEM) ---",
         "T *Xup     = s_temp;",
-        "T *Xdown   = Xup     + 36*NUM_BODIES;",
-        "T *IC      = Xdown   + 36*NUM_BODIES;",
+        "T *IC      = Xup     + 36*NUM_BODIES;",
         "T *BC      = IC      + 36*NUM_BODIES;",
-        "T *v_w     = BC      + 36*NUM_BODIES;",
-        "T *a_w     = v_w     +  6*NUM_BODIES;",
-        "T *f_w     = a_w     +  6*NUM_BODIES;",
+        "T *f_w     = BC      + 36*NUM_BODIES;",
         "T *S_vel   = f_w     +  6*NUM_BODIES;",
         "T *Sd_vel  = S_vel   +  6*NUM_VEL;",
         "T *psid_v  = Sd_vel  +  6*NUM_VEL;",
@@ -2637,6 +2725,18 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "T *S_crf_S_f_i  = S_BCiT_S     +  6;",
         "T *S_A5_vec     = S_crf_S_f_i  +  6;",
         "T *S_A7_vec     = S_A5_vec     +  6;",
+        "// --- COLD region (end of arena): Xdown (dead after Step 3) + v_w/a_w (dead",
+        "// after Step 4's f_w build). Placed last so a surgical sub-region (d_cold) can",
+        "// route JUST these to d_workspace at a spill rung while the hot buffers stay smem.",
+        "T *Xdown   = S_A7_vec  +  6;",
+        "T *v_w     = Xdown     + 36*NUM_BODIES;",
+        "T *a_w     = v_w       +  6*NUM_BODIES;",
+        "// COLD_IN_SMEM=false repoints the cold trio to a d_workspace sub-region (d_cold).",
+        "// Contract: COLD_IN_SMEM=false is only used with SCRATCH_IN_SMEM=true (hot stays",
+        "// in smem), so d_cold = &d_workspace[0] is exclusive — the deep rung instead uses",
+        "// SCRATCH_IN_SMEM=false (whole arena, incl. these three, to d_workspace) with",
+        "// COLD_IN_SMEM=true. The two spill levers are mutually exclusive by construction.",
+        "if constexpr (!COLD_IN_SMEM) { Xdown = d_workspace; v_w = Xdown + 36*NUM_BODIES; a_w = v_w + 6*NUM_BODIES; }",
         "T *d2tau_dq2  = s_idsva_so;",
         "T *d2tau_dqd2 = d2tau_dq2  + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
         "T *d2tau_dvdq = d2tau_dqd2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
@@ -3131,66 +3231,85 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_end_function()
 
 
-def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False, scratch_in_smem_expr = "true"):
+def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False, scratch_in_smem_expr = "true",
+                                                 cold_in_smem_expr = "true"):
     """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper.
     scratch_in_smem_expr selects the inner's scratch placement (s_temp vs d_workspace);
-    callers spilling the world inner pass "false" + a valid d_temp_spill region."""
-    id_so_code_start = "idsva_so_world_frame_inner<T, " + scratch_in_smem_expr + ">(s_idsva_so, s_q, s_qd, s_qdd, "
+    cold_in_smem_expr selects the surgical cold-trio placement (Xdown/v_w/a_w in smem vs
+    d_workspace). Callers spilling the whole inner pass scratch="false" + a valid
+    d_temp_spill region; callers doing the surgical spill pass cold="false" + d_temp_spill.
+    The inner now OWNS the load_update_XImats call, so d_robotModel is threaded through."""
+    id_so_code_start = ("idsva_so_world_frame_inner<T, " + scratch_in_smem_expr + ", "
+                        + cold_in_smem_expr + ">(s_idsva_so, s_q, s_qd, s_qdd, ")
     id_so_code_middle = self.gen_insert_helpers_function_call()
-    # Unified signature: world inner takes (s_temp, d_workspace, gravity). `d_temp_spill`
-    # is the kernel-local typed view into d_workspace (nullptr until tier-spill wires it).
-    id_so_code_end = "s_temp, d_temp_spill, gravity);"
+    # Unified signature: world inner takes (s_temp, d_workspace, d_robotModel, gravity).
+    # `d_temp_spill` is the kernel-local typed view into d_workspace (nullptr at the full
+    # rung). d_robotModel is forwarded so the inner can own the XImats load.
+    id_so_code_end = "s_temp, d_temp_spill, d_robotModel, gravity);"
     if use_thread_group:
         id_so_code_start = id_so_code_start.replace("(", "(tgrp, ")
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
 def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group,
-                                                     use_global_output, s_temp_in_global):
+                                                     use_global_output, s_temp_in_global, cold_in_global = False):
     """Emit the idsva_so world-frame kernel body for one tier's spill flags.
 
-    Flags: use_global_output (4*NV^3 output -> d_idsva_so global) and
-    s_temp_in_global (whole world inner s_temp arena -> d_workspace; guaranteed-fit
-    fallback). No surgical rung here (the world inner is un-aliased; a surgical pass
-    is tractable future work — see docs/idsva_so_inner_refactor_notes.md).
+    Flags:
+      - use_global_output: 4*NV^3 output -> d_idsva_so global.
+      - cold_in_global:    surgical — only the cold trio (Xdown 36*NB + v_w/a_w 6*NB each)
+                           routes to d_workspace (inner COLD_IN_SMEM=false); hot stays smem.
+      - s_temp_in_global:  whole world inner s_temp arena -> d_workspace (inner
+                           SCRATCH_IN_SMEM=false; guaranteed-fit fallback).
+    The inner now OWNS its scratch placement AND the XImats load (inner-owns-placement,
+    mirrors fdsva_so_full_inner): the kernel no longer repoints s_temp nor calls
+    load_update_XImats — it just forwards the flags + the d_temp_spill region.
     """
     extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
     inner_temp = gen_idsva_so_world_frame_temp_mem_size(self) if self.robot.floating_base else self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    smem_temp = 0 if s_temp_in_global else inner_temp
+    # Surgical rung: hot arena = inner_temp minus the cold trio (36*NB + 12*NB).
+    cold_floats = 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
+    if s_temp_in_global:
+        smem_temp = 0
+    elif cold_in_global:
+        smem_temp = inner_temp - cold_floats
+    else:
+        smem_temp = inner_temp
     self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers=extra_t_buffers)
-    # `d_temp_spill` keeps the world inner call shape uniform (the world inner (void)s
-    # its d_workspace param); nullptr always for the world frame.
+    # `d_temp_spill` is the inner's d_workspace param: the whole-arena base (s_temp_in_global)
+    # or the cold-trio base / d_cold (cold_in_global). nullptr at the full rung.
     self.gen_add_code_line("T *d_temp_spill = nullptr;")
-    if not s_temp_in_global:
+    needs_workspace = s_temp_in_global or cold_in_global
+    if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
     self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
+    scratch_in_smem_expr = "false" if s_temp_in_global else "true"
+    cold_in_smem_expr = "false" if cold_in_global else "true"
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
         self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(2*n + NUM_POS), use_thread_group)
-        if s_temp_in_global:
-            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+        if needs_workspace:
+            self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         if use_global_output:
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group, scratch_in_smem_expr, cold_in_smem_expr)
         if not use_global_output:
             self.gen_kernel_save_result("idsva_so", str(4*n**3), str(4*n**3), use_thread_group)
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs_single_timing("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
-        if s_temp_in_global:
-            self.gen_add_code_line(f"s_temp = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+        if needs_workspace:
+            self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         if use_global_output:
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group, scratch_in_smem_expr, cold_in_smem_expr)
         self.gen_add_end_control_flow()
         if not use_global_output:
             self.gen_kernel_save_result_single_timing("idsva_so", str(4*n**3), use_thread_group)
@@ -3220,18 +3339,18 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
 
-    table = self._idsva_so_world_tier_table  # [(name, t_count, use_global_output, s_temp_in_global), ...]
+    table = self._idsva_so_world_tier_table  # [(name, t_count, use_global_output, s_temp_in_global, cold_in_global), ...]
     picks = self.idsva_so_world_frame_spill_tier_3way
     if picks[0] == picks[1] == picks[2]:
-        _, _, ugo, stg = table[picks[0]]
-        _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg)
+        _, _, ugo, stg, cig = table[picks[0]]
+        _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg, cig)
     else:
         for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
-            _, _, ugo, stg = table[picks[tier_idx]]
+            _, _, ugo, stg, cig = table[picks[tier_idx]]
             head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
                    ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
             self.gen_add_code_line(head, True)
-            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg)
+            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg, cig)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
