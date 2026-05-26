@@ -7,21 +7,23 @@ def gen_end_effector_pose_inner_temp_mem_size(self, fixed_target_name = ""):
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     return 2*16*num_ees
 
-def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, updated_var_names = None, fixed_target_name = ""):
+def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, updated_var_names = None, fixed_target_name = "",
+                                              temp_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
         s_eePos_name = "s_eePos", \
         s_q_name = "s_q", \
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
+        d_workspace_name = "nullptr", \
         s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T>(" + var_names["s_eePos_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T, " + temp_in_smem_expr + ">(" + var_names["s_eePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group and serial chains
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -45,11 +47,12 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                    "s_Xhom is the pointer to the homogenous transformation matricies ", \
                    "s_temp is a pointer to helper shared memory of size " + \
                             str(self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name)), \
-                   "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
+                   "d_workspace is the global-memory chain workspace used in place of s_temp when !TEMP_IN_SMEM", \
+                   "s_linalg_smem is optional byte-addressed shared memory (reserved; unused by this inner)"]
     func_notes = ["Assumes the Xhom matricies have already been updated for the given q", "Defaults to all leave nodes if fixed_target_name is not provided"]
     func_def_start = "void end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_eePos, const T *s_q, const T *s_Xhom, "
-    func_def_end = "T *s_temp, unsigned char *s_linalg_smem) {"
+    func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -58,9 +61,13 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     # now generate the code
     self.gen_add_func_doc("Computes the End Effector Position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch placement: the (tiny, double-buffered) chain
+    # workspace moves to d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the
+    # top keeps every s_temp[...] reference below unchanged.
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     #
     # Initial Debug Prints if Requested
     #
@@ -632,6 +639,14 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if not use_workspace_temp:
         self.gen_add_code_line("(void)d_workspace;")
+    # Per-tier eegrad_temp byte offset. The shared GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES
+    # macro keys off the single-valued PERF-pick GRID_EE_GRAD_USES_WORKSPACE_DXHOM, so it
+    # would collide with the spilled dXhom region at tiers whose pick spills dXhom but whose
+    # PERF pick does not (e.g. go2 ee_grad = (0,0,2)). Compute the offset locally from THIS
+    # tier's use_workspace_dxhom so the temp arena always lands past the spilled dXhom region.
+    eegrad_temp_off = "GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()"
+    if use_workspace_dxhom:
+        eegrad_temp_off += " + sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT)"
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -641,7 +656,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
             self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
-            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + eegrad_temp_off + "]);")
             # Whole inner arena spilled -> smem s_temp is null. Repoint it at the
             # spilled workspace so the XmatsHom helper's sincos scratch is backed.
             self.gen_add_code_line("s_temp = s_eegrad_temp;")
@@ -662,7 +677,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
             self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = d_deePos;")
-            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[" + eegrad_temp_off + "]);")
             # See note above: repoint the null smem s_temp at the spilled workspace.
             self.gen_add_code_line("s_temp = s_eegrad_temp;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
@@ -777,9 +792,11 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient\", DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
-    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    # Per-tier gate: arm L2 persistence if ANY tier routes the chain workspace
+    # through d_workspace (runtime RESOURCE_TIER may differ from the PERF pick).
+    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
@@ -803,7 +820,8 @@ def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self, include_d2_
     d2_temp_size = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size() if include_d2_temp else 0
     return 2*16*num_ees*(n+1) + d2_temp_size
 
-def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+                                                               d2temp_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
         s_dXhom_name = "s_dXmatsHom", \
@@ -814,14 +832,15 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
         s_topology_helpers_name = "s_topology_helpers", \
         s_temp_name = "s_temp", \
         s_d2eeTemp_name = "s_d2eeTemp", \
+        d_workspace_name = "nullptr", \
         s_linalg_smem_name = "s_linalg_smem", \
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_gradient_hessian_inner<T>(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_gradient_hessian_inner<T, " + d2temp_in_smem_expr + ">(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", " + var_names["s_d2Xhom_name"] + ", "
-    code_end =  var_names["s_temp_name"] + ", " + var_names["s_d2eeTemp_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
+    code_end =  var_names["s_temp_name"] + ", " + var_names["s_d2eeTemp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
     if use_thread_group:
         code_start = code_start.replace("(","(tgrp, ")
@@ -844,14 +863,18 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                    "s_dXhom is the pointer to the 1st derivative of the homogenous transformation matricies ", \
                    "s_d2Xhom is the pointer to the 2nd derivative of the homogenous transformation matricies ", \
                    "s_temp is a pointer to helper shared memory of size " + \
-                            str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)), \
+                            str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + \
+                            " (the hot eeTemp/deeTemp chain; kept in smem at every tier)", \
                    "s_d2eeTemp is a pointer to helper memory of size " + \
-                            str(self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()), \
+                            str(self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()) + \
+                            " (the large n^2 Hessian arena). When !D2TEMP_IN_SMEM the inner repoints it at d_workspace", \
+                   "d_workspace is the global spill arena s_d2eeTemp is repointed at when !D2TEMP_IN_SMEM (else unused)", \
                    "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
-    func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
+    func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q",
+                  "Inner-owns scratch placement: the large n^2 s_d2eeTemp arena moves to d_workspace when !D2TEMP_IN_SMEM. The smaller eeTemp/deeTemp chain (s_temp) stays in smem always (it is hot)."]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, const T *s_d2Xhom, "
-    func_def_end = "T *s_temp, T *s_d2eeTemp, unsigned char *s_linalg_smem) {"
+    func_def_end = "T *s_temp, T *s_d2eeTemp, T *d_workspace, unsigned char *s_linalg_smem) {"
     if use_thread_group:
         func_def_start += "cgrps::thread_group tgrp, "
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -860,9 +883,14 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     # now generate the code
     self.gen_add_func_doc("Computes the Gradient and Hessian of the End Effector Pose with respect to joint position",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool D2TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch placement: only the large n^2 s_d2eeTemp arena
+    # moves to d_workspace when !D2TEMP_IN_SMEM. Reassigning it at the top keeps
+    # every s_d2eeTemp[...] reference below unchanged. The hot eeTemp/deeTemp
+    # chain (s_temp) stays in smem at every tier.
+    self.gen_add_code_line("if constexpr (!D2TEMP_IN_SMEM) { s_d2eeTemp = d_workspace; } else { (void)d_workspace; }")
     #
     # Initial Debug Prints if Requested
     #
@@ -1204,24 +1232,26 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Smem arena: s_temp is the inner-no-d2 size always (in smem at every tier).
-    # s_d2eeTemp is tier-conditional: at TIER_PERF it extends the arena past
-    # linalg/topology; at TIER_LITE+ it comes from d_workspace.
+    # s_d2eeTemp placement is now INNER-OWNED: the device only carves the smem
+    # arena slot when this tier keeps it in smem (D2EE_D2TEMP_IN_SMEM<TIER>());
+    # otherwise it hands the inner d_workspace and the per-tier D2TEMP_IN_SMEM
+    # flag, and the inner repoints s_d2eeTemp at d_workspace itself.
     self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_no_d2_size, include_gradients = True, include_hessians = True,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
-    self.gen_add_code_line("T *s_d2eeTemp;")
-    self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
-    self.gen_add_code_line("(void)d_workspace;")
+    self.gen_add_code_line("T *s_d2eeTemp = nullptr;")
+    self.gen_add_code_line("if constexpr (D2EE_D2TEMP_IN_SMEM<RESOURCE_TIER>()) {", True)
     self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
     self.gen_add_code_line("s_d2eeTemp = grid_arena_ptr<T>(s_arena, s_arena_offset);")
     self.gen_add_code_line("s_arena_offset += sizeof(T) * static_cast<size_t>(" + str(d2_temp_size) + ");")
     self.gen_add_end_control_flow()
-    self.gen_add_code_line("else {", True)
-    self.gen_add_code_line("s_d2eeTemp = d_workspace;")
-    self.gen_add_end_control_flow()
     # then load/update XI and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
-    self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+    # Inner-owns placement: pass d_workspace + the per-tier flag. When the flag is
+    # false the inner repoints s_d2eeTemp (currently nullptr) at d_workspace.
+    self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+        updated_var_names = {"d_workspace_name": "d_workspace"},
+        d2temp_in_smem_expr = "D2EE_D2TEMP_IN_SMEM<RESOURCE_TIER>()")
     self.gen_add_end_function()
 
 _D2EE_PICK_FLAGS = [
@@ -1244,9 +1274,24 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_temp, use_w
                                                       include_d2xhom_shared = not use_workspace_d2xhom,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
+    # Inner-owns s_d2eeTemp placement. When this tier keeps it in smem, carve it
+    # from the tail of the (d2-inclusive) s_temp arena and pass the inner
+    # d2temp_in_smem='true' with a null workspace. When this tier spills it, leave
+    # s_d2eeTemp null and hand the inner the per-timestep workspace slice + 'false';
+    # the inner repoints s_d2eeTemp at d_workspace itself.
     if not use_workspace_temp:
         self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("T *s_d2eeTemp = &s_temp[" + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp = False)) + "];")
+    d2temp_in_smem_expr = "false" if use_workspace_temp else "true"
+    # Per-tier d2eeTemp byte offset into the workspace slice. The shared
+    # GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES macro keys off the single-valued
+    # PERF-pick GRID_D2EE_USES_WORKSPACE_D2XHOM, so it would collide with the
+    # spilled d2Xhom region at tiers whose pick spills d2Xhom but whose PERF pick
+    # does not. Compute the offset locally from THIS tier's use_workspace_d2xhom
+    # so d2eeTemp always lands past the (tier-local) spilled d2Xhom region.
+    d2eetemp_off = "GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
+    if use_workspace_d2xhom:
+        d2eetemp_off += " + sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT)"
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
@@ -1257,10 +1302,14 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_temp, use_w
         if use_workspace_temp:
             self.gen_add_code_line("T *s_d2eePos = &d_d2eePos[k*" + str(6*n*n*num_ees) + "];")
             self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
-            self.gen_add_code_line("T *s_d2eeTemp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES<T>()]);")
+            # Inner-owns: s_d2eeTemp stays null; the inner repoints it at this slice.
+            self.gen_add_code_line("T *s_d2eeTemp = nullptr;")
+            self.gen_add_code_line("T *s_d2eeTemp_ws = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + d2eetemp_off + "]);")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+        updated = {"d_workspace_name": "s_d2eeTemp_ws"} if use_workspace_temp else None
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+            updated_var_names = updated, d2temp_in_smem_expr = d2temp_in_smem_expr)
         self.gen_add_sync(use_thread_group)
         if not use_workspace_temp:
             self.gen_kernel_save_result("d2eePos",str(6*n*n*num_ees),str(6*n*n*num_ees),use_thread_group)
@@ -1273,12 +1322,16 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_temp, use_w
         if use_workspace_temp:
             self.gen_add_code_line("T *s_d2eePos = d_d2eePos;")
             self.gen_add_code_line("T *s_deePos = d_deePos;")
-            self.gen_add_code_line("T *s_d2eeTemp = reinterpret_cast<T *>(&d_workspace[GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES<T>()]);")
+            # Inner-owns: s_d2eeTemp stays null; the inner repoints it at this slice.
+            self.gen_add_code_line("T *s_d2eeTemp = nullptr;")
+            self.gen_add_code_line("T *s_d2eeTemp_ws = reinterpret_cast<T *>(&d_workspace[" + d2eetemp_off + "]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="d2eePos")
         self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True, include_hessians = True)
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group)
+        updated = {"d_workspace_name": "s_d2eeTemp_ws"} if use_workspace_temp else None
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+            updated_var_names = updated, d2temp_in_smem_expr = d2temp_in_smem_expr)
         self.gen_anti_licm_output_write("d2eePos")
         self.gen_add_end_control_flow()
         if not use_workspace_temp:
@@ -1386,9 +1439,11 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     self.gen_add_code_line("if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_gradient_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
-    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    # Per-tier gate: arm L2 persistence if ANY tier routes the d2eeTemp arena
+    # through d_workspace (runtime RESOURCE_TIER may differ from the PERF pick).
+    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_D2EE_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
