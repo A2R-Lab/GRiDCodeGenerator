@@ -160,25 +160,58 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             comment = "// s_v[k] = X[k]*v[parent_k] + S[k]*qd[k] and s_a[k] = X[k]*a[parent_k]"
             comment += " + S[k]*qdd[k] + mxS[k](v[k])*qd[k]" if use_qdd_input else " + mxS[k](v[k])*qd[k]"
             self.gen_add_code_line(comment)
-            # per-jid row_strided_gemv for v and a
-            for jid_val in inds:
-                parent_val = self.robot.get_parent_id(jid_val)
-                s_ind_val = self.robot.get_S_index_by_id(jid_val)
-                s_sign_val = self.robot.get_S_sign_by_id(jid_val)
-                qd_idx = str(jid_val + 5) if self.robot.floating_base else str(jid_val)
-                # v[jid] = X[jid]*v[parent] + S[jid]*qd[jid]
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*parent_val}], &s_vaf[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+            # Sibling joints at the SAME bfs level are independent (disjoint, already-computed
+            # parents), so we fuse all of this level's per-joint 6x6 row-strided GEMVs into ONE
+            # block-cooperative grid_linalg_segmented_row_strided_gemv call instead of a serial
+            # Python-unrolled loop. The += S*qd (and += S*qdd) correction folds into the same
+            # store via FUSE_SCALED_ADD: a compile-time per-segment selector vector S_sel holds
+            # the joint sign at the joint's S index (0 elsewhere), and scalar[seg] = qd[/qdd].
+            # This is a pure independent-work reorder -> numerically identical (per-segment GEMV
+            # column reduction order is unchanged), but it keeps threads busy across siblings.
+            seg = len(inds)
+            parents = [self.robot.get_parent_id(jid_val) for jid_val in inds]
+            s_inds = [self.robot.get_S_index_by_id(jid_val) for jid_val in inds]
+            s_signs = [self.robot.get_S_sign_by_id(jid_val) for jid_val in inds]
+            qd_idxs = [str(jid_val + 5) if self.robot.floating_base else str(jid_val) for jid_val in inds]
+            tag = "lvl" + str(bfs_level)
+            # compile-time descriptor / selector arrays for this level (element offsets)
+            a_off = ", ".join(str(36*jid_val) for jid_val in inds)
+            self.gen_add_code_line(f"static const int seg_a_off_{tag}[{seg}] = {{{a_off}}};")
+            v_x_off = ", ".join(str(6*p) for p in parents)
+            v_y_off = ", ".join(str(6*jid_val) for jid_val in inds)
+            self.gen_add_code_line(f"static const int seg_v_x_off_{tag}[{seg}] = {{{v_x_off}}};")
+            self.gen_add_code_line(f"static const int seg_v_y_off_{tag}[{seg}] = {{{v_y_off}}};")
+            # per-segment 6-vector selector: sign at the joint S index, 0 elsewhere (seg_s_off = 6*seg)
+            sel_vals = []
+            for i in range(seg):
+                row_vals = ["static_cast<T>(0)"]*6
+                row_vals[s_inds[i]] = f"static_cast<T>({s_signs[i]})"
+                sel_vals.extend(row_vals)
+            self.gen_add_code_line(f"static const int seg_s_off_{tag}[{seg}] = {{{', '.join(str(6*i) for i in range(seg))}}};")
+            self.gen_add_code_line(f"static const T S_sel_{tag}[{6*seg}] = {{{', '.join(sel_vals)}}};")
+            # build scalar[seg] = s_qd[qd_idx] in s_temp (free during the forward pass)
+            self.gen_add_serial_ops(use_thread_group)
+            for i in range(seg):
+                self.gen_add_code_line(f"s_temp[{i}] = s_qd[{qd_idxs[i]}];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync(use_thread_group)
+            # s_v[k] = X[k]*v[parent_k] (+= sign*qd[k] at S index) for all level joints at once
+            self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_v_x_off_{tag}, seg_v_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, s_temp, s_linalg_smem);")
+            # a[jid] = X[jid]*a[parent] (+= sign*qdd[k] at S index if use_qdd_input)
+            a_x_off = ", ".join(str(6*n + 6*p) for p in parents)
+            a_y_off = ", ".join(str(6*n + 6*jid_val) for jid_val in inds)
+            self.gen_add_code_line(f"static const int seg_a_x_off_{tag}[{seg}] = {{{a_x_off}}};")
+            self.gen_add_code_line(f"static const int seg_a_y_off_{tag}[{seg}] = {{{a_y_off}}};")
+            if use_qdd_input:
+                # rebuild scalar[seg] = s_qdd[qd_idx] in s_temp, then fuse the += S*qdd
                 self.gen_add_serial_ops(use_thread_group)
-                self.gen_add_code_line(f"s_vaf[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{qd_idx}];")
+                for i in range(seg):
+                    self.gen_add_code_line(f"s_temp[{i}] = s_qdd[{qd_idxs[i]}];")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
-                # a[jid] = X[jid]*a[parent] (+ S[jid]*qdd[jid] if use_qdd_input)
-                self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_vaf[{6*n + 6*parent_val}], &s_vaf[{6*n + 6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
-                if use_qdd_input:
-                    self.gen_add_serial_ops(use_thread_group)
-                    self.gen_add_code_line(f"s_vaf[{6*n + 6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qdd[{qd_idx}];")
-                    self.gen_add_end_control_flow()
-                    self.gen_add_sync(use_thread_group)
+                self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_a_x_off_{tag}, seg_a_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, s_temp, s_linalg_smem);")
+            else:
+                self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6>({seg}, seg_a_off_{tag}, seg_a_x_off_{tag}, seg_a_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0));")
 
             # add debug if requested
             if self.DEBUG_MODE:
