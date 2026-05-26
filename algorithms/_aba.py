@@ -25,24 +25,39 @@ def gen_aba_inner_floating(self, use_thread_group = False):
                 "s_qd is the vector of joint velocities", \
                 "s_tau is the vector of generalized forces", \
                 "s_temp is the (shared) scratch; size ABA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the band when TEMP_IN_SMEM, else 0)", \
-                "d_workspace is the global scratch; size ABA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
+                "d_workspace is the global scratch. !TEMP_IN_SMEM: the whole band (ABA_INNER_WORKSPACE_BYTES). TEMP_IN_SMEM && !COLD_IN_SMEM: the cold slab d_cold (ABA_INNER_COLD_BYTES = vcross 36*NJ + fb* root tail 138, packed back-to-back). Pass nullptr at PERF (TEMP_IN_SMEM && COLD_IN_SMEM).", \
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
     func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
                   "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly.",
-                  "Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs d_workspace), decided at the top."]
+                  "Inner-controlled placement, two orthogonal levers decided at the top:",
+                  "  TEMP_IN_SMEM=false                : whole scratch band -> d_workspace (blunt MINIMAL fallback).",
+                  "  TEMP_IN_SMEM=true, COLD_IN_SMEM=true  : PERF, everything in s_temp (byte-identical to the original).",
+                  "  TEMP_IN_SMEM=true, COLD_IN_SMEM=false : SURGICAL -- hot recursion stays in s_temp, only the cold vcross slab [36*NJ,72*NJ) and the fb* root tail [140*NJ,140*NJ+138) spill to d_cold (=d_workspace sub-offset), packed back-to-back.",
+                  "Caller sizes the arenas from ABA_INNER_{SMEM,WORKSPACE,COLD}_BYTES."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Floating-Base Articulated Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true, bool COLD_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch-band placement (two levers):
+    #   !TEMP_IN_SMEM           : whole band -> d_workspace (s_temp reassigned).
+    #   TEMP_IN_SMEM,!COLD_IN_SMEM: hot band stays in s_temp; the cold vcross
+    #     slab [36*NJ,72*NJ) and the fb* root tail [140*NJ,140*NJ+138) are
+    #     repointed through s_vcross_cold / s_fb_cold to d_cold (=d_workspace),
+    #     packed back-to-back (vcross at d_cold[0..36*NJ), fb tail after it).
+    # The biases line up the absolute offsets onto d_cold; when COLD_IN_SMEM
+    # both pointers are just s_temp -> byte-identical to the original.
     self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_add_code_line("T *s_vcross_cold = s_temp;")
+    self.gen_add_code_line("T *s_fb_cold = s_temp;")
+    self.gen_add_code_line("if constexpr (TEMP_IN_SMEM && !COLD_IN_SMEM) { s_vcross_cold = d_workspace - " + str(vcrossOffset) + "; s_fb_cold = d_workspace + " + str(36 * NJ - fbUOffset) + "; }")
     temp_size = self.gen_aba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
     self.gen_add_code_line("// Recursive floating ABA root-port.")
@@ -99,7 +114,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
     self.gen_add_code_line("// Initialize vcross[k]")
     self.gen_add_parallel_loop("jid", str(NJ), use_thread_group)
     self.gen_add_code_line("int jid6 = 6 * jid;")
-    self.gen_add_code_line("vcross<T>(&s_temp[" + str(vcrossOffset) + " + 36*jid], &s_va[jid6]);")
+    self.gen_add_code_line("vcross<T>(&s_vcross_cold[" + str(vcrossOffset) + " + 36*jid], &s_va[jid6]);")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -107,7 +122,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
     self.gen_add_parallel_loop("ind", str(36 * NJ), use_thread_group)
     self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) % 6; int jid = ind / 36;")
     self.gen_add_code_line("int jid6 = 6 * jid;")
-    self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + jid6*6 + row + col*6] = -dot_prod<T,6,1,1>(&s_temp[" + str(vcrossOffset) + " + 36*jid + row*6], &s_XImats[" + str(36 * NJ) + " + 36*jid + col*6]);")
+    self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + jid6*6 + row + col*6] = -dot_prod<T,6,1,1>(&s_vcross_cold[" + str(vcrossOffset) + " + 36*jid + row*6], &s_XImats[" + str(36 * NJ) + " + 36*jid + col*6]);")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
@@ -131,15 +146,15 @@ def gen_aba_inner_floating(self, use_thread_group = False):
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
             self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
-            self.gen_add_code_line("s_temp[" + str(fbUOffset) + " + ind] = s_temp[" + str(IAOffset) + " + row + 6*S_col];")
-            self.gen_add_code_line("s_temp[" + str(fbDOffset) + " + ind] = s_temp[" + str(IAOffset) + " + S_row + 6*S_col];")
-            self.gen_add_code_line("s_temp[" + str(fbDinvOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+            self.gen_add_code_line("s_fb_cold[" + str(fbUOffset) + " + ind] = s_temp[" + str(IAOffset) + " + row + 6*S_col];")
+            self.gen_add_code_line("s_fb_cold[" + str(fbDOffset) + " + ind] = s_temp[" + str(IAOffset) + " + S_row + 6*S_col];")
+            self.gen_add_code_line("s_fb_cold[" + str(fbDinvOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
-            self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(fbDOffset) + "], &s_temp[" + str(fbDinvOffset) + "], &s_temp[" + str(fbInvTempOffset) + "]);")
+            self.gen_add_code_line("invert_matrix(6, &s_fb_cold[" + str(fbDOffset) + "], &s_fb_cold[" + str(fbDinvOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
             self.gen_add_parallel_loop("col", "6", use_thread_group)
             self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
-            self.gen_add_code_line("s_temp[" + str(fbRhsOffset) + " + col] = s_tau[col] - s_temp[" + str(pAOffset) + " + S_col];")
+            self.gen_add_code_line("s_fb_cold[" + str(fbRhsOffset) + " + col] = s_tau[col] - s_temp[" + str(pAOffset) + " + S_col];")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             continue
@@ -207,17 +222,17 @@ def gen_aba_inner_floating(self, use_thread_group = False):
             self.gen_add_code_line("s_temp[" + str(tempVecOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
-            self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_temp[" + str(fbInvTempOffset) + "]);")
+            self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
             self.gen_add_parallel_loop("row", "6", use_thread_group)
             self.gen_add_code_line("s_va[" + str(6 * NJ) + " + row] = s_temp[" + str(tempVecOffset) + " + row + 6*5] * gravity;")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             self.gen_add_parallel_loop("row", "6", use_thread_group)
-            self.gen_add_code_line("s_temp[" + str(fbRhsOffset) + " + row] -= dot_prod<T,6,1,1>(&s_temp[" + str(fbUOffset) + " + 6*row], &s_va[" + str(6 * NJ) + "]);")
+            self.gen_add_code_line("s_fb_cold[" + str(fbRhsOffset) + " + row] -= dot_prod<T,6,1,1>(&s_fb_cold[" + str(fbUOffset) + " + 6*row], &s_va[" + str(6 * NJ) + "]);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             self.gen_add_parallel_loop("row", "6", use_thread_group)
-            self.gen_add_code_line("s_qdd[row] = dot_prod<T,6,6,1>(&s_temp[" + str(fbDinvOffset) + " + row], &s_temp[" + str(fbRhsOffset) + "]);")
+            self.gen_add_code_line("s_qdd[row] = dot_prod<T,6,6,1>(&s_fb_cold[" + str(fbDinvOffset) + " + row], &s_fb_cold[" + str(fbRhsOffset) + "]);")
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             self.gen_add_parallel_loop("row", "6", use_thread_group)
@@ -264,26 +279,35 @@ def gen_aba_inner(self, use_thread_group = False):
                 "s_qd is the vector of joint velocities", \
                 "s_tau is the vector of joint torques", \
                 "s_temp is the (shared) scratch; size ABA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the 140*NJ+ band when TEMP_IN_SMEM, else 0)", \
-                "d_workspace is the global scratch; size ABA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
+                "d_workspace is the global scratch. !TEMP_IN_SMEM: the whole band (ABA_INNER_WORKSPACE_BYTES). TEMP_IN_SMEM && !COLD_IN_SMEM: the cold slab d_cold (ABA_INNER_COLD_BYTES = the [98*NJ,140*NJ) tempMat slab). Pass nullptr at PERF (TEMP_IN_SMEM && COLD_IN_SMEM).", \
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
     func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
-                  "Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs d_workspace). Decided at the top; caller sizes both arenas from ABA_INNER_*_BYTES."]
+                  "Inner-controlled placement, two orthogonal levers decided at the top:",
+                  "  TEMP_IN_SMEM=false                : whole scratch band -> d_workspace (blunt MINIMAL fallback).",
+                  "  TEMP_IN_SMEM=true, COLD_IN_SMEM=true  : PERF, everything in s_temp (byte-identical to the original).",
+                  "  TEMP_IN_SMEM=true, COLD_IN_SMEM=false : SURGICAL -- hot recursion stays in s_temp, only the cold tempMat slab [98*NJ,140*NJ) spills to d_cold (=d_workspace sub-offset).",
+                  "Caller sizes the arenas from ABA_INNER_{SMEM,WORKSPACE,COLD}_BYTES."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Articulated Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true, bool COLD_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # Inner-controlled scratch-band placement: the whole band moves to
-    # d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps every
-    # s_temp[...] reference below unchanged.
+    # Inner-controlled scratch-band placement (two levers):
+    #   !TEMP_IN_SMEM           : whole band -> d_workspace (s_temp reassigned).
+    #   TEMP_IN_SMEM,!COLD_IN_SMEM: hot band stays in s_temp, the cold tempMat
+    #     slab [98*n,140*n) is repointed through s_cold to d_cold (=d_workspace).
+    # s_cold is biased by the cold base so the cold s_cold[98*n+...] references
+    # land at d_cold[0...]; when COLD_IN_SMEM it is just s_temp -> byte-identical.
     self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_add_code_line("T *s_cold = s_temp;")
+    self.gen_add_code_line("if constexpr (TEMP_IN_SMEM && !COLD_IN_SMEM) { s_cold = d_workspace - " + str(98 * n) + "; }")
     temp_size = self.gen_aba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
 
@@ -410,7 +434,7 @@ def gen_aba_inner(self, use_thread_group = False):
     self.gen_add_parallel_loop("ind", str(36*n), use_thread_group)
     self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) %6; int jid = ind / 36;")
     self.gen_add_code_line("int jid6 = 6 * jid;")
-    self.gen_add_code_line("s_temp[98 * " + str(n) + " + jid6*6 + row+col*6] = -1 * dot_prod<T,6,1,1>(&s_temp[36*("+str(n)+"+jid)+row*6], &s_XImats[36 * ("+str(n)+"+jid) + col*6]);")
+    self.gen_add_code_line("s_cold[98 * " + str(n) + " + jid6*6 + row+col*6] = -1 * dot_prod<T,6,1,1>(&s_temp[36*("+str(n)+"+jid)+row*6], &s_XImats[36 * ("+str(n)+"+jid) + col*6]);")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
     # calculate pA
@@ -418,7 +442,7 @@ def gen_aba_inner(self, use_thread_group = False):
     self.gen_add_parallel_loop("ind", str(6*n), use_thread_group)
     self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int jid = comp % " + str(n) + ";")
     self.gen_add_code_line("int jid6 = 6 * jid;")
-    self.gen_add_code_line("s_temp[78 * " + str(n) + " + jid6 + row] = dot_prod<T,6,6,1>(&s_temp[98 * " + str(n) + " + 6*jid6+row], &s_va[jid6]);")
+    self.gen_add_code_line("s_temp[78 * " + str(n) + " + jid6 + row] = dot_prod<T,6,6,1>(&s_cold[98 * " + str(n) + " + 6*jid6+row], &s_va[jid6]);")
 
     self.gen_add_end_control_flow()
 
@@ -525,7 +549,7 @@ def gen_aba_inner(self, use_thread_group = False):
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(36*(i+1)) for i in range(len(inds))], select_var_vals)
                 self.gen_add_code_line("int jid6 = 6 * jid;")
-                self.gen_add_code_line("s_temp[98 * " + str(n) + " + 6 * jid6 + row + 6*col] = dot_prod<T,6,1,1>(&s_XImats[6*jid6+6*row], &s_temp[36 * "+str(n)+"+jid6*6+6*col]);")
+                self.gen_add_code_line("s_cold[98 * " + str(n) + " + 6 * jid6 + row + 6*col] = dot_prod<T,6,1,1>(&s_XImats[6*jid6+6*row], &s_temp[36 * "+str(n)+"+jid6*6+6*col]);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
                 # update IA of the parent
@@ -536,7 +560,7 @@ def gen_aba_inner(self, use_thread_group = False):
                 self.gen_add_multi_threaded_select("ind", "<", [str(36*(i+1)) for i in range(len(inds))], select_var_vals)
                 self.gen_add_code_line("int jid6 = 6 * jid;")
                 self.gen_add_code_line("T prodtemp = static_cast<T>(0);")
-                self.gen_add_code_line("prodtemp =  dot_prod<T,6,6,1>(&s_temp[98 * " + str(n) + " + 6 * jid6 + row], &s_XImats[6*jid6+6*col]);")
+                self.gen_add_code_line("prodtemp =  dot_prod<T,6,6,1>(&s_cold[98 * " + str(n) + " + 6 * jid6 + row], &s_XImats[6*jid6+6*col]);")
                 self.gen_add_code_line("atomicAdd(&s_temp[36 * " + parent_ind_cpp +" + row + 6*col], prodtemp);")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync(use_thread_group)
@@ -545,8 +569,8 @@ def gen_aba_inner(self, use_thread_group = False):
                 for jid_val in inds:
                     parent_val = self.robot.get_parent_id(jid_val)
                     self.gen_add_code_line("// X[" + str(jid_val) + "].T*Ia[" + str(jid_val) + "]*X[" + str(jid_val) + "] -> IA[" + str(parent_val) + "]")
-                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid_val}], &s_temp[{36*(n+jid_val)}], &s_temp[{98*n + 36*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
-                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{98*n + 36*jid_val}], &s_XImats[{36*jid_val}], &s_temp[{36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid_val}], &s_temp[{36*(n+jid_val)}], &s_cold[{98*n + 36*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+                    self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_cold[{98*n + 36*jid_val}], &s_XImats[{36*jid_val}], &s_temp[{36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
 
             # update pA of the parent (sequential GEMVs safe even for repeated parents)
             self.gen_add_code_line("// pA[parent] += X[k].T*pa[k]")
@@ -667,8 +691,24 @@ def gen_aba_inner_temp_mem_size(self):
         return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
     return 140 * n
 
+def gen_aba_inner_cold_mem_size(self):
+    """Float count of the COLD sub-band aba_inner spills under the surgical
+    rung (TEMP_IN_SMEM=true, COLD_IN_SMEM=false). The hot recursion stays in
+    s_temp; only this cold slab moves to d_cold (a sub-offset of d_workspace).
+
+    FIXED-base : the tempMat/vcross build-scratch slab [98*n, 140*n) -> 42*n.
+    FLOATING   : vcross [36*NJ, 72*NJ) (36*NJ) packed contiguously ahead of the
+                 fb* root block tail [140*NJ, 140*NJ+138) (138) -> 36*NJ + 138.
+    The two floating regions are laid out back-to-back in d_cold so a single
+    d_cold pointer covers them (vcross at d_cold[0..36*NJ), fb tail at
+    d_cold[36*NJ..36*NJ+138))."""
+    n = self.robot.get_num_joints()
+    if self.robot.floating_base:
+        return 36 * n + 138
+    return 42 * n
+
 def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_names = None,
-                                temp_in_smem_expr = "true"):
+                                temp_in_smem_expr = "true", cold_in_smem_expr = "true"):
     var_names = dict( \
         s_va_name = "s_va", \
         s_q_name = "s_q", \
@@ -682,7 +722,7 @@ def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_name
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
+    aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ", " + cold_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
     aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
@@ -725,50 +765,78 @@ def gen_aba_device(self, use_thread_group = False):
     self.gen_aba_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
-def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing, use_thread_group):
-    """Emit aba_kernel body for one tier's spill flag.
-    use_workspace_temp=False: s_temp in smem (full arena); Level 0 / current.
-    use_workspace_temp=True:  s_temp redirected to L2-pinned workspace; smem arena holds only extra_t_buffers."""
-    shared_mem_size = 0 if use_workspace_temp else self.gen_aba_inner_temp_mem_size()
+def _aba_surgical_inner_smem_size(self):
+    """Float count the smem s_temp arena needs at the SURGICAL rung. The cold
+    band relocates to d_cold, but the remaining hot references run up to a
+    fixed top offset, so the contiguous arena must reach that offset.
+      FIXED   : hot ends at the cold base 98*n  -> reclaims the whole 42*n tail.
+      FLOATING: hot tempVec ends at 140*NJ; only the 138-float fb* tail above it
+                is reclaimed from smem (the interior vcross slot still spills to
+                d_cold but its smem hole cannot be compacted byte-identically)."""
+    n = self.robot.get_num_joints()
+    if self.robot.floating_base:
+        return self.gen_aba_inner_temp_mem_size() - 138
+    return 98 * n
+
+def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_call_timing, use_thread_group):
+    """Emit aba_kernel body for one tier's spill level.
+    level 0 (full)     : s_temp in smem, whole inner arena in smem (PERF; byte-identical to original).
+    level 1 (surgical) : hot recursion stays in smem; only the cold band spills to d_cold
+                         (= d_workspace sub-offset GRID_ABA_COLD_OFFSET_BYTES). smem holds the hot arena.
+    level 2 (workspace): whole inner arena redirected to L2-pinned workspace; smem holds only extra_t_buffers."""
+    use_workspace_temp = (level == 2)
+    use_cold_spill     = (level == 1)
+    if use_workspace_temp:
+        shared_mem_size = 0
+    elif use_cold_spill:
+        shared_mem_size = _aba_surgical_inner_smem_size(self)
+    else:
+        shared_mem_size = self.gen_aba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", nv), ("s_q_qd_tau", input_count), ("s_va", 12*n)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(nq + nv) + "];")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
+    # per-timestep workspace base expr (k-indexed in the batched kernel, slot 0 for single-timing)
+    ws_base = "&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]" if not single_call_timing else "d_workspace"
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_tau","stride_q_qd",str(input_count),use_thread_group)
-        if use_workspace_temp:
-            self.gen_add_code_line("T *aba_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
-            # The whole inner arena spilled to global, so the smem s_temp slot is
-            # null. Repoint s_temp at the workspace so the XImats helper's sincos
-            # scratch (and the inner) have a valid backing store, not nullptr.
-            self.gen_add_code_line("s_temp = aba_d_workspace;")
-        else:
-            self.gen_add_code_line("(void)d_workspace;")
+    else:
+        self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
+    if use_workspace_temp:
+        self.gen_add_code_line("T *aba_d_workspace = reinterpret_cast<T *>(" + ws_base + ");")
+        # The whole inner arena spilled to global, so the smem s_temp slot is
+        # null. Repoint s_temp at the workspace so the XImats helper's sincos
+        # scratch (and the inner) have a valid backing store, not nullptr.
+        self.gen_add_code_line("s_temp = aba_d_workspace;")
+    elif use_cold_spill:
+        # Surgical rung: hot band stays in smem s_temp; only the cold sub-band
+        # lives in d_cold, a sub-offset of the per-timestep workspace. Reuse the
+        # SO/grad band base (ABA never runs concurrently with SO/grad).
+        self.gen_add_code_line("T *aba_d_cold = reinterpret_cast<T *>(" + ws_base + " + GRID_ABA_COLD_OFFSET_BYTES<T>());")
+    else:
+        self.gen_add_code_line("(void)d_workspace;")
+    if not single_call_timing:
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_aba_inner_function_call(use_thread_group,
-            updated_var_names = (dict(d_workspace_name = "aba_d_workspace") if use_workspace_temp else None),
-            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
+            updated_var_names = (dict(d_workspace_name = "aba_d_workspace") if use_workspace_temp else
+                                 (dict(d_workspace_name = "aba_d_cold") if use_cold_spill else None)),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"),
+            cold_in_smem_expr = ("false" if use_cold_spill else "true"))
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("qdd",str(nv),str(nv),use_thread_group)
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs_single_timing("q_qd_tau",str(input_count),use_thread_group)
-        if use_workspace_temp:
-            self.gen_add_code_line("T *aba_d_workspace = reinterpret_cast<T *>(d_workspace);")
-            # See note above: repoint the null smem s_temp at the spilled workspace
-            # so the XImats helper scratch is backed by valid (global) memory.
-            self.gen_add_code_line("s_temp = aba_d_workspace;")
-        else:
-            self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_tau",str(input_count),use_thread_group,feedback_from="qdd")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
         self.gen_aba_inner_function_call(use_thread_group,
-            updated_var_names = (dict(d_workspace_name = "aba_d_workspace") if use_workspace_temp else None),
-            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
+            updated_var_names = (dict(d_workspace_name = "aba_d_workspace") if use_workspace_temp else
+                                 (dict(d_workspace_name = "aba_d_cold") if use_cold_spill else None)),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"),
+            cold_in_smem_expr = ("false" if use_cold_spill else "true"))
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result_single_timing("qdd",str(nv),use_thread_group)
@@ -797,20 +865,22 @@ def gen_aba_kernel(self, use_thread_group = False, single_call_timing = False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # Phase 3c: 3-way pick dispatch. ABA's inner scratch (140*NJ + 138) is
-    # heavily interleaved across the recursion, so we spill the whole arena
-    # as one band rather than surgically per-buffer. Level 0 = arena in smem
-    # (current); Level 1 = redirected to L2-pinned workspace.
+    # Surgical-spill ladder, 3 rungs. ABA's inner scratch (140*NJ + 138) keeps
+    # its hot recursion in smem and spills only the cold sub-band when it can.
+    #   level 0 (full)     : whole arena in smem (PERF; byte-identical to original).
+    #   level 1 (surgical) : hot band in smem, cold sub-band -> d_cold.
+    #   level 2 (workspace): whole arena -> L2-pinned workspace (blunt fallback).
+    # picks[tier] IS the level for that tier (see aba_spill_tier_3way).
     picks = getattr(self, "aba_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
-        _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing, use_thread_group)
+        _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, picks[0], single_call_timing, use_thread_group)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing, use_thread_group)
+            _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, pick, single_call_timing, use_thread_group)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
