@@ -47,10 +47,14 @@ def _integrator_type_token(integrator_type):
     return integrator_type
 
 
-def gen_integrator_inner_temp_mem_size(self):
+def gen_integrator_inner_temp_mem_size(self, minv_f_in_smem=True):
     # Integrator's only extra scratch is the FD itself; the assembly step is
-    # in-place over a parallel loop with no additional storage.
-    return self.gen_forward_dynamics_inner_temp_mem_size()
+    # in-place over a parallel loop with no additional storage. The surgical
+    # Minv-F lever is forwarded straight through to the FD inner: when
+    # minv_f_in_smem the FD's 6*NV*NV F-region is sized into s_temp here; when
+    # spilled it lives in d_workspace and is excluded (callers size per
+    # placement via INTEGRATOR_INNER_{SMEM,WORKSPACE}_BYTES<T, MINV_F_IN_SMEM>).
+    return self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=minv_f_in_smem)
 
 
 def gen_lie_group_helpers(self):
@@ -411,7 +415,23 @@ def gen_integrator_inner(self, use_thread_group=False):
     """Templated inner: invokes forward_dynamics_inner(es) then either the
     single-stage integrator_finish or a multi-stage weighted assembly.
 
+    Templated on `<T, IntegratorType IT, bool MINV_F_IN_SMEM>`. The single
+    surgical lever (MINV_F_IN_SMEM) is forwarded straight into every FD-inner
+    call: when true the FD inner's 6*NV*NV Minv F-region lives in s_temp, when
+    false it spills to the L2-pinned d_workspace (the hot FD path stays in
+    smem either way). Arenas are sized per placement by the canonical trio in
+    GRiDCodeGenerator.py: INTEGRATOR_INNER_SMEM_BYTES<T, MINV_F_IN_SMEM>,
+    INTEGRATOR_INNER_WORKSPACE_BYTES<T, MINV_F_IN_SMEM>, and the per-robot
+    tier->placement map INTEGRATOR_MINV_F_IN_SMEM<TIER>. There is intentionally
+    no whole-arena lever here — the value path's single F lever is sufficient.
+
     Caller owns:
+      - the stage-1 s_XImats load (load_update_XImats_helpers for s_q) — the
+        inner re-derives s_XImats internally only for the multi-stage
+        intermediate configs (s_p1_q/...); stage 1 is loaded by the
+        device/kernel wrappers before the call. (Kept caller-owned so the
+        value-path emitted CUDA stays byte-identical; the optional
+        helper-inside-inner uniformity move was deliberately skipped.)
       - `s_qdd`: stage-1 qdd output (size n) — always used.
       - `s_stage_qdd`: stages 2..N qdd outputs (size (max_stages-1)*n) — only
         used for multi-stage integrators (Midpoint/RK3/RK4).
@@ -435,7 +455,7 @@ def gen_integrator_inner(self, use_thread_group=False):
                    "s_stage_qdd is shared memory for stages 2..N qdd outputs (size " + str(extra_qdd_count) + ")",
                    "s_stage_point is shared memory for stages 2..N intermediate (q,qd) states (size " + str(extra_point_count) + ")",
                    "s_temp is the pointer to the shared memory needed of size: " +
-                       str(self.gen_integrator_inner_temp_mem_size()),
+                       str(self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=True)),
                    "gravity is the gravity constant",
                    "dt is the integration timestep"]
     func_def_start = ("void integrator_inner(T *s_x_kp1, const T *s_q, const T *s_qd, const T *s_u, "
@@ -638,7 +658,9 @@ def gen_integrator_device(self, use_thread_group=False):
     self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def_start + func_def_end, True)
-    shared_mem_size = self.gen_integrator_inner_temp_mem_size()
+    # Device wrapper keeps the FD Minv-F region in smem (the default PERF
+    # placement); the spill ladder is exercised through the kernel path.
+    shared_mem_size = self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=True)
     max_stages = _max_stages_in_use()
     extra_t_buffers = [
         ("s_qdd", n),
