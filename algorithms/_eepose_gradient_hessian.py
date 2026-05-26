@@ -477,86 +477,38 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                     self.gen_add_end_control_flow()
                     self.gen_add_sync(use_thread_group)
         else:
-            # if first loop then just set to transform at the leaf
-            if bfs_level == 0:
-                self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
-                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
-                select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
-                # make sure to zero out all things not in the chain
-                jidChainCode = []
-                for eejid in all_ees:
-                    jidChain = sorted(self.robot.get_ancestors_by_id(eejid))
-                    jidChain.append(eejid)
-                    qinds = []
-                    for jid in jidChain:
-                        qind = self.robot.get_joint_index_q(jid)
-                        qinds.extend(qind if isinstance(qind, list) else [qind])
-                    code = self.gen_var_in_list("djid", [str(qind) for qind in qinds])
-                    jidChainCode.append(code)
-                select_var_vals.append(("bool", "inChain", jidChainCode))
-                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
-                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
-                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, eeInd);")
-                self.gen_add_code_line("s_deeTemp[ind] = inChain * s_Xhom_dXhom[rc];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-                if self.DEBUG_MODE:
-                    self.gen_add_sync(use_thread_group)
-                    self.gen_add_serial_ops(use_thread_group)
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}")
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain level[%d] with dj_ee_id [%d]\\n\"," + str(bfs_level) + ",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}")
-                    self.gen_add_end_control_flow()
-                    self.gen_add_sync(use_thread_group)
-            else:
-                self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                # get the parents we need at this level working backwards from all_ees
-                curr_parents = all_ees
-                for i in range(bfs_level):
-                    curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
-                # need to swap dst and start each time
-                even = bfs_level % 2
-                tempDstOffset = 16*n*num_ees*(even)
-                tempSrcOffset = 16*n*num_ees*(not even)
-                # SIMT parallel_loop computes s_eeTemp (the 4×4 chain product
-                # against parent_jid's homogeneous transform) and s_deeTemp
-                # (the gradient version) per (djid, ee, row, col) cell.
-                # Pre-v2.0 had an opt-in `glass::nvidia::gemm_strided_batched_1d`
-                # path for s_eeTemp on cuBLASDx builds; the 2026-05-18
-                # autotune + sweep showed cuBLASDx loses to SIMT on 4×4×4 by
-                # 2.6× so the dispatch was removed (see
-                # docs/source/user_guide/concepts/cublasdx_removal_design.rst).
-                self.gen_add_parallel_loop("ind",str(16*n*num_ees),use_thread_group)
-                self.gen_add_code_line("int rc = ind % 16; int djid = (ind / 16) % " + str(n) + ";")
-                self.gen_add_code_line("int row = rc % 4; int colInd = ind - row;")
-                # get parents for this level
-                select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
-                self.gen_add_multi_threaded_select("ind", "<", [str(16*n*(i+1)) for i in range(num_ees)], select_var_vals)
-                if (-1 in curr_parents):
-                    self.gen_add_code_line("if(parent_jid == -1){continue;}")
-                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom[16*parent_jid + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, parent_jid);")
-                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-                if self.DEBUG_MODE:
-                    self.gen_add_sync(use_thread_group)
-                    self.gen_add_serial_ops(use_thread_group)
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"X_chain[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i + " + str(tempDstOffset) + "],4);}")
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n*num_ees) + "; i++){printf(\"dX_chain[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i + " + str(tempDstOffset) + "],4);}")
-                    self.gen_add_end_control_flow()
-                    self.gen_add_sync(use_thread_group)
-    
-    self.gen_add_code_line("//")
-    self.gen_add_code_line("// Now extract the eePos from the Transforms")
-    self.gen_add_code_line("// TODO: ADD OFFSETS")
-    self.gen_add_code_line("//")
-    tempOffset = 16*n*num_ees*(bfs_level % 2)
+            # NON-SERIAL / FLOATING-BASE: the legacy dense path computed ALL
+            # (djid, ee) pairs at every BFS level and masked the out-of-chain
+            # ones with `inChain` (most work computed then discarded). Instead we
+            # emit ONE compacted chain-up over only the in-chain (ee, djid) pairs
+            # via grid_linalg_indexed_batched_gemm, then break out of the
+            # bfs_level loop (the compaction already walks every level). Output is
+            # numerically identical: the masked entries contributed exactly 0.
+            _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group)
+            break
+    if self.robot.is_serial_chain():
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Now extract the eePos from the Transforms")
+        self.gen_add_code_line("// TODO: ADD OFFSETS")
+        self.gen_add_code_line("//")
+        tempOffset = 16*n*num_ees*(bfs_level % 2)
+        _emit_eepose_grad_extraction(self, n, num_ees, tempOffset, tempOffset, use_thread_group, ee_compact = False)
+    self.gen_add_end_function()
+
+def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, use_thread_group, ee_compact = False):
+    # Shared eePos extraction: reads the chained ee transform (s_eeTemp at ee_off)
+    # and the gradient transform (s_deeTemp at dee_off) and writes s_deePos. When
+    # ee_compact is True the ee transform is stored once per ee (slot = deeInd/n)
+    # instead of redundantly per (ee, djid) pair (the serial/dense path used the
+    # redundant layout and passes ee_off == dee_off, ee_compact == False).
     self.gen_add_parallel_loop("ind",str(6*n*num_ees),use_thread_group)
     self.gen_add_code_line("int outputInd = ind % 6; int deeInd = ind / 6;")
-    self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[" + str(tempOffset) + " + 16*deeInd]; T *s_dXmat_hom = &s_deeTemp[" + str(tempOffset) + " + 16*deeInd];")
+    if ee_compact:
+        # ee transform stored once per ee (slot = deeInd / n); deeTemp still full
+        # (ee*n + djid) layout (out-of-chain slots pre-zeroed -> 0 gradient out).
+        self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[" + str(ee_off) + " + 16*(deeInd / " + str(n) + ")]; T *s_dXmat_hom = &s_deeTemp[" + str(dee_off) + " + 16*deeInd];")
+    else:
+        self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[" + str(ee_off) + " + 16*deeInd]; T *s_dXmat_hom = &s_deeTemp[" + str(dee_off) + " + 16*deeInd];")
     # xyz position is easy (eePos_xyz1 = Xmat_hom * offset) where offset = [x,y,z,1]
     self.gen_add_code_line("// xyz is easy")
     self.gen_add_code_line("if (outputInd < 3){s_deePos[6*deeInd + outputInd] = s_dXmat_hom[12 + outputInd];}")
@@ -566,7 +518,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     self.gen_add_code_line("// Also note that d/dz of sqrt(f(z)) = f'(z)/2sqrt(f(z))")
     self.gen_add_code_line("else {", add_indent_after=True)
     self.gen_add_code_line("// simpler to recompute")
-    self.gen_add_code_line("T sqrtTerm = sqrt(s_Xmat_hom[10]*s_Xmat_hom[10] + s_Xmat_hom[6]*s_Xmat_hom[6]);") 
+    self.gen_add_code_line("T sqrtTerm = sqrt(s_Xmat_hom[10]*s_Xmat_hom[10] + s_Xmat_hom[6]*s_Xmat_hom[6]);")
     self.gen_add_code_line("T dsqrtTerm = (s_Xmat_hom[10]*s_dXmat_hom[10] + s_Xmat_hom[6]*s_dXmat_hom[6])/sqrtTerm;")
     select_var_vals = [("T", "y",       ["s_Xmat_hom[6]",  "-s_Xmat_hom[2]",  "s_Xmat_hom[1]"]), \
                        ("T", "x",       ["s_Xmat_hom[10]",  "sqrtTerm",        "s_Xmat_hom[0]"]), \
@@ -577,7 +529,405 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    self.gen_add_end_function()
+
+def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group):
+    # ---- Compacted (in-chain only) gradient chain-up for the non-serial /
+    # floating-base case. Replaces the dense n*num_ees-per-level sweep that
+    # masked out-of-chain pairs. Numerically identical: out-of-chain gradients
+    # are exactly 0, and we keep the deeTemp pairs at the SAME (ee*n + djid)
+    # slot layout (pre-zeroed) so the shared extraction reads them unchanged.
+    #
+    # Layout:
+    #   s_eeTemp  : per-ee FK transform, double-buffered. ee `ei` -> slot
+    #               parity*num_ees + ei  (16 floats / matrix).
+    #   s_deeTemp : per in-chain (ei, djid) gradient transform, double-buffered
+    #               at the full (ei*n + djid) layout. parity offset 16*n*num_ees.
+    #
+    # The chain for ee `ei` is J_e = [ee, parent(ee), ... , root]. At BFS level l
+    # the incoming factor is joint J_e[l]; for the gradient pair (ei, djid) that
+    # factor is dXhom[djid] iff djid affects J_e[l] (exactly one level per pair),
+    # else Xhom[J_e[l]]. Each level is two grid_linalg_indexed_batched_gemm calls
+    # (one A_base = s_dXhom for the dX-substituted pairs, one A_base = s_Xhom for
+    # the rest) plus the per-ee FK multiply.
+    import_q = self.robot.get_joint_index_q
+    # `affects(q, j)` mirrors grid_q_index_affects_joint for BOTH base modes:
+    # q affects joint j iff q is one of j's q-indices (floating root joint 0 owns
+    # the 0..5/6 base coords; a revolute joint owns exactly its single q-index).
+    def _affects_set(joint_id):
+        q = import_q(joint_id)
+        return set(q) if isinstance(q, list) else {q}
+    affects = lambda q_index, joint_id: q_index in _affects_set(joint_id)
+    # Build per-ee chains and the flat in-chain pair list.
+    ee_chains = []          # ee_chains[ei] = [ee, p1, ..., root]
+    max_len = 0
+    for ee in all_ees:
+        chain = [ee]
+        cur = ee
+        while True:
+            par = self.robot.get_parent_id(cur)
+            if par == -1:
+                break
+            chain.append(par)
+            cur = par
+        ee_chains.append(chain)
+        max_len = max(max_len, len(chain))
+    # in-chain q-indices per ee (sorted, matches dense djid ascending order)
+    ee_qinds = []
+    for ei, ee in enumerate(all_ees):
+        qset = set()
+        for j in ee_chains[ei]:
+            q = import_q(j)
+            for qi in (q if isinstance(q, list) else [q]):
+                qset.add(qi)
+        ee_qinds.append(sorted(qset))
+
+    self.gen_add_code_line("// NON-SERIAL: compacted in-chain chain-up (GLASS indexed batched 4x4 GEMM)")
+    # zero s_deeTemp (both buffers) so out-of-chain (ee,djid) slots read as 0 in
+    # extraction -> exactly the dense `inChain * ...` masked result.
+    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees), use_thread_group)
+    self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # ---- Level 0: seed eeTemp (per ee) and deeTemp (per in-chain pair).
+    # eeTemp[ei] = Xhom[ee]; deeTemp[ei,djid] = (djid affects ee ? dXhom[djid] : Xhom[ee]).
+    self.gen_add_code_line("// level 0: seed per-ee FK transform")
+    self.gen_add_parallel_loop("ind", str(16*num_ees), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
+    select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
+    self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
+    self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # level-0 deeTemp seed: for each in-chain pair, the leaf factor.
+    seed_pairs = []   # (dst_slot, src_matrix_slot_in_base, base) base in {"X","dX"}
+    for ei, ee in enumerate(all_ees):
+        for djid in ee_qinds[ei]:
+            dst = ei*n + djid
+            if affects(djid, ee):
+                seed_pairs.append((dst, djid, "dX"))
+            else:
+                seed_pairs.append((dst, ee, "X"))
+    self.gen_add_code_line("// level 0: seed per-(ee,djid) gradient transform (in-chain only)")
+    self.gen_add_code_line("static const int grad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
+    self.gen_add_code_line("static const int grad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
+    self.gen_add_code_line("static const int grad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
+    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
+    self.gen_add_code_line("const T *s_src = grad_seed_isdx[p] ? &s_dXhom[16*grad_seed_src[p]] : &s_Xhom[16*grad_seed_src[p]];")
+    self.gen_add_code_line("s_deeTemp[16*grad_seed_dst[p] + rc] = s_src[rc];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # ---- Levels 1..max_len-1: chain up by the parent factor at that level.
+    for level in range(1, max_len):
+        even = level % 2
+        ee_dst_off = 16*num_ees*even
+        ee_src_off = 16*num_ees*(not even)
+        dee_dst_off = 16*n*num_ees*even
+        dee_src_off = 16*n*num_ees*(not even)
+        # eeTemp: for each ee whose chain has a joint at this level: dst = parent * src.
+        ee_a, ee_b, ee_c = [], [], []   # matrix slots
+        for ei in range(num_ees):
+            if level < len(ee_chains[ei]):
+                par = ee_chains[ei][level]
+                ee_a.append(par)                                  # s_Xhom slot
+                ee_b.append((ee_src_off // 16) + ei)              # s_eeTemp src slot
+                ee_c.append((ee_dst_off // 16) + ei)              # s_eeTemp dst slot
+        # deeTemp: split into dX-substituted and X-only pair lists at this level.
+        dee_dx_a, dee_dx_b, dee_dx_c = [], [], []
+        dee_x_a,  dee_x_b,  dee_x_c  = [], [], []
+        # carry-forward copies: ees whose chain already reached the root must keep
+        # ping-ponging so EVERY ee lands in the same final-parity buffer (the dense
+        # path assumed uniform final parity; copying makes us robust regardless).
+        ee_carry_src, ee_carry_dst = [], []   # eeTemp matrix slots
+        dee_carry_src, dee_carry_dst = [], []  # deeTemp matrix slots
+        for ei in range(num_ees):
+            if level >= len(ee_chains[ei]):
+                ee_carry_src.append((ee_src_off // 16) + ei)
+                ee_carry_dst.append((ee_dst_off // 16) + ei)
+                for djid in ee_qinds[ei]:
+                    dee_carry_src.append((dee_src_off // 16) + ei*n + djid)
+                    dee_carry_dst.append((dee_dst_off // 16) + ei*n + djid)
+        for ei in range(num_ees):
+            if level >= len(ee_chains[ei]):
+                continue
+            par = ee_chains[ei][level]
+            for djid in ee_qinds[ei]:
+                src_slot = (dee_src_off // 16) + ei*n + djid
+                dst_slot = (dee_dst_off // 16) + ei*n + djid
+                if affects(djid, par):
+                    dee_dx_a.append(djid)            # s_dXhom slot
+                    dee_dx_b.append(src_slot)
+                    dee_dx_c.append(dst_slot)
+                else:
+                    dee_x_a.append(par)              # s_Xhom slot
+                    dee_x_b.append(src_slot)
+                    dee_x_c.append(dst_slot)
+        self.gen_add_code_line("// level " + str(level) + "/" + str(max_len-1) + ": chain up by parent factor")
+        sfx = "_l" + str(level)
+        # eeTemp FK multiply
+        if ee_a:
+            self.gen_add_code_line("static const int ee_a" + sfx + "[] = {" + ", ".join(map(str, ee_a)) + "};")
+            self.gen_add_code_line("static const int ee_b" + sfx + "[] = {" + ", ".join(map(str, ee_b)) + "};")
+            self.gen_add_code_line("static const int ee_c" + sfx + "[] = {" + ", ".join(map(str, ee_c)) + "};")
+            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(ee_a)) + ", ee_a" + sfx + ", ee_b" + sfx + ", ee_c" + sfx + ", s_Xhom, s_eeTemp, s_eeTemp);")
+        # deeTemp X-only multiply
+        if dee_x_a:
+            self.gen_add_code_line("static const int dee_xa" + sfx + "[] = {" + ", ".join(map(str, dee_x_a)) + "};")
+            self.gen_add_code_line("static const int dee_xb" + sfx + "[] = {" + ", ".join(map(str, dee_x_b)) + "};")
+            self.gen_add_code_line("static const int dee_xc" + sfx + "[] = {" + ", ".join(map(str, dee_x_c)) + "};")
+            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(dee_x_a)) + ", dee_xa" + sfx + ", dee_xb" + sfx + ", dee_xc" + sfx + ", s_Xhom, s_deeTemp, s_deeTemp);")
+        # deeTemp dX-substituted multiply
+        if dee_dx_a:
+            self.gen_add_code_line("static const int dee_da" + sfx + "[] = {" + ", ".join(map(str, dee_dx_a)) + "};")
+            self.gen_add_code_line("static const int dee_db" + sfx + "[] = {" + ", ".join(map(str, dee_dx_b)) + "};")
+            self.gen_add_code_line("static const int dee_dc" + sfx + "[] = {" + ", ".join(map(str, dee_dx_c)) + "};")
+            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(dee_dx_a)) + ", dee_da" + sfx + ", dee_db" + sfx + ", dee_dc" + sfx + ", s_dXhom, s_deeTemp, s_deeTemp);")
+        # carry forward already-finished ees (copy src->dst parity, unchanged value)
+        if ee_carry_src:
+            self.gen_add_code_line("static const int ee_csrc" + sfx + "[] = {" + ", ".join(map(str, ee_carry_src)) + "};")
+            self.gen_add_code_line("static const int ee_cdst" + sfx + "[] = {" + ", ".join(map(str, ee_carry_dst)) + "};")
+            self.gen_add_parallel_loop("ind", str(16*len(ee_carry_src)), use_thread_group)
+            self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
+            self.gen_add_code_line("s_eeTemp[16*ee_cdst" + sfx + "[c] + rc] = s_eeTemp[16*ee_csrc" + sfx + "[c] + rc];")
+            self.gen_add_end_control_flow()
+        if dee_carry_src:
+            self.gen_add_code_line("static const int dee_csrc" + sfx + "[] = {" + ", ".join(map(str, dee_carry_src)) + "};")
+            self.gen_add_code_line("static const int dee_cdst" + sfx + "[] = {" + ", ".join(map(str, dee_carry_dst)) + "};")
+            self.gen_add_parallel_loop("ind", str(16*len(dee_carry_src)), use_thread_group)
+            self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
+            self.gen_add_code_line("s_deeTemp[16*dee_cdst" + sfx + "[c] + rc] = s_deeTemp[16*dee_csrc" + sfx + "[c] + rc];")
+            self.gen_add_end_control_flow()
+        if ee_carry_src or dee_carry_src:
+            self.gen_add_sync(use_thread_group)
+        # NOTE: grid_linalg_indexed_batched_gemm already issues a trailing
+        # __syncthreads(); the three calls in this level read distinct buffers /
+        # disjoint c_idx slots so they are independent. The carry-forward copies
+        # write the OTHER parity half (distinct slots) so they are independent too.
+    # final parity after the last level
+    final_level = max_len - 1
+    final_even = final_level % 2
+    ee_final_off = 16*num_ees*final_even
+    dee_final_off = 16*n*num_ees*final_even
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// extract eePos from the compacted transforms (ee transform per-ee)")
+    self.gen_add_code_line("//")
+    # extraction reads eeTemp per-ee (slot deeInd/n) at ee_final_off and deeTemp
+    # at the full (ee*n+djid) layout at dee_final_off.
+    _emit_eepose_grad_extraction(self, n, num_ees, ee_final_off, dee_final_off, use_thread_group, ee_compact = True)
+
+def _eepose_chain_metadata(self, all_ees):
+    # Shared topology pre-compute for the compacted non-serial ee chains.
+    # Returns (ee_chains, ee_qinds, max_len, affects) where ee_chains[ei] is the
+    # leaf->root joint list and ee_qinds[ei] the sorted in-chain q-indices.
+    # `affects(q, j)` mirrors grid_q_index_affects_joint for BOTH base modes.
+    def _affects_set(joint_id):
+        q = self.robot.get_joint_index_q(joint_id)
+        return set(q) if isinstance(q, list) else {q}
+    affects = lambda q_index, joint_id: q_index in _affects_set(joint_id)
+    ee_chains, max_len = [], 0
+    for ee in all_ees:
+        chain, cur = [ee], ee
+        while True:
+            par = self.robot.get_parent_id(cur)
+            if par == -1:
+                break
+            chain.append(par); cur = par
+        ee_chains.append(chain); max_len = max(max_len, len(chain))
+    ee_qinds = []
+    for ei, ee in enumerate(all_ees):
+        qset = set()
+        for j in ee_chains[ei]:
+            q = self.robot.get_joint_index_q(j)
+            for qi in (q if isinstance(q, list) else [q]):
+                qset.add(qi)
+        ee_qinds.append(sorted(qset))
+    return ee_chains, ee_qinds, max_len, affects
+
+def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group):
+    # ---- Compacted (in-chain only) gradient + hessian chain-up for the
+    # non-serial / floating-base case. Replaces the dense n*n*num_ees-per-level
+    # quadratic sweep that masked out-of-chain (i,j,ee) triples. Numerically
+    # identical: out-of-chain entries are exactly 0, and we keep the SAME slot
+    # layouts (pre-zeroed) so the shared extraction reads them unchanged.
+    #
+    # Layouts (matching the dense hessian extraction):
+    #   s_eeTemp   : per-ee FK transform, slot ei                 (dbl-buf 16*num_ees)
+    #   s_deeTemp  : per-(ei,djid) gradient, slot ei*n + djid      (dbl-buf 16*n*num_ees)
+    #   s_d2eeTemp : per-(ei,i,j) hessian, slot ei*n*n + i*n + j   (dbl-buf 16*n*n*num_ees)
+    ee_chains, ee_qinds, max_len, affects = _eepose_chain_metadata(self, all_ees)
+
+    # ============ Phase 1: gradient chain (eeTemp + deeTemp) ============
+    self.gen_add_code_line("// NON-SERIAL: compacted gradient chain (GLASS indexed batched 4x4 GEMM)")
+    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees), use_thread_group)
+    self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # level 0 eeTemp seed
+    self.gen_add_code_line("// level 0: seed per-ee FK transform")
+    self.gen_add_parallel_loop("ind", str(16*num_ees), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
+    select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
+    self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
+    self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # level 0 deeTemp seed
+    seed_pairs = []
+    for ei, ee in enumerate(all_ees):
+        for djid in ee_qinds[ei]:
+            dst = ei*n + djid
+            seed_pairs.append((dst, djid, "dX") if affects(djid, ee) else (dst, ee, "X"))
+    self.gen_add_code_line("// level 0: seed per-(ee,djid) gradient transform (in-chain only)")
+    self.gen_add_code_line("static const int hgrad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
+    self.gen_add_code_line("static const int hgrad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
+    self.gen_add_code_line("static const int hgrad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
+    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
+    self.gen_add_code_line("const T *s_src = hgrad_seed_isdx[p] ? &s_dXhom[16*hgrad_seed_src[p]] : &s_Xhom[16*hgrad_seed_src[p]];")
+    self.gen_add_code_line("s_deeTemp[16*hgrad_seed_dst[p] + rc] = s_src[rc];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # gradient chain-up levels
+    for level in range(1, max_len):
+        even = level % 2
+        ee_dst, ee_src = 16*num_ees*even // 16, 16*num_ees*(not even) // 16
+        dee_dst, dee_src = 16*n*num_ees*even // 16, 16*n*num_ees*(not even) // 16
+        ee_a, ee_b, ee_c = [], [], []
+        dee_dx_a, dee_dx_b, dee_dx_c = [], [], []
+        dee_x_a, dee_x_b, dee_x_c = [], [], []
+        ee_csrc, ee_cdst, dee_csrc, dee_cdst = [], [], [], []
+        for ei in range(num_ees):
+            if level >= len(ee_chains[ei]):
+                ee_csrc.append(ee_src + ei); ee_cdst.append(ee_dst + ei)
+                for djid in ee_qinds[ei]:
+                    dee_csrc.append(dee_src + ei*n + djid); dee_cdst.append(dee_dst + ei*n + djid)
+                continue
+            par = ee_chains[ei][level]
+            ee_a.append(par); ee_b.append(ee_src + ei); ee_c.append(ee_dst + ei)
+            for djid in ee_qinds[ei]:
+                s = dee_src + ei*n + djid; d = dee_dst + ei*n + djid
+                if affects(djid, par):
+                    dee_dx_a.append(djid); dee_dx_b.append(s); dee_dx_c.append(d)
+                else:
+                    dee_x_a.append(par); dee_x_b.append(s); dee_x_c.append(d)
+        self.gen_add_code_line("// gradient level " + str(level) + "/" + str(max_len-1))
+        sfx = "_hg" + str(level)
+        _emit_idx_gemm(self, "ee" + sfx, ee_a, ee_b, ee_c, "s_Xhom", "s_eeTemp", "s_eeTemp")
+        _emit_idx_gemm(self, "dx" + sfx, dee_x_a, dee_x_b, dee_x_c, "s_Xhom", "s_deeTemp", "s_deeTemp")
+        _emit_idx_gemm(self, "dd" + sfx, dee_dx_a, dee_dx_b, dee_dx_c, "s_dXhom", "s_deeTemp", "s_deeTemp")
+        _emit_carry_copy(self, "eec" + sfx, ee_csrc, ee_cdst, "s_eeTemp", use_thread_group)
+        _emit_carry_copy(self, "dec" + sfx, dee_csrc, dee_cdst, "s_deeTemp", use_thread_group)
+        if ee_csrc or dee_csrc:
+            self.gen_add_sync(use_thread_group)
+    final_even = (max_len - 1) % 2
+    ee_final = 16*num_ees*final_even
+    dee_final = 16*n*num_ees*final_even
+
+    # ============ Phase 2: hessian chain (d2eeTemp) ============
+    self.gen_add_code_line("// NON-SERIAL: compacted hessian chain (GLASS indexed batched 4x4 GEMM)")
+    self.gen_add_parallel_loop("ind", str(2*16*n*n*num_ees), use_thread_group)
+    self.gen_add_code_line("s_d2eeTemp[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+    # in-chain (ei, i, j) triples. The d2Xhom matrix slot must match
+    # grid_d2xhom_offset: floating base stores a dense (q_i,q_j) block (slot
+    # i*n+j); fixed base stores only the diagonal (slot i, and i==j there since a
+    # fixed-base joint is owned by a single q-index so "both affect" => i==j).
+    floating = self.robot.floating_base
+    def d2_factor(i, j, joint):
+        ai, aj = affects(i, joint), affects(j, joint)
+        if ai and aj:
+            return ("d2", (i*n + j) if floating else i)   # s_d2Xhom slot grid_d2xhom_offset
+        if ai:
+            return ("dxi", i)               # s_dXhom slot i
+        if aj:
+            return ("dxj", j)               # s_dXhom slot j
+        return ("x", joint)                 # s_Xhom slot
+    # level 0 seed
+    seed_d2, seed_dxi, seed_dxj, seed_x = [], [], [], []  # (dst, src)
+    for ei, ee in enumerate(all_ees):
+        for i in ee_qinds[ei]:
+            for j in ee_qinds[ei]:
+                dst = ei*n*n + i*n + j
+                kind, src = d2_factor(i, j, ee)
+                if kind == "d2": seed_d2.append((dst, src))
+                elif kind == "dxi": seed_dxi.append((dst, src))
+                elif kind == "dxj": seed_dxj.append((dst, src))
+                else: seed_x.append((dst, src))
+    self.gen_add_code_line("// hessian level 0: seed per-(ee,i,j) transform (in-chain only)")
+    _emit_seed_copy(self, "hs_d2", seed_d2, "s_d2Xhom", "s_d2eeTemp", use_thread_group)
+    _emit_seed_copy(self, "hs_di", seed_dxi, "s_dXhom", "s_d2eeTemp", use_thread_group)
+    _emit_seed_copy(self, "hs_dj", seed_dxj, "s_dXhom", "s_d2eeTemp", use_thread_group)
+    _emit_seed_copy(self, "hs_x", seed_x, "s_Xhom", "s_d2eeTemp", use_thread_group)
+    self.gen_add_sync(use_thread_group)
+    # hessian chain-up levels
+    for level in range(1, max_len):
+        even = level % 2
+        d2_dst, d2_src = 16*n*n*num_ees*even // 16, 16*n*n*num_ees*(not even) // 16
+        g = {"d2": ([], [], []), "dxi": ([], [], []), "dxj": ([], [], []), "x": ([], [], [])}
+        carry_src, carry_dst = [], []
+        for ei in range(num_ees):
+            if level >= len(ee_chains[ei]):
+                for i in ee_qinds[ei]:
+                    for j in ee_qinds[ei]:
+                        carry_src.append(d2_src + ei*n*n + i*n + j); carry_dst.append(d2_dst + ei*n*n + i*n + j)
+                continue
+            par = ee_chains[ei][level]
+            for i in ee_qinds[ei]:
+                for j in ee_qinds[ei]:
+                    s = d2_src + ei*n*n + i*n + j; d = d2_dst + ei*n*n + i*n + j
+                    kind, src = d2_factor(i, j, par)
+                    g[kind][0].append(src); g[kind][1].append(s); g[kind][2].append(d)
+        self.gen_add_code_line("// hessian level " + str(level) + "/" + str(max_len-1))
+        sfx = "_hh" + str(level)
+        _emit_idx_gemm(self, "d2" + sfx, g["d2"][0], g["d2"][1], g["d2"][2], "s_d2Xhom", "s_d2eeTemp", "s_d2eeTemp")
+        _emit_idx_gemm(self, "di" + sfx, g["dxi"][0], g["dxi"][1], g["dxi"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
+        _emit_idx_gemm(self, "dj" + sfx, g["dxj"][0], g["dxj"][1], g["dxj"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
+        _emit_idx_gemm(self, "xx" + sfx, g["x"][0], g["x"][1], g["x"][2], "s_Xhom", "s_d2eeTemp", "s_d2eeTemp")
+        _emit_carry_copy(self, "d2c" + sfx, carry_src, carry_dst, "s_d2eeTemp", use_thread_group)
+        if carry_src:
+            self.gen_add_sync(use_thread_group)
+    d2_final = 16*n*n*num_ees*final_even
+
+    # ============ Phase 3: extraction (rebase pointers to final parity) ============
+    self.gen_add_code_line("// rebase to the final-parity buffers, then extract")
+    self.gen_add_code_line("s_eeTemp = &s_eeTemp[" + str(ee_final) + "];")
+    self.gen_add_code_line("s_deeTemp = &s_deeTemp[" + str(dee_final) + "];")
+    self.gen_add_code_line("s_d2eeTemp = &s_d2eeTemp[" + str(d2_final) + "];")
+    _emit_eepose_hess_extraction(self, n, num_ees, use_thread_group)
+
+def _emit_idx_gemm(self, name, a, b, c, A_base, B_base, C_base):
+    if not a:
+        return
+    self.gen_add_code_line("static const int " + name + "_a[] = {" + ", ".join(map(str, a)) + "};")
+    self.gen_add_code_line("static const int " + name + "_b[] = {" + ", ".join(map(str, b)) + "};")
+    self.gen_add_code_line("static const int " + name + "_c[] = {" + ", ".join(map(str, c)) + "};")
+    self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(a)) + ", " + name + "_a, " + name + "_b, " + name + "_c, " + A_base + ", " + B_base + ", " + C_base + ");")
+
+def _emit_seed_copy(self, name, pairs, src_base, dst_base, use_thread_group):
+    # pairs: list of (dst_slot, src_slot). Copies 4x4 from src_base[src] to dst_base[dst].
+    if not pairs:
+        return
+    self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(str(p[0]) for p in pairs) + "};")
+    self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(str(p[1]) for p in pairs) + "};")
+    self.gen_add_parallel_loop("ind", str(16*len(pairs)), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
+    self.gen_add_code_line(dst_base + "[16*" + name + "_dst[p] + rc] = " + src_base + "[16*" + name + "_src[p] + rc];")
+    self.gen_add_end_control_flow()
+
+def _emit_carry_copy(self, name, src, dst, base, use_thread_group):
+    # carry-forward: copy already-finished slots into the other parity half.
+    if not src:
+        return
+    self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(map(str, src)) + "};")
+    self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(map(str, dst)) + "};")
+    self.gen_add_parallel_loop("ind", str(16*len(src)), use_thread_group)
+    self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
+    self.gen_add_code_line(base + "[16*" + name + "_dst[c] + rc] = " + base + "[16*" + name + "_src[c] + rc];")
+    self.gen_add_end_control_flow()
 
 def gen_end_effector_pose_gradient_device_temp_mem_size(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
@@ -908,6 +1258,15 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// Keep all gradients (and the value) as we need them for the hessian")
     self.gen_add_code_line("//")
     self.gen_add_code_line("T *s_eeTemp = &s_temp[0]; T *s_deeTemp = &s_temp[" + str(2*16*num_ees) + "];")
+    if not self.robot.is_serial_chain():
+        # NON-SERIAL / FLOATING-BASE: the legacy dense path computed ALL
+        # (djid_i, djid_j, ee) triples per BFS level (quadratically wasteful) and
+        # masked the out-of-chain ones. Emit ONE compacted in-chain chain-up
+        # (gradient + hessian) via grid_linalg_indexed_batched_gemm instead.
+        # Numerically identical: masked entries contributed exactly 0.
+        _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group)
+        self.gen_add_end_function()
+        return
     for bfs_level in range(n_bfs_levels): # at most bfs levels of parents to chain
         # if serial chain manipulator then this is easy
         if self.robot.is_serial_chain():
@@ -1135,6 +1494,14 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     if self.DEBUG_MODE:
         code_lines = ["for (int ind = 0; ind < " + str(n*n) + "; ind++){int i = ind / " + str(n) + "; int j = ind % " + str(n) + "; printf(\"d2X_chain[%d][%d]\\n\",i,j); printMat<T,4,4>(&s_d2eeTemp[16*ind],4);}"]
         self.gen_add_debug_print_code_lines(code_lines,use_thread_group)
+    _emit_eepose_hess_extraction(self, n, num_ees, use_thread_group)
+    self.gen_add_end_function()
+
+def _emit_eepose_hess_extraction(self, n, num_ees, use_thread_group):
+    # Shared d2eePos/deePos extraction. Assumes s_eeTemp (per-ee), s_deeTemp
+    # (per-(ee,djid)) and s_d2eeTemp (per-(ee,i,j)) already point at their final
+    # base (caller rebased). Out-of-chain deeTemp/d2eeTemp slots must be 0 so the
+    # arctan2 derivative formulas evaluate to 0 there (matches the dense mask).
     self.gen_add_code_line("// For all n*n*num_ee in parallel")
     self.gen_add_parallel_loop("ind6",str(6*n*n*num_ees),use_thread_group)
     self.gen_add_code_line("int ind = ind6 / 6; int outputInd = ind6 % 6;")
@@ -1198,7 +1565,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("s_d2eePos[d2eePosOffset_ee + outputInd*d2eePosOffset_ind + d2eePosOffset_ij] = (bottom*dtop - top*dbottom) / (bottom*bottom);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
     n = self.robot.get_num_pos()
