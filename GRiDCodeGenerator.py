@@ -33,6 +33,7 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_gradient_kernel, gen_inverse_dynamics_gradient_host, gen_inverse_dynamics_gradient, \
                             gen_forward_dynamics_gradient_inner_temp_mem_size, gen_forward_dynamics_gradient_kernel_max_temp_mem_size, \
                             gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_kernel, \
+                            gen_forward_dynamics_gradient_full_inner, gen_forward_dynamics_gradient_full_inner_function_call, \
                             gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, gen_forward_dynamics_gradient_device_function_call, \
                             gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
@@ -42,7 +43,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, gen_X_single_thread, gen_X_warp, \
                             gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
-                            gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, \
+                            gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, gen_aba_inner_cold_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
                             gen_idsva_so_body_frame_inner_temp_mem_size, gen_idsva_so_body_frame_inner_function_call, idsva_so_needs_reference_order_output_repair, \
@@ -61,7 +62,8 @@ class GRiDCodeGenerator:
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
                             gen_integrator_kernel, gen_integrator_host, gen_integrator, gen_lie_group_helpers, \
                             gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
-                            gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, gen_integrator_gradient_device, \
+                            gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, \
+                            gen_integrator_gradient_full_inner, gen_integrator_gradient_full_inner_function_call, gen_integrator_gradient_device, \
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient
 
     # finally import the test code
@@ -430,19 +432,31 @@ class GRiDCodeGenerator:
         self.fd_du_t_count_per_tier = tuple(_fd_du_arenas[i] for i in self.fd_du_spill_tier_3way)
         aba_input_t_count = n + 2*nv
         crba_input_t_count = n + nv
-        # Phase 3c (ABA): the 140*NJ+138 interleaved scratch band is the bulk
-        # of ABA's smem. Level 0 = scratch in smem (current); Level 1 =
-        # scratch redirected to L2-pinned workspace.
+        # ABA surgical-spill ladder, 3 rungs. The 140*NJ+138 inner scratch band
+        # keeps its hot recursion in smem and spills only the cold sub-band when
+        # possible:
+        #   level 0 (full)     : whole inner arena in smem (PERF, byte-identical).
+        #   level 1 (surgical) : hot band in smem, cold sub-band -> d_cold. The
+        #                        smem arena shrinks to the hot region only.
+        #   level 2 (workspace): whole inner arena -> L2-pinned workspace (blunt
+        #                        MINIMAL fallback).
         _aba_inner_temp_count = self.gen_aba_inner_temp_mem_size()
+        _aba_inner_cold_count = self.gen_aba_inner_cold_mem_size()
+        # Hot smem arena at the surgical rung: FIXED reclaims the whole 42*n cold
+        # tail (hot ends at 98*n); FLOATING reclaims only the 138-float fb* tail
+        # above tempVec (the interior vcross slot still relocates to d_cold but
+        # cannot be byte-identically compacted out of smem).
+        _aba_surgical_inner_count = (_aba_inner_temp_count - 138) if self.robot.floating_base else (98 * NJ)
         _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size
         _aba_t_count_full      = _aba_base_count + _aba_inner_temp_count
+        _aba_t_count_surgical  = _aba_base_count + _aba_surgical_inner_count
         _aba_t_count_workspace = _aba_base_count
-        self.aba_spill_tier_3way = select_shared_tier_3way(_aba_t_count_full, _aba_t_count_workspace)
-        self.aba_use_workspace_temp = self.aba_spill_tier_3way[0] == 1
-        aba_t_count = _aba_t_count_full if not self.aba_use_workspace_temp else _aba_t_count_workspace
-        self.aba_t_count_per_tier = tuple(
-            (_aba_t_count_full, _aba_t_count_workspace)[i] for i in self.aba_spill_tier_3way
-        )
+        self.aba_spill_tier_3way = select_shared_tier_3way(_aba_t_count_full, _aba_t_count_surgical, _aba_t_count_workspace)
+        self.aba_use_workspace_temp = self.aba_spill_tier_3way[0] == 2
+        _aba_arenas = (_aba_t_count_full, _aba_t_count_surgical, _aba_t_count_workspace)
+        aba_t_count = _aba_arenas[self.aba_spill_tier_3way[0]]
+        self.aba_t_count_per_tier = tuple(_aba_arenas[i] for i in self.aba_spill_tier_3way)
+        self._aba_inner_cold_count = _aba_inner_cold_count
         # CRBA: the inner scratch band is spilled as one band to L2-pinned
         # workspace at LITE/MINIMAL. Level 0 = scratch in smem (current);
         # Level 1 = scratch redirected to workspace.
@@ -550,14 +564,22 @@ class GRiDCodeGenerator:
         idsva_so_world_frame_base_t_count = (2*nv + n) + idsva_so_world_frame_inner_temp_count + XI_size
         idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
         # ----- idsva_so WORLD-frame per-tier spill ladder -----
-        # Flags = (use_global_output, s_temp_in_global). No surgical buffer rung: the
-        # world inner is not aliased, so a future surgical pass is tractable (see
-        # docs/idsva_so_inner_refactor_notes.md); for now output -> whole-s_temp.
+        # Flags = (use_global_output, s_temp_in_global, cold_in_global). The world inner
+        # is UN-aliased, so a surgical rung is now landed: the cold trio Xdown (36*NB,
+        # dead after Step 3) + v_w/a_w (6*NB each, dead after Step 4's f_w build) can move
+        # to d_workspace while the hot arena stays in smem (inner COLD_IN_SMEM=false).
+        # Rungs least->most spill:
+        #   full:               output + whole s_temp arena in smem
+        #   global_output:      4*NV^3 output tensor -> d_idsva_so global (coalesced one-shot)
+        #   output_cold:        + surgical cold trio (36*NB + 12*NB) -> d_workspace
+        #   output_temp:        + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
+        _idsva_wf_cold = 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
         _idsva_wf_base_smem = (2*nv + n) + XI_size
         _idsva_so_world_tiers = [
-            ("full",          idsva_so_world_frame_full_t_count, False, False),
-            ("global_output", idsva_so_world_frame_base_t_count, True,  False),
-            ("output_temp",   _idsva_wf_base_smem,               True,  True),
+            ("full",          idsva_so_world_frame_full_t_count,                  False, False, False),
+            ("global_output", idsva_so_world_frame_base_t_count,                  True,  False, False),
+            ("output_cold",   idsva_so_world_frame_base_t_count - _idsva_wf_cold, True,  False, True),
+            ("output_temp",   _idsva_wf_base_smem,                                True,  True,  False),
         ]
         self._idsva_so_world_tier_table = _idsva_so_world_tiers
         _idsva_so_world_arenas = tuple(t[1] for t in _idsva_so_world_tiers)
@@ -569,7 +591,13 @@ class GRiDCodeGenerator:
         def _idsva_body_ws_floats(pick):
             return idsva_so_body_frame_inner_temp_count if pick == 3 else (_idsva_bf_BC if pick == 2 else 0)
         def _idsva_world_ws_floats(pick):
-            return idsva_so_world_frame_inner_temp_count if pick == 2 else 0
+            # pick 3 (output_temp) spills the whole inner arena; pick 2 (output_cold)
+            # spills just the surgical cold trio (Xdown 36*NB + v_w/a_w 12*NB).
+            if pick == 3:
+                return idsva_so_world_frame_inner_temp_count
+            if pick == 2:
+                return 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
+            return 0
         idsva_so_spill_ws_t_count = max(
             [_idsva_body_ws_floats(p) for p in self.idsva_so_body_frame_spill_tier_3way] +
             [_idsva_world_ws_floats(p) for p in self.idsva_so_world_frame_spill_tier_3way] + [0])
@@ -647,10 +675,17 @@ class GRiDCodeGenerator:
                                            _minv_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_du_workspace_count)
+        # Max workspace required by D2EE across ANY tier (mirrors the EE_POSE_GRAD
+        # per-tier accounting just below). The PERF pick may be 0 while LITE/MINIMAL
+        # spill the d2eeTemp (and d2Xhom) arenas to d_workspace; the allocation must
+        # cover what any instantiated tier needs at runtime, else the d2ee kernel
+        # writes past the per-timestep slice (OOB) when the user switches tier via
+        # the kernel template. Keying off the single-valued PERF-pick macros here
+        # under-allocates for divergent 3-way picks (e.g. go2 d2ee = (0,1,2)).
         d2ee_workspace_t_count = 0
-        if self.d2ee_use_workspace_temp:
+        if any(p >= 1 for p in self.d2ee_spill_tier_3way):
             d2ee_workspace_t_count += d2ee_workspace_temp_count
-        if self.d2ee_use_workspace_d2xhom:
+        if any(p >= 2 for p in self.d2ee_spill_tier_3way):
             d2ee_workspace_t_count += d2Xhom_size
         # Phase 3d: max workspace required by EE_POSE_GRAD across any tier (PERF
         # may pick 0, but the workspace allocation must cover what LITE/MINIMAL
@@ -691,6 +726,7 @@ class GRiDCodeGenerator:
                                  "const int GRID_ID_DU_USES_GLOBAL_TEMP = " + str(int(self.id_du_use_global_temp)) + ";", \
                                  "const int GRID_ID_DU_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.id_du_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
+                                 "const int GRID_FD_DU_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.fd_du_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
                                  "const int GRID_INTEGRATOR_USES_WORKSPACE = " + str(int(any(p == 1 for p in self.integrator_spill_tier_3way))) + ";", \
@@ -704,8 +740,15 @@ class GRiDCodeGenerator:
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_TEMP = " + str(int(self.fdsva_so_use_workspace_temp)) + ";", \
                                  "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_temp)) + ";", \
                                  "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = " + str(int(self.d2ee_use_workspace_d2xhom)) + ";", \
+                                 # Per-tier L2-persisting gate: 1 if ANY tier spills the d2eeTemp arena to
+                                 # d_workspace. The host gate must arm L2 persistence whenever a runtime
+                                 # tier switch could route d2eeTemp through global memory (not just the
+                                 # PERF-pick single-valued GRID_D2EE_USES_WORKSPACE_TEMP).
+                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.d2ee_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_D2EE_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
                                  "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP = " + str(int(self.ee_grad_use_workspace_temp)) + ";", \
+                                 # Same per-tier gate for the EE_POSE_GRAD chain workspace.
+                                 "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.ee_grad_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_EE_GRAD_USES_WORKSPACE_DXHOM = " + str(int(self.ee_grad_use_workspace_dxhom)) + ";", \
                                  "const int GRID_EE_GRAD_SHARED_TIER_VALUE = " + str(self.ee_grad_spill_tier) + ";", \
                                  "const int GRID_ID_DU_SHARED_TIER_VALUE = " + str(self.id_du_spill_tier) + ";", \
@@ -892,10 +935,21 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t FD_INNER_SMEM_BYTES() { return MINV_F_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)) + ") : sizeof(T) * static_cast<size_t>(" + str(self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)) + "); }",
                                  "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t FD_INNER_WORKSPACE_BYTES() { return MINV_F_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(6*nv*nv) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool FD_MINV_F_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.fd_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fd_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.fd_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "// --- aba_inner (scratch band) ---",
+                                 # The integrator value path's only inner scratch is the FD inner itself,
+                                 # so its arena sizes mirror FD_INNER_* exactly: when MINV_F_IN_SMEM the
+                                 # 6*NV*NV F-region is in s_temp, else it spills to d_workspace. The
+                                 # per-robot tier->placement map is INTEGRATOR_MINV_F_IN_SMEM<TIER> (above).
+                                 "// --- integrator_inner (forwards the FD inner's Minv F-region lever) ---",
+                                 "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t INTEGRATOR_INNER_SMEM_BYTES() { return MINV_F_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=True)) + ") : sizeof(T) * static_cast<size_t>(" + str(self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=False)) + "); }",
+                                 "template <typename T, bool MINV_F_IN_SMEM = true> __host__ __device__ constexpr size_t INTEGRATOR_INNER_WORKSPACE_BYTES() { return MINV_F_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(6*nv*nv) + "); }",
+                                 "// --- aba_inner (scratch band, surgical-spill ladder) ---",
+                                 "// Levels: 0=full (smem), 1=surgical (hot smem + cold d_cold), 2=workspace (whole band global).",
+                                 "// TEMP_IN_SMEM is false only at the level-2 (workspace) rung; COLD_IN_SMEM is false only at the level-1 (surgical) rung.",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + "); }",
-                                 "template <int TIER> __host__ __device__ constexpr bool ABA_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.aba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.aba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.aba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "template <typename T> __host__ __device__ constexpr size_t ABA_INNER_COLD_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._aba_inner_cold_count) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool ABA_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("false" if self.aba_spill_tier_3way[0] == 2 else "true") + " : (TIER == TIER_LITE) ? " + ("false" if self.aba_spill_tier_3way[1] == 2 else "true") + " : " + ("false" if self.aba_spill_tier_3way[2] == 2 else "true") + "; }",
+                                 "template <int TIER> __host__ __device__ constexpr bool ABA_COLD_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("false" if self.aba_spill_tier_3way[0] == 1 else "true") + " : (TIER == TIER_LITE) ? " + ("false" if self.aba_spill_tier_3way[1] == 1 else "true") + " : " + ("false" if self.aba_spill_tier_3way[2] == 1 else "true") + "; }",
                                  "// --- crba_inner (scratch band) ---",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + "); }",
@@ -904,6 +958,9 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.ee_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ee_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ee_grad_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- end_effector_pose_gradient_hessian_inner (large n^2 d2eeTemp arena) ---",
+                                 "// Per-tier placement of the inner's s_d2eeTemp scratch: true => smem, false => d_workspace.",
+                                 "template <int TIER> __host__ __device__ constexpr bool D2EE_D2TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.d2ee_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.d2ee_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.d2ee_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
@@ -947,6 +1004,11 @@ class GRiDCodeGenerator:
                                  # Safe to overlap with id_du_spill region because Minv finishes before
                                  # id_du_grad starts in any kernel that composes both.
                                  "template <typename T> __host__ __device__ inline size_t GRID_MINV_F_WORKSPACE_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 # ABA surgical cold sub-buffer reuses the SO/grad workspace band base (ABA
+                                 # never runs concurrently with SO/grad). The cold band (ABA_INNER_COLD_BYTES)
+                                 # is far smaller than GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP, so it fits at
+                                 # offset 0 without growing GRID_WORKSPACE_BYTES_PER_TIMESTEP.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_ABA_COLD_OFFSET_BYTES() { return static_cast<size_t>(0); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>() + (GRID_D2EE_USES_WORKSPACE_D2XHOM ? sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT) : 0); }",
@@ -1569,7 +1631,7 @@ class GRiDCodeGenerator:
             "    __global__ forward_dynamics_gradient_kernel<T>(T *d_df_du, const T *d_q_qd, const T *d_qdd, const T *d_Minv, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   forward_dynamics_gradient<T,USE_QDD_MINV_FLAG=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_pose_inner<T>(T *s_eePos, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_inner<T,TEMP_IN_SMEM=true>(T *s_eePos, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp, T *d_workspace, unsigned char *s_linalg_smem)", \
             "    __device__ end_effector_pose_device<T>(T *s_eePos, const T *s_q, const robotModel<T> *d_robotModel)", \
             "    __global__ end_effector_pose_kernel<T>(T *d_eePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
