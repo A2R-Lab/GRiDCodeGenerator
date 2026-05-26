@@ -29,6 +29,7 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_gradient_inner_temp_mem_size, gen_inverse_dynamics_gradient_temp_layout, \
                             gen_inverse_dynamics_gradient_kernel_max_temp_mem_size, \
                             gen_inverse_dynamics_gradient_inner_function_call, gen_inverse_dynamics_gradient_inner, gen_inverse_dynamics_gradient_device, \
+                            gen_inverse_dynamics_gradient_full_inner, gen_inverse_dynamics_gradient_full_inner_function_call, \
                             gen_inverse_dynamics_gradient_kernel, gen_inverse_dynamics_gradient_host, gen_inverse_dynamics_gradient, \
                             gen_forward_dynamics_gradient_inner_temp_mem_size, gen_forward_dynamics_gradient_kernel_max_temp_mem_size, \
                             gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_kernel, \
@@ -442,7 +443,18 @@ class GRiDCodeGenerator:
         self.aba_t_count_per_tier = tuple(
             (_aba_t_count_full, _aba_t_count_workspace)[i] for i in self.aba_spill_tier_3way
         )
-        crba_t_count = nv*nv + crba_input_t_count + self.gen_crba_inner_temp_mem_size() + XI_size
+        # CRBA: the inner scratch band is spilled as one band to L2-pinned
+        # workspace at LITE/MINIMAL. Level 0 = scratch in smem (current);
+        # Level 1 = scratch redirected to workspace.
+        _crba_base_count = nv*nv + crba_input_t_count + XI_size
+        _crba_t_count_full      = _crba_base_count + self.gen_crba_inner_temp_mem_size()
+        _crba_t_count_workspace = _crba_base_count
+        self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_workspace)
+        self.crba_use_workspace_temp = self.crba_spill_tier_3way[0] == 1
+        crba_t_count = _crba_t_count_full if not self.crba_use_workspace_temp else _crba_t_count_workspace
+        self.crba_t_count_per_tier = tuple(
+            (_crba_t_count_full, _crba_t_count_workspace)[i] for i in self.crba_spill_tier_3way
+        )
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         # Phase 3d (EE_POSE_GRAD): three-tier spill, mirrors D2EE.
         # Level 0 = full smem (inner_temp + s_deePos + dXmatsHom). Level 1 =
@@ -621,10 +633,17 @@ class GRiDCodeGenerator:
         # because Minv runs before id_du_grad / fd_grad in any kernel that
         # composes both — they sequentially reuse the same workspace bytes).
         _minv_F_workspace_count = self.gen_direct_minv_inner_F_size() if any(p == 1 for p in self.minv_spill_tier_3way) else 0
+        # CRBA whole-arena spill: when crba_inner's scratch band is redirected to
+        # d_workspace (LITE/MINIMAL, or a forced deep-spill tier), the per-timestep
+        # workspace must be able to back the full 140*NJ-class band. Include it in
+        # the grad-section max so the allocation always covers it regardless of the
+        # tier the kernel template is instantiated with.
+        _crba_inner_temp_count = self.gen_crba_inner_temp_mem_size()
         grad_spill_workspace_t_count = max(id_du_temp_layout["spill_count"],
                                            id_du_temp_count,
                                            fd_du_temp_count,
                                            2*nv*nv,
+                                           _crba_inner_temp_count,
                                            _minv_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_du_workspace_count)
@@ -670,6 +689,7 @@ class GRiDCodeGenerator:
                                  "const int DXHOM_T_COUNT = " + str(dXhom_size) + ";", \
                                  "const int D2XHOM_T_COUNT = " + str(d2Xhom_size) + ";", \
                                  "const int GRID_ID_DU_USES_GLOBAL_TEMP = " + str(int(self.id_du_use_global_temp)) + ";", \
+                                 "const int GRID_ID_DU_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.id_du_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
                                  "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
                                  "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
@@ -811,7 +831,11 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
-                                 "template <typename T> __host__ __device__ inline size_t CRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(crba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t CRBA_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.crba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.crba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.crba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
                                  "template <typename T> __host__ __device__ constexpr size_t GRID_EE_LINALG_SHARED_BYTES() { return static_cast<size_t>(0); }",
                                  "template <typename T> __host__ __device__ inline size_t EE_POS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  # Phase 3d: tier-aware. PERF/LITE/MINIMAL each report the smem
@@ -872,6 +896,10 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t ABA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_aba_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool ABA_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.aba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.aba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.aba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- crba_inner (scratch band) ---",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
+                                 "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + "); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool CRBA_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.crba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.crba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.crba_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// --- end_effector_pose_gradient_inner (chain workspace) ---",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
@@ -1137,9 +1165,9 @@ class GRiDCodeGenerator:
         ]),
         ("crba", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("crba_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("crba_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("end_effector_pose", "ee_pose", None, "EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("end_effector_pose_kernel<T>",

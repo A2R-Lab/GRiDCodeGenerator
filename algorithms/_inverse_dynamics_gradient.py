@@ -111,7 +111,8 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     func_def_start = "void inverse_dynamics_gradient_inner(T *s_dc_du, const T *s_q, const T *s_qd, const T *s_vaf, "
     func_def_end = "T *s_temp, T *d_temp_spill, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
-    func_notes = ["Assumes s_XImats is updated already for the current s_q"]
+    func_notes = ["Assumes s_XImats is updated already for the current s_q",
+                  "This is the id_du band sub-inner (the stable surface composed by fd_du / integrator_gradient). It does NOT own s_temp placement; the USE_DA_DF_SPILL band selectively spills its da_dq..fxvi band to d_temp_spill via grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>. The whole-pool placement is owned by the wrapping inverse_dynamics_gradient_full_inner."]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -941,6 +942,99 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     function_code = self.code_str[function_start:]
     self.code_str = self.code_str[:function_start] + _rewrite_id_du_temp_accesses_for_spill(function_code)
 
+def gen_inverse_dynamics_gradient_full_inner_function_call(self, use_thread_group = False,
+                                                           use_qdd_input = False,
+                                                           scratch_in_smem_expr = "true",
+                                                           use_da_df_spill_expr = "false",
+                                                           d_workspace_pool_name = "nullptr",
+                                                           d_temp_spill_name = "nullptr"):
+    """Emit the call to `inverse_dynamics_gradient_full_inner`. Arg order MUST
+    match the def in gen_inverse_dynamics_gradient_full_inner. Pool/spill regions
+    default to nullptr (unused under the matching if-constexpr); the kernel passes
+    real pointers per tier. The _qdd C++ name variant additionally threads s_qdd."""
+    fname = "inverse_dynamics_gradient_full_inner_qdd" if use_qdd_input else "inverse_dynamics_gradient_full_inner"
+    tmpl = "<T, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + ">"
+    start = fname + tmpl + "(s_dc_du, s_q, s_qd, s_vaf, "
+    if use_qdd_input:
+        start += "s_qdd, "
+    middle = self.gen_insert_helpers_function_call()
+    end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
+           + "d_robotModel, gravity);")
+    if use_thread_group:
+        start = start.replace("(", "(tgrp, ")
+    self.gen_add_code_line(start + middle + end)
+
+def gen_inverse_dynamics_gradient_full_inner(self, use_thread_group = False, use_qdd_input = False):
+    """Emit `inverse_dynamics_gradient_full_inner` — the whole id_du orchestration
+    as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
+    mirrors gen_fdsva_so_full_inner). It wraps, in order:
+      [repoint s_temp] -> load_update_XImats -> inverse_dynamics_inner (vaf) ->
+      inverse_dynamics_gradient_inner (the id_du band sub-inner).
+    Because the s_temp repoint happens at the very top, EVERY consumer below —
+    including the XImats helper's sincos scratch — follows the placement, so the
+    kernel never repoints s_temp from the outside.
+
+    TWO independent template flags:
+      SCRATCH_IN_SMEM  : the shared s_temp pool lives in smem (true) or routes the
+                         WHOLE pool to d_workspace (false; the rung-2 global-temp
+                         path). Dominant lever on big floating humanoids.
+      USE_DA_DF_SPILL  : the id_du band selectively spills its da_dq..fxvi band to
+                         d_temp_spill (rung 1). Threaded through to the band
+                         sub-inner's grid_id_du_temp_ptr<T, USE_DA_DF_SPILL> helper.
+    The 3-rung menu (see _ID_DU_PICK_FLAGS): pick0=(SMEM=true, SPILL=false) full;
+    pick1=(true, true) selective band; pick2=(false, false) whole-pool global.
+
+    Pointer params are caller-supplied (the kernel decides where the OUTPUT s_dc_du
+    lives and hands in the spill regions); only the s_temp POOL placement is the
+    inner's call. The id inner `inverse_dynamics_inner_vaf` is FROZEN and
+    placement-free: after the repoint, s_temp already points at the right pool, so
+    passing it through is correct with no id-side change."""
+    n = self.robot.get_num_vel()
+    func_params = [
+        "s_dc_du is the output buffer (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
+        "s_q is the vector of joint positions",
+        "s_qd is the vector of joint velocities",
+        "s_vaf is the id intermediate band (caller places); size 18*NUM_JOINTS = " + str(18*n),
+        "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
+        "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
+        "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_robotModel holds XImats/topology; gravity is the gravity constant",
+    ]
+    fname = "inverse_dynamics_gradient_full_inner_qdd" if use_qdd_input else "inverse_dynamics_gradient_full_inner"
+    func_def_start = "void " + fname + "(T *s_dc_du, const T *s_q, const T *s_qd, T *s_vaf, "
+    if use_qdd_input:
+        func_def_start += "const T *s_qdd, "
+    func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
+                    "const robotModel<T> *d_robotModel, const T gravity) {")
+    if use_thread_group:
+        func_def_start += "cgrps::thread_group tgrp, "
+        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
+    if use_qdd_input:
+        func_params.insert(4, "s_qdd is the vector of joint accelerations")
+    func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
+    func_def = func_def_start + func_def_end
+    self.gen_add_func_doc("id_du orchestration as a single inner-owns-placement device function",
+                          ["Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch)"],
+                          func_params, None)
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
+    # __forceinline__ so the whole orchestration inlines into the calling kernel.
+    # Under -rdc a separate __device__ wrapper keeps its callees as distinct
+    # functions whose regcount must fit the kernel's launch_bounds budget
+    # (80 at LITE / 64 at MINIMAL) -> ptxas regcount error. Inlining folds them
+    # into the kernel. See _fdsva_so.py:295-300 / HANDOFF.md "Problem 1".
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line(func_def, True)
+    # Inner owns the pool placement; the repoint covers every consumer below
+    # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
+    self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_inverse_dynamics_inner_function_call(use_thread_group, False, use_qdd_input)
+    self.gen_inverse_dynamics_gradient_inner_function_call(
+        use_thread_group,
+        dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = "USE_DA_DF_SPILL")
+    )
+    self.gen_add_end_function()
+
 def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd_input = False):
     n = self.robot.get_num_vel()
     inner_temp_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
@@ -967,12 +1061,14 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables
+    # add the shared memory variables. The arena macro (tier_workspace_expr) already
+    # places s_temp in smem (TIER_PERF) or d_workspace (TIER_LITE+); the full_inner
+    # is therefore called with SCRATCH_IN_SMEM=true (no inner repoint — placement is
+    # already done by the arena) and d_workspace=nullptr. This delegates the
+    # XImats-helper + id-inner + id_du-band orchestration to the full_inner so the
+    # device path no longer duplicates it.
     self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, extra_t_buffers = [("s_vaf", 18*n)], include_linalg_scratch=True, tier_workspace_expr="d_workspace")
-    # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-    self.gen_inverse_dynamics_gradient_inner_function_call(use_thread_group)
+    self.gen_inverse_dynamics_gradient_full_inner_function_call(use_thread_group, use_qdd_input)
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
@@ -1009,17 +1105,18 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
         else:
             self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group)
+        # The kernel only SLICES the workspace band pointers; the full_inner owns
+        # the s_temp pool placement (the whole-pool global-temp repoint is its
+        # SCRATCH_IN_SMEM=false path). Per-rung flags are passed as literals.
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
-        elif use_global_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
-        self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(
-            use_thread_group,
-            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = ("true" if use_selective_spill else "false"))
-        )
+        self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
+        self.gen_inverse_dynamics_gradient_full_inner_function_call(
+            use_thread_group, use_qdd_input,
+            scratch_in_smem_expr = ("false" if use_global_temp else "true"),
+            use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
+            d_workspace_pool_name = ("reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()])" if use_global_temp else "nullptr"),
+            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
         self.gen_add_sync(use_thread_group)
         self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
         self.gen_add_end_control_flow()
@@ -1030,20 +1127,19 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
             self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group)
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(d_workspace);")
-        elif use_global_temp:
-            self.gen_add_code_line("s_temp = reinterpret_cast<T *>(d_workspace);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
             self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),feedback_from="dc_du")
         else:
             self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,feedback_from="dc_du")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,False,use_qdd_input)
-        self.gen_inverse_dynamics_gradient_inner_function_call(
-            use_thread_group,
-            dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = ("true" if use_selective_spill else "false"))
-        )
+        # full_inner owns s_temp placement (whole-pool global path = SCRATCH_IN_SMEM=false).
+        self.gen_inverse_dynamics_gradient_full_inner_function_call(
+            use_thread_group, use_qdd_input,
+            scratch_in_smem_expr = ("false" if use_global_temp else "true"),
+            use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
+            d_workspace_pool_name = ("reinterpret_cast<T *>(d_workspace)" if use_global_temp else "nullptr"),
+            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
         self.gen_anti_licm_output_write("dc_du")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)
@@ -1156,9 +1252,9 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics_gradient\", ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
-    self.gen_add_code_line("if (GRID_ID_DU_USES_GLOBAL_TEMP || GRID_ID_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    self.gen_add_code_line("if (GRID_ID_DU_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_ID_DU_USES_GLOBAL_TEMP || GRID_ID_DU_USES_DA_DF_SPILL) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_ID_DU_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
@@ -1172,8 +1268,13 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient(self, use_thread_group = False):
-    # gen the inner code
+    # gen the inner code (the id_du band sub-inner; stable surface for fd_du etc.)
     self.gen_inverse_dynamics_gradient_inner(use_thread_group)
+    # then the orchestration inner (owns s_temp placement; wraps XImats + id-inner +
+    # band sub-inner). Emitted BEFORE the device/kernel wrappers that call it, in
+    # both qdd variants (mirrors the device-wrapper duplication).
+    self.gen_inverse_dynamics_gradient_full_inner(use_thread_group, True)
+    self.gen_inverse_dynamics_gradient_full_inner(use_thread_group, False)
     # gen the wrapper code for with and without qdd
     self.gen_inverse_dynamics_gradient_device(use_thread_group,True)
     self.gen_inverse_dynamics_gradient_device(use_thread_group,False)

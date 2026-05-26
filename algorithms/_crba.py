@@ -9,20 +9,22 @@ def gen_crba_inner_temp_mem_size(self):
     n = self.robot.get_num_pos()
     return 140*n
 
-def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+                                 temp_in_smem_expr = "true"):
     var_names = dict( \
         s_M_name = "s_M", \
         s_q_name = "s_q", \
         s_qd_name = "s_qd", \
         s_temp_name = "s_temp", \
+        d_workspace_name = "nullptr", \
         #s_XI = "s_XImats", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    crba_code_start = "crba_inner<T>(" + var_names["s_M_name"] + ", " +  var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " 
-    crba_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    crba_code_start = "crba_inner<T, " + temp_in_smem_expr + ">(" + var_names["s_M_name"] + ", " +  var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
+    crba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
     crba_code_middle = self.gen_insert_helpers_function_call()
@@ -44,13 +46,13 @@ def gen_crba_inner(self, use_thread_group = False):
                     "s_qd is the vector of joint velocities", \
                     "s_M is a pointer to the matrix of inertia" \
                     "s_XI is the pointer to the transformation and inertia matricies ", \
-                    "s_temp is a pointer to helper shared memory of size 6*NUM_JOINTS = " + \
-                            str(self.gen_crba_inner_temp_mem_size()), \
+                    "s_temp is the (shared) scratch; size CRBA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the 140*NJ band when TEMP_IN_SMEM, else 0)", \
+                    "d_workspace is the global scratch; size CRBA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
                     "gravity is the gravity constant"]
-    func_notes = [] #insert notes abt function 
+    func_notes = ["Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs d_workspace). Decided at the top; caller sizes both arenas from CRBA_INNER_*_BYTES."]
     func_def_start = "void crba_inner("
     func_def_middle = "T *s_M, const T *s_q, const T *s_qd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
@@ -58,9 +60,13 @@ def gen_crba_inner(self, use_thread_group = False):
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Compute the Composite Rigid Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch-band placement: the whole band moves to
+    # d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps every
+    # s_temp[...] reference below unchanged.
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     temp_size = self.gen_crba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
 
@@ -209,22 +215,27 @@ def gen_crba_inner_floating(self, use_thread_group = False):
                     "s_qd is the vector of joint velocities", \
                     "s_M is a pointer to the matrix of inertia", \
                     "s_XI is the pointer to the transformation and inertia matricies", \
-                    "s_temp is a pointer to helper shared memory of size " + \
-                            str(self.gen_crba_inner_temp_mem_size()), \
+                    "s_temp is the (shared) scratch; size CRBA_INNER_SMEM_BYTES<T, TEMP_IN_SMEM>() (the band when TEMP_IN_SMEM, else 0)", \
+                    "d_workspace is the global scratch; size CRBA_INNER_WORKSPACE_BYTES<T, TEMP_IN_SMEM>() (the band when !TEMP_IN_SMEM, else 0). Pass nullptr when TEMP_IN_SMEM", \
                     "gravity is the gravity constant"]
-    func_notes = ["Floating-base CRBA keeps composite inertias in body order and writes a public-order NUM_VEL x NUM_VEL mass matrix."]
+    func_notes = ["Floating-base CRBA keeps composite inertias in body order and writes a public-order NUM_VEL x NUM_VEL mass matrix.",
+                  "Inner-controlled placement: TEMP_IN_SMEM selects where the scratch band lives (s_temp vs d_workspace). Decided at the top; caller sizes both arenas from CRBA_INNER_*_BYTES."]
     func_def_start = "void crba_inner("
     func_def_middle = "T *s_M, const T *s_q, const T *s_qd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Compute the Floating-Base Composite Rigid Body Algorithm", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
+    # Inner-controlled scratch-band placement: the whole band moves to
+    # d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps every
+    # s_temp[...] reference below unchanged.
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     temp_size = self.gen_crba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
 
@@ -339,35 +350,11 @@ def gen_crba_device(self, use_thread_group = False):
     self.gen_crba_inner_function_call(use_thread_group)
     self.gen_add_end_function()
 
-def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
-    nq = self.robot.get_num_pos()
-    nv = self.robot.get_num_vel()
-    n = self.robot.get_num_joints()
-    input_count = nq + nv
-    # define function def and params
-    func_params = ["d_M is the pointer to the matrix of inertia", \
-                    "d_q_qd is the vector of joint positions and velocities", \
-                    "stride_q_qd is the stride between each q, qd", \
-                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                    "gravity is the gravity constant", \
-                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_notes = []
-    func_def_start = "void crba_kernel(T *d_M, const T *d_q_qd, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    
-    # then generate the code
-    self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)", \
-                            func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
-
-    # add shared memory variables
-    shared_mem_size = self.gen_crba_inner_temp_mem_size()
+def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing, use_thread_group):
+    """Emit crba_kernel body for one tier's spill flag.
+    use_workspace_temp=False: s_temp in smem (full arena); Level 0 / current.
+    use_workspace_temp=True:  s_temp redirected to L2-pinned workspace; smem arena holds only extra_t_buffers."""
+    shared_mem_size = 0 if use_workspace_temp else self.gen_crba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
     if use_thread_group:
@@ -376,10 +363,20 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(input_count),use_thread_group)
+        if use_workspace_temp:
+            self.gen_add_code_line("T *crba_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+            # The whole inner arena spilled to global, so the smem s_temp slot is
+            # null. Repoint s_temp at the workspace BEFORE the XImats helper call
+            # so its sincos scratch (and the inner) have a valid backing store.
+            self.gen_add_code_line("s_temp = crba_d_workspace;")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_crba_inner_function_call(use_thread_group)
+        self.gen_crba_inner_function_call(use_thread_group,
+            updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync(use_thread_group)
         # save to global  (stride = nv*nv per timestep — without this, batches
         # overlap since each block writes nv*nv elements starting at offset k*1)
@@ -388,16 +385,69 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
         self.gen_kernel_load_inputs_single_timing("q_qd",str(input_count),use_thread_group)
+        if use_workspace_temp:
+            self.gen_add_code_line("T *crba_d_workspace = reinterpret_cast<T *>(d_workspace);")
+            # See note above: repoint the null smem s_temp at the spilled workspace
+            # before the XImats helper call so its scratch is valid (global) memory.
+            self.gen_add_code_line("s_temp = crba_d_workspace;")
+        else:
+            self.gen_add_code_line("(void)d_workspace;")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd",str(input_count),use_thread_group,feedback_from="M")
         self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_crba_inner_function_call(use_thread_group)
+        self.gen_crba_inner_function_call(use_thread_group,
+            updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
+            temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("M")
         self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result_single_timing("M",str(nv*nv),use_thread_group)
+
+
+def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    n = self.robot.get_num_joints()
+    input_count = nq + nv
+    # define function def and params
+    func_params = ["d_M is the pointer to the matrix of inertia", \
+                    "d_workspace is the L2-pinned global spill buffer (used at LITE/MINIMAL on large robots)", \
+                    "d_q_qd is the vector of joint positions and velocities", \
+                    "stride_q_qd is the stride between each q, qd", \
+                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                    "gravity is the gravity constant", \
+                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_notes = []
+    func_def_start = "void crba_kernel(T *d_M, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+
+    # then generate the code
+    self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)", \
+                            func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+
+    # Whole-arena spill lever: the CRBA inner scratch band is spilled as one
+    # band to L2-pinned workspace at LITE/MINIMAL. Level 0 = arena in smem
+    # (current); Level 1 = redirected to workspace.
+    picks = getattr(self, "crba_spill_tier_3way", (0, 0, 0))
+    if picks[0] == picks[1] == picks[2]:
+        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing, use_thread_group)
+    else:
+        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing, use_thread_group)
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_crba_host(self, mode = 0):
@@ -429,7 +479,7 @@ def gen_crba_host(self, mode = 0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"crba requires all-data or dynamics gridData\");")
-    func_call_start = "crba_kernel<T><<<block_dimms,thread_dimms,CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_M,hd_data->d_q_qd,stride_q_qd,"
+    func_call_start = "crba_kernel<T><<<block_dimms,thread_dimms,CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_M,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
