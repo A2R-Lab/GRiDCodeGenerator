@@ -564,6 +564,142 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
         )
 
 
+def gen_integrator_gradient_full_inner_function_call(self, use_thread_group=False, compute_x_kp1=False,
+                                                     scratch_in_smem_expr="true",
+                                                     use_da_df_spill_expr="false",
+                                                     d_workspace_pool_name="nullptr",
+                                                     d_temp_spill_name="nullptr"):
+    """Emit the call to `integrator_gradient[_with_x_kp1]_full_inner`. Arg order MUST
+    match the def in gen_integrator_gradient_full_inner. The FD-grad inner POOL
+    placement region (d_workspace) and the id_du da_df band spill region
+    (d_temp_spill) default to nullptr (unused under the matching if-constexpr); the
+    kernel passes real pointers per tier. s_D_qdd_stage / s_dAB remain SEPARATE
+    caller-placed pointers — they are threaded through unchanged."""
+    suffix = "_with_x_kp1" if compute_x_kp1 else ""
+    fname = "integrator_gradient" + suffix + "_full_inner"
+    tmpl = "<T, IT, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + ">"
+    start = fname + tmpl + "(s_dAB, "
+    if compute_x_kp1:
+        start += "s_x_kp1, "
+    start += ("s_q, s_qd, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
+              "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
+              "s_dInt_q_6x6, s_dInt_v_6x6, ")
+    middle = self.gen_insert_helpers_function_call()
+    end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
+           + "d_robotModel, gravity, dt);")
+    if use_thread_group:
+        start = start.replace("(", "(tgrp, ", 1)
+    self.gen_add_code_line(start + middle + end)
+
+
+def gen_integrator_gradient_full_inner(self, use_thread_group=False, compute_x_kp1=False):
+    """Emit `integrator_gradient[_with_x_kp1]_full_inner` — the whole integrator
+    gradient orchestration as ONE inner that OWNS its FD-grad scratch (s_temp) pool
+    placement (inner-owns-placement; mirrors gen_inverse_dynamics_gradient_full_inner /
+    gen_fdsva_so_full_inner). It wraps, in order:
+      [repoint s_temp] -> load_update_XImats -> (compile-time IT dispatch)
+        single-stage: gen_integrator_gradient_inner_python (Euler / SI-Euler)
+        multi-stage : gen_integrator_gradient_multistage    (Midpoint / RK3 / RK4)
+    Because the s_temp repoint happens at the very top, EVERY consumer below —
+    including the XImats helper's sincos scratch and the per-stage XImats refresh in
+    the multi-stage path — follows the placement, so the kernel never repoints
+    s_temp from the outside.
+
+    TWO independent template flags:
+      SCRATCH_IN_SMEM : the shared FD-grad inner s_temp pool lives in smem (true) or
+                        routes the WHOLE pool to d_workspace (false; the rung-2
+                        whole-pool global-temp path, formerly the kernel's line-744
+                        repoint). Dominant lever on big floating humanoids.
+      USE_DA_DF_SPILL : the FD-grad inner's id_du band selectively spills its
+                        da_dq..fxvi band to d_temp_spill (rung 1). Threaded through
+                        the stable gen_forward_dynamics_gradient_inner_python
+                        composition surface to the id_du band sub-inner.
+
+    Pointer params are caller-supplied (the kernel decides where the OUTPUT s_dAB
+    and the multi-band scratch s_D_qdd_stage live — smem or de-aliased workspace
+    sub-offsets — and hands in the spill regions): only the FD-grad inner s_temp
+    POOL placement is the inner's call. s_q / s_qd are NON-const: the multi-stage
+    path MUTATES them in shared memory across RK stages (and re-derives the per-stage
+    XImats from the freshly-mutated s_q)."""
+    n = self.robot.get_num_vel()
+    fb = self.robot.floating_base
+    suffix = "_with_x_kp1" if compute_x_kp1 else ""
+    fname = "integrator_gradient" + suffix + "_full_inner"
+    func_params = [
+        "s_dAB is the output [A | B] buffer (caller places); size 2*NUM_VEL*3*NUM_VEL = " + str(2 * n * 3 * n),
+    ]
+    if compute_x_kp1:
+        func_params.append("s_x_kp1 is the next-state output (caller places); size NUM_POS + NUM_VEL")
+    func_params += [
+        "s_q is the vector of joint positions (NON-const: mutated across RK stages)",
+        "s_qd is the vector of joint velocities (NON-const: mutated across RK stages)",
+        "s_u is the vector of joint input torques",
+        "s_df_du / s_dc_du / s_vaf / s_Minv / s_qdd are FD-grad in/out scratch (caller places)",
+        "s_q_orig / s_qd_orig / s_stage_grad_qdd / s_D_qdd_stage are multi-stage scratch (caller places; s_D_qdd_stage is a de-aliased workspace band when spilled)",
+        "s_dInt_q_6x6 / s_dInt_v_6x6 are the floating-base SE(3) dIntegrate blocks (unused fixed-base)",
+        "s_temp is the FD-grad inner scratch pool (used when SCRATCH_IN_SMEM)",
+        "d_workspace is the global scratch pool the FD-grad inner s_temp routes to (used when !SCRATCH_IN_SMEM)",
+        "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_robotModel holds XImats/topology; gravity is the gravity constant; dt is the timestep",
+    ]
+    func_def_start = "void " + fname + "(T *s_dAB, "
+    if compute_x_kp1:
+        func_def_start += "T *s_x_kp1, "
+    func_def_middle = ("T *s_q, T *s_qd, const T *s_u, T *s_df_du, T *s_dc_du, T *s_vaf, "
+                       "T *s_Minv, T *s_qdd, T *s_q_orig, T *s_qd_orig, T *s_stage_grad_qdd, "
+                       "T *s_D_qdd_stage, T *s_dInt_q_6x6, T *s_dInt_v_6x6, ")
+    func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
+                    "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+    if use_thread_group:
+        func_def_start += "cgrps::thread_group tgrp, "
+        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("integrator gradient orchestration as a single inner-owns-placement device function",
+                          ["Owns the FD-grad inner s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch and the per-stage XImats refresh)"],
+                          func_params, None)
+    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
+    # __forceinline__ so the whole orchestration inlines into the calling kernel.
+    # Under -rdc a separate __device__ wrapper keeps its RBD callees as distinct
+    # functions whose regcount must fit the kernel's launch_bounds budget -> ptxas
+    # regcount error. Inlining folds them into the kernel. See _fdsva_so.py:295-300.
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line(func_def, True)
+    # Inner owns the FD-grad pool placement; the repoint covers every consumer below
+    # (incl. the XImats helper's sincos scratch and the multi-stage per-stage XImats
+    # refresh), so no caller-side repoint. This is the migrated kernel line-744 case.
+    self.gen_add_code_line("if constexpr(!SCRATCH_IN_SMEM){ s_temp = d_workspace; } else { (void)d_workspace; }")
+    # XImats helper INSIDE the inner AFTER the repoint (no shared-helper edit) so its
+    # sincos scratch follows the placed s_temp pool.
+    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    # Compile-time IT dispatch: single-stage (Euler / SI-Euler) vs multi-stage
+    # (Midpoint / RK3 / RK4). Per-rung band flags are passed as 'true'/'false'
+    # literals through the stable FD-grad _inner_python composition surface.
+    spill_flag = "USE_DA_DF_SPILL"
+    self.gen_add_code_line(
+        "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
+    )
+    self.gen_integrator_gradient_inner_python(
+        use_thread_group=use_thread_group,
+        compute_x_kp1=compute_x_kp1,
+        integrator_type="IT",
+        s_dAB_name="s_dAB",
+        s_x_kp1_name="s_x_kp1",
+        d_temp_spill_name="d_temp_spill",
+        temp_spill_flag_name=spill_flag,
+    )
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_integrator_gradient_multistage(
+        use_thread_group=use_thread_group,
+        compute_x_kp1=compute_x_kp1,
+        d_temp_spill_name="d_temp_spill",
+        temp_spill_flag_name=spill_flag,
+    )
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
 def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=False):
     n = self.robot.get_num_vel()
     suffix = "_with_x_kp1" if compute_x_kp1 else ""
@@ -653,15 +789,22 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
     d_qdd_count = max_stages * n * 3 * n
 
     def _emit_body(dqdd_in_smem, dab_in_smem, inner_level):
-        # Surgical per-tier body. Three buffers spill independently to distinct,
-        # non-aliasing d_workspace sub-offsets (the integrator gradient never runs
-        # concurrently with id_du/fd_du/fdsva_so, so it reuses those sections):
-        #   - s_D_qdd_stage (max_stages*nv*3nv) -> Dqdd region (offset 0) when !dqdd_in_smem
-        #   - s_dAB output (2nv*3nv)            -> dAB region              when !dab_in_smem
-        #   - the FD-grad inner s_temp:
-        #       inner_level 0: full smem; 1: da_df-band SELECTIVE spill (s_temp
-        #       shrinks, only the band leaves smem); 2: whole inner -> inner region.
-        # The hot scaffold (s_dc_du / s_vaf / s_Minv) always stays in smem.
+        # Surgical per-tier body. The 3 distinct buffers spill independently to
+        # SEPARATE non-aliasing d_workspace sub-offsets (the integrator gradient
+        # never runs concurrently with id_du/fd_du/fdsva_so, so it reuses those
+        # sections) — the de-aliased multi-band layout is preserved, NOT collapsed:
+        #   - s_D_qdd_stage (max_stages*nv*3nv) -> Dqdd region (offset 0) when !dqdd_in_smem  [caller-placed]
+        #   - s_dAB output (2nv*3nv)            -> dAB region              when !dab_in_smem  [caller-placed]
+        #   - the FD-grad inner s_temp POOL (the integrator_gradient_full_inner OWNS
+        #     this placement via its SCRATCH_IN_SMEM template flag):
+        #       inner_level 0: full smem (SCRATCH_IN_SMEM=true);
+        #       1: da_df-band SELECTIVE spill (s_temp shrinks, only the id_du band
+        #          leaves smem to d_temp_spill; SCRATCH_IN_SMEM=true, USE_DA_DF_SPILL=true);
+        #       2: whole inner POOL -> inner region (SCRATCH_IN_SMEM=false; the inner
+        #          repoints s_temp=d_workspace at its top — this is the migrated
+        #          former kernel line-744 repoint).
+        # The hot scaffold (s_dc_du / s_vaf / s_Minv) always stays in smem. The kernel
+        # only slices the band base pointers + passes the per-rung flags as literals.
         inner_temp_size = (inner_temp_full if inner_level == 0
                            else (inner_temp_selective if inner_level == 1 else 0))
         extra_t_buffers = [("s_q_qd_u", 3 * n + fb)]
@@ -695,40 +838,24 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         self.gen_add_code_line(
             "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
         )
-        # da_df-band selective spill buffer (set per-timestep below when inner_level==1).
+        # The kernel only SLICES the de-aliased workspace band base pointers and
+        # passes per-rung flags; the full_inner OWNS the FD-grad inner s_temp pool
+        # placement (the rung-2 whole-pool repoint is its SCRATCH_IN_SMEM=false path).
+        # Per-rung flags are passed as 'true'/'false' literals.
+        scratch_in_smem_expr = "false" if inner_level == 2 else "true"
         spill_flag = "true" if inner_level == 1 else "false"
-        if inner_level == 1:
-            self.gen_add_code_line("T *d_temp_spill = nullptr;")
+        # d_temp_spill is the id_du da_df band region (rung 1); always declared so the
+        # full_inner call can reference it (nullptr unless inner_level==1).
+        self.gen_add_code_line("T *d_temp_spill = nullptr;")
         if use_thread_group:
             self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
 
-        def _emit_dispatch():
-            spill_name = "d_temp_spill" if inner_level == 1 else "nullptr"
-            # Dispatch single-stage vs multi-stage at compile time on IT.
-            self.gen_add_code_line(
-                "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
-            )
-            self.gen_integrator_gradient_inner_python(
-                use_thread_group=use_thread_group,
-                compute_x_kp1=compute_x_kp1,
-                integrator_type="IT",
-                s_dAB_name="s_dAB",
-                s_x_kp1_name="s_x_kp1",
-                d_temp_spill_name=spill_name,
-                temp_spill_flag_name=spill_flag,
-            )
-            self.gen_add_end_control_flow()
-            self.gen_add_code_line("else {", True)
-            self.gen_integrator_gradient_multistage(
-                use_thread_group=use_thread_group,
-                compute_x_kp1=compute_x_kp1,
-                d_temp_spill_name=spill_name,
-                temp_spill_flag_name=spill_flag,
-            )
-            self.gen_add_end_control_flow()
-
         def _emit_spill_pointers(slot_expr):
-            # Repoint the spilled buffers into d_workspace at their fixed sub-offsets.
+            # Slice the de-aliased multi-band workspace base pointers. The 3 distinct
+            # buffers (s_D_qdd_stage, s_dAB, the FD-grad inner pool) keep SEPARATE
+            # non-aliasing workspace sub-offsets; only the FD-grad inner POOL repoint
+            # moved into the full_inner (its SCRATCH_IN_SMEM=false path). The kernel
+            # passes that pool base via d_workspace_pool_name below.
             if not dqdd_in_smem:
                 self.gen_add_code_line(
                     "T *s_D_qdd_stage = reinterpret_cast<T *>(&d_workspace[" + slot_expr + "]);"
@@ -737,24 +864,32 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                 self.gen_add_code_line(
                     "T *s_dAB = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_DAB_OFFSET_BYTES<T>()]);"
                 )
-            if inner_level == 2:
-                # s_temp is already declared by the arena helper (size 0 at this
-                # rung) — repoint it, do not redeclare.
-                self.gen_add_code_line(
-                    "s_temp = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
-                )
-            elif inner_level == 1:
+            if inner_level == 1:
                 self.gen_add_code_line(
                     "d_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
                 )
 
+        def _emit_full_inner_call(slot_expr):
+            # The FD-grad inner pool base (only consumed by the inner when
+            # SCRATCH_IN_SMEM=false; nullptr otherwise).
+            pool_name = ("reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()])"
+                         if inner_level == 2 else "nullptr")
+            spill_name = "d_temp_spill" if inner_level == 1 else "nullptr"
+            self.gen_integrator_gradient_full_inner_function_call(
+                use_thread_group=use_thread_group,
+                compute_x_kp1=compute_x_kp1,
+                scratch_in_smem_expr=scratch_in_smem_expr,
+                use_da_df_spill_expr=spill_flag,
+                d_workspace_pool_name=pool_name,
+                d_temp_spill_name=spill_name,
+            )
+
         if not single_call_timing:
             self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
             self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
-            self.gen_add_code_line("// compute")
+            self.gen_add_code_line("// compute — the orchestration inner owns its FD-grad s_temp pool placement")
             _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
-            self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-            _emit_dispatch()
+            _emit_full_inner_call("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             self.gen_add_sync(use_thread_group)
             self.gen_kernel_save_result("dAB", str(2 * n * 3 * n), str(2 * n * 3 * n), use_thread_group)
             if compute_x_kp1:
@@ -767,8 +902,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
             self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
             self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="dAB")
-            self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-            _emit_dispatch()
+            _emit_full_inner_call("0")
             self.gen_anti_licm_output_write("dAB")
             self.gen_add_end_control_flow()
             self.gen_kernel_save_result_single_timing("dAB", str(2 * n * 3 * n), use_thread_group)
@@ -869,6 +1003,10 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
 
 
 def gen_integrator_gradient(self, use_thread_group=False):
+    # Inner-owns-placement orchestration inners (one per output kind). Emitted
+    # before the kernels that call them. Mirrors id_du / fdsva_so full_inner.
+    self.gen_integrator_gradient_full_inner(use_thread_group, compute_x_kp1=False)
+    self.gen_integrator_gradient_full_inner(use_thread_group, compute_x_kp1=True)
     # Gradient-only device + kernel + host
     self.gen_integrator_gradient_device(use_thread_group, compute_x_kp1=False)
     self.gen_integrator_gradient_kernel(use_thread_group, compute_x_kp1=False, single_call_timing=True)
