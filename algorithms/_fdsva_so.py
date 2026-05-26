@@ -112,6 +112,29 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     # bottleneck — could equally be memory-bandwidth or sync-bound, in
     # which case cuBLASDx won't help. Then prototype on a single robot
     # before generalizing.
+    #
+    # COALESCED-DOT EXPERIMENT (2026-05-26, EVALUATED, NOT TAKEN): the spilled
+    # operand (inner_dq/inner_cross/inner_tau/d2tau_dvdv, in d_workspace when
+    # CONTRACT_IN_SMEM=false) is gathered with stride n^2 over the contracted
+    # axis L — inner_dq[j + k*n + L*n^2] reads the SAME buffer that was written
+    # as [i][j][k], so L (the sum axis) maps to the buffer's slowest, stride-n^2
+    # index. grid_linalg_dot_strided_coalesced coalesces ALONG the contraction
+    # stride (consecutive thread ranks read x[rank*SX], y[rank*SY]), so applying
+    # it here would issue stride-n^2 loads across the warp — WORSE than the
+    # current stride-n warp gather, not better; the primitive only helps when the
+    # summed axis is the contiguous (small-stride) one, which it is not in this
+    # iL,Ljk->ijk layout. Worse still, it is BLOCK-COOPERATIVE (one scalar per
+    # call): producing 4*n^3 outputs would mean 4*n^3 sequential block-reductions
+    # (g1: ~171.5k dots, ~343k __syncthreads), each n-element dot using only
+    # ~n/blockDim of the threads — collapsing the current embarrassingly-parallel
+    # 4*n^3-way thread parallelism. Making the primitive coalesce would require
+    # transposing inner_* so L is contiguous (an extra full global read+write of
+    # the 4*n^3 tensor) AND still pay the per-output block-reduction serialization.
+    # Both effects are large regressions, so the contraction is LEFT AS-IS (the
+    # smem path is already fine; the spilled path's stride-n^2 gather is the cost
+    # of spilling, not something this primitive fixes). Profiled/reasoned and
+    # rejected — do not re-attempt with this primitive without a layout that puts
+    # the contracted axis contiguous AND avoids one-dot-per-block serialization.
     self.gen_add_parallel_loop("ind",str(4*n**3),use_thread_group)
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
     self.gen_add_code_line(f'if (ind < {n**3}) d2a_dqdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_dq[j + k*{n}]);')
