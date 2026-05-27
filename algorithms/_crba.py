@@ -149,86 +149,48 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
-    # M[jid, parent_id] = dot product between (S_parent^T * X_lambda^t) * IS
-    # IS = I[6*S_ind]; (S_parent^T * X_lambda^t) reads the parent S_ind row.
+    # M[jid, parent] = S_parent^T * (X_lambda^T chain) * IS.
     #
-    # PERF: the ancestor walk is depth-stepped instead of jid-serial. The
-    # loop-carried dependence lives ALONG each chain (s_fh advances one Xmat^T
-    # per step), so the depth axis stays serial. But at a fixed depth every
-    # active jid's step is INDEPENDENT, and the 6 rows of each Xmat^T*fh apply
-    # are independent too. We widen across (active-jid, row): a block-stride
-    # parallel loop over active*6 lanes does all jids' depth-d step at once,
-    # versus the old code where only `n` threads were live (one chain each) and
-    # each serially ground through its whole ancestor list. On branched robots
-    # (g1: 29 joints, depth 9) this turns ~n live threads into up to ~active*6
-    # ~= (n)*6 live lanes during the dominant fill phase.
+    # Each thread owns ONE jid and walks ITS ancestor chain serially, advancing
+    # s_fh[jid] by one Xmat^T per step (the loop-carried dependence is ALONG the
+    # chain). Threads are independent — thread `jid` only touches s_fh[jid*6..]
+    # and the M cells (jid,parent)/(parent,jid) for its own ancestors — so the
+    # whole fill needs NO inter-thread syncs. (A depth-stepped variant that split
+    # each chain step into separate parallel loops added 3 __syncthreads PER
+    # DEPTH — ~21 for a 7-deep chain — and regressed crba 2.5-6x; reverted.)
     #
-    # NOTE: the GLASS segmented_row_strided_gemv wrapper is a NON-transposed
-    # col-major batched GEMV; this step needs Xmat^T * fh (transpose), which the
-    # wrapper cannot express (no ROW_STRIDE makes row scale by 6 and col by 1).
-    # So the per-step apply is a manual block-stride transposed GEMV (the same
-    # dot_prod<T,6,1,1> the serial code used), kept numerically identical.
-
-    # Group the ancestor walk by depth: at depth d, active[d] holds every
-    # (jid, X_ind, parent) whose chain reaches step d. X_ind is jid at d==0,
-    # else the (d-1)-th ancestor; parent is the d-th ancestor (the M column).
-    max_depth = self.robot.get_max_num_ancestors()
-    depth_active = []
-    for d in range(max_depth):
-        rows = []
-        for jid in range(n):
-            anc = self.robot.get_ancestors_by_id(jid)
-            if d < len(anc):
-                X_ind = jid if d == 0 else anc[d-1]
-                parent = anc[d]
-                rows.append((jid, X_ind, parent))
-        if rows:
-            depth_active.append(rows)
-
-    # s_fh holds the per-jid running 6-vector; s_beta is a scratch landing pad
-    # for the freshly-applied Xmat^T*fh so the in-place read/write race (a lane
-    # writing s_fh[row] while a sibling lane still reads s_fh[col]) is avoided.
-    # beta scratch (36*n words) easily covers the n*6 fh footprint.
-    for d, rows in enumerate(depth_active):
-        na = len(rows)
-        # compile-time descriptor arrays for this depth's active steps:
-        #   s_ajid  - owning joint, s_axind - Xmat^T to apply this step,
-        #   s_apar  - parent (M column), s_apsi/s_apss - parent S index/sign.
-        jid_arr   = "{" + ", ".join(str(t[0]) for t in rows) + "}"
-        xind_arr  = "{" + ", ".join(str(t[1]) for t in rows) + "}"
-        par_arr   = "{" + ", ".join(str(t[2]) for t in rows) + "}"
-        psind_arr = "{" + ", ".join(str(self.robot.get_S_index_by_id(t[2])) for t in rows) + "}"
-        pssgn_arr = "{" + ", ".join(str(self.robot.get_S_sign_by_id(t[2])) for t in rows) + "}"
-        self.gen_add_code_line(f"// depth {d}: {na} active ancestor step(s)")
-        self.gen_add_code_line("{", True)
-        self.gen_add_code_line(f"const int s_ajid[{na}] = {jid_arr};")
-        self.gen_add_code_line(f"const int s_axind[{na}] = {xind_arr};")
-        self.gen_add_code_line(f"const int s_apar[{na}] = {par_arr};")
-        self.gen_add_code_line(f"const int s_apsi[{na}] = {psind_arr};")
-        self.gen_add_code_line(f"const T s_apss[{na}] = {pssgn_arr};")
-        # 1) widened transposed GEMV: beta[slot*6+row] = Xmat[X_ind]^T_row . s_fh[jid].
-        #    Output lands in beta scratch (not in-place) to avoid the per-segment
-        #    read-after-write race between a lane storing row and a lane reading col.
-        self.gen_add_parallel_loop("lane", str(na*6), use_thread_group)
-        self.gen_add_code_line("int slot = lane / 6; int row = lane % 6;")
-        self.gen_add_code_line("int a_jid = s_ajid[slot]; int a_xind = s_axind[slot];")
-        self.gen_add_code_line("beta[slot*6 + row] = dot_prod<T,6,1,1>(&s_XImats[36*a_xind + row*6], &s_fh[a_jid*6]);")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        # 2) copy the advanced fh back into s_fh for the next depth step
-        self.gen_add_parallel_loop("lane", str(na*6), use_thread_group)
-        self.gen_add_code_line("int slot = lane / 6; int row = lane % 6;")
-        self.gen_add_code_line("s_fh[s_ajid[slot]*6 + row] = beta[slot*6 + row];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        # 3) one lane per active step writes the (parent-indexed) mass-matrix entry
-        self.gen_add_parallel_loop("slot", str(na), use_thread_group)
-        self.gen_add_code_line("int a_jid = s_ajid[slot]; int parent_ind = s_apar[slot];")
-        self.gen_add_code_line(f"s_M[a_jid*{n} + parent_ind] = s_apss[slot] * s_fh[a_jid*6 + s_apsi[slot]];")
-        self.gen_add_code_line(f"s_M[parent_ind*{n} + a_jid] = s_M[a_jid*{n} + parent_ind];") # M symmetric
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_end_control_flow()
+    # CORRECTNESS: the M entry indexes s_fh by the PARENT's S index/sign, not the
+    # owning jid's (they differ on branched robots). s_Sidx/s_Ssgn_by_jid are
+    # compile-time per-joint tables looked up at runtime by parent id.
+    max_ancestors = self.robot.get_max_num_ancestors()
+    S_idx_arr = "{" + ", ".join(str(self.robot.get_S_index_by_id(j)) for j in range(n)) + "}"
+    S_sgn_arr = "{" + ", ".join(str(self.robot.get_S_sign_by_id(j)) for j in range(n)) + "}"
+    self.gen_add_parallel_loop("jid", str(n), use_thread_group)
+    self.gen_add_code_line(f"const int s_Sidx_by_jid[{n}] = {S_idx_arr};")
+    self.gen_add_code_line(f"const T s_Ssgn_by_jid[{n}] = {S_sgn_arr};")
+    parent_chain_init = "{" + "-1, " * (max_ancestors - 1) + "-1}" if max_ancestors >= 1 else "{-1}"
+    self.gen_add_code_line(f"int jid_parents[] = {parent_chain_init};")
+    self.gen_add_code_line("int num_parents = 0;")
+    self.gen_add_code_line("switch (jid) {", True)
+    for jid in range(n):
+        self.gen_add_code_line(f"case {jid}:", True)
+        parent_chain = self.robot.get_ancestors_by_id(jid)
+        for i, parent_ind in enumerate(parent_chain):
+            self.gen_add_code_line(f"jid_parents[{i}] = {parent_ind};")
+        self.gen_add_code_line(f"num_parents += {len(parent_chain)};")
+        self.gen_add_code_line("break;")
+        self.indent_level -= 1
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("T s_alpha[6];")
+    self.gen_add_code_line("for (int i = 0; i < num_parents; i++) {", True)
+    self.gen_add_code_line("int X_ind = i==0 ? jid : jid_parents[i-1];")
+    self.gen_add_code_line("for (int k = 0; k < 6; k++) s_alpha[k] = s_fh[jid*6+k];")
+    self.gen_add_code_line("for (int k = 0; k < 6; k++) s_fh[jid*6 + k] = dot_prod<T,6,1,1>(&s_XImats[36*X_ind+k*6], &s_alpha[0]);")
+    self.gen_add_code_line("int parent_ind = jid_parents[i];")
+    self.gen_add_code_line(f"s_M[jid*{n} + parent_ind] = s_Ssgn_by_jid[parent_ind] * s_fh[jid*6 + s_Sidx_by_jid[parent_ind]];")
+    self.gen_add_code_line(f"s_M[parent_ind*{n} + jid] = s_M[jid*{n} + parent_ind];") # M symmetric
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
 
     self.gen_add_end_function()
 
