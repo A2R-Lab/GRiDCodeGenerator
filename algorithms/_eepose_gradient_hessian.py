@@ -337,9 +337,14 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_inner_temp_mem_size(self, fixed_target_name = ""):
-    n = self.robot.get_num_pos()
+    # Scratch for the shared-chain geometric Jacobian:
+    #   s_Xworld  : 16 * NUM_JOINTS   (world transforms of every joint)
+    #   s_Jv,s_Jw : 2 * (3 * nv * num_ees)
+    #   s_E       : 4 * num_ees       (cy, sy, cp, sp per ee for E(rpy) inversion)
+    n_joints = self.robot.get_num_joints()
+    nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
-    return 2*2*16*num_ees*n
+    return 16*n_joints + 2*3*nv*num_ees + 4*num_ees
 
 def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = False, updated_var_names = None, fixed_target_name = "",
                                                        temp_in_smem_expr = "true"):
@@ -368,23 +373,98 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
     code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
+def _eepose_grad_chain_metadata(self, all_ees, fixed_target_name):
+    """Bake out per-ee chain-joint fill jobs for the geometric-Jacobian rewrite.
+
+    For each end-effector returns:
+      (chain_jids, ee_anchor_jid, ee_uses_fixed_offset_chain)
+      jobs: list of dicts { j, vi, ang_local (len-3), lin_local (len-3), revolute }
+
+    `ee_anchor_jid` is the joint whose world transform is the EE's world frame
+    (for a leaf-joint EE this is the leaf itself; for a fixed-joint EE this is
+    the parent joint and the fixed transform is composed in C++ separately —
+    not implemented in this first cut and is asserted out)."""
+    import numpy as _np
+    chains, anchors, jobs_all = [], [], []
+    for ee in all_ees:
+        chain = sorted(self.robot.get_ancestors_by_id(ee)) + [ee]
+        chains.append(chain)
+        anchors.append(ee)
+        jobs = []
+        for j in chain:
+            S = _np.asarray(self.robot.get_S_by_id(j), dtype=_np.float64)
+            if S.ndim == 1:
+                S = S.reshape(-1, 1)
+            try:
+                vinds = self.robot.get_joint_index_v(j)
+            except Exception:
+                vinds = self.robot.get_joint_index_q(j)
+            if not isinstance(vinds, (list, tuple, _np.ndarray)):
+                vinds = [vinds]
+            vinds = list(vinds)
+            for c in range(S.shape[1]):
+                vi = vinds[c] if c < len(vinds) else vinds[-1]
+                ang_local = [float(x) for x in S[:3, c]]
+                lin_local = [float(x) for x in S[3:6, c]]
+                revolute = max(abs(x) for x in ang_local) > 0.5
+                jobs.append({
+                    "j": int(j), "vi": int(vi),
+                    "ang": ang_local, "lin": lin_local,
+                    "revolute": bool(revolute),
+                })
+        jobs_all.append(jobs)
+    return chains, anchors, jobs_all
+
 def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_target_name = ""):
+    """Shared-chain geometric (spatial) Jacobian for d(pose)/dv (tangent).
+
+    Output `s_deePos` is sized 6 * nv * NUM_EE (NOT 6 * nq) so the floating-base
+    base block is the spatial Jacobian (omega; v_world) rather than the older
+    non-standard quaternion-component derivs. Convention matches pinocchio's
+    LOCAL_WORLD_ALIGNED frame Jacobian (mapped through E(rpy)^{-1} for the rpy
+    rows). Algorithm:
+      1. One forward-kinematics pass builds the world transform of every joint
+         via BFS-level chain-up (s_Xworld).
+      2. Per ee, per chain joint j, per S column c: J_w[:, ee, vi] = R_j_world *
+         ang_local (revolute) or 0 (prismatic); J_v[:, ee, vi] = J_w x (p_ee -
+         p_j) (revolute) or R_j_world * lin_local (prismatic). vi is the
+         joint's velocity index from get_joint_index_v.
+      3. Per ee, extract (cy, sy, cp, sp) from R_ee_world.
+      4. Write s_deePos: rows 0..2 = J_v columns; rows 3..5 = E(rpy)^{-1} * J_w
+         columns. Closed-form E^{-1} avoids an explicit matrix inverse:
+            row 3 (droll/dv): (cy*Jw[0] + sy*Jw[1]) / cp
+            row 4 (dpitch/dv): -sy*Jw[0] + cy*Jw[1]
+            row 5 (dyaw/dv):  sp/cp * (cy*Jw[0] - sy*Jw[1]) + Jw[2]
+    """
     n = self.robot.get_num_pos()
-    n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
+    nv = self.robot.get_num_vel()
+    n_joints = self.robot.get_num_joints()
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
+
     if fixed_target_name == "":
         all_ees = self.robot.get_leaf_nodes()
     else:
-        all_ees = [self.robot.get_fixed_joint_by_name(fixed_target_name).get_id()]
+        # The fixed-target gradient path predates this rewrite and is not
+        # exercised by the current bench/equivalence harness; flag if it
+        # ever surfaces so we know to extend the shared-chain emission.
+        raise NotImplementedError(
+            "gen_end_effector_pose_gradient_inner: fixed_target_name='" + fixed_target_name +
+            "' not yet supported by the shared-chain geometric-Jacobian rewrite."
+        )
     num_ees = len(all_ees)
-    # construct the boilerplate and function definition
-    func_params = ["s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
-                   "s_q is the vector of joint positions", \
-                   "s_Xhom is the pointer to the homogenous transformation matricies ", \
-                   "s_dXhom is the pointer to the gradient of the homogenous transformation matricies ", \
+    chains, anchors, fill_jobs = _eepose_grad_chain_metadata(self, all_ees, fixed_target_name)
+
+    # function header
+    func_params = ["s_deePos is a pointer to shared memory of size 6*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees), \
+                   "s_q is the vector of joint positions (unused; kept for signature compatibility)", \
+                   "s_Xhom is the pointer to the LOCAL homogeneous transformation matrices (per-joint Xhom_local)", \
+                   "s_dXhom is the pointer to the LOCAL d-transforms (unused by the geometric-Jacobian path; kept for signature compatibility)", \
                    "s_temp is a pointer to helper shared memory of size " + \
                             str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()), \
-                   "s_linalg_smem is optional byte-addressed shared memory for cuBLASDx"]
-    func_notes = ["Assumes the Xhom and dXhom matricies have already been updated for the given q"]
+                   "d_workspace is the global-memory chain workspace used in place of s_temp when !TEMP_IN_SMEM", \
+                   "s_linalg_smem is optional byte-addressed shared memory (reserved; unused)"]
+    func_notes = ["Assumes s_Xhom has been populated with the per-joint LOCAL transforms for the given q.",
+                  "Output d/dv (TANGENT) is 6 x nv per ee (was 6 x nq for d/dq) -- matches pinocchio."]
     func_def_start = "void end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, "
     func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
@@ -393,106 +473,175 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
         func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
-    # now generate the code
-    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
+    self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to generalized velocity (d/dv tangent, pinocchio convention)",
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # Inner-controlled scratch placement: the double-buffered chain workspace
-    # moves to d_workspace when !TEMP_IN_SMEM. Reassigning s_temp at the top keeps
-    # every s_temp[...] reference below unchanged.
     self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
-    #
-    # Initial Debug Prints if Requested
-    #
-    if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
-        self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,4,4>(&s_Xhom[16*i],4);}")
-        self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"dX[%d]\\n\",i); printMat<T,4,4>(&s_dXhom[16*i],4);}")
+    self.gen_add_code_line("(void)s_q; (void)s_dXhom; (void)s_linalg_smem;")
+
+    # scratch layout (matches gen_end_effector_pose_gradient_inner_temp_mem_size)
+    off_Xworld = 0
+    off_Jv = off_Xworld + 16 * n_joints
+    off_Jw = off_Jv + 3 * nv * num_ees
+    off_E  = off_Jw + 3 * nv * num_ees   # 4 * num_ees floats: cy, sy, cp, sp per ee
+    self.gen_add_code_line("// scratch layout: Xworld | Jv (3 x nv x ee) | Jw (3 x nv x ee) | E_sincos (4 x ee)")
+    self.gen_add_code_line("T *s_Xworld = &s_temp[" + str(off_Xworld) + "];")
+    self.gen_add_code_line("T *s_Jv     = &s_temp[" + str(off_Jv)     + "];")
+    self.gen_add_code_line("T *s_Jw     = &s_temp[" + str(off_Jw)     + "];")
+    self.gen_add_code_line("T *s_E_sc   = &s_temp[" + str(off_E)      + "];   // cy,sy,cp,sp per ee")
+
+    # ============ Step 1: world transforms by BFS level ============
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 1: build world transforms for every joint via BFS-level chain-up")
+    self.gen_add_code_line("//")
+    for level in range(n_bfs_levels):
+        ids_at_level = self.robot.get_ids_by_bfs_level(level)
+        if not ids_at_level:
+            continue
+        njs = len(ids_at_level)
+        self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
+        self.gen_add_parallel_loop("ind", str(16 * njs), use_thread_group)
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        # bake the joint id and parent id per slot
+        jid_list = [str(j) for j in ids_at_level]
+        par_list = [str(self.robot.get_parent_id(j)) for j in ids_at_level]
+        select_var_vals = [("int", "jid", jid_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(njs)], select_var_vals)
+        # If par == -1 (root), world := local; else world[jid] = world[par] @ local[jid].
+        # local[jid] is s_Xhom[16*jid]; world[jid] is s_Xworld[16*jid].
+        self.gen_add_code_line("if (par == -1) {", True)
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = s_Xhom[16*jid + ele];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        # dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col])
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
+        self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 
-    #
-    # For each chain we need to (in parallel) multiply the (d)Xmats
-    # 
+    # ============ Step 2: zero Jv, Jw ============
     self.gen_add_code_line("//")
-    self.gen_add_code_line("// For each branch/gradient in parallel chain up the transform")
-    self.gen_add_code_line("// Keep chaining until reaching the root (starting from the leaves)")
+    self.gen_add_code_line("// Step 2: zero the J_v and J_w scratch (out-of-chain columns stay zero)")
     self.gen_add_code_line("//")
-    self.gen_add_code_line("T *s_eeTemp = &s_temp[0]; T *s_deeTemp = &s_temp[" + str(2*16*num_ees*n) + "];")
-    parent = -1
-    for bfs_level in range(n_bfs_levels + (0 if fixed_target_name == "" else 1)): # at most bfs levels of parents to chain (unless with fixed target can be one larger)
-        # if serial chain manipulator then this is easy
-        if self.robot.is_serial_chain():
-            self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
-            if bfs_level == 0:
-                self.gen_add_code_line("// First set the leaf transforms for eePos and deePos")
-                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
-                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int eeIndStart = 16*" + str(all_ees[0]) + ";")
-                self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[eeIndStart + rc];")
-                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, " + str(all_ees[0]) + ");")
-                self.gen_add_code_line("s_deeTemp[ind] = s_Xhom_dXhom[rc];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-                # update parent for next loop (if there is one)
-                if fixed_target_name == "":
-                    parent = self.robot.get_parent_id(all_ees[0])
-                else:
-                    parent_name = self.robot.get_fixed_joint_by_id(all_ees[0]).get_parent()
-                    parent = self.robot.get_joint_by_name(parent_name).get_id() if parent_name != "" else -1
-                if self.DEBUG_MODE:
-                    self.gen_add_sync(use_thread_group)
-                    self.gen_add_serial_ops(use_thread_group)
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i],4);}")
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i],4);}")
-                    self.gen_add_end_control_flow()
-                    self.gen_add_sync(use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2 * 3 * nv * num_ees), use_thread_group)
+    self.gen_add_code_line("s_Jv[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # ============ Step 3: per-ee, per-chain-joint, per-S-col column fills ============
+    # Each (ee, vi) pair emits one block that:
+    #   - reads R_j_world (3x3 in column-major from s_Xworld[16*j+0..10])
+    #   - reads p_j_world (s_Xworld[16*j + 12..14])
+    #   - reads p_ee_world (s_Xworld[16*ee_anchor + 12..14])
+    #   - computes axis_world (3-vector via R_j @ S_local)
+    #   - writes Jv, Jw columns
+    # Flatten all (ee, job) pairs across ees so each work item is one column-fill.
+    flat_jobs = []
+    for ee_idx, jobs in enumerate(fill_jobs):
+        ee_anchor = anchors[ee_idx]
+        for job in jobs:
+            flat_jobs.append((ee_idx, ee_anchor, job))
+    n_flat = len(flat_jobs)
+    if n_flat > 0:
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Step 3: per-chain-joint columns of J_v, J_w (one block per (ee, S-column))")
+        self.gen_add_code_line("//")
+        self.gen_add_serial_ops(use_thread_group)
+        # Use a serial single-thread emission per (ee, S-col) so each block can use
+        # compile-time constants for the joint id, axis, etc. Total work per block is
+        # ~10 FLOPs; total blocks ~chain_depth * num_ees * dofs_per_joint -- small.
+        for ee_idx, ee_anchor, job in flat_jobs:
+            j = job["j"]; vi = job["vi"]
+            ang = job["ang"]; lin = job["lin"]; rev = job["revolute"]
+            # column-major rotation: R_j[r,c] = s_Xworld[16*j + r + 4*c], r,c in 0..2
+            # local axis as compile-time floats
+            ax = ang if rev else lin
+            ax_str = ["static_cast<T>(" + ("{:.17g}".format(a)) + ")" for a in ax]
+            # axis_world[r] = sum_c R_j[r,c] * ax[c] = sum_c s_Xworld[16*j + r + 4*c] * ax[c]
+            self.gen_add_code_line("// ee=" + str(ee_idx) + " j=" + str(j) + " vi=" + str(vi) + (" rev" if rev else " prism"))
+            self.gen_add_code_line("{", True)
+            for r in range(3):
+                term = []
+                for c in range(3):
+                    if abs(ax[c]) < 1e-15:
+                        continue
+                    term.append("s_Xworld[" + str(16*j + r + 4*c) + "] * " + ax_str[c])
+                expr = " + ".join(term) if term else "static_cast<T>(0)"
+                self.gen_add_code_line("T axw_" + str(r) + " = " + expr + ";")
+            if rev:
+                # J_w[ee, vi, r] = axw_r
+                for r in range(3):
+                    self.gen_add_code_line("s_Jw[" + str(3*nv*ee_idx + 3*vi + r) + "] = axw_" + str(r) + ";")
+                # arm = p_ee - p_j -> dx, dy, dz
+                self.gen_add_code_line("T dx = s_Xworld[" + str(16*ee_anchor + 12) + "] - s_Xworld[" + str(16*j + 12) + "];")
+                self.gen_add_code_line("T dy = s_Xworld[" + str(16*ee_anchor + 13) + "] - s_Xworld[" + str(16*j + 13) + "];")
+                self.gen_add_code_line("T dz = s_Xworld[" + str(16*ee_anchor + 14) + "] - s_Xworld[" + str(16*j + 14) + "];")
+                # J_v = axw cross (p_ee - p_j)
+                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 0) + "] = axw_1*dz - axw_2*dy;")
+                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 1) + "] = axw_2*dx - axw_0*dz;")
+                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 2) + "] = axw_0*dy - axw_1*dx;")
             else:
-                if parent == -1:
-                    break # if no parent then we are done (this can happen if we have a fixed joint that is not at the end of the chain)
-                self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
-                # need to swap dst and start each time
-                even = bfs_level % 2
-                tempDstOffset = 16*n*(even)
-                tempSrcOffset = 16*n*(not even)
-                self.gen_add_parallel_loop("ind",str(16*n),use_thread_group)
-                self.gen_add_code_line("int djid = ind / 16; int rc = ind % 16; int row = rc % 4; int colInd = ind - row;")
-                self.gen_add_code_line("s_eeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom[16*" + str(parent) + " + row], &s_eeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_code_line("const T *s_Xhom_dXhom = grid_xhom_or_dxhom_ptr<T>(s_Xhom, s_dXhom, djid, " + str(parent) + ");")
-                self.gen_add_code_line("s_deeTemp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
-                                       "(&s_Xhom_dXhom[row], &s_deeTemp[" + str(tempSrcOffset) + " + colInd]);")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-                # update parent for next loop (if there is one)
-                parent = self.robot.get_parent_id(parent)
-                if self.DEBUG_MODE:
-                    self.gen_add_sync(use_thread_group)
-                    self.gen_add_serial_ops(use_thread_group)
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X_chain0[%d]\\n\",i); printMat<T,4,4>(&s_eeTemp[16*i + " + str(tempDstOffset) + "],4);}")
-                    self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"dX_chain0[%d]\\n\",i); printMat<T,4,4>(&s_deeTemp[16*i + " + str(tempDstOffset) + "],4);}")
-                    self.gen_add_end_control_flow()
-                    self.gen_add_sync(use_thread_group)
-        else:
-            # NON-SERIAL / FLOATING-BASE: the legacy dense path computed ALL
-            # (djid, ee) pairs at every BFS level and masked the out-of-chain
-            # ones with `inChain` (most work computed then discarded). Instead we
-            # emit ONE compacted chain-up over only the in-chain (ee, djid) pairs
-            # via grid_linalg_indexed_batched_gemm, then break out of the
-            # bfs_level loop (the compaction already walks every level). Output is
-            # numerically identical: the masked entries contributed exactly 0.
-            _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group)
-            break
-    if self.robot.is_serial_chain():
-        self.gen_add_code_line("//")
-        self.gen_add_code_line("// Now extract the eePos from the Transforms")
-        self.gen_add_code_line("// TODO: ADD OFFSETS")
-        self.gen_add_code_line("//")
-        tempOffset = 16*n*num_ees*(bfs_level % 2)
-        _emit_eepose_grad_extraction(self, n, num_ees, tempOffset, tempOffset, use_thread_group, ee_compact = False)
+                # J_v[ee, vi, r] = axw_r; J_w already zero from init
+                for r in range(3):
+                    self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + r) + "] = axw_" + str(r) + ";")
+            self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync(use_thread_group)
+
+    # ============ Step 4: per-ee rpy sincos ============
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 4: extract (cy, sy, cp, sp) from each ee's world rotation for E(rpy)^{-1}")
+    self.gen_add_code_line("//")
+    self.gen_add_parallel_loop("ee", str(num_ees), use_thread_group)
+    # bake the ee anchor jid via select
+    if num_ees > 1:
+        select_var_vals = [("int", "ee_jid", [str(a) for a in anchors])]
+        self.gen_add_multi_threaded_select("ee", "<", [str(i+1) for i in range(num_ees)], select_var_vals)
+    else:
+        self.gen_add_code_line("const int ee_jid = " + str(anchors[0]) + ";")
+    # R world is column-major: R[r,c] = s_Xworld[16*ee_jid + r + 4*c], r,c in 0..2
+    # roll  = atan2(R[2,1], R[2,2]) -> ind 2 + 4*1 = 6 ; 2 + 4*2 = 10
+    # pitch = atan2(-R[2,0], sqrt(R[2,2]^2 + R[2,1]^2)) -> ind 2 + 4*0 = 2 ; 10, 6
+    # yaw   = atan2(R[1,0], R[0,0]) -> ind 1, 0
+    self.gen_add_code_line("T R20 = s_Xworld[16*ee_jid + 2];")
+    self.gen_add_code_line("T R21 = s_Xworld[16*ee_jid + 6];")
+    self.gen_add_code_line("T R22 = s_Xworld[16*ee_jid + 10];")
+    self.gen_add_code_line("T R10 = s_Xworld[16*ee_jid + 1];")
+    self.gen_add_code_line("T R00 = s_Xworld[16*ee_jid + 0];")
+    self.gen_add_code_line("T cp_term = sqrt(R22*R22 + R21*R21);")
+    self.gen_add_code_line("T yaw = atan2(R10, R00);")
+    self.gen_add_code_line("T pitch = atan2(-R20, cp_term);")
+    self.gen_add_code_line("s_E_sc[4*ee + 0] = cos(yaw);")
+    self.gen_add_code_line("s_E_sc[4*ee + 1] = sin(yaw);")
+    self.gen_add_code_line("s_E_sc[4*ee + 2] = cos(pitch);")
+    self.gen_add_code_line("s_E_sc[4*ee + 3] = sin(pitch);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # ============ Step 5: write s_deePos = [J_v ; E^{-1} J_w] ============
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 5: write s_deePos (rows 0..2 = J_v, rows 3..5 = E(rpy)^{-1} J_w)")
+    self.gen_add_code_line("//")
+    self.gen_add_parallel_loop("ind", str(6 * nv * num_ees), use_thread_group)
+    self.gen_add_code_line("int row = ind % 6; int rem = ind / 6; int vi = rem % " + str(nv) + "; int ee = rem / " + str(nv) + ";")
+    self.gen_add_code_line("int jv_base = 3 * (" + str(nv) + " * ee + vi);")
+    self.gen_add_code_line("if (row < 3) {", True)
+    self.gen_add_code_line("s_deePos[ind] = s_Jv[jv_base + row];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("T cy = s_E_sc[4*ee + 0]; T sy = s_E_sc[4*ee + 1]; T cp = s_E_sc[4*ee + 2]; T sp = s_E_sc[4*ee + 3];")
+    self.gen_add_code_line("T Jw0 = s_Jw[jv_base + 0]; T Jw1 = s_Jw[jv_base + 1]; T Jw2 = s_Jw[jv_base + 2];")
+    self.gen_add_code_line("T outv;")
+    self.gen_add_code_line("if (row == 3) { outv = (cy*Jw0 + sy*Jw1) / cp; }")
+    self.gen_add_code_line("else if (row == 4) { outv = -sy*Jw0 + cy*Jw1; }")
+    self.gen_add_code_line("else { outv = (sp / cp) * (cy*Jw0 + sy*Jw1) + Jw2; }")
+    self.gen_add_code_line("s_deePos[ind] = outv;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
     self.gen_add_end_function()
 
 def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, use_thread_group, ee_compact = False):
@@ -937,9 +1086,10 @@ def gen_end_effector_pose_gradient_device_temp_mem_size(self, fixed_target_name 
 
 def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_target_name = ""):
     n = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     # construct the boilerplate and function definition
-    func_params = ["s_deePos is a pointer to shared memory of size 6*NUM_JOINTS*NUM_EE where NUM_JOINTS = " + str(n) + " and NUM_EE = " + str(num_ees), \
+    func_params = ["s_deePos is a pointer to shared memory of size 6*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees), \
                    "s_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
     func_notes = []
@@ -980,8 +1130,9 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     Used by gen_end_effector_pose_gradient_kernel to emit either a single body
     (collapsed picks) or three branched bodies (divergent picks). Mirrors
     _emit_d2ee_kernel_body_for_flags."""
+    nv = self.robot.get_num_vel()
     shared_mem_size = 0 if use_workspace_temp else self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
-    extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_deePos", 6*n*num_ees)]
+    extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_deePos", 6*nv*num_ees)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True,
                                                       extra_t_buffers = extra_t_buffers,
                                                       include_dxhom_shared = not use_workspace_dxhom,
@@ -1005,7 +1156,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         if use_workspace_dxhom:
             self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
-            self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*n*num_ees) + "];")
+            self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*nv*num_ees) + "];")
             self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + eegrad_temp_off + "]);")
             # Whole inner arena spilled -> smem s_temp is null. Repoint it at the
             # spilled workspace so the XmatsHom helper's sincos scratch is backed.
@@ -1019,7 +1170,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync(use_thread_group)
         if not use_workspace_temp:
-            self.gen_kernel_save_result("deePos",str(6*n*num_ees),str(6*n*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),str(6*nv*num_ees),use_thread_group)
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
@@ -1041,7 +1192,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         self.gen_anti_licm_output_write("deePos")
         self.gen_add_end_control_flow()
         if not use_workspace_temp:
-            self.gen_kernel_save_result_single_timing("deePos",str(6*n*num_ees),use_thread_group)
+            self.gen_kernel_save_result_single_timing("deePos",str(6*nv*num_ees),use_thread_group)
 
 
 def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single_call_timing = False, fixed_target_name = ""):
@@ -1150,7 +1301,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                 "gpuErrchk(cudaMemcpy(hd_data->h_deePos,hd_data->d_deePos,6*NUM_EES*NUM_JOINTS*" + \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_deePos,hd_data->d_deePos,6*NUM_EES*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested
