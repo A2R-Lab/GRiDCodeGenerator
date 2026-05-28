@@ -1106,13 +1106,18 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # add the shared memory variables
+    # add the shared memory variables. The shared-chain geometric-Jacobian inner
+    # uses ONLY local Xhom (s_dXhom is unused, marked `(void)`) so skip the
+    # per-joint local d-transform allocation + computation entirely. On floating
+    # base this also skips the (expensive) quaternion derivative of the base
+    # transform, which dominated the old per-(djid, ee) re-chain cost.
     shared_mem_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True, include_linalg_scratch = True,
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = False, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     # then load/update XI and run the algo
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
-    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
+    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
+    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
+        updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_end_function()
 
 _EE_GRAD_PICK_FLAGS = [
@@ -1133,9 +1138,9 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     nv = self.robot.get_num_vel()
     shared_mem_size = 0 if use_workspace_temp else self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name)
     extra_t_buffers = [("s_q", n)] if use_workspace_temp else [("s_q", n), ("s_deePos", 6*nv*num_ees)]
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = True,
+    # Geometric-Jacobian inner doesn't use s_dXhom -> skip its allocation/computation entirely.
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = False,
                                                       extra_t_buffers = extra_t_buffers,
-                                                      include_dxhom_shared = not use_workspace_dxhom,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if not use_workspace_temp:
@@ -1162,10 +1167,12 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
             # spilled workspace so the XmatsHom helper's sincos scratch is backed.
             self.gen_add_code_line("s_temp = s_eegrad_temp;")
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
         # Inner-controlled: pass both arenas + placement; the inner picks where
-        # the chain workspace lives via TEMP_IN_SMEM.
-        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
+        # the chain workspace lives via TEMP_IN_SMEM. s_dXhom is unused by the
+        # shared-chain geometric-Jacobian inner -> pass nullptr.
+        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else {}
+        updated["s_dXhom_name"] = "nullptr"
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync(use_thread_group)
@@ -1185,8 +1192,9 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         # TODO(licm-eepose-grad): sm_86-specific, deprioritized. See pre-Phase-3d note in git history.
         self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = True)
-        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else None
+        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
+        updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else {}
+        updated["s_dXhom_name"] = "nullptr"
         self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("deePos")
