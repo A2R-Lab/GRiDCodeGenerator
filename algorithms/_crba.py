@@ -238,55 +238,84 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
+    # Phase 1 — body recursions (sequential by tree, unchanged).
+    # For each jid NJ-1..1: alpha = X^T IC[jid]; IC[parent] += alpha X.
+    # This is data-dependent in jid (each iter feeds the parent's IC), so it
+    # stays sequential. Each iter is a single GLASS gemm pair — already
+    # block-cooperative within the gemm — no per-pair sync churn.
     for jid in range(NJ - 1, 0, -1):
         parent = self.robot.get_parent_id(jid)
-        S_ind = self.robot.get_S_index_by_id(jid)
-        S_sign = self.robot.get_S_sign_by_id(jid)
-        dof = jid + 5
         self.gen_add_code_line("// CRBA body " + str(jid))
         self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{ICOffset + 36*jid}], &s_temp[{alphaOffset}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
         self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
 
-        self.gen_add_parallel_loop("row", "6", use_thread_group)
-        self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(ICOffset + 36 * jid + 6 * S_ind) + " + row];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
-        self.gen_add_code_line("s_M[" + str(dof + nv * dof) + "] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(fhOffset + S_ind) + "];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-
-        chain = []
-        curr = jid
-        while self.robot.get_parent_id(curr) > 0:
-            chain.append((curr, self.robot.get_parent_id(curr)))
-            curr = self.robot.get_parent_id(curr)
-        chain.append((curr, 0))
-        for x_jid, ancestor in chain:
-            self.gen_add_parallel_loop("row", "6", use_thread_group)
-            self.gen_add_code_line("s_temp[" + str(alphaOffset) + " + row] = dot_prod<T,6,1,1>(&s_XImats[" + str(36 * x_jid) + " + 6*row], &s_temp[" + str(fhOffset) + "]);")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_parallel_loop("row", "6", use_thread_group)
-            self.gen_add_code_line("s_temp[" + str(fhOffset) + " + row] = s_temp[" + str(alphaOffset) + " + row];")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
-            if ancestor > 0:
-                a_S_ind = self.robot.get_S_index_by_id(ancestor)
-                a_S_sign = self.robot.get_S_sign_by_id(ancestor)
-                a_dof = ancestor + 5
-                self.gen_add_serial_ops(use_thread_group)
-                self.gen_add_code_line("s_M[" + str(dof + nv * a_dof) + "] = static_cast<T>(" + str(a_S_sign) + ") * s_temp[" + str(fhOffset + a_S_ind) + "];")
-                self.gen_add_code_line("s_M[" + str(a_dof + nv * dof) + "] = s_M[" + str(dof + nv * a_dof) + "];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
-            else:
-                self.gen_add_parallel_loop("col", "6", use_thread_group)
-                self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
-                self.gen_add_code_line("s_M[" + str(dof) + " + " + str(nv) + "*col] = s_temp[" + str(fhOffset) + " + S_col];")
-                self.gen_add_code_line("s_M[col + " + str(nv * dof) + "] = s_M[" + str(dof) + " + " + str(nv) + "*col];")
-                self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+    # Phase 2 — per-jid thread-parallel walk for M's diagonal + scalar-joint
+    # off-diagonal + floating-root coupling cells. ONE __syncthreads at the
+    # end of the loop, vs the ~3-per-(jid, ancestor) of the prior impl
+    # (~42 syncs/call on iiwa14-floating). See
+    # docs/a3_core_dynamics_floating_loss_audit.md for the full refactor plan.
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Phase 2: per-jid thread-parallel chain walk filling M's scalar-joint")
+    self.gen_add_code_line("// diagonal + scalar/scalar off-diagonals + scalar/floating-root coupling.")
+    self.gen_add_code_line("// Each thread owns ONE jid in [1, NJ) and walks its ancestor chain in")
+    self.gen_add_code_line("// thread-local registers (s_fh, s_alpha); writes are race-free because")
+    self.gen_add_code_line("// each thread only touches M cells indexed by its own dof = jid+5.")
+    self.gen_add_code_line("//")
+    max_ancestors = max(1, self.robot.get_max_num_ancestors())
+    S_idx_arr = "{" + ", ".join(str(self.robot.get_S_index_by_id(j)) for j in range(NJ)) + "}"
+    S_sgn_arr = "{" + ", ".join(str(self.robot.get_S_sign_by_id(j)) for j in range(NJ)) + "}"
+    self.gen_add_parallel_loop("jid_off", str(NJ - 1), use_thread_group)
+    self.gen_add_code_line("int jid = jid_off + 1;          // jid in [1, NJ)")
+    self.gen_add_code_line(f"int dof = jid + 5;")
+    self.gen_add_code_line(f"const int s_Sidx_by_jid[{NJ}] = {S_idx_arr};")
+    self.gen_add_code_line(f"const T s_Ssgn_by_jid[{NJ}] = {S_sgn_arr};")
+    # Per-jid compile-time ancestor chain (matches fixed-base's pattern, _crba.py:165-183).
+    parent_chain_init = "{" + ", ".join(["-1"] * max_ancestors) + "}"
+    self.gen_add_code_line(f"int jid_parents[{max_ancestors}] = {parent_chain_init};")
+    self.gen_add_code_line("int num_parents = 0;")
+    self.gen_add_code_line("switch (jid) {", True)
+    for jid in range(1, NJ):
+        self.gen_add_code_line(f"case {jid}:", True)
+        parent_chain = self.robot.get_ancestors_by_id(jid)
+        for i, parent_ind in enumerate(parent_chain):
+            self.gen_add_code_line(f"jid_parents[{i}] = {parent_ind};")
+        self.gen_add_code_line(f"num_parents = {len(parent_chain)};")
+        self.gen_add_code_line("break;")
+        self.indent_level -= 1
+    self.gen_add_end_control_flow()
+    # Initialize fh = S_sgn[jid] * IC[jid][:, S_ind[jid]] in thread-local regs.
+    self.gen_add_code_line("int sidx = s_Sidx_by_jid[jid];")
+    self.gen_add_code_line("T   ssgn = s_Ssgn_by_jid[jid];")
+    self.gen_add_code_line("T s_fh[6];")
+    self.gen_add_code_line(f"for (int k = 0; k < 6; k++) s_fh[k] = ssgn * s_temp[{ICOffset} + 36*jid + 6*sidx + k];")
+    # Diagonal M[dof, dof] = S_sgn * fh[sidx] = ssgn^2 * IC[jid][sidx, sidx] = IC[jid][sidx, sidx].
+    self.gen_add_code_line(f"s_M[dof + {nv}*dof] = ssgn * s_fh[sidx];")
+    # Chain walk: at step i, transform fh via X[X_id]^T and write M[jid, jid_parents[i]].
+    self.gen_add_code_line("T s_alpha[6];")
+    self.gen_add_code_line("for (int i = 0; i < num_parents; i++) {", True)
+    self.gen_add_code_line("int X_id = (i == 0) ? jid : jid_parents[i-1];")
+    self.gen_add_code_line("for (int k = 0; k < 6; k++) s_alpha[k] = s_fh[k];")
+    self.gen_add_code_line("for (int k = 0; k < 6; k++) s_fh[k] = dot_prod<T,6,1,1>(&s_XImats[36*X_id + 6*k], &s_alpha[0]);")
+    self.gen_add_code_line("int anc = jid_parents[i];")
+    self.gen_add_code_line("if (anc > 0) {", True)
+    self.gen_add_code_line("// scalar-joint ancestor: single M cell + its symmetric partner")
+    self.gen_add_code_line("int a_dof = anc + 5;")
+    self.gen_add_code_line("int a_sidx = s_Sidx_by_jid[anc];")
+    self.gen_add_code_line("T   a_ssgn = s_Ssgn_by_jid[anc];")
+    self.gen_add_code_line(f"s_M[dof + {nv}*a_dof] = a_ssgn * s_fh[a_sidx];")
+    self.gen_add_code_line(f"s_M[a_dof + {nv}*dof] = s_M[dof + {nv}*a_dof];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("// floating-base root coupling: 6-wide M[dof, 0..5] row + symmetric col")
+    self.gen_add_code_line("for (int col = 0; col < 6; col++) {", True)
+    self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+    self.gen_add_code_line(f"s_M[dof + {nv}*col] = s_fh[S_col];")
+    self.gen_add_code_line(f"s_M[col + {nv}*dof] = s_M[dof + {nv}*col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
 
     self.gen_add_code_line("// floating-base root block H[:6,:6] = S^T * IC[0] * S")
     self.gen_add_parallel_loop("ind", "36", use_thread_group)
