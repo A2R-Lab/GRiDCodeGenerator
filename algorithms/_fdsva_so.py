@@ -339,7 +339,7 @@ _FDSVA_SO_PICK_FLAGS = [
     (True,  True,  True,  False, False, False),   # pick 3: + fd_grad da_df band to global
     (True,  True,  True,  True,  False, False),   # pick 4 (Phase 3e): + s_df_du to global
     (True,  True,  True,  True,  True,  False),   # pick 5 (Phase 3e): + s_Minv to global
-    (True,  True,  False, False, False, True),    # pick 6: pool->global (whole s_temp via full inner SCRATCH_IN_SMEM=false); df_du/Minv stay in smem (small); floating-base only
+    (True,  True,  False, False, False, True),    # pick 6: pool->global (whole s_temp via full inner SCRATCH_IN_SMEM=false); df_du/Minv stay in smem (small). Works for BOTH bases because fdsva_so_device hands the placed pool to whichever idsva inner it composes (world for floating, body for fixed) and the inner does the repoint via its own SCRATCH_IN_SMEM=false.
 ]
 
 def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, use_workspace_temp,
@@ -349,8 +349,12 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     use_workspace_idsva_temp: route the embedded idsva_so inner's scratch to
     d_workspace (via the inner's SCRATCH_IN_SMEM=false). The idsva inner is the
     dominant s_temp consumer on big robots; spilling it drops the smem arena to
-    the next-largest sub-inner (fd_grad / minv / fd). Floating-base only for now
-    (the world inner owns its placement; the body inner does not yet)."""
+    the next-largest sub-inner (fd_grad / minv / fd). Works for BOTH bases —
+    both the world inner (floating) and the body inner (fixed) now own their
+    placement and accept SCRATCH_IN_SMEM=false, so the whole-arena pool->global
+    fallback composes uniformly. (Earlier revisions of this comment said
+    floating-only because the body inner had not yet migrated; that has since
+    landed — see docs/idsva_so_inner_refactor_notes.md.)"""
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base
         else self.gen_idsva_so_body_frame_inner_temp_mem_size()

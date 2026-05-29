@@ -1497,6 +1497,12 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     # arena can be allocated 36*NB smaller for this rung (see the kernel body's
     # smem_temp computation) and only BC's tail is truncated — the hot chain below is
     # untouched. d_workspace here is the typed BC slab passed by the kernel.
+    # Contract: BC_IN_SMEM=false is only used with SCRATCH_IN_SMEM=true (hot stays
+    # in smem, BC moves to d_workspace[0]). The deep rung instead uses
+    # SCRATCH_IN_SMEM=false (whole arena, incl. BC, to d_workspace) with
+    # BC_IN_SMEM=true. The two spill levers are mutually exclusive by construction
+    # (see the body tier table in GRiDCodeGenerator.py: rung 2 picks BC=F+SCRATCH=T;
+    # rung 3 picks SCRATCH=F+BC=T), so the two BC= writes can never both fire.
     self.gen_add_code_line("if constexpr (!BC_IN_SMEM) { BC = d_workspace; }")
 
     self.gen_add_code_line("// Initialize output tensor; optimized assembly paths only write structurally nonzero entries.")
