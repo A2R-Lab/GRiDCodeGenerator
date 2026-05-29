@@ -1,7 +1,7 @@
 MEMORY_THRESHOLD = 8 # Max num joints for shared mem allocation of result
 
 
-def gen_fdsva_so_inner(self, use_thread_group = False):
+def gen_fdsva_so_contract(self, use_thread_group = False):
 	# construct the boilerplate and function definition
     n = self.robot.get_num_vel()
     inner_arena_size = 4 * n**3
@@ -12,7 +12,7 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
                 "s_temp is the (shared) scratch buffer; size FDSVA_SO_INNER_SMEM_BYTES<T, SCRATCH_IN_SMEM>() bytes (= " + str(inner_arena_size) + "*sizeof(T) when SCRATCH_IN_SMEM, else 0)", \
                 "d_workspace is the global scratch buffer; size FDSVA_SO_INNER_WORKSPACE_BYTES<T, SCRATCH_IN_SMEM>() bytes (= " + str(inner_arena_size) + "*sizeof(T) when !SCRATCH_IN_SMEM, else 0). Pass nullptr when SCRATCH_IN_SMEM", \
                 "gravity is the gravity constant"]
-    func_def_start = "void fdsva_so_inner("
+    func_def_start = "void fdsva_so_contract("
     func_def_middle = "T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, "
     func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
     func_notes = ["Assumes works with IDSVA",
@@ -95,7 +95,7 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
     # 2Dx3D tensor computation defined as iL,Ljk->ijk
     self.gen_add_code_line('// Multiply by -Minv to finish algorithm')
     # PERF EXPERIMENT CANDIDATE (2026-05-18): this 4*n^3 parallel_loop has the
-    # highest FMA count in fdsva_so_inner (g1_floating: ~6M FMAs out of ~9M
+    # highest FMA count in fdsva_so_contract (g1_floating: ~6M FMAs out of ~9M
     # total). Each thread does a serial n-element dot_prod, so total FMAs ~
     # 4*n^4. Structurally an iL,Ljk->ijk tensor contraction — could be
     # rewritten as 4*n batched n×n×n gemms or 4 large n × n² × n gemms.
@@ -146,7 +146,7 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
 
     self.gen_add_end_function()
 
-def gen_fdsva_so_inner_temp_mem_size(self):
+def gen_fdsva_so_contract_temp_mem_size(self):
     n = self.robot.get_num_vel()
     return 4*n**3
 
@@ -224,7 +224,7 @@ def gen_fdsva_so_fd_gradient_inline(self, use_thread_group = False, use_spill = 
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
     
-def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+def gen_fdsva_so_contract_function_call(self, use_thread_group = False, updated_var_names = None,
                                      scratch_in_smem_expr = "true"):
     var_names = dict( \
         s_df2_name = "s_df2", \
@@ -238,7 +238,7 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    fdsva_so_code_start = "fdsva_so_inner<T, " + scratch_in_smem_expr + ">(" + var_names["s_df2_name"] + ", " + var_names["s_idsva_so_name"] + ", " + var_names["s_Minv_name"] + ", " + var_names["s_df_du_name"] + ", "
+    fdsva_so_code_start = "fdsva_so_contract<T, " + scratch_in_smem_expr + ">(" + var_names["s_df2_name"] + ", " + var_names["s_idsva_so_name"] + ", " + var_names["s_Minv_name"] + ", " + var_names["s_df_du_name"] + ", "
     fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     if use_thread_group:
         id_code_start = id_code_start.replace("(","(tgrp, ")
@@ -270,7 +270,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     inner that OWNS its scratch (s_temp) placement (inner-owns-placement; see
     docs/idsva_so_inner_refactor_notes.md). It wraps, in order:
       load_update_XImats -> direct_minv_inner -> forward_dynamics_inner ->
-      fd-gradient-inline -> idsva_so_{world,body}_inner -> fdsva_so_inner.
+      fd-gradient-inline -> idsva_so_{world,body}_inner -> fdsva_so_contract.
     Because the s_temp repoint happens at the very top, EVERY consumer below —
     including the XImats helper's sincos scratch — follows the placement, so the
     kernel never repoints s_temp from the outside.
@@ -282,7 +282,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
                           is what overflows, so false makes it fit.
       FD_GRAD_USE_SPILL : the fd-gradient inline spills its da_dq..fxvi band to
                           d_fd_grad_spill (only meaningful when the pool is smem).
-      CONTRACT_IN_SMEM  : the fdsva_so_inner 4*NV^3 contraction scratch placement.
+      CONTRACT_IN_SMEM  : the fdsva_so_contract 4*NV^3 contraction scratch placement.
 
     Pointer params are caller-supplied (the kernel decides where the OUTPUTS and
     df_du/Minv live — smem, device arrays, or workspace bands — and hands in the
@@ -338,7 +338,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     else:
         self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-    self.gen_fdsva_so_inner_function_call(use_thread_group,
+    self.gen_fdsva_so_contract_function_call(use_thread_group,
         updated_var_names = dict(d_workspace_name = "s_fdsva_temp"),
         scratch_in_smem_expr = "CONTRACT_IN_SMEM")
     self.gen_add_end_function()
@@ -379,7 +379,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     else:
         shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
         if not use_workspace_temp:
-            shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_inner_temp_mem_size())
+            shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_contract_temp_mem_size())
     # Phase 3e: s_df_du and s_Minv can now be in workspace too. Drop them from
     # extra_t_buffers when spilled; declare workspace pointers in the body.
     extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_qdd", n)]
@@ -573,7 +573,7 @@ def gen_fdsva_so_host(self, mode = 0):
 
 def gen_fdsva_so(self, use_thread_group = False):
     # first the contraction sub-inner used by the orchestration _device
-    self.gen_fdsva_so_inner(use_thread_group)
+    self.gen_fdsva_so_contract(use_thread_group)
     # then the canonical _device (orchestrator: owns s_temp placement; called from kernel)
     self.gen_fdsva_so_device(use_thread_group)
     # then the kernels (call _device with caller-allocated smem)

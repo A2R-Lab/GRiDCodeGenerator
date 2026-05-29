@@ -55,7 +55,7 @@ class GRiDCodeGenerator:
                             gen_idsva_so_device, gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
-                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, \
+                            gen_fdsva_so, gen_fdsva_so_contract_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_contract_function_call, gen_fdsva_so_contract, \
                             gen_fdsva_so_device, gen_fdsva_so_device_function_call, gen_fdsva_so_kernel, gen_fdsva_so_host, \
                             gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
@@ -618,7 +618,7 @@ class GRiDCodeGenerator:
         #   - use_workspace_temp:  s_fdsva_temp (4*nv³ inner) -> d_workspace
         #   - fd_grad_use_spill:   fd_grad_inline's da_dq..fxvi band -> d_workspace grad section
         fdsva_so_base_t_count = 4*nv + nv*nv + nv + 2*nv*nv + XI_size
-        fdsva_so_inner_temp_count = 4*nv**3
+        fdsva_so_contract_temp_count = 4*nv**3
         fdsva_so_fd_gradient_inline_temp_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
         fdsva_so_fd_gradient_inline_spilled_count = self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled()
         # fdsva_so dispatches to world_frame_inner for floating-base (smaller
@@ -627,8 +627,8 @@ class GRiDCodeGenerator:
             idsva_so_world_frame_inner_temp_count if self.robot.floating_base
             else idsva_so_body_frame_inner_temp_count
         )
-        _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_inner_temp_count, fdsva_so_fd_gradient_inline_temp_count)
-        _temp_no_inner = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _temp_no_contract = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
         _temp_spilled  = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
         # Phase 3e: extend to 6 levels. Each level pushes an additional buffer
         # to L2-pinned workspace. Tuple is
@@ -650,7 +650,7 @@ class GRiDCodeGenerator:
         _fdsva_so_tiers = [
             ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False),
             ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False, False),
-            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_inner,        True,  True,  False, False, False, False),
+            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_contract,        True,  True,  False, False, False, False),
             ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False, False),
             ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False, False),
             ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True,  False),
@@ -920,9 +920,9 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.fdsva_so_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "}",
-                                 "// Per-tier scratch sizes for fdsva_so_inner (inline-CUDA users only — the host launchers always use TIER_PERF).",
+                                 "// Per-tier scratch sizes for fdsva_so_contract (inline-CUDA users only — the host launchers always use TIER_PERF).",
                                  "// At TIER_PERF the 4*NV^3 inner scratch lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing shared memory for the caller's outer kernel.",
-                                 "// fdsva_so_inner scratch sizing, keyed on the INNER's placement choice",
+                                 "// fdsva_so_contract scratch sizing, keyed on the INNER's placement choice",
                                  "// (SCRATCH_IN_SMEM) rather than a tier — the inner decides placement, the",
                                  "// caller sizes both arenas from these. FDSVA_SO_SCRATCH_IN_SMEM<TIER>()",
                                  "// gives the placement codegen assigned to each tier for THIS robot.",
@@ -1659,7 +1659,7 @@ class GRiDCodeGenerator:
             "    __global__ idsva_so_body_frame_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   idsva_so_body_frame_host<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ fdsva_so_inner(T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau, T *s_XImats, T *s_temp, const T gravity)",\
+            "    __device__ fdsva_so_contract(T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau, T *s_XImats, T *s_temp, const T gravity)",\
             "    __device__ fdsva_so_device(T *s_df2, T *s_df_du, const T *s_q, const T *s_qd, const T *s_u, const robotModel<T> *d_robotModel, const T gravity)", \
             "    __global__ fdsva_so_kernel(T *d_df2, const T *d_q_qd_qdd_tau, const int stride_q_qd_qdd, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   fdsva_so<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
