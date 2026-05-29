@@ -70,7 +70,7 @@ def _rewrite_id_du_temp_accesses_for_spill(code):
 
     return replace_accesses(replace_accesses(code, True), False)
 
-def gen_inverse_dynamics_gradient_inner_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_inverse_dynamics_gradient_inner_function_call(self, updated_var_names = None):
     var_names = dict( \
         s_dc_du_name = "s_dc_du", \
         s_vaf_name = "s_vaf", \
@@ -91,7 +91,7 @@ def gen_inverse_dynamics_gradient_inner_function_call(self, use_thread_group = F
     id_du_code = id_du_code_start + id_du_code_middle + id_du_code_end
     self.gen_add_code_line(id_du_code)
 
-def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
+def gen_inverse_dynamics_gradient_inner(self):
     function_start = len(self.code_str)
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
@@ -164,8 +164,8 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                               "T *s_Iv = &s_temp[" + str(Offset_Iv) + "];")
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Validating Function Inputs\\n\");", \
                                  "printf(\"-------------------------\\n\");", \
@@ -178,7 +178,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"I[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*(i+" + str(n) + ")],6);}")
         self.gen_add_code_line("printf(\"-------------------------\\n\");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     
     #
     # Initial temp comps
@@ -190,7 +190,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     # we can use part of FxvI temp mem for Xv and Xa initial comps also compute Iv
     self.gen_add_code_line("// First compute Imat*v and Xmat*v_parent, Xmat*a_parent (store in FxvI for now)")
     self.gen_add_code_line("// Note that if jid_parent == -1 then v_parent = 0 and a_parent = gravity")
-    self.gen_add_parallel_loop("ind",str(6*3*NJ),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*3*NJ))
     self.gen_add_code_line("int row = ind % 6; int col = ind / 6; int jid = col % " + str(NJ) + "; int jid6 = 6*jid;")
     # get the parent (note that in some cases we have more efficient ways of computing this so add some special cases)
     parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True, OFFSET=False)
@@ -209,11 +209,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ? comp3 * s_XImats[XIOffset + 30] * gravity : ",
                                  "                                               dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Temp Comps Part 1\\n\");", \
                                  "printf(\"-------------------------\\n\");", \
@@ -222,11 +222,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                  "printf(\"Xa\\n\"); printMat<T,6," + str(n) + ">(&s_temp[" + str(Offset_FxvI + 6*n) + "],6);"])
         self.gen_add_code_line("printf(\"-------------------------\\n\");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # then do the mx comps
     self.gen_add_code_line("// Then compute Mx(Xv), Mx(Xa), Mx(v), Mx(f)")
-    self.gen_add_parallel_loop("col",str(4*n),use_thread_group)
+    self.gen_add_parallel_loop("col",str(4*n))
     self.gen_add_code_line("int dof_id = col / 4; int selector = col % 4; int dof_id6 = 6*dof_id;")
     if self.robot.floating_base: self.gen_add_code_line("int jid = dof_id < 6 ? 0 : dof_id - 5; int jid6 = jid*6;") # First 6 dof belong to fb
     else: self.gen_add_code_line("int jid6 = dof_id6;")
@@ -239,7 +239,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = "&s_temp[dstOffset + dof_id6]", s_src_name = "&src[jid6]", s_scale_name = S_sign_cpp)
     self.gen_mx_func_call_for_cpp(PEQ_FLAG = False, SCALE_FLAG = True, updated_var_names = updated_var_names)
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     has_linear_axis = any(
         self.robot.get_S_index_by_id(jid) >= 3 for jid in range(n)
@@ -248,7 +248,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         # For prismatic axes, the force derivative term needs the force cross-product
         # column. The motion and force columns coincide for the revolute axes covered
         # by the original path, but differ for linear axes.
-        self.gen_add_parallel_loop("dof_id", str(n), use_thread_group)
+        self.gen_add_parallel_loop("dof_id", str(n))
         _, S_ind_dof_cpp = self.gen_topology_helpers_pointers_for_cpp(
             list(range(n)),
             updated_var_names=dict(jid_name="dof_id"),
@@ -284,11 +284,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Temp Comps Part 2\\n\");", \
                                  "printf(\"-------------------------\\n\");", \
@@ -298,7 +298,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                  "printf(\"Mx(f)\\n\"); printMat<T,6," + str(n) + ">(&s_temp[" + str(Offset_Mxf) + "],6);"])
         self.gen_add_code_line("printf(\"-------------------------\\n\");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # FORWARD PASS
@@ -323,14 +323,14 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         if bfs_level == 0:
             self.gen_add_code_line("// when parent is base dv_dq = 0, dv_dqd = S")
             if self.robot.floating_base:
-                self.gen_add_parallel_loop("ind",str(6*2*n),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*2*n))
                 self.gen_add_code_line("bool dq_flag = ind < " + str(6*n) + ";")
                 self.gen_add_code_line("int row = ind % 6; int col = (!dq_flag * " + str(-n) + ") + (ind / 6);")
                 self.gen_add_code_line("int du_offset = dq_flag ? " + str(Offset_dv_dq) + " : " + str(Offset_dv_dqd) + ";")
                 self.gen_add_code_line("int fb_col = row < 3 ? row + 3 : row - 3;")
                 self.gen_add_code_line("s_temp[du_offset + 6*col + row] = !dq_flag * (fb_col == col);")
             else:
-                self.gen_add_parallel_loop("ind",str(6*2*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*2*len(inds)))
                 if len(inds) > 1:
                     self.gen_add_code_line("int row = ind % 6; int col = ind / 6; int col_du = col % " + str(len(inds)) + "; bool dq_flag = col == col_du;")
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
@@ -348,7 +348,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_line("// dv/du = Xmat*dv_parent/du + {Mx(Xv) or S for col ind}")
             self.gen_add_code_line("// first compute dv/du = Xmat*dv_parent/du")
             if self.robot.floating_base:
-                self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
                 self.gen_add_code_line(f"bool dq_flag = ind < {6*n*len(inds)};")
                 self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
                 if len(inds) > 1: 
@@ -375,7 +375,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                         f" * ({S_sign_cpp}) + dq_flag * s_temp[{Offset_MxXv} + ({jid}+5)*6 + row];")
                 self.gen_add_end_control_flow()
             else:
-                self.gen_add_parallel_loop("ind",str(6*2*(bfs_level)*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*2*(bfs_level)*len(inds)))
                 self.gen_add_code_line("int row = ind % 6; int col = ind / 6; int col_du = col % " + str(bfs_level*len(inds)) + "; " + \
                                                                             "int col_jid = col_du % " + str(bfs_level) + ";")
                 if bfs_level > 1 or len(inds) > 1:
@@ -404,11 +404,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 if bfs_level > 1:
                     self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             if bfs_level == 0:
                 self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                          "printf(\"dv/du in bfs waves\\n\");", \
@@ -422,7 +422,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                          "printMat<T,6," + str(bfs_level+1) + ">(&s_temp[" + \
                                                 str(Offset_dv_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
     # Start the da/du comp with da/du = MxS(dv/du)*qd + {MxXa, Mxv}
     self.gen_add_code_line("// start da/du by setting = MxS(dv/du)*qd + {MxXa, Mxv} for all n in parallel")
@@ -433,20 +433,20 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     if self.robot.floating_base:
         # set da/du = 0
         self.gen_add_code_line("// First zero da/du")
-        self.gen_add_parallel_loop('ind',str(2*n*NJ*6),use_thread_group)
+        self.gen_add_parallel_loop('ind',str(2*n*NJ*6))
         self.gen_add_code_line(f"s_temp[{Offset_da_dq} + ind] = static_cast<T>(0);")
         self.gen_add_end_control_flow()
         # Sync before the += accumulation below: the zeroing loop and the
         # MxS(dv/du)*qd accumulation write the same s_temp[Offset_da_dq] region
         # from different threads. Without this barrier the result is correct
         # only within a single warp (<=32 threads) and races at larger blocks.
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id')
         if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
         # Axis-indexed S helpers for the serialized root accumulation below.
         S_ind_ax = S_ind_cpp.replace('dof_id', 'ax')
         S_sign_ax = S_sign_cpp.replace('dof_id', 'ax')
-        self.gen_add_parallel_loop("col",str(2*n*n),use_thread_group)
+        self.gen_add_parallel_loop("col",str(2*n*n))
         self.gen_add_code_line(f"int dof = col % {n};") # column within each joint that is being focused
         self.gen_add_code_line(f"int dof_id = (col / {n}) % {n}; int jid = dof_id < 6 ? 0 : dof_id - 5;") # dof_id being applied with S, to jid
         self.gen_add_code_line(f"bool dq_flag = col < {n*n}; int dqd_offset = !dq_flag * {6*dva_cols_per_partial};")
@@ -482,9 +482,9 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_end_control_flow()  # if dof == dof_id
         self.gen_add_end_control_flow()  # if jid != 0
         self.gen_add_end_control_flow()  # parallel loop
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     else:
-        self.gen_add_parallel_loop("col",str(2*dva_cols_per_partial),use_thread_group)
+        self.gen_add_parallel_loop("col",str(2*dva_cols_per_partial))
         self.gen_add_code_line("int col_du = col % " + str(dva_cols_per_partial) + ";") # signifies col of corresponding du
         select_var_vals = [("int", "jid", [str(jid) for jid in range(NJ)])]
         self.gen_add_multi_threaded_select("col_du", "<", [str(running_sum_dva_cols_per_jid[jid+1]) for jid in range(NJ)], select_var_vals)
@@ -501,11 +501,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"da/du part 1 = MxS(dv/du)*qd + {MxXa, Mxf}\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
@@ -518,7 +518,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                      "printMat<T,6," + str(num_cols) + ">(&s_temp[" + \
                                             str(Offset_da_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # then serial da/du in bfs waves
     self.gen_add_code_line("// Finish da/du with parent updates noting that we only have values")
@@ -537,7 +537,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         # there are 2*(bfs_level + 1) columns per du with 2*bfs mults with X and then the addition in the last col
         self.gen_add_code_line("// da/du += Xmat*da_parent/du")    
         if self.robot.floating_base: 
-            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
             self.gen_add_code_line(f"bool dq_flag = ind < {6*n*len(inds)};")
             self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
             if len(inds) > 1: 
@@ -556,7 +556,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_line("s_temp[du_offset + 6*col + row] += dot_prod<T,6,6,1>(&s_XImats[36 * " + str(jid) + " + row]," + \
                                         " &s_temp[6*col + parent_du_offset]);")
         else:
-            self.gen_add_parallel_loop("ind",str(6*2*bfs_level*len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*2*bfs_level*len(inds)))
             self.gen_add_code_lines(["int row = ind % 6; int col = ind / 6; int col_du = col % " + str(bfs_level*len(inds)) + ";", \
                                     "int dq_flag = col == col_du; int col_jid = col_du % " + str(bfs_level) + ";"])
             if len(inds) > 1:
@@ -570,11 +570,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                     "    dot_prod<T,6,6,1>(&s_XImats[36*" + jid + " + row]," + \
                                                             "&s_temp[du_col_offset + 6*" + dva_col_offset_for_parent_cpp + "]);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             if bfs_level == 1:
                 self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                          "printf(\"da/du in bfs waves\\n\");", \
@@ -588,15 +588,15 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                          "printMat<T,6," + str(bfs_level+1) + ">(&s_temp[" + \
                                                 str(Offset_da_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
     
     # Intiialize df/du to 0 to make sure we don't have issues with remaining values later when we do +=
     self.gen_add_code_line("// Init df/du to 0")
-    self.gen_add_parallel_loop("ind",str(6*2*df_cols_per_partial),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*2*df_cols_per_partial))
     self.gen_add_code_line("s_temp[" + str(Offset_df_dq) + " + ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Start the df/du by setting = fx(dv/du)*Iv and also compute the temp = Fx(v)*I 
     # aka do all of the Fx comps in parallel
@@ -604,7 +604,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                              "//    aka do all of the Fx comps in parallel", \
                              "// note that while df has more cols than dva the dva cols are the first few df cols"])
     _, _, dva_col_offset_for_jid_cpp, df_col_offset_for_jid_cpp, _, _, _, _ = self.gen_topology_helpers_pointers_for_cpp(list(range(n)), OFFSET=False)
-    self.gen_add_parallel_loop("col",str(2*dva_cols_per_partial + 6*NJ),use_thread_group)
+    self.gen_add_parallel_loop("col",str(2*dva_cols_per_partial + 6*NJ))
     self.gen_add_code_line("int col_du = col % " + str(dva_cols_per_partial) + ";")
     if self.robot.floating_base: 
         self.gen_add_code_line(f'int jid = col_du / {n};')
@@ -633,11 +633,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_code_line("fx_times_v<T>(dst, fx_src, mult_src);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"df/du part 1 = fx(dv/du)*Iv\\n\");", \
                                  "printf(\"     and Temp = Fx(v)*I\\n\");", \
@@ -651,11 +651,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_lines(["printf(\"Fx(v)*I[%d]\\n\"," + str(ind) + ");", \
                                      "printMat<T,6,6>(&s_temp[" + str(Offset_FxvI) + " + 36*" + str(ind) + "],6);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # then in parallel finish df/du += I*da/du + FxvI*dv/du
     self.gen_add_code_line("// Then in parallel finish df/du += I*da/du + (Fx(v)I)*dv/du")
-    self.gen_add_parallel_loop("ind",str(6*2*dva_cols_per_partial),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*2*dva_cols_per_partial))
     if self.robot.floating_base: 
         self.gen_add_code_line(f"int row = ind % 6; int col = ind / 6; int jid = (ind / {6*n}) % {NJ};")
         self.gen_add_code_lines(["T *df_row_col = &s_temp[" + str(Offset_df_dq) + " + 6*col + row];",
@@ -680,8 +680,8 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     self.gen_add_end_control_flow()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"df/du += I*da/du + FxvI*dv/du\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
@@ -692,13 +692,13 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                      "printf(\"df[%d]/dqd\\n\"," + str(ind) + ");", \
                                      "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dqd + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # and also at the same time compute the temp var -X^T * mxf
     # since all temps are done re-use one in practice
     self.gen_add_code_line("// At the same time compute the last temp var: -X^T * mx(f)")
     self.gen_add_code_line("// use Mx(Xv) temp memory as those values are no longer needed")
-    self.gen_add_parallel_loop("ind",str(6*n),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*n))
     if self.robot.floating_base: 
         self.gen_add_code_line("int XTcol = ind % 6; int jid = ind / 6; int dof_id6 = (jid+5)*6; int jid6 = jid*6;")
         self.gen_add_code_line("s_temp[" + str(Offset_MxXv) + " + ind] = -dot_prod<T,6,1,1>(" + \
@@ -708,11 +708,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line("s_temp[" + str(Offset_MxXv) + " + ind] = -dot_prod<T,6,1,1>(" + \
                                         "&s_XImats[6*(jid6 + XTcol)], &s_temp[" + str(Offset_Mxf) + " + jid6]);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Temp = -X^T * mx(f)\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
@@ -720,7 +720,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             self.gen_add_code_lines(["printf(\"-X^T*mx(f)[%d]\\n\"," + str(ind) + ");", \
                                      "printMat<T,1,6>(&s_temp[" + str(Offset_MxXv) + " + 6*" + str(ind) + "],1);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # BACKWARD PASS
@@ -739,8 +739,8 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         self.gen_add_code_line("//     links are: " + ", ".join(link_names))
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             for ind in self.robot.get_unique_parent_ids(inds):
                 self.gen_add_code_lines(["printf(\"df[%d]/dq (parent update) BEFORE UPDATE\\n\"," + str(ind) + ");", \
                                          "printMat<T,6," + str(df_cols_per_jid[ind]) + ">(&s_temp[" + str(Offset_df_dq + \
@@ -749,7 +749,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                          "printMat<T,6," + str(df_cols_per_jid[ind]) + ">(&s_temp[" + str(Offset_df_dqd + \
                                                     6*running_sum_df_cols_per_jid[ind]) + "],6);"])
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
         # df_lambda/du = X^T * df/du + {Xmx(f), 0}
         # there are 2*(bfs_level + 1) columns per du
@@ -763,7 +763,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             sparsity_branch_corrector = str(0)
         self.gen_add_code_line("// df_lambda/du += X^T * df/du + {Xmx(f), 0}")
         if self.robot.floating_base: 
-            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
             self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
             if len(inds) > 1:
                 self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
@@ -775,7 +775,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                 self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
                 parent_jid = f'parent_jid*{6*n}'
         else:
-            self.gen_add_parallel_loop("ind",str(6*2*curr_cols_per_du),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*2*curr_cols_per_du))
             self.gen_add_code_line(f"int row = ind % 6; int col = ind / 6; int col_du = col % {curr_cols_per_du};")
             if len(inds) > 1:
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
@@ -815,11 +815,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
         else:
             self.gen_add_code_line("*dst += update_val;")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             if bfs_level == 0:
                 self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                          "printf(\"df/du in bfs waves\\n\");", \
@@ -831,11 +831,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                          "printf(\"df[%d]/dqd (parent update)\\n\"," + str(ind) + ");", \
                                          "printMat<T,6," + str(df_cols_per_jid[ind]) + ">(&s_temp[" + str(Offset_df_dqd + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Final dvaf/du\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
@@ -871,7 +871,7 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     S_sign_cpp = self.gen_topology_S_sign_for_cpp(OFFSET=False)
     # Note that for a serial chain this is straightforward (all df are size n) but otherwise gets complicated
     if self.robot.is_serial_chain() or self.robot.floating_base:
-        self.gen_add_parallel_loop("ind",str(2*n*n),use_thread_group)
+        self.gen_add_parallel_loop("ind",str(2*n*n))
         if self.robot.floating_base: 
             self.gen_add_code_line(f"bool dq_flag = ind < {n*n}; int row = ind % {n}; int col = (ind / {n}) % {n};")
             self.gen_add_code_line("int jid = row < 6 ? 0 : row - 5;")
@@ -887,10 +887,10 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                     "int Offset_dst = !dq_flag * " + str(n*n) + " + " + str(n) + " * jid_du + jid;"])
             self.gen_add_code_line("s_dc_du[Offset_dst] = (" + S_sign_cpp + ") * s_temp[Offset_src];")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     else:
-        self.gen_add_parallel_loop("jid_dq_qd",str(2*NJ),use_thread_group)
+        self.gen_add_parallel_loop("jid_dq_qd",str(2*NJ))
         self.gen_add_code_line("int jid = jid_dq_qd % " + str(NJ) + "; int dq_flag = jid == jid_dq_qd;")
         # now we need to get a local pointer and loop over all n filling in 0 or col data based on the local pointer
         # and the specific topology of the robot
@@ -918,11 +918,11 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
             else: # else everyone updates and updates their pointer
                 self.gen_add_code_line("s_dc_du[Offset_dst] = (" + S_sign_cpp + ") * s_temp[Offset_src]; Offset_src += 6; Offset_dst += " + str(n) + ";")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Final dc/du\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
@@ -931,13 +931,13 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
                                  "printf(\"dc/dqd\\n\");", \
                                  "printMat<T," + str(n) + "," + str(n) + ">(&s_dc_du[" + str(n*n) + "]," + str(n) + ");"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     self.gen_add_end_function()
     function_code = self.code_str[function_start:]
     self.code_str = self.code_str[:function_start] + _rewrite_id_du_temp_accesses_for_spill(function_code)
 
-def gen_inverse_dynamics_gradient_device_function_call(self, use_thread_group = False,
+def gen_inverse_dynamics_gradient_device_function_call(self,
                                                            use_qdd_input = False,
                                                            scratch_in_smem_expr = "true",
                                                            use_da_df_spill_expr = "false",
@@ -957,7 +957,7 @@ def gen_inverse_dynamics_gradient_device_function_call(self, use_thread_group = 
            + "d_robotModel, gravity);")
     self.gen_add_code_line(start + middle + end)
 
-def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd_input = False):
+def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     """Emit `inverse_dynamics_gradient_device` — the whole id_du orchestration
     as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
     mirrors gen_fdsva_so_device). It wraps, in order:
@@ -1017,10 +1017,9 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     # Inner owns the pool placement; the repoint covers every consumer below
     # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_inverse_dynamics_inner_function_call(use_thread_group, False, use_qdd_input)
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_inverse_dynamics_inner_function_call(False, use_qdd_input)
     self.gen_inverse_dynamics_gradient_inner_function_call(
-        use_thread_group,
         dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = "USE_DA_DF_SPILL")
     )
     self.gen_add_end_function()
@@ -1039,7 +1038,7 @@ _ID_DU_PICK_FLAGS = [
 ]
 
 def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
-                                      use_qdd_input, single_call_timing, use_thread_group):
+                                      use_qdd_input, single_call_timing):
     """Emit the id_du kernel body for one tier's spill flags."""
     extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", 18*n)]
     if use_qdd_input:
@@ -1052,11 +1051,11 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_input:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
         else:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),stride="stride_q_qd")
         # The kernel only SLICES the workspace band pointers; the device owns
         # the s_temp pool placement (the whole-pool global-temp repoint is its
         # SCRATCH_IN_SMEM=false path). Per-rung flags are passed as literals.
@@ -1064,40 +1063,40 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
         self.gen_inverse_dynamics_gradient_device_function_call(
-            use_thread_group, use_qdd_input,
+            use_qdd_input,
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             d_workspace_pool_name = ("reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()])" if use_global_temp else "nullptr"),
             d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
-        self.gen_add_sync(use_thread_group)
-        self.gen_kernel_save_result("dc_du",str(n*2*n),str(n*2*n),use_thread_group)
+        self.gen_add_sync()
+        self.gen_kernel_save_result("dc_du",str(n*2*n),stride=str(n*2*n))
         self.gen_add_end_control_flow()
     else:
         if use_qdd_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n))
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(n + NUM_POS),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS))
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(d_workspace);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),feedback_from="dc_du")
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),"qdd",str(n),feedback_from="dc_du")
         else:
-            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),use_thread_group,feedback_from="dc_du")
+            self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),feedback_from="dc_du")
         # device owns s_temp placement (whole-pool global path = SCRATCH_IN_SMEM=false).
         self.gen_inverse_dynamics_gradient_device_function_call(
-            use_thread_group, use_qdd_input,
+            use_qdd_input,
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             d_workspace_pool_name = ("reinterpret_cast<T *>(d_workspace)" if use_global_temp else "nullptr"),
             d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
         self.gen_anti_licm_output_write("dc_du")
         self.gen_add_end_control_flow()
-        self.gen_kernel_save_result_single_timing("dc_du",str(n*2*n),use_thread_group)
+        self.gen_kernel_save_result("dc_du",str(n*2*n))
 
 
-def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
+def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_call_timing = False):
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
     func_params = ["d_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
@@ -1127,7 +1126,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     picks = getattr(self, "id_du_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
         uss, ugt = _ID_DU_PICK_FLAGS[picks[0]]
-        _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing, use_thread_group)
+        _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
@@ -1135,7 +1134,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing, use_thread_group)
+            _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -1219,20 +1218,20 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("id_du"))
     self.gen_add_end_function()
 
-def gen_inverse_dynamics_gradient(self, use_thread_group = False):
+def gen_inverse_dynamics_gradient(self):
     # first the id_du band sub-inner (internal helper composed by the orchestration
     # _device; also called by fd_du / integrator_gradient orchestrators).
-    self.gen_inverse_dynamics_gradient_inner(use_thread_group)
+    self.gen_inverse_dynamics_gradient_inner()
     # then the canonical _device (orchestrator: owns s_temp placement; wraps XImats
     # + id-inner + id_du band sub-inner; called from kernel and fd_du / integrator).
     # Both qdd variants (qdd-input vs qdd=0 specialization).
-    self.gen_inverse_dynamics_gradient_device(use_thread_group, True)
-    self.gen_inverse_dynamics_gradient_device(use_thread_group, False)
+    self.gen_inverse_dynamics_gradient_device(True)
+    self.gen_inverse_dynamics_gradient_device(False)
     # and the kernels
-    self.gen_inverse_dynamics_gradient_kernel(use_thread_group,True,True)
-    self.gen_inverse_dynamics_gradient_kernel(use_thread_group,True,False)
-    self.gen_inverse_dynamics_gradient_kernel(use_thread_group,False,True)
-    self.gen_inverse_dynamics_gradient_kernel(use_thread_group,False,False)
+    self.gen_inverse_dynamics_gradient_kernel(True,True)
+    self.gen_inverse_dynamics_gradient_kernel(True,False)
+    self.gen_inverse_dynamics_gradient_kernel(False,True)
+    self.gen_inverse_dynamics_gradient_kernel(False,False)
     # and host wrapeprs
     self.gen_inverse_dynamics_gradient_host(0)
     self.gen_inverse_dynamics_gradient_host(1)

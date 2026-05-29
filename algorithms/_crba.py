@@ -9,7 +9,7 @@ def gen_crba_inner_temp_mem_size(self):
     n = self.robot.get_num_pos()
     return 140*n
 
-def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+def gen_crba_inner_function_call(self, updated_var_names = None,
                                  temp_in_smem_expr = "true"):
     var_names = dict( \
         s_M_name = "s_M", \
@@ -30,9 +30,9 @@ def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_nam
     self.gen_add_code_line(crba_code)
 
 
-def gen_crba_inner(self, use_thread_group = False):
+def gen_crba_inner(self):
     if self.robot.floating_base:
-        return gen_crba_inner_floating(self, use_thread_group)
+        return gen_crba_inner_floating(self)
     
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
@@ -67,10 +67,10 @@ def gen_crba_inner(self, use_thread_group = False):
 
 
     # first clear the matrix
-    self.gen_add_parallel_loop("i",str(n*n),use_thread_group)
+    self.gen_add_parallel_loop("i",str(n*n))
     self.gen_add_code_line('s_M[i] = static_cast<T>(0);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     #deal with like memory for variables --> memory is taken care of in device and host 
     alpha_offset = 0
     beta_offset = alpha_offset + 36*n
@@ -125,12 +125,12 @@ def gen_crba_inner(self, use_thread_group = False):
     _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True)
     S_sign_cpp = self.gen_topology_S_sign_for_cpp()
     
-    self.gen_add_parallel_loop("jid",str(n),use_thread_group)
+    self.gen_add_parallel_loop("jid",str(n))
 
     ImatOffset = 36*n   # Offset in XImats to Imats
     self.gen_add_code_line(f"s_M[jid+jid*{n}] = s_XImats[{ImatOffset} + 36*jid + 6*{S_ind_cpp} + {S_ind_cpp}];") # take the S_ind row and S_ind column of appropriate Imat
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     
 
     self.gen_add_code_line("//")
@@ -138,11 +138,11 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_code_line("//")
 
     # initialize fh as (XS)^T
-    self.gen_add_parallel_loop('i',str(n*6),use_thread_group)
+    self.gen_add_parallel_loop('i',str(n*6))
     self.gen_add_code_line('int jid = i / 6; int ind = i % 6;')
     self.gen_add_code_line(f's_fh[i] = ({S_sign_cpp}) * s_XImats[{ImatOffset} + 36*jid + 6*{S_ind_cpp} + ind];')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # M[jid, parent] = S_parent^T * (X_lambda^T chain) * IS.
     #
@@ -160,7 +160,7 @@ def gen_crba_inner(self, use_thread_group = False):
     max_ancestors = self.robot.get_max_num_ancestors()
     S_idx_arr = "{" + ", ".join(str(self.robot.get_S_index_by_id(j)) for j in range(n)) + "}"
     S_sgn_arr = "{" + ", ".join(str(self.robot.get_S_sign_by_id(j)) for j in range(n)) + "}"
-    self.gen_add_parallel_loop("jid", str(n), use_thread_group)
+    self.gen_add_parallel_loop("jid", str(n))
     self.gen_add_code_line(f"const int s_Sidx_by_jid[{n}] = {S_idx_arr};")
     self.gen_add_code_line(f"const T s_Ssgn_by_jid[{n}] = {S_sgn_arr};")
     parent_chain_init = "{" + "-1, " * (max_ancestors - 1) + "-1}" if max_ancestors >= 1 else "{-1}"
@@ -190,7 +190,7 @@ def gen_crba_inner(self, use_thread_group = False):
     self.gen_add_end_function()
 
 
-def gen_crba_inner_floating(self, use_thread_group = False):
+def gen_crba_inner_floating(self):
     NJ = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
     ICOffset = 0
@@ -224,11 +224,11 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     self.gen_linalg_smem_setup(temp_size)
 
     self.gen_add_code_line("// Initialize IC = I and clear H")
-    self.gen_add_parallel_loop("ind", str(36 * NJ + nv * nv), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(36 * NJ + nv * nv))
     self.gen_add_code_line("if (ind < " + str(36 * NJ) + ") { s_temp[" + str(ICOffset) + " + ind] = s_XImats[" + str(36 * NJ) + " + ind]; }")
     self.gen_add_code_line("else { s_M[ind - " + str(36 * NJ) + "] = static_cast<T>(0); }")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Phase 1 — body recursions (sequential by tree, unchanged).
     # For each jid NJ-1..1: alpha = X^T IC[jid]; IC[parent] += alpha X.
@@ -256,7 +256,7 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     max_ancestors = max(1, self.robot.get_max_num_ancestors())
     S_idx_arr = "{" + ", ".join(str(self.robot.get_S_index_by_id(j)) for j in range(NJ)) + "}"
     S_sgn_arr = "{" + ", ".join(str(self.robot.get_S_sign_by_id(j)) for j in range(NJ)) + "}"
-    self.gen_add_parallel_loop("jid_off", str(NJ - 1), use_thread_group)
+    self.gen_add_parallel_loop("jid_off", str(NJ - 1))
     self.gen_add_code_line("int jid = jid_off + 1;          // jid in [1, NJ)")
     self.gen_add_code_line(f"int dof = jid + 5;")
     self.gen_add_code_line(f"const int s_Sidx_by_jid[{NJ}] = {S_idx_arr};")
@@ -307,16 +307,16 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     self.gen_add_code_line("// floating-base root block H[:6,:6] = S^T * IC[0] * S")
-    self.gen_add_parallel_loop("ind", "36", use_thread_group)
+    self.gen_add_parallel_loop("ind", "36")
     self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
     self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
     self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
     self.gen_add_code_line("s_M[row + " + str(nv) + "*col] = s_temp[" + str(ICOffset) + " + S_row + 6*S_col];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     self.gen_add_end_function()
 
@@ -328,7 +328,7 @@ def gen_crba_device_temp_mem_size(self):
     wrapper_size = self.gen_topology_helpers_size() + 72*n # for XImats
     return self.gen_crba_inner_temp_mem_size() + wrapper_size
 
-def gen_crba_device(self, use_thread_group = False):
+def gen_crba_device(self):
     n = self.robot.get_num_joints()
 
     # construct the boilerplate and function definition
@@ -356,11 +356,11 @@ def gen_crba_device(self, use_thread_group = False):
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
 
     # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_crba_inner_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_crba_inner_function_call()
     self.gen_add_end_function()
 
-def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing, use_thread_group):
+def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing):
     """Emit crba_kernel body for one tier's spill flag.
     use_workspace_temp=False: s_temp in smem (full arena); Level 0 / current.
     use_workspace_temp=True:  s_temp redirected to L2-pinned workspace; smem arena holds only extra_t_buffers."""
@@ -369,8 +369,8 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(input_count),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q_qd",str(input_count),stride="stride_q_qd")
         if use_workspace_temp:
             self.gen_add_code_line("T *crba_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
             # The whole inner arena spilled to global, so the smem s_temp slot is
@@ -381,18 +381,18 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
             self.gen_add_code_line("(void)d_workspace;")
         # compute
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_crba_inner_function_call(use_thread_group,
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_crba_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         # save to global  (stride = nv*nv per timestep — without this, batches
         # overlap since each block writes nv*nv elements starting at offset k*1)
-        self.gen_kernel_save_result("M",str(nv*nv),str(nv*nv),use_thread_group)
+        self.gen_kernel_save_result("M",str(nv*nv),stride=str(nv*nv))
         self.gen_add_end_control_flow()
     else:
         # repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q_qd",str(input_count),use_thread_group)
+        self.gen_kernel_load_inputs("q_qd",str(input_count))
         if use_workspace_temp:
             self.gen_add_code_line("T *crba_d_workspace = reinterpret_cast<T *>(d_workspace);")
             # See note above: repoint the null smem s_temp at the spilled workspace
@@ -403,18 +403,18 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd",str(input_count),use_thread_group,feedback_from="M")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_crba_inner_function_call(use_thread_group,
+        self.gen_anti_licm_input_reload("q_qd",str(input_count),feedback_from="M")
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_crba_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("M")
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("M",str(nv*nv),use_thread_group)
+        self.gen_kernel_save_result("M",str(nv*nv))
 
 
-def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
+def gen_crba_kernel(self, single_call_timing = False):
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     n = self.robot.get_num_joints()
@@ -447,14 +447,14 @@ def gen_crba_kernel(self, use_thread_group = False, single_call_timing = False):
     # (current); Level 1 = redirected to workspace.
     picks = getattr(self, "crba_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
-        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing, use_thread_group)
+        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing, use_thread_group)
+            _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -528,14 +528,14 @@ def gen_crba_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("crba"))
     self.gen_add_end_function()
 
-def gen_crba(self, use_thread_group = False):
+def gen_crba(self):
     # first generate the inner helpers
-    self.gen_crba_inner(use_thread_group)
+    self.gen_crba_inner()
     # then generate the device wrappers
-    self.gen_crba_device(use_thread_group)
+    self.gen_crba_device()
     # then generate the kernels
-    self.gen_crba_kernel(use_thread_group,True)
-    self.gen_crba_kernel(use_thread_group,False)
+    self.gen_crba_kernel(True)
+    self.gen_crba_kernel(False)
     # then the host launch wrappers
     self.gen_crba_host(0)
     self.gen_crba_host(1)

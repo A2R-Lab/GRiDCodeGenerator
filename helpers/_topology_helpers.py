@@ -173,7 +173,7 @@ def gen_load_update_XImats_helpers_temp_mem_size(self):
     n = self.robot.get_num_pos()
     return 2*n
 
-def gen_load_update_XImats_helpers_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None):
     var_names = dict( \
         s_XImats_name = "s_XImats", \
         d_robotModel_name = "d_robotModel", \
@@ -209,7 +209,7 @@ def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_
                                   extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
                                   tier_workspace_expr = tier_workspace_expr)
 
-def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False):
+def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_homogenous_transforms = False):
     n = self.robot.get_num_joints()
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
     baseXI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms=False) # just base XI size (for homogenous if needed)
@@ -241,32 +241,20 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
             use_trig = True
             break
     # if we need trig then compute sin and cos while loading in XI from global to shared (if possible to do async)
-    if use_trig and use_thread_group:
-        self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + "*sizeof(T));")
-        if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_topology_helpers,d_robotModel->d_topology_helpers," + str(self.gen_topology_helpers_size()) + "*sizeof(int));")
-        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()),use_thread_group)
-        # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
-        self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
-        self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
-        self.gen_add_end_control_flow()
-        self.gen_add_code_line("cgrps::wait(tgrp);")
-        self.gen_add_sync(use_thread_group)
-    # else do them in parallel but sequentially
-    elif use_trig:
-        self.gen_add_parallel_loop("ind",str(XI_size),use_thread_group)
+    if use_trig:
+        self.gen_add_parallel_loop("ind",str(XI_size))
         self.gen_add_code_line("s_XImats[ind] = d_robotModel->d_XImats[ind];")
         self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()),use_thread_group)
+        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
         # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
         self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
         self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     # else just load in XI from global to shared efficiently
     else:
         self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + ");")
@@ -274,7 +262,7 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
             self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_topology_helpers,d_robotModel->d_topology_helpers," + str(self.gen_topology_helpers_size()) + "*sizeof(int));")
         self.gen_add_code_line("cgrps::wait(tgrp);")
     # loop through Xmats and update all non-constant values serially
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     for ind in range(n):
         self.gen_add_code_line("// X[" + str(ind) + "]")
         for col in range(3): # TL and BR are identical so only update TL and BL serially
@@ -375,18 +363,18 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
 
     # end the serial section
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # then copy the TL to BR in parallel across all 6x6 X
-    self.gen_add_parallel_loop("kcr",str(9*self.robot.get_num_joints()),use_thread_group)
+    self.gen_add_parallel_loop("kcr",str(9*self.robot.get_num_joints()))
     self.gen_add_code_line("int k = kcr / 9; int cr = kcr % 9; int c = cr / 3; int r = cr % 3;")
     self.gen_add_code_line("int srcInd = k*36 + c*6 + r; int dstInd = srcInd + 21; // 3 more rows and cols")
     self.gen_add_code_line("s_XImats[dstInd] = s_XImats[srcInd];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # add the function end
     self.gen_add_end_function()
 
-def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = False, updated_var_names = None, include_gradients = False, include_hessians = False):
+def gen_load_update_XmatsHom_helpers_function_call(self, updated_var_names = None, include_gradients = False, include_hessians = False):
     var_names = dict( \
         s_XmatsHom_name = "s_XmatsHom", \
         s_dXmatsHom_name = "s_dXmatsHom", \
@@ -433,7 +421,7 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                   topology_name = "s_topology_helpers",
                                   extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None)
 
-def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_base_inertia = False, include_gradients = False, include_hessians = False):
+def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
     NJ = self.robot.get_num_joints()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
@@ -472,45 +460,45 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
             break
     # if we need trig then compute sin and cos while loading in XI from global to shared (if possible to do async)
     if use_trig:
-        self.gen_add_parallel_loop("ind",str(Xhom_size),use_thread_group)
+        self.gen_add_parallel_loop("ind",str(Xhom_size))
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
         self.gen_add_end_control_flow()
         if include_gradients:
-            self.gen_add_parallel_loop("ind",str(dXhom_size),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(dXhom_size))
             self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
             self.gen_add_end_control_flow()
         if include_hessians:
-            self.gen_add_parallel_loop("ind",str(d2Xhom_size),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(d2Xhom_size))
             self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
             self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()),use_thread_group)
+        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
         # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
         self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
         self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     # else just load in XI from global to shared efficiently
     else:
-        self.gen_add_parallel_loop("ind",str(Xhom_size),use_thread_group)
+        self.gen_add_parallel_loop("ind",str(Xhom_size))
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
         self.gen_add_end_control_flow()
         if include_gradients:
-            self.gen_add_parallel_loop("ind",str(dXhom_size),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(dXhom_size))
             self.gen_add_code_line("s_dXmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size) + "];")
             self.gen_add_end_control_flow()
         if include_hessians:
-            self.gen_add_parallel_loop("ind",str(d2Xhom_size),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(d2Xhom_size))
             self.gen_add_code_line("s_d2XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size + Xhom_size + dXhom_size) + "];")
             self.gen_add_end_control_flow()
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     # loop through Xmats and update all non-constant values serially
     def replace_hom_config_symbols(str_val, ind):
         if self.robot.floating_base:
@@ -550,7 +538,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     # by fanning each per-matrix block out across threads via parallel_loop —
     # would let any thread count consume the function, not just thread 0.
     # See conversation 2026-05-16 for the design discussion.
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     for ind in range(NJ):
         self.gen_add_code_line("// X_hom[" + str(ind) + "]")
         for col in range(4):
@@ -563,9 +551,9 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                     self.gen_add_code_line("s_XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     if include_gradients:
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_serial_ops()
         dXmats_hom, dXhom_owners = _global_hom_derivative_matrices_by_q(self)
         for ind in range(n):
             owner_jid = dXhom_owners[ind]
@@ -580,9 +568,9 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_dXmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     if include_hessians:
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_serial_ops()
         d2Xmats_hom, d2Xhom_owners = _global_hom_second_derivative_matrices(self)
         for ind in range(len(d2Xmats_hom)):
             owner_jid = d2Xhom_owners[ind]
@@ -597,7 +585,7 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
                         cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_d2XmatsHom[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_add_end_function()
 
 def gen_topology_helpers_size(self):

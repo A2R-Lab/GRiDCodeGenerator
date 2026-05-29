@@ -66,10 +66,10 @@ def gen_add_func_doc(self, func_desc, notes = [], params = [], return_val = None
         self.gen_add_code_line(" * @return " + return_val)
     self.gen_add_code_line(" */")
 
-def gen_add_serial_ops(self, use_thread_group = False):
+def gen_add_serial_ops(self):
     self.gen_add_code_line("if(threadIdx.x == 0 && threadIdx.y == 0){", True)
 
-def gen_add_parallel_loop(self, var_name, max_val, use_thread_group = False, block_level = False):
+def gen_add_parallel_loop(self, var_name, max_val, block_level = False):
     if block_level:
         code = "for(int " + var_name + " = blockIdx.x + blockIdx.y*gridDim.x; " + \
                     var_name + " < " + max_val + "; " + var_name + " += gridDim.x*gridDim.y){"
@@ -84,23 +84,23 @@ def gen_static_array_ind_2d(self, col, row, col_stride = 6):
 def gen_static_array_ind_3d(self, ind, col, row, ind_stride = 36, col_stride = 6):
     return ind_stride*ind + col_stride*col + row
 
-def gen_add_sync(self, use_thread_group = False):
+def gen_add_sync(self):
     self.gen_add_code_line("__syncthreads();")
 
-def gen_add_debug_print_code_line(self, print_code_string, use_thread_group = False):
-    self.gen_add_sync(use_thread_group)
-    self.gen_add_serial_ops(use_thread_group)
+def gen_add_debug_print_code_line(self, print_code_string):
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
     self.gen_add_code_line(print_code_string)
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
-def gen_add_debug_print_code_lines(self, print_code_string_arr, use_thread_group = False):
-    self.gen_add_sync(use_thread_group)
-    self.gen_add_serial_ops(use_thread_group)
+def gen_add_debug_print_code_lines(self, print_code_string_arr):
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
     for code_string in print_code_string_arr:
         self.gen_add_code_line(code_string)
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 def gen_var_in_list(self, var_name, option_list):
     if len(option_list) == 1:
@@ -165,52 +165,49 @@ def gen_add_multi_threaded_select(self, loop_counter, comparator, counts, select
                 branch_code += " * " + select_tuples[tuple_i][2][ind]
             self.gen_add_code_line(dst_code[tuple_i] + " = " + branch_code + ";")
 
-def gen_kernel_load_inputs(self, name, stride, amount, use_thread_group = False, \
-                                 name2 = None, stride2 = 1, amount2 = 1, name3 = None, stride3 = 1, amount3 = 1):
-    self.gen_add_code_line("// load to shared mem")
-    self.gen_add_code_line("const T *d_" + name + "_k = &d_" + name + "[k*" + stride + "];")
-    self.gen_add_parallel_loop("ind",amount,use_thread_group)
-    self.gen_add_code_line("s_" + name + "[ind] = d_" + name + "_k[ind];")
-    self.gen_add_end_control_flow()
-    if name2 is not None:
-        self.gen_add_code_line("const T *d_" + name2 + "_k = &d_" + name2 + "[k*" + stride2 + "];")
-        self.gen_add_parallel_loop("ind",amount2,use_thread_group)
-        self.gen_add_code_line("s_" + name2 + "[ind] = d_" + name2 + "_k[ind];")
-        self.gen_add_end_control_flow()
-    if name3 is not None:
-        self.gen_add_code_line("const T *d_" + name3 + "_k = &d_" + name3 + "[k*" + stride3 + "];")
-        self.gen_add_parallel_loop("ind",amount3,use_thread_group)
-        self.gen_add_code_line("s_" + name3 + "[ind] = d_" + name3 + "_k[ind];")
-        self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+def gen_kernel_load_inputs(self, name, amount, name2=None, amount2=1, name3=None, amount3=1,
+                                 stride=None, stride2=None, stride3=None):
+    """Emit a load-inputs-to-shared block for up to 3 (name, amount) pairs.
 
-def gen_kernel_save_result(self, store_to_name, stride, amount, use_thread_group = False, load_from_name = None):
+    Batched-k kernels pass `stride{,2,3}` to address each timestep's slot via
+    `&d_<name>[k*stride]`. Single-timing kernels omit strides; the load reads
+    `d_<name>` directly.
+    """
+    def _emit(nm, amt, st):
+        if st is None:
+            src = "d_" + nm
+        else:
+            self.gen_add_code_line("const T *d_" + nm + "_k = &d_" + nm + "[k*" + st + "];")
+            src = "d_" + nm + "_k"
+        self.gen_add_parallel_loop("ind", amt)
+        self.gen_add_code_line("s_" + nm + "[ind] = " + src + "[ind];")
+        self.gen_add_end_control_flow()
+    self.gen_add_code_line("// load to shared mem")
+    _emit(name, amount, stride)
+    if name2 is not None:
+        _emit(name2, amount2, stride2)
+    if name3 is not None:
+        _emit(name3, amount3, stride3)
+    self.gen_add_sync()
+
+def gen_kernel_save_result(self, store_to_name, amount, load_from_name=None, stride=None):
+    """Emit a save-result-from-shared block. Batched-k kernels pass `stride`
+    to address each timestep's slot via `&d_<store_to_name>[k*stride]`;
+    single-timing kernels omit it."""
     if load_from_name is None:
         load_from_name = "s_" + store_to_name
     self.gen_add_code_line("// save down to global")
-    self.gen_add_code_line("T *d_" + store_to_name + "_k = &d_" + store_to_name + "[k*" + stride + "];")
-    self.gen_add_parallel_loop("ind",amount,use_thread_group)
-    self.gen_add_code_line("d_" + store_to_name + "_k[ind] = " + load_from_name + "[ind];")
+    if stride is None:
+        dst = "d_" + store_to_name
+    else:
+        self.gen_add_code_line("T *d_" + store_to_name + "_k = &d_" + store_to_name + "[k*" + stride + "];")
+        dst = "d_" + store_to_name + "_k"
+    self.gen_add_parallel_loop("ind", amount)
+    self.gen_add_code_line(dst + "[ind] = " + load_from_name + "[ind];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
-def gen_kernel_load_inputs_single_timing(self, name, amount, use_thread_group = False, \
-                                               name2 = None, amount2 = 1, name3 = None, amount3 = 1):
-    self.gen_add_code_line("// load to shared mem")
-    self.gen_add_parallel_loop("ind",amount,use_thread_group)
-    self.gen_add_code_line("s_" + name + "[ind] = d_" + name + "[ind];")
-    self.gen_add_end_control_flow()
-    if name2 is not None:
-        self.gen_add_parallel_loop("ind",amount2,use_thread_group)
-        self.gen_add_code_line("s_" + name2 + "[ind] = d_" + name2 + "[ind];")
-        self.gen_add_end_control_flow()
-    if name3 is not None:
-        self.gen_add_parallel_loop("ind",amount3,use_thread_group)
-        self.gen_add_code_line("s_" + name3 + "[ind] = d_" + name3 + "[ind];")
-        self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
-
-def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
+def gen_anti_licm_input_reload(self, name, amount, \
                                      name2 = None, amount2 = 1, name3 = None, amount3 = 1, \
                                      feedback_from = None):
     """Inside a `for (rep ...)` single_timing loop, reload all inputs from
@@ -254,27 +251,27 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
     # can prove d_* contents are loop-invariant when no kernel writes them) —
     # the rep-stomp below provides the actual LICM defense.
     self.gen_add_code_line("// anti-LICM: volatile reload of inputs each rep")
-    self.gen_add_parallel_loop("_aopt_i", amount, use_thread_group)
+    self.gen_add_parallel_loop("_aopt_i", amount)
     self.gen_add_code_line(
         "reinterpret_cast<volatile T *>(s_" + name + ")[_aopt_i] = "
         "reinterpret_cast<const volatile T *>(d_" + name + ")[_aopt_i];"
     )
     self.gen_add_end_control_flow()
     if name2 is not None:
-        self.gen_add_parallel_loop("_aopt_i", amount2, use_thread_group)
+        self.gen_add_parallel_loop("_aopt_i", amount2)
         self.gen_add_code_line(
             "reinterpret_cast<volatile T *>(s_" + name2 + ")[_aopt_i] = "
             "reinterpret_cast<const volatile T *>(d_" + name2 + ")[_aopt_i];"
         )
         self.gen_add_end_control_flow()
     if name3 is not None:
-        self.gen_add_parallel_loop("_aopt_i", amount3, use_thread_group)
+        self.gen_add_parallel_loop("_aopt_i", amount3)
         self.gen_add_code_line(
             "reinterpret_cast<volatile T *>(s_" + name3 + ")[_aopt_i] = "
             "reinterpret_cast<const volatile T *>(d_" + name3 + ")[_aopt_i];"
         )
         self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # anti-LICM defense (1/2): stomp one input slot with `rep`. First line
     # of defense. The compiler cannot fold the loop induction variable, so
     # at minimum one input slot provably varies per rep.
@@ -333,7 +330,7 @@ def gen_anti_licm_input_reload(self, name, amount, use_thread_group = False, \
             + ")[(rep + 3) % (" + str(amount) + ")] += _aopt_fb3;"
         )
         self.gen_add_code_line("}")
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
     """Inside a `for (rep ...)` single_timing loop, write the per-iter output's
@@ -364,14 +361,6 @@ def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
         "reinterpret_cast<const volatile T *>(" + load_from_name + ")[rep & 7]; }"
     )
 
-def gen_kernel_save_result_single_timing(self, store_to_name, amount, use_thread_group = False, load_from_name = None):
-    if load_from_name is None:
-        load_from_name = "s_" + store_to_name
-    self.gen_add_code_line("// save down to global")
-    self.gen_add_parallel_loop("ind",amount,use_thread_group)
-    self.gen_add_code_line("d_" + store_to_name + "[ind] = " + load_from_name + "[ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
 
 def _any_algo_uses_workspace_spill(self):
     """Return True when any Phase 2/3 spill-aware algo's PERF pick is non-zero

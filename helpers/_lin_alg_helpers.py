@@ -196,7 +196,7 @@ def gen_grid_linalg_backend_helpers(self):
     ])
 
 
-def gen_invert_matrix(self, use_thread_group=False):
+def gen_invert_matrix(self):
     """Emits a thin wrapper around `glass::invertMatrix_dense` (block-
     cooperative Gauss-Jordan; `GLASS/src/base/L3/inv.cuh`).
 

@@ -45,7 +45,7 @@ def gen_integrator_gradient_inner_temp_mem_size(self):
     return self.gen_forward_dynamics_gradient_inner_temp_mem_size()
 
 
-def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_group=False,
+def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT",
                                           s_dAB_name="s_dAB",
                                           s_df_du_name="s_df_du",
                                           s_Minv_name="s_Minv"):
@@ -58,7 +58,7 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     fb = self.robot.floating_base
     twoN = 2 * n
     nn = n * n
-    self.gen_add_parallel_loop("ind", str(twoN * 3 * n), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(twoN * 3 * n))
     self.gen_add_code_line("int row = ind % " + str(twoN) + ";")
     self.gen_add_code_line("int col = ind / " + str(twoN) + ";")
     tok = _integrator_type_token(integrator_type)
@@ -218,7 +218,7 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", use_thread_
     self.gen_add_end_control_flow()  # end parallel loop
 
 
-def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_kp1=False,
+def gen_integrator_gradient_multistage(self, compute_x_kp1=False,
                                        d_temp_spill_name="nullptr", temp_spill_flag_name="false"):
     """Emit the multi-stage gradient body inline.
 
@@ -252,13 +252,13 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     # Save original q (nq entries — floating-base carries the 7-element pose
     # prefix), qd (n) so we can rebuild p_{i+1} on later stages.
     self.gen_add_code_line("// --- multi-stage gradient: save original q, qd ---")
-    self.gen_add_parallel_loop("ind", str(nq), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(nq))
     self.gen_add_code_line("s_q_orig[ind] = s_q[ind];")
     self.gen_add_end_control_flow()
-    self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(n))
     self.gen_add_code_line("s_qd_orig[ind] = s_qd[ind];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     for stage_idx in range(max_stages):
         stage_num = stage_idx + 1  # 1-indexed for readability
@@ -289,57 +289,56 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
             if fb:
                 # Floating-base q-update is the SE(3) Lie retract over the full
                 # nq layout; the velocity update is the plain Euler add.
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_serial_ops()
                 self.gen_add_code_line(f"T v_scaled[{n}];")
                 self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = c_offset * dt * s_qd_orig[i];")
                 self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q_orig, v_scaled, s_q);")
                 self.gen_add_end_control_flow()
-                self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+                self.gen_add_parallel_loop("ind", str(n))
                 self.gen_add_code_line(f"s_qd[ind] = s_qd_orig[ind] + c_offset * dt * s_stage_grad_qdd[{prev_offset} + ind];")
                 self.gen_add_end_control_flow()
             else:
-                self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+                self.gen_add_parallel_loop("ind", str(n))
                 self.gen_add_code_line(f"s_q[ind] = s_q_orig[ind] + c_offset * dt * s_qd_orig[ind];")
                 self.gen_add_code_line(f"s_qd[ind] = s_qd_orig[ind] + c_offset * dt * s_stage_grad_qdd[{prev_offset} + ind];")
                 self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             # Update XImats for the new s_q.
-            self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-            self.gen_add_sync(use_thread_group)
+            self.gen_load_update_XImats_helpers_function_call()
+            self.gen_add_sync()
             if fb:
                 # Per-stage SE(3) dIntegrate blocks at v_dt = c*dt*qd_orig (the
                 # q-perturbation increment for p.q = integrate(q_orig, c*dt*qd_orig)).
                 # Reused buffers s_dInt_*_6x6 — consumed in this stage's D_qdd loop
                 # below before the next stage overwrites them.
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_serial_ops()
                 self.gen_add_code_line(f"T v_dt_stage[{n}];")
                 self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_stage[i] = c_offset * dt * s_qd_orig[i];")
                 self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_stage, s_dInt_q_6x6);")
                 self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_stage, s_dInt_v_6x6);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
         # Run FD-gradient at this stage's (s_q, s_qd, s_u).
         # After this call: s_qdd, s_Minv, s_df_du = stage `stage_num` values.
         self.gen_forward_dynamics_gradient_inner_python(
-            use_thread_group=use_thread_group,
             use_qdd_Minv_input=False,
             s_df_du_name="s_df_du",
             d_temp_spill_name=d_temp_spill_name,
             temp_spill_flag_name=temp_spill_flag_name,
         )
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         # Always save this stage's qdd into s_stage_grad_qdd[stage_idx * n].
         # The next stage's FD-grad will overwrite s_qdd, so we need this
         # snapshot to (a) build p_{stage+1} on the next iteration and
         # (b) assemble x_{k+1} at the end when compute_x_kp1.
-        self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(n))
         self.gen_add_code_line(
             f"s_stage_grad_qdd[{stage_idx * n} + ind] = s_qdd[ind];"
         )
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         # Compute D_qdd_{stage_num} into s_D_qdd_stage[stage_idx * (n*3n)].
         # For stage 1 we use the unified formula with c_0 = 0 (i.e. no chain).
@@ -362,7 +361,7 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
             self.gen_add_code_line(
                 f"T *s_D_qdd_prev = &s_D_qdd_stage[{(stage_idx - 1) * n * three_n}];"
             )
-        self.gen_add_parallel_loop("ind", str(n * three_n), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(n * three_n))
         self.gen_add_code_line(f"int r = ind % {n};")
         self.gen_add_code_line(f"int c = ind / {n};")
         # base term per block. For floating-base on stage > 1 the J_qq columns
@@ -414,7 +413,7 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
         else:
             self.gen_add_code_line(f"s_D_qdd_cur[c * {n} + r] = base;")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         self.gen_add_end_control_flow()  # close `if constexpr (gating)`
 
@@ -423,15 +422,15 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     # top rows are [dInt_q | dt*dInt_v | 0] at v_dt = dt*qd. For fixed-base these
     # reduce to [I | dt*I | 0].
     if fb:
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_serial_ops()
         self.gen_add_code_line(f"T v_dt_final[{n}];")
         self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_dt_final[i] = dt * s_qd_orig[i];")
         self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_final, s_dInt_q_6x6);")
         self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_final, s_dInt_v_6x6);")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_add_code_line("// --- multi-stage gradient: assemble final dAB ---")
-    self.gen_add_parallel_loop("ind", str(2 * n * three_n), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2 * n * three_n))
     self.gen_add_code_line(f"int row = ind % {2 * n};")
     self.gen_add_code_line(f"int col = ind / {2 * n};")
     self.gen_add_code_line("T val = static_cast<T>(0);")
@@ -475,13 +474,13 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
     self.gen_add_code_line("}")
     self.gen_add_code_line("s_dAB[ind] = val;")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Optionally also assemble x_{k+1}.
     if compute_x_kp1:
         self.gen_add_code_line("// --- multi-stage gradient: assemble x_{k+1} ---")
         # v_{k+1} = qd + dt * sum(b_i * qdd_i); stage qdds live in s_stage_grad_qdd.
-        self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(n))
         self.gen_add_code_line("T accel = static_cast<T>(0);")
         for name, (cnt, _, b_list) in _INTEGRATOR_BUTCHER.items():
             self.gen_add_code_line(f"if constexpr (IT == IntegratorType::{name}) {{")
@@ -493,22 +492,22 @@ def gen_integrator_gradient_multistage(self, use_thread_group=False, compute_x_k
         v_out_index = f"{nq} + ind" if fb else f"{n} + ind"
         self.gen_add_code_line(f"s_x_kp1[{v_out_index}] = s_qd_orig[ind] + dt * accel;")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         # q_{k+1} = integrate(q, dt*qd) (Euler-style q-update for every RK variant).
         if fb:
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_serial_ops()
             self.gen_add_code_line(f"T v_scaled_x[{n}];")
             self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled_x[i] = dt * s_qd_orig[i];")
             self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q_orig, v_scaled_x, s_x_kp1);")
             self.gen_add_end_control_flow()
         else:
-            self.gen_add_parallel_loop("ind", str(n), use_thread_group)
+            self.gen_add_parallel_loop("ind", str(n))
             self.gen_add_code_line("s_x_kp1[ind] = s_q_orig[ind] + dt * s_qd_orig[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
 
-def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x_kp1=False,
+def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
                                           integrator_type="IT", s_dAB_name="s_dAB",
                                           s_x_kp1_name="s_x_kp1",
                                           d_temp_spill_name="nullptr", temp_spill_flag_name="false"):
@@ -525,19 +524,18 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
     fb = self.robot.floating_base
     n = self.robot.get_num_vel()
     self.gen_forward_dynamics_gradient_inner_python(
-        use_thread_group=use_thread_group,
         use_qdd_Minv_input=False,
         s_df_du_name="s_df_du",
         d_temp_spill_name=d_temp_spill_name,
         temp_spill_flag_name=temp_spill_flag_name,
     )
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     if fb:
         # Precompute the SE(3) dIntegrate blocks at the q-update increment v_dt.
         # Euler:    q_new = integrate(q, dt*qd)            -> v_dt = dt*qd
         # SI-Euler: q_new = integrate(q, dt*v_new), where  -> v_dt = dt*(qd + dt*qdd)
         #           v_new = qd + dt*qdd  (s_qdd holds qdd after the FD gradient).
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_serial_ops()
         self.gen_add_code_line(f"T v_dt_for_dInt[{n}];")
         self.gen_add_code_line("if constexpr (" + _integrator_type_token(integrator_type) + " == IntegratorType::SEMI_IMPLICIT_EULER) {")
         self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * (s_qd[i] + dt * s_qdd[i]);")
@@ -547,24 +545,22 @@ def gen_integrator_gradient_inner_python(self, use_thread_group=False, compute_x
         self.gen_add_code_line("grid_dIntegrate_q_block<T>(v_dt_for_dInt, s_dInt_q_6x6);")
         self.gen_add_code_line("grid_dIntegrate_v_block<T>(v_dt_for_dInt, s_dInt_v_6x6);")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_integrator_gradient_dAB_assembly(
         integrator_type=integrator_type,
-        use_thread_group=use_thread_group,
         s_dAB_name=s_dAB_name,
     )
     # Optionally also build x_kp1 (the value) from the s_qdd that FD-gradient
     # populated. Saves a redundant FD pass for the both-at-once API.
     if compute_x_kp1:
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         self.gen_integrator_finish_function_call(
             integrator_type=integrator_type,
-            use_thread_group=use_thread_group,
             updated_var_names=dict(s_x_kp1_name=s_x_kp1_name),
         )
 
 
-def gen_integrator_gradient_device_function_call(self, use_thread_group=False, compute_x_kp1=False,
+def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
                                                      scratch_in_smem_expr="true",
                                                      use_da_df_spill_expr="false",
                                                      d_workspace_pool_name="nullptr",
@@ -590,7 +586,7 @@ def gen_integrator_gradient_device_function_call(self, use_thread_group=False, c
     self.gen_add_code_line(start + middle + end)
 
 
-def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=False):
+def gen_integrator_gradient_device(self, compute_x_kp1=False):
     """Emit `integrator_gradient[_with_x_kp1]_device` — the whole integrator
     gradient orchestration as ONE inner that OWNS its FD-grad scratch (s_temp) pool
     placement (inner-owns-placement; mirrors gen_inverse_dynamics_gradient_device /
@@ -666,7 +662,7 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
     self.gen_add_code_line("if constexpr(!SCRATCH_IN_SMEM){ s_temp = d_workspace; } else { (void)d_workspace; }")
     # XImats helper INSIDE the inner AFTER the repoint (no shared-helper edit) so its
     # sincos scratch follows the placed s_temp pool.
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
     # Compile-time IT dispatch: single-stage (Euler / SI-Euler) vs multi-stage
     # (Midpoint / RK3 / RK4). Per-rung band flags are passed as 'true'/'false'
     # literals through the stable FD-grad _inner_python composition surface.
@@ -675,7 +671,6 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
         "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
     )
     self.gen_integrator_gradient_inner_python(
-        use_thread_group=use_thread_group,
         compute_x_kp1=compute_x_kp1,
         integrator_type="IT",
         s_dAB_name="s_dAB",
@@ -686,7 +681,6 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
     self.gen_add_end_control_flow()
     self.gen_add_code_line("else {", True)
     self.gen_integrator_gradient_multistage(
-        use_thread_group=use_thread_group,
         compute_x_kp1=compute_x_kp1,
         d_temp_spill_name="d_temp_spill",
         temp_spill_flag_name=spill_flag,
@@ -695,7 +689,7 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
     self.gen_add_end_function()
 
 
-def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=False, single_call_timing=False):
+def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing=False):
     n = self.robot.get_num_vel()
     suffix = "_with_x_kp1" if compute_x_kp1 else ""
     func_params = ["d_dAB is a pointer to memory for [A | B] of size 2*NUM_VEL*3*NUM_VEL per timestep"]
@@ -824,7 +818,6 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
                          if inner_level == 2 else "nullptr")
             spill_name = "d_temp_spill" if inner_level == 1 else "nullptr"
             self.gen_integrator_gradient_device_function_call(
-                use_thread_group=use_thread_group,
                 compute_x_kp1=compute_x_kp1,
                 scratch_in_smem_expr=scratch_in_smem_expr,
                 use_da_df_spill_expr=spill_flag,
@@ -833,29 +826,29 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
             )
 
         if not single_call_timing:
-            self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
-            self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(3 * n + fb), use_thread_group)
+            self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+            self.gen_kernel_load_inputs("q_qd_u",str(3 * n + fb),stride="stride_q_qd_u")
             self.gen_add_code_line("// compute — the orchestration inner owns its FD-grad s_temp pool placement")
             _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             _emit_device_call("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
-            self.gen_add_sync(use_thread_group)
-            self.gen_kernel_save_result("dAB", str(2 * n * 3 * n), str(2 * n * 3 * n), use_thread_group)
+            self.gen_add_sync()
+            self.gen_kernel_save_result("dAB",str(2 * n * 3 * n),stride=str(2 * n * 3 * n))
             if compute_x_kp1:
-                self.gen_kernel_save_result("x_kp1", str(2 * n + fb), str(2 * n + fb), use_thread_group)
+                self.gen_kernel_save_result("x_kp1",str(2 * n + fb),stride=str(2 * n + fb))
             self.gen_add_end_control_flow()
         else:
             input_count = 3 * n + fb
-            self.gen_kernel_load_inputs_single_timing("q_qd_u", str(input_count))
+            self.gen_kernel_load_inputs("q_qd_u",str(input_count))
             _emit_spill_pointers("0")
             self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
             self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-            self.gen_anti_licm_input_reload("q_qd_u", str(input_count), use_thread_group, feedback_from="dAB")
+            self.gen_anti_licm_input_reload("q_qd_u", str(input_count), feedback_from="dAB")
             _emit_device_call("0")
             self.gen_anti_licm_output_write("dAB")
             self.gen_add_end_control_flow()
-            self.gen_kernel_save_result_single_timing("dAB", str(2 * n * 3 * n), use_thread_group)
+            self.gen_kernel_save_result("dAB",str(2 * n * 3 * n))
             if compute_x_kp1:
-                self.gen_kernel_save_result_single_timing("x_kp1", str(2 * n + fb), use_thread_group)
+                self.gen_kernel_save_result("x_kp1",str(2 * n + fb))
 
     # Per-tier surgical placement (perf, lite, minimal). When all three rungs
     # agree (small robots that fit at PERF), emit a single body; otherwise gate
@@ -950,20 +943,20 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     self.gen_add_end_function()
 
 
-def gen_integrator_gradient(self, use_thread_group=False):
+def gen_integrator_gradient(self):
     # Canonical _device (orchestrator: owns s_temp placement; called from kernel).
     # One per output kind (gradient-only vs gradient + x_kp1).
-    self.gen_integrator_gradient_device(use_thread_group, compute_x_kp1=False)
-    self.gen_integrator_gradient_device(use_thread_group, compute_x_kp1=True)
+    self.gen_integrator_gradient_device(compute_x_kp1=False)
+    self.gen_integrator_gradient_device(compute_x_kp1=True)
     # Gradient-only kernel + host
-    self.gen_integrator_gradient_kernel(use_thread_group, compute_x_kp1=False, single_call_timing=True)
-    self.gen_integrator_gradient_kernel(use_thread_group, compute_x_kp1=False, single_call_timing=False)
+    self.gen_integrator_gradient_kernel(compute_x_kp1=False, single_call_timing=True)
+    self.gen_integrator_gradient_kernel(compute_x_kp1=False, single_call_timing=False)
     self.gen_integrator_gradient_host(0, compute_x_kp1=False)
     self.gen_integrator_gradient_host(1, compute_x_kp1=False)
     self.gen_integrator_gradient_host(2, compute_x_kp1=False)
     # Gradient + x_kp1 (both-at-once) kernel + host
-    self.gen_integrator_gradient_kernel(use_thread_group, compute_x_kp1=True, single_call_timing=True)
-    self.gen_integrator_gradient_kernel(use_thread_group, compute_x_kp1=True, single_call_timing=False)
+    self.gen_integrator_gradient_kernel(compute_x_kp1=True, single_call_timing=True)
+    self.gen_integrator_gradient_kernel(compute_x_kp1=True, single_call_timing=False)
     self.gen_integrator_gradient_host(0, compute_x_kp1=True)
     self.gen_integrator_gradient_host(1, compute_x_kp1=True)
     self.gen_integrator_gradient_host(2, compute_x_kp1=True)

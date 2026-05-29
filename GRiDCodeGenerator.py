@@ -6,7 +6,7 @@ class GRiDCodeGenerator:
     from .helpers import gen_add_code_line, gen_add_code_lines, gen_add_end_control_flow, gen_add_end_function, \
                          gen_add_func_doc, gen_add_serial_ops, gen_add_parallel_loop, gen_add_sync, gen_var_in_list, \
                          gen_var_not_in_list, gen_add_multi_threaded_select, gen_kernel_load_inputs, gen_kernel_save_result, \
-                         gen_kernel_load_inputs_single_timing, gen_kernel_save_result_single_timing, gen_anti_licm_input_reload, gen_anti_licm_output_write, \
+                         gen_anti_licm_input_reload, gen_anti_licm_output_write, \
                          gen_static_array_ind_2d, gen_static_array_ind_3d, gen_add_debug_print_code_lines, \
                          gen_mx_func_call_for_cpp, gen_add_shared_memory_helpers, gen_declare_shared_arena, \
                          gen_shared_arena_t_count, gen_spatial_algebra_helpers, \
@@ -182,7 +182,7 @@ class GRiDCodeGenerator:
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
-    def gen_add_includes(self, use_thread_group = False):
+    def gen_add_includes(self):
         # first all of the includes
         self.gen_add_code_line("")
         self.gen_add_code_line("#include <assert.h>")
@@ -1547,7 +1547,7 @@ class GRiDCodeGenerator:
             self.gen_add_end_function()
 
     # finally generate all of the code
-    def gen_all_code(self, use_thread_group = False, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
+    def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
                      enable_idsva_so_world_frame = None):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
@@ -1667,7 +1667,7 @@ class GRiDCodeGenerator:
             file_notes += ["", "Additional EEPose Functions Included for Fixed Kinematic Target: " + fixed_target_name,""]
         self.gen_add_func_doc("This instance of grid.cuh is optimized for the urdf: " + self.robot.name,file_notes)
         # then all of the includes (and namespaces and defines)
-        self.gen_add_includes(use_thread_group)
+        self.gen_add_includes()
         # then add the gpu error macro
         self.gen_add_gpu_err()
         # File-scope preprocessor mirrors of the second-order codegen gates.
@@ -1719,7 +1719,7 @@ class GRiDCodeGenerator:
         self.gen_spatial_algebra_helpers()
         self.gen_crm()
         self.gen_crm_mul()
-        self.gen_invert_matrix(use_thread_group)
+        self.gen_invert_matrix()
         self.gen_matmul()
         self.gen_matmul_trans() 
         self.gen_outer_product()
@@ -1730,13 +1730,13 @@ class GRiDCodeGenerator:
         self.gen_init_gridData()
         self.gen_joint_limits_size()
         self.gen_init_joint_limits()
-        self.gen_load_update_XImats_helpers(use_thread_group)
+        self.gen_load_update_XImats_helpers()
         if include_homogenous_transforms and include_any_kinematics:
-            self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia)
+            self.gen_load_update_XmatsHom_helpers(include_base_inertia)
             if "ee_pose_gradient" in algorithms or "ee_pose_hessian" in algorithms:
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
+                self.gen_load_update_XmatsHom_helpers(include_base_inertia,include_gradients = True)
             if "ee_pose_hessian" in algorithms:
-                self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
+                self.gen_load_update_XmatsHom_helpers(include_base_inertia,include_gradients = True, include_hessians = True)
         # then generate kinematic algorithms.
         # SE(3) Lie-group helpers (grid_integrate_floating_q, grid_so3_*, grid_quat_*)
         # are needed by the FD-on-Jacobian d2ee inner on floating base. Emit them
@@ -1747,7 +1747,7 @@ class GRiDCodeGenerator:
             if self.robot.floating_base and "ee_pose_hessian" in algorithms:
                 self.gen_lie_group_helpers()
                 self._lie_helpers_emitted = True
-            self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
+            self.gen_eepose_and_derivatives(fixed_target_name = fixed_target_name,
                                             include_pose = "ee_pose" in algorithms,
                                             include_gradient = "ee_pose_gradient" in algorithms,
                                             include_hessian = "ee_pose_hessian" in algorithms)
@@ -1755,38 +1755,38 @@ class GRiDCodeGenerator:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
         if "id" in algorithms:
-            self.gen_inverse_dynamics(use_thread_group)
+            self.gen_inverse_dynamics()
         if "minv" in algorithms:
-            self.gen_direct_minv(use_thread_group)
+            self.gen_direct_minv()
         if "fd" in algorithms:
-            self.gen_forward_dynamics(use_thread_group)
+            self.gen_forward_dynamics()
         if "id_du" in algorithms:
-            self.gen_inverse_dynamics_gradient(use_thread_group)
+            self.gen_inverse_dynamics_gradient()
         if "fd_du" in algorithms:
-            self.gen_forward_dynamics_gradient(use_thread_group)
+            self.gen_forward_dynamics_gradient()
         if "aba" in algorithms:
-            self.gen_aba(use_thread_group)
+            self.gen_aba()
         if "crba" in algorithms:
-            self.gen_crba(use_thread_group)
+            self.gen_crba()
         if "integrator" in algorithms:
-            self.gen_integrator(use_thread_group)
+            self.gen_integrator()
         if ("integrator_gradient" in algorithms) or ("integrator_with_gradient" in algorithms):
-            self.gen_integrator_gradient(use_thread_group)
+            self.gen_integrator_gradient()
         if not self.robot.floating_base or enable_floating_second_order:
             if "idsva_so_body_frame" in algorithms:
-                self.gen_idsva_so_body_frame(use_thread_group)
+                self.gen_idsva_so_body_frame()
                 # Optional: emit the world-frame single-pass alternative path alongside
                 # the existing emission. Co-exists with `idsva_so_body_frame_kernel`/`idsva_so_body_frame_host`;
                 # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame_host`.
                 if enable_idsva_so_world_frame:
-                    self.gen_idsva_so_world_frame(use_thread_group)
+                    self.gen_idsva_so_world_frame()
                 # Emit the dispatching `idsva_so` host wrapper. For floating-base
                 # robots, requires world_frame to be enabled (it forwards there).
                 # For fixed-base, forwards to body_frame.
                 if (not self.robot.floating_base) or enable_idsva_so_world_frame:
                     self.gen_idsva_so_dispatcher()
             if "fdsva_so" in algorithms:
-                self.gen_fdsva_so(use_thread_group)
+                self.gen_fdsva_so()
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()

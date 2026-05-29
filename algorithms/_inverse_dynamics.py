@@ -2,7 +2,7 @@ def gen_inverse_dynamics_inner_temp_mem_size(self):
         n = self.robot.get_num_pos()
         return 6*n
 
-def gen_inverse_dynamics_inner_function_call(self, use_thread_group = False, compute_c = False, use_qdd_input = False, updated_var_names = None):
+def gen_inverse_dynamics_inner_function_call(self, compute_c = False, use_qdd_input = False, updated_var_names = None):
     var_names = dict( \
         s_c_name = "s_c", \
         s_vaf_name = "s_vaf", \
@@ -28,7 +28,7 @@ def gen_inverse_dynamics_inner_function_call(self, use_thread_group = False, com
     id_code = id_code_start + id_code_middle + id_code_end
     self.gen_add_code_line(id_code)
 
-def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False, use_qdd_input = False):
+def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
     # construct the boilerplate and function definition
@@ -68,8 +68,8 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
     # Initial Debug Prints if Requested
     #
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
         self.gen_add_code_line("printf(\"qd\\n\"); printMat<T,1," + str(n) + ">(s_qd,1);")
         if use_qdd_input:
@@ -77,7 +77,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*i],6);}")
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"I[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*(i+" + str(n) + ")],6);}")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # Forward Pass we are going to go in bfs_level waves
@@ -108,13 +108,13 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             # load in 0 to v and X*gravity to a in parallel
             # note that depending on S we need to add qd/qdd to one entry
             if len(inds) > 1:
-                self.gen_add_parallel_loop("ind",str(6*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*len(inds)))
                 self.gen_add_code_line("int row = ind % 6;")
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
                 jid = "jid"
             else:
-                self.gen_add_parallel_loop("row",str(6),use_thread_group)
+                self.gen_add_parallel_loop("row",str(6))
                 jid = str(inds[0])
             self.gen_add_code_lines(["int jid6 = 6*" + jid + ";", \
                                         "s_vaf[jid6 + row] = static_cast<T>(0);",])
@@ -135,17 +135,17 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                     qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qdd[" + jid + "];}")
             self.gen_add_code_line(qd_qdd_code)
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             
             # add debug if requested
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 for ind in inds:
                     self.gen_add_code_line("printf(\"s_v[" + str(ind) + "]\\n\"); printMat<T,1,6>(&s_vaf[6*" + str(ind) + "],1);")
                     self.gen_add_code_line("printf(\"s_a[" + str(ind) + "]\\n\"); printMat<T,1,6>(&s_vaf[" + str(6*n) + " + 6*" + str(ind) + "],1);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
         else:
             self.gen_add_code_line("// s_v and s_a where bfs_level is " + str(bfs_level))
@@ -185,11 +185,11 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             self.gen_add_code_line(f"static const int seg_s_off_{tag}[{seg}] = {{{', '.join(str(6*i) for i in range(seg))}}};")
             self.gen_add_code_line(f"static const T S_sel_{tag}[{6*seg}] = {{{', '.join(sel_vals)}}};")
             # build scalar[seg] = s_qd[qd_idx] in s_temp (free during the forward pass)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_serial_ops()
             for i in range(seg):
                 self.gen_add_code_line(f"s_temp[{i}] = s_qd[{qd_idxs[i]}];")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             # s_v[k] = X[k]*v[parent_k] (+= sign*qd[k] at S index) for all level joints at once
             self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_v_x_off_{tag}, seg_v_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, s_temp, s_linalg_smem);")
             # a[jid] = X[jid]*a[parent] (+= sign*qdd[k] at S index if use_qdd_input)
@@ -199,19 +199,19 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             self.gen_add_code_line(f"static const int seg_a_y_off_{tag}[{seg}] = {{{a_y_off}}};")
             if use_qdd_input:
                 # rebuild scalar[seg] = s_qdd[qd_idx] in s_temp, then fuse the += S*qdd
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_serial_ops()
                 for i in range(seg):
                     self.gen_add_code_line(f"s_temp[{i}] = s_qdd[{qd_idxs[i]}];")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
                 self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_a_x_off_{tag}, seg_a_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, s_temp, s_linalg_smem);")
             else:
                 self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6>({seg}, seg_a_off_{tag}, seg_a_x_off_{tag}, seg_a_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0));")
 
             # add debug if requested
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 for ind in inds:
                     self.gen_add_code_line("printf(\"s_v[" + str(ind) + "] = X*s_v[" + str(self.robot.get_parent_id(ind)) + "] + S*qd[" + str(ind) + "]\\n\"); printMat<T,1,6>(&s_vaf[6*" + str(ind) + "],1);")
                     if use_qdd_input:
@@ -219,12 +219,12 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
                     else:
                         self.gen_add_code_line("printf(\"s_a[" + str(ind) + "] = X*s_a[" + str(self.robot.get_parent_id(ind)) + "]\\n\"); printMat<T,1,6>(&s_vaf[" + str(6*n) + " + 6*" + str(ind) + "],1);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
             self.gen_add_code_line("// sync before a += MxS(v)*qd[S] ")
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             
             # attempt to do as much of the Mx in parallel as possible (will branch on different S but that is inevitable)
-            self.gen_add_parallel_loop("ind",str(len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(len(inds)))
             if len(inds) > 1:
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("ind", "==", [str(i) for i in range(len(inds))], select_var_vals)
@@ -241,15 +241,15 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = dst_name, s_src_name = src_name, s_scale_name = scale_name)
             self.gen_mx_func_call_for_cpp(inds, PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             # add debug if requested
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 for ind in inds:
                     self.gen_add_code_line("printf(\"s_a[" + str(ind) + "] += MxS(s_v[" + str(ind) + "])\\n\"); printMat<T,1,6>(&s_vaf[" + str(6*n) + " + 6*" + str(ind) + "],1);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
     #
     # then compute all f in parallel
     #
@@ -259,36 +259,36 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
     self.gen_add_code_line("//")
     self.gen_add_code_line("// s_f[k] = I[k]*a[k] + fx(v[k])*I[k]*v[k]")
     self.gen_add_code_line("// start with s_f[k] = I[k]*a[k] and temp = *I[k]*v[k]")
-    self.gen_add_parallel_loop("ind",str(6*2*n),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*2*n))
     self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int jid = comp % " + str(n) + ";")
     self.gen_add_code_line("bool IaFlag = comp == jid; int jid6 = 6*jid; int vaOffset = IaFlag * " + str(6*n) + " + jid6;")
     self.gen_add_code_line("T *dst = IaFlag ? &s_vaf[" + str(12*n) + "] : s_temp;")
     self.gen_add_code_line("// compute based on the branch and save Iv to temp to prep for fx(v)*Iv and then sync")
     self.gen_add_code_line("dst[jid6 + row] = dot_prod<T,6,6,1>(&s_XImats[" + str(36*n) + " + 6*jid6 + row], &s_vaf[vaOffset]);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         for ind in inds:
             self.gen_add_code_line("printf(\"s_f[" + str(ind) + "] = I*s_a[" + str(ind) + "])\\n\"); printMat<T,1,6>(&s_vaf[" + str(12*n) + " + 6*" + str(ind) + "],1);")
             self.gen_add_code_line("printf(\"I*s_v[" + str(ind) + "])\\n\"); printMat<T,1,6>(&s_temp[6*" + str(ind) + "],1);")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_add_code_line("// finish with s_f[k] += fx(v[k])*Iv[k]")
-    self.gen_add_parallel_loop("jid",str(len(inds)),use_thread_group)
+    self.gen_add_parallel_loop("jid",str(len(inds)))
     self.gen_add_code_line("int jid6 = 6*jid;")
     self.gen_add_code_line("fx_times_v_peq<T>(&s_vaf[" + str(12*n) + " + jid6], &s_vaf[jid6], &s_temp[jid6]);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         for ind in inds:
             self.gen_add_code_line("printf(\"s_f[" + str(ind) + "] += fx(v[" + str(ind) + "])*I*v[" + str(ind) + "])\\n\"); printMat<T,1,6>(&s_vaf[" + str(12*n) + " + 6*" + str(ind) + "],1);")
         self.gen_add_code_line("printf(\"s_f forward pass\\n\"); printMat<T,6," + str(n) + ">(&s_vaf[" + str(12*n) + "],6);")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     #
     # Then compute the Backward Pass again in bfs waves
     #
@@ -312,12 +312,12 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             self.gen_add_code_line(f"grid_linalg_gemv<T,6,6,true>(&s_XImats[{36*jid_val}], &s_vaf[{12*n + 6*jid_val}], &s_vaf[{12*n + 6*parent_val}], static_cast<T>(1), static_cast<T>(1));")
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             for ind in inds:
                 self.gen_add_code_line("printf(\"s_f[" + str(self.robot.get_parent_id(ind)) + "] += X^T*s_f[" + str(ind) + "]\\n\"); printMat<T,1,6>(&s_vaf[" + str(12*n) + " + 6*" + str(self.robot.get_parent_id(ind)) + "],1);")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
     if compute_c:
         # then extract all c in parallel
@@ -326,7 +326,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
         self.gen_add_code_line("//")
         self.gen_add_code_line("// s_c extracted in parallel (S*f)")
         self.gen_add_code_line("//")
-        self.gen_add_parallel_loop("dof_id",str(self.robot.get_num_vel()),use_thread_group) # one component for each dof
+        self.gen_add_parallel_loop("dof_id",str(self.robot.get_num_vel())) # one component for each dof
         if 'jid' in S_ind_cpp: S_ind_cpp = S_ind_cpp.replace('jid', 'dof_id') 
         if 'jid' in S_sign_cpp: S_sign_cpp = S_sign_cpp.replace('jid', 'dof_id')
         if self.robot.floating_base:
@@ -336,7 +336,7 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
             self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + fb_offset + " + S_ind_cpp + "];")
         else: self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + 6*dof_id + " + S_ind_cpp + "];")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_device_temp_mem_size(self, compute_c = False):
@@ -344,7 +344,7 @@ def gen_inverse_dynamics_device_temp_mem_size(self, compute_c = False):
     wrapper_size = (18*n if compute_c else 0) + self.gen_topology_helpers_size() + 72*n # for XImats
     return self.gen_inverse_dynamics_inner_temp_mem_size() + wrapper_size
 
-def gen_inverse_dynamics_device(self, use_thread_group = False, compute_c = False, use_qdd_input = False):
+def gen_inverse_dynamics_device(self, compute_c = False, use_qdd_input = False):
     n = self.robot.get_num_pos()
     # construct the boilerplate and function definition
     func_params = ["s_q is the vector of joint positions", \
@@ -379,11 +379,11 @@ def gen_inverse_dynamics_device(self, use_thread_group = False, compute_c = Fals
     extra_t_buffers = [("s_vaf", 18*n)] if compute_c else []
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_inverse_dynamics_inner_function_call(use_thread_group,compute_c,use_qdd_input)
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_inverse_dynamics_inner_function_call(compute_c,use_qdd_input)
     self.gen_add_end_function()
 
-def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
+def gen_inverse_dynamics_kernel(self, use_qdd_input = False, single_call_timing = False):
     n = self.robot.get_num_pos()
     compute_c = True
     # define function def and params
@@ -420,38 +420,38 @@ def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = 
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_input:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n),use_thread_group,"qdd",str(n),str(n))
+            self.gen_kernel_load_inputs("q_qd",str(2*n),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
         else:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd",str(2*n),stride="stride_q_qd")
         # compute
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,compute_c,use_qdd_input)
-        self.gen_add_sync(use_thread_group)
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_inverse_dynamics_inner_function_call(compute_c,use_qdd_input)
+        self.gen_add_sync()
         # save to global
-        self.gen_kernel_save_result("c",str(n),str(n),use_thread_group)
+        self.gen_kernel_save_result("c",str(n),stride=str(n))
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
         if use_qdd_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n))
+            self.gen_kernel_load_inputs("q_qd",str(2*n),"qdd",str(n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd",str(2*n))
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
-            self.gen_anti_licm_input_reload("q_qd",str(2*n),use_thread_group,"qdd",str(n),feedback_from="c")
+            self.gen_anti_licm_input_reload("q_qd",str(2*n),"qdd",str(n),feedback_from="c")
         else:
-            self.gen_anti_licm_input_reload("q_qd",str(2*n),use_thread_group,feedback_from="c")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group,compute_c,use_qdd_input)
+            self.gen_anti_licm_input_reload("q_qd",str(2*n),feedback_from="c")
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_inverse_dynamics_inner_function_call(compute_c,use_qdd_input)
         self.gen_anti_licm_output_write("c")
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("c",str(n),use_thread_group)
+        self.gen_kernel_save_result("c",str(n))
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_host(self, mode = 0):
@@ -531,22 +531,22 @@ def gen_inverse_dynamics_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("id"))
     self.gen_add_end_function()
 
-def gen_inverse_dynamics(self, use_thread_group = False):
+def gen_inverse_dynamics(self):
     # first generate the inner helpers
-    self.gen_inverse_dynamics_inner(use_thread_group,True,True)
-    self.gen_inverse_dynamics_inner(use_thread_group,True,False)
-    self.gen_inverse_dynamics_inner(use_thread_group,False,True)
-    self.gen_inverse_dynamics_inner(use_thread_group,False,False)
+    self.gen_inverse_dynamics_inner(True,True)
+    self.gen_inverse_dynamics_inner(True,False)
+    self.gen_inverse_dynamics_inner(False,True)
+    self.gen_inverse_dynamics_inner(False,False)
     # then generate the device wrappers
-    self.gen_inverse_dynamics_device(use_thread_group,True,True)
-    self.gen_inverse_dynamics_device(use_thread_group,True,False)
-    self.gen_inverse_dynamics_device(use_thread_group,False,True)
-    self.gen_inverse_dynamics_device(use_thread_group,False,False)
+    self.gen_inverse_dynamics_device(True,True)
+    self.gen_inverse_dynamics_device(True,False)
+    self.gen_inverse_dynamics_device(False,True)
+    self.gen_inverse_dynamics_device(False,False)
     # then generate the kernels
-    self.gen_inverse_dynamics_kernel(use_thread_group,True,True)
-    self.gen_inverse_dynamics_kernel(use_thread_group,True,False)
-    self.gen_inverse_dynamics_kernel(use_thread_group,False,True)
-    self.gen_inverse_dynamics_kernel(use_thread_group,False,False)
+    self.gen_inverse_dynamics_kernel(True,True)
+    self.gen_inverse_dynamics_kernel(True,False)
+    self.gen_inverse_dynamics_kernel(False,True)
+    self.gen_inverse_dynamics_kernel(False,False)
     # then the host launch wrappers
     self.gen_inverse_dynamics_host(0)
     self.gen_inverse_dynamics_host(1)

@@ -4,7 +4,7 @@ def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input =
     id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return max(minv_temp,id_du_temp) if not use_qdd_Minv_input else id_du_temp
 
-def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, use_qdd_Minv_input = False,
+def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
                                                s_df_du_name = "s_df_du",
                                                d_temp_spill_name = "nullptr",
                                                temp_spill_flag_name = "false"):
@@ -19,25 +19,24 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
         # from the tail of s_temp (FD_DU keeps Minv-F in smem; its surgical spill
         # is the id_du da_df band, handled separately). After Minv returns, the
         # c+vaf/ID code reuses these bytes (the steps run sequentially).
-        self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
+        self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
         # updated_var_names = dict(s_c_name = "s_temp", s_vaf_name = "&s_temp[" + str(n) + "]", s_temp_name = "&s_temp[" + str(19*n) + "]")
         updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]")
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
-        self.gen_forward_dynamics_finish_function_call(use_thread_group, updated_var_names)
-        self.gen_add_sync(use_thread_group)
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = False, use_qdd_input = True)
+        self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
+        self.gen_forward_dynamics_finish_function_call(updated_var_names)
+        self.gen_add_sync()
+        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True)
     # else just compute vaf
     else:
-        self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = False, use_qdd_input = True)
+        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True)
     # then run the gradient code
     self.gen_inverse_dynamics_gradient_inner_function_call(
-        use_thread_group,
         dict(d_temp_spill_name = d_temp_spill_name, temp_spill_flag_name = temp_spill_flag_name)
     )
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"Minv\\n\");", \
                                  "printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");", \
                                  "printf(\"qdd\\n\");", \
@@ -53,10 +52,10 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
                                  "printf(\"dc/dqd\\n\");", \
                                  "printMat<T," + str(n) + "," + str(n) + ">(&s_dc_du[" + str(n*n) + "]," + str(n) + ");"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # and finally finish with df/du = -Minv*dc/du
-    self.gen_add_parallel_loop("ind",str(n*2*n),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(n*2*n))
     self.gen_add_code_line("int row = ind % " + str(n) + "; int dc_col_offset = ind - row;")
     self.gen_add_code_line("// account for the fact that Minv is an SYMMETRIC_UPPER triangular matrix")
     self.gen_add_code_line("T val = static_cast<T>(0);")
@@ -67,7 +66,7 @@ def gen_forward_dynamics_gradient_inner_python(self, use_thread_group = False, u
     self.gen_add_code_line(s_df_du_name + "[ind] = -val;")
     self.gen_add_end_control_flow()
 
-def gen_forward_dynamics_gradient_device_function_call(self, use_thread_group = False,
+def gen_forward_dynamics_gradient_device_function_call(self,
                                                            use_qdd_Minv_input = False,
                                                            scratch_in_smem_expr = "true",
                                                            use_da_df_spill_expr = "false",
@@ -93,7 +92,7 @@ def gen_forward_dynamics_gradient_device_function_call(self, use_thread_group = 
            + "d_robotModel, gravity);")
     self.gen_add_code_line(start + middle + end)
 
-def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd_Minv_input = False):
+def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     """Emit `forward_dynamics_gradient_device` — the whole fd_du orchestration
     as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
     mirrors gen_inverse_dynamics_gradient_device / gen_fdsva_so_device). It
@@ -174,9 +173,9 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
     # caller-side repoint. The XImats helper call goes AFTER this repoint so its
     # sincos scratch follows the placement (avoids a null-s_temp sincos crash).
     self.gen_add_code_line("if constexpr(!SCRATCH_IN_SMEM){ s_temp = d_workspace; } else { (void)d_workspace; }")
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
     self.gen_forward_dynamics_gradient_inner_python(
-        use_thread_group, use_qdd_Minv_input,
+        use_qdd_Minv_input,
         s_df_du_name = "s_df_du",
         d_temp_spill_name = "d_temp_spill",
         temp_spill_flag_name = "USE_DA_DF_SPILL")
@@ -196,7 +195,7 @@ _FD_DU_PICK_FLAGS = [
 ]
 
 def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_temp,
-                                      use_qdd_Minv_input, single_call_timing, use_thread_group):
+                                      use_qdd_Minv_input, single_call_timing):
     """Emit fd_du kernel body for one tier's spill flags."""
     extra_t_buffers = [("s_q_qd", 2*n+self.robot.floating_base),
                        ("s_dc_du", n*2*n),
@@ -216,11 +215,11 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
     else:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];")
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),str(n),"Minv",str(n*n),str(n*n))
+            self.gen_kernel_load_inputs("q_qd",str(2*n+self.robot.floating_base),"qdd",str(n),"Minv",str(n*n),stride="stride_q_qd",stride2=str(n),stride3=str(n*n))
         else:
-            self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd_u",str(3*n+self.robot.floating_base),stride="stride_q_qd_u")
         # The kernel only SLICES the workspace band pointers; the device owns
         # the s_temp pool placement (the whole-pool global-temp repoint is its
         # SCRATCH_IN_SMEM=false path). Per-rung flags are passed as literals.
@@ -230,20 +229,20 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
         self.gen_forward_dynamics_gradient_device_function_call(
-            use_thread_group, use_qdd_Minv_input,
+            use_qdd_Minv_input,
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             s_df_du_name = ("d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp"),
             d_workspace_pool_name = ("reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()])" if use_global_temp else "nullptr"),
             d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
         if not (use_global_temp or use_selective_spill):
-            self.gen_kernel_save_result("df_du",str(n*2*n),str(n*2*n),use_thread_group,"s_temp")
+            self.gen_kernel_save_result("df_du",str(n*2*n),"s_temp",stride=str(n*2*n))
         self.gen_add_end_control_flow()
     else:
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n+self.robot.floating_base),use_thread_group,"qdd",str(n),"Minv",str(n*n))
+            self.gen_kernel_load_inputs("q_qd",str(2*n+self.robot.floating_base),"qdd",str(n),"Minv",str(n*n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd_u",str(3*n+self.robot.floating_base),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd_u",str(3*n+self.robot.floating_base))
         if use_selective_spill or use_global_temp:
             self.gen_add_code_line("T *d_df_du_k = d_df_du;")
         if use_selective_spill:
@@ -251,12 +250,12 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_Minv_input:
-            self.gen_anti_licm_input_reload("q_qd", str(2*n + self.robot.floating_base), use_thread_group, "qdd", str(n), "Minv", str(n*n))
+            self.gen_anti_licm_input_reload("q_qd", str(2*n + self.robot.floating_base), "qdd", str(n), "Minv", str(n*n))
         else:
-            self.gen_anti_licm_input_reload("q_qd_u", str(3*n + self.robot.floating_base), use_thread_group)
+            self.gen_anti_licm_input_reload("q_qd_u", str(3*n + self.robot.floating_base))
         # device owns s_temp placement (whole-pool global path = SCRATCH_IN_SMEM=false).
         self.gen_forward_dynamics_gradient_device_function_call(
-            use_thread_group, use_qdd_Minv_input,
+            use_qdd_Minv_input,
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             s_df_du_name = ("d_df_du_k" if (use_global_temp or use_selective_spill) else "s_temp"),
@@ -270,10 +269,10 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
         )
         self.gen_add_end_control_flow()
         if not (use_global_temp or use_selective_spill):
-            self.gen_kernel_save_result_single_timing("df_du",str(n*2*n),use_thread_group,"s_temp")
+            self.gen_kernel_save_result("df_du",str(n*2*n),"s_temp")
 
 
-def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd_Minv_input = False, single_call_timing = False):
+def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, single_call_timing = False):
     n = self.robot.get_num_vel()
     func_params = ["d_df_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
@@ -304,7 +303,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
     picks = getattr(self, "fd_du_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
         uss, ugt = _FD_DU_PICK_FLAGS[picks[0]]
-        _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing, use_thread_group)
+        _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
@@ -312,7 +311,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_thread_group = False, use_qdd
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing, use_thread_group)
+            _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -387,17 +386,17 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("fd_du"))
     self.gen_add_end_function()
 
-def gen_forward_dynamics_gradient(self, use_thread_group = False):
+def gen_forward_dynamics_gradient(self):
     # the canonical _device (orchestrator: owns s_temp placement; wraps XImats +
     # minv/id/finish/id + id_du band sub-inner + (-Minv*dc/du); called from kernel
     # and integrator_gradient). Both qdd-Minv-input variants.
-    self.gen_forward_dynamics_gradient_device(use_thread_group, False)
-    self.gen_forward_dynamics_gradient_device(use_thread_group, True)
+    self.gen_forward_dynamics_gradient_device(False)
+    self.gen_forward_dynamics_gradient_device(True)
     # then kernels
-    self.gen_forward_dynamics_gradient_kernel(use_thread_group,True,True)
-    self.gen_forward_dynamics_gradient_kernel(use_thread_group,True,False)
-    self.gen_forward_dynamics_gradient_kernel(use_thread_group,False,True)
-    self.gen_forward_dynamics_gradient_kernel(use_thread_group,False,False)
+    self.gen_forward_dynamics_gradient_kernel(True,True)
+    self.gen_forward_dynamics_gradient_kernel(True,False)
+    self.gen_forward_dynamics_gradient_kernel(False,True)
+    self.gen_forward_dynamics_gradient_kernel(False,False)
     # finally host wrappers
     self.gen_forward_dynamics_gradient_host(0)
     self.gen_forward_dynamics_gradient_host(1)

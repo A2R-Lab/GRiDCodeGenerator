@@ -21,7 +21,7 @@ def gen_direct_minv_inner_temp_mem_size(self):
     (at offset 0) and s_temp (at offset 6*NV*NV) to direct_minv_inner."""
     return self.gen_direct_minv_inner_F_size() + self.gen_direct_minv_inner_no_F_size()
 
-def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+def gen_direct_minv_inner_function_call(self, updated_var_names = None,
                                         f_in_smem_expr = "true"):
     var_names = dict( \
         s_Minv_name = "s_Minv", \
@@ -43,7 +43,7 @@ def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_
     minv_code = minv_code_start + minv_code_middle + minv_code_end
     self.gen_add_code_line(minv_code)
 
-def gen_direct_minv_inner(self, use_thread_group = False):
+def gen_direct_minv_inner(self):
     NJ = self.robot.get_num_joints()
     n = self.robot.get_num_vel()
     max_bfs_levels = self.robot.get_max_bfs_level()
@@ -103,24 +103,24 @@ def gen_direct_minv_inner(self, use_thread_group = False):
 
     # set initial IA to I and zero Minv/F
     self.gen_add_code_line("// Initialize IA = I")
-    self.gen_add_parallel_loop("ind",str(36*NJ),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(36*NJ))
     self.gen_add_code_line("s_temp[" + str(IAOffset) + " + ind] = s_XImats[" + str(36*NJ) + " + ind];")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("// Zero Minv and F")
-    self.gen_add_parallel_loop("ind",str(n*n*7),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(n*n*7))
     self.gen_add_code_line("if(ind < " + str(6*n*n) + "){s_F[" + str(FOffset) + " + ind] = static_cast<T>(0);}")
     self.gen_add_code_line("else{s_Minv[ind - " + str(6*n*n) + "] = static_cast<T>(0);}")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,6,6>(&s_XImats[36*i],6);}")
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"IA_init = I[%d]\\n\",i); printMat<T,6,6>(&s_temp[" + str(IAOffset) + " + 36*i],6);}")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # First compute the Backward Pass in bfs waves
@@ -153,18 +153,18 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line(f"invert_matrix(6, &s_temp[{str(IAOffset)}], &s_temp[{str(fb_DinvOffset)}], &s_temp[{IaTempOffset}]);")
 
             # Top left 6x6 in minv <- Dinv
-            self.gen_add_parallel_loop("ind", '36', use_thread_group)
+            self.gen_add_parallel_loop("ind", '36')
             self.gen_add_code_line("int row = ind % 6, col = ind / 6;")
             self.gen_add_code_line(f"s_Minv[col*{n}+row] = s_temp[{fb_DinvOffset}+ind];")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
 
         else:
             # U = Scol of IA then D = Srow of U then note that DInv = 1/D, Minv[i,i] = Dinv
             self.gen_add_code_line("// U = IA*S, D = S^T*U, DInv = 1/D, Minv[i,i] = Dinv")
             if len(inds) > 1:
-                self.gen_add_parallel_loop("ind",str(6*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*len(inds)))
                 self.gen_add_code_line("int row = ind % 6;")
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
@@ -174,7 +174,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             else:
                 jid = str(inds[0]) 
                 jid6 = str(6*inds[0])
-                self.gen_add_parallel_loop("row",str(6),use_thread_group)
+                self.gen_add_parallel_loop("row",str(6))
             self.gen_add_code_line("s_temp[" + str(UOffset) + " + " + jid6 + " + row] = (" + S_sign_cpp + ") * s_temp[" + str(IAOffset) + " + 6*" + jid6 + " + 6*" + S_ind_cpp + " + row];")
             self.gen_add_code_line("if(row == " + S_ind_cpp + "){", True)
             self.gen_add_code_line("s_temp[" + str(DinvOffset) + " + " + jid + "] = static_cast<T>(1)/((" + S_sign_cpp + ") * s_temp[" + str(UOffset) + " + " + jid6 + " + " + S_ind_cpp + "]);")
@@ -183,17 +183,17 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             else: self.gen_add_code_line("s_Minv[" + str(n + 1) + " * " + jid + "] = s_temp[" + str(DinvOffset) + " + " + jid + "];")
             self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             for ind in inds:
                 self.gen_add_code_line("printf(\"U[" + str(ind) + "]\\n\"); printMat<T,1,6>(&s_temp[" + str(UOffset) + " + 6*" + str(ind) + "],1);")
                 self.gen_add_code_line("printf(\"Dinv[" + str(ind) + "] = %f\\n\",s_temp[" + str(DinvOffset) + " + " + str(ind) + "]);")
             self.gen_add_code_line("printf(\"Minv after Dinv setting before subtree\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
         # then for the subtrees we know that Minv[i,subTreeInds] -= F[i,Srow,SubTreeInds] scalar -> scalar
         #                                and temp comp F[i,:,subTreeInds] += U*Minv[i,subTreeInds] vector*scalar -> vector (only if parent exists)
@@ -201,14 +201,14 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         self.gen_add_code_line("// Minv[i,subTreeInds] -= Dinv*F[i,Srow,SubTreeInds]")
 
         if self.robot.floating_base and bfs_level == 0:
-            self.gen_add_parallel_loop("ind", str((NJ-1)*6), use_thread_group)
+            self.gen_add_parallel_loop("ind", str((NJ-1)*6))
             self.gen_add_code_line(f"int row = ind % 6, col = ind / 6;")
             self.gen_add_code_line(f"s_Minv[(6+col)*{n}+row] -= dot_prod<T,6,1,1>(&s_temp[{fb_DinvOffset}+6*row], &s_F[{FOffset+6*n*5+36}+6*col]);") # offset to 7th dof (past fb) in fb F matrix
             self.gen_add_end_control_flow()
         else:
             if bfs_level != 0:
                 self.gen_add_code_line("// Temp Comp: F[i,:,subTreeInds] += U*Minv[i,subTreeInds] - to start Fparent Update")
-            self.gen_add_parallel_loop("ind",str(len(ind_subtree_inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(len(ind_subtree_inds)))
             if len(inds) > 1:
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds]),
                                 ("int", "subTreeAdj", [str(val) for val in subtree_adjust])]
@@ -251,19 +251,19 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_end_control_flow()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             self.gen_add_code_line("printf(\"Minv after subtree updates\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");")
             if bfs_level != 0:
                 for ind in inds:
                     self.gen_add_code_line("printf(\"F Temp += U*Minv[" + str(ind) + "]\\n\"); printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + n*6*ind) + "],6);")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
         # Then start the IA update (if there is a parent) with Ia = IA[ind] - np.outer(U[ind,:],Dinv[ind]*U[ind,:])
         if bfs_level != 0:
             self.gen_add_code_line("// Ia = IA - U^T Dinv U | to start IAparent Update")
-            self.gen_add_parallel_loop("ind",str(36*len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(36*len(inds)))
             if len(inds) > 1:
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(36*(i+1)) for i in range(len(inds))], select_var_vals)
@@ -276,16 +276,16 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_code_line("s_temp[" + str(IaOffset) + " + ind] = s_temp[" + str(IAOffset + 36*jid) + " + ind] - " + \
                   "(s_temp[" + str(UOffset + 6*jid) + " + row] * s_temp[" + str(DinvOffset + jid) + "] * s_temp[" + str(UOffset + 6*jid) + " + col]);")
             self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
         if self.DEBUG_MODE:
-            self.gen_add_sync(use_thread_group)
-            self.gen_add_serial_ops(use_thread_group)
+            self.gen_add_sync()
+            self.gen_add_serial_ops()
             for i in range(len(inds)):
                 self.gen_add_code_lines(["printf(\"Ia[" + str(inds[i]) + "]\\n\");",
                                          "printMat<T,6,6>(&s_temp[" + str(IaOffset + 36*i) + "],6);"])
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
         if bfs_level != 0:
             # then for the subtrees we can do (in parallel by both subtree and row)
@@ -293,7 +293,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             # At the same time also do next step of IA update: IA_Update_Temp = Xmat^T * Ia
             self.gen_add_code_line("// F[parent_ind,:,subTreeInds] += Xmat^T * F[ind,:,subTreeInds]")
             self.gen_add_code_line("// IA_Update_Temp = Xmat^T * Ia | for IAparent Update")
-            self.gen_add_parallel_loop("ind",str(6*len(ind_subtree_inds) + 6*6*len(inds)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*len(ind_subtree_inds) + 6*6*len(inds)))
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             if len(ind_subtree_inds) > 1:
                 if len(inds) > 1:
@@ -337,23 +337,23 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             # then do the computation
             self.gen_add_code_line("dst[row] = dot_prod<T,6,1,1>(&s_XImats[36*" + jid + " + 6*row],src);")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 for i in range(len(inds)):
                     self.gen_add_code_lines(["printf(\"F[" + str(self.robot.get_parent_id(inds[i])) + "] = X^T F[" + str(inds[i]) + "]\\n\");",
                                              "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + n*6*self.robot.get_parent_id(inds[i])) + "],6);",
                                              "printf(\"Ia*X[" + str(inds[i]) + "]\\n\");",
                                              "printMat<T,6,6>(&s_temp[" + str(IaTempOffset + 36*i) + "],6);"])
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
             # Finally IA[parent_ind] += IA_Update_Temp * Xmat
             self.gen_add_code_line("// IA[parent_ind] += IA_Update_Temp * Xmat")
             if len(inds) > 1 and self.robot.has_repeated_parents(inds):
-                self.gen_add_parallel_loop("ind",str(6*6*len(inds)),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(6*6*len(inds)))
                 self.gen_add_code_line("int col = ind / 6; int row = ind % 6;")
                 self.gen_add_code_line("int col_max6 = col % 6; int jid_ind = col / 6;")
                 select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
@@ -364,7 +364,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_code_line("T val = dot_prod<T,6,6,1>(src,&s_XImats[36*jid + 6*col_max6]);")
                 self.gen_add_code_line("atomicAdd(dst,val);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
             elif len(inds) > 1:
                 for i, jid_val in enumerate(inds):
                     parent_val = self.robot.get_parent_id(jid_val)
@@ -375,17 +375,17 @@ def gen_direct_minv_inner(self, use_thread_group = False):
                 self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{IaTempOffset}], &s_XImats[{36*jid_val}], &s_temp[{IAOffset + 36*parent_val}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
 
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 for ind in inds:
                     self.gen_add_code_lines(["printf(\"IA[" + str(self.robot.get_parent_id(ind)) + "] = X^T*(Ia*X)\\n\");",
                                              "printMat<T,6,6>(&s_temp[" + str(IAOffset + 36*self.robot.get_parent_id(ind)) + "],6);"])
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"-------------------\\n\");", \
                                  "printf(\"After Backward Pass\\n\");", \
                                  "printf(\"-------------------\\n\");", \
@@ -396,7 +396,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         self.gen_add_code_line("printf(\"Minv\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");")
         self.gen_add_code_line("printf(\"-------------------\\n\");")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # Then compute the Forwad Pass
@@ -449,7 +449,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             self.gen_add_code_line("//   Per column: F[i,:,col]=Xmat*F[parent,:,col], then")
             self.gen_add_code_line("//   Minv[i,col]-=Dinv*U^T*F[i,:,col] and F[i,Srow,col]+=S*Minv[i,col]")
             diag_offset = dof_id - jid  # 0 fixed-base, 5 floating-base
-            self.gen_add_parallel_loop("c",str(len(dof_cols)),use_thread_group)
+            self.gen_add_parallel_loop("c",str(len(dof_cols)))
             self.gen_add_code_line("int col_ind = c + " + str(jid) + ";")
             self.gen_add_code_line("T *s_Fcol = &s_F[" + str(FOffset + 6*n*jid) + " + 6*col_ind];")
             self.gen_add_code_line("T *s_Fpcol = &s_F[" + str(FOffset + 6*n*jid_parent) + " + 6*col_ind];")
@@ -467,41 +467,41 @@ def gen_direct_minv_inner(self, use_thread_group = False):
             if diag_offset > 0:
                 self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 self.gen_add_code_lines(["printf(\"Minv[i,i:] -= Dinv*U^T*F[i,:,i:] for i = %d\\n\"," + str(jid) + ");", \
                                          "printMat<T," + str(n) + "," + str(n) + ">(s_Minv," + str(n) + ");"])
                 if jid < n-1: # redundant comp on last loop
                     self.gen_add_code_lines(["printf(\"F[i,:,i:] += S*Minv[i,i:]\");", \
                                              "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + 6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
         elif jid < n-1: # redundant comp on last loop
             self.gen_add_code_line("// F[i,:,i:] = S * Minv[i,i:] as parent is base so rest is skipped")
-            self.gen_add_parallel_loop("ind",str(6*len(dof_cols)),use_thread_group)
+            self.gen_add_parallel_loop("ind",str(6*len(dof_cols)))
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             if self.robot.floating_base: self.gen_add_code_line(f"s_F[ind] = s_Minv[row + {n} * col];") # update F[0] (Phase 3a: F is in s_F)
             else:
                 self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = (row == " + SInd + ") * " + \
                                             "(" + SSign + ") * s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
             if self.DEBUG_MODE:
-                self.gen_add_sync(use_thread_group)
-                self.gen_add_serial_ops(use_thread_group)
+                self.gen_add_sync()
+                self.gen_add_serial_ops()
                 self.gen_add_code_lines(["printf(\"F[i,:,i:] += S*Minv[i,i:] for i = %d\\n\"," + str(jid) + ");", \
                                          "printMat<T,6," + str(n) + ">(&s_F[" + str(FOffset + 6*n*jid) + "],6);"])
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
     if self.robot.floating_base:
         self.gen_add_code_line("// Convert floating-base Minv from internal spatial order to public velocity order.")
         self.gen_add_code_line("// Internal root vectors are [angular, linear]; public qd/u/qdd are [linear, angular].")
-        self.gen_add_parallel_loop("ind", str(n*n), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(n*n))
         self.gen_add_code_line("int row = ind % " + str(n) + "; int col = ind / " + str(n) + ";")
         self.gen_add_code_line("T val = static_cast<T>(0);")
         self.gen_add_code_line("if (row <= col) {", True)
@@ -517,14 +517,14 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         # smaller than NV*NV on humanoid-scale floating-base robots.)
         self.gen_add_code_line("s_F[ind] = val;")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_parallel_loop("ind", str(n*n), use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_parallel_loop("ind", str(n*n))
         self.gen_add_code_line("s_Minv[ind] = s_F[ind];")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
     self.gen_add_end_function()
 
-def gen_direct_minv_device(self, use_thread_group = False):
+def gen_direct_minv_device(self):
     # construct the boilerplate and function definition
     func_params = ["s_Minv is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
@@ -542,11 +542,11 @@ def gen_direct_minv_device(self, use_thread_group = False):
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
     # then load/update XI and run the algo. Inner-callable device path keeps F in
     # smem (F_IN_SMEM=true); the inner slices s_F from the tail of s_temp itself.
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
     self.gen_add_end_function()
 
-def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, use_thread_group):
+def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
     """Emit direct_minv_kernel body for one tier's spill flag.
     spill_F=False: s_F lives at &s_temp[0]; s_temp_inner at &s_temp[6*NV*NV]; smem holds everything.
     spill_F=True:  s_F lives at &d_workspace[...]; s_temp_inner at &s_temp[0]; saves 6*NV*NV from smem."""
@@ -558,40 +558,40 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, u
         shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n_pos), ("s_Minv", n*n)], include_linalg_scratch=True)
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n_pos),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q",str(n_pos),stride="stride_q")
         if spill_F:
             # L2-pinned workspace slot for Minv-F (inner picks it via F_IN_SMEM=false).
             self.gen_add_code_line("T *minv_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group,
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_direct_minv_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "minv_d_workspace") if spill_F else None),
             f_in_smem_expr = ("false" if spill_F else "true"))
-        self.gen_add_sync(use_thread_group)
-        self.gen_kernel_save_result("Minv",str(n*n),str(n*n),use_thread_group)
+        self.gen_add_sync()
+        self.gen_kernel_save_result("Minv",str(n*n),stride=str(n*n))
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs_single_timing("q",str(n_pos),use_thread_group)
+        self.gen_kernel_load_inputs("q",str(n_pos))
         if spill_F:
             self.gen_add_code_line("T *minv_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n_pos),use_thread_group,feedback_from="Minv")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_direct_minv_inner_function_call(use_thread_group,
+        self.gen_anti_licm_input_reload("q",str(n_pos),feedback_from="Minv")
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_direct_minv_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "minv_d_workspace") if spill_F else None),
             f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_anti_licm_output_write("Minv")
         self.gen_add_end_control_flow()
-        self.gen_kernel_save_result_single_timing("Minv",str(n*n),use_thread_group)
+        self.gen_kernel_save_result("Minv",str(n*n))
 
 
-def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = False):
+def gen_direct_minv_kernel(self, single_call_timing = False):
     n_pos = self.robot.get_num_pos()
     n_vel = self.robot.get_num_vel()
     func_params = ["d_Minv is a pointer to memory for the final result", \
@@ -613,14 +613,14 @@ def gen_direct_minv_kernel(self, use_thread_group = False, single_call_timing = 
     # (current behavior); when they diverge, emit if-constexpr branches.
     picks = getattr(self, "minv_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
-        _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(picks[0]), single_call_timing, use_thread_group)
+        _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(picks[0]), single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing, use_thread_group)
+            _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -690,14 +690,14 @@ def gen_direct_minv_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("minv"))
     self.gen_add_end_function()
 
-def gen_direct_minv(self, use_thread_group = False):
+def gen_direct_minv(self):
     # gen inner
-    self.gen_direct_minv_inner(use_thread_group)
+    self.gen_direct_minv_inner()
     # and device wrapper
-    self.gen_direct_minv_device(use_thread_group)
+    self.gen_direct_minv_device()
     # and kernel wrappers
-    self.gen_direct_minv_kernel(use_thread_group, True)
-    self.gen_direct_minv_kernel(use_thread_group, False)
+    self.gen_direct_minv_kernel(True)
+    self.gen_direct_minv_kernel(False)
     # and host function call wrappers
     self.gen_direct_minv_host(0)
     self.gen_direct_minv_host(1)

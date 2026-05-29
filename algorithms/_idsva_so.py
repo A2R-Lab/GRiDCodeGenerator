@@ -248,7 +248,7 @@ def gen_floating_gravity_d2tau_dq_temp_mem_size(self):
     return int(gen_floating_gravity_d2tau_dq_shared_count(self)
                + gen_floating_gravity_d2tau_dq_spill_count(self))
 
-def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
+def gen_floating_gravity_d2tau_dq_lie_inline(self):
     """Emit (inline) the floating-base gravity-Hessian addition into `d2tau_dq2`.
 
     Translates the Python helper `_floating_gravity_d2tau_dq_lie_direct` (see
@@ -745,9 +745,9 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self, use_thread_group=False):
     self.gen_add_end_control_flow()  # vi loop for d2f
     self.gen_add_end_control_flow()  # jid backward loop
     self.gen_add_end_control_flow()  # close thread-zero wrap
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
-def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None):
+def gen_idsva_so_body_frame_inner_function_call(self, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None):
     var_names = dict( \
         s_idsva_so_name = "s_idsva_so", \
         s_q_name = "s_q", \
@@ -807,7 +807,7 @@ def idsva_so_needs_reference_order_output_repair(self):
     parent_ids = [self.robot.get_parent_id(jid) for jid in range(self.robot.get_num_joints())]
     return idsva_so_parent_topology_needs_reference_order_output_repair(parent_ids)
 
-def gen_idsva_so_body_frame_reference_order_output_repair(self, use_thread_group = False):
+def gen_idsva_so_body_frame_reference_order_output_repair(self):
     """
     Emits a serial final tensor assembly pass that mirrors RBDReference.idsva_so.
 
@@ -842,7 +842,7 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self, use_thread_group
             return ", ".join(map(str, values))
         return "0"
 
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line("// Reference-order final IDSVA-SO tensor assembly")
     self.gen_add_code_line(f"static const int idsva_ref_st_start[] = {{ {int_array(st_start)} }};")
@@ -931,9 +931,9 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self, use_thread_group
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
-def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = False, use_qdd_input = False):
+def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False):
     """
     Emits a floating-base diagnostic IDSVA-SO path with explicit body/velocity
     split memory. Fixed-base keeps the optimized generator path below.
@@ -975,7 +975,7 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
     # repoint). For floating SCRATCH_IN_SMEM is always true so s_temp is untouched and
     # d_workspace keeps its gravity-shim meaning.
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)0; }")
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
 
     self.gen_add_code_lines([
         "// Floating IDSVA-SO split-memory layout.",
@@ -1308,11 +1308,11 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
     # Phase B: emit the Lie-tangent gravity-Hessian addition. Main sweep above ran with
     # a_world[5] = 0, so this call provides the missing gravity contribution to d2tau_dq2
     # (mirrors the Python `idsva_so` + `_floating_gravity_d2tau_dq_lie_direct` pattern).
-    self.gen_floating_gravity_d2tau_dq_lie_inline(use_thread_group)
-    self.gen_add_sync(use_thread_group)
+    self.gen_floating_gravity_d2tau_dq_lie_inline()
+    self.gen_add_sync()
     self.gen_add_end_function()
 
-def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input = False):
+def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     """
     Generates the inner device function to compute the second order idsva.
 
@@ -1330,7 +1330,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     The inner loads/updates s_XImats from s_q internally, so it takes d_robotModel.
     """
     if self.robot.floating_base:
-        self.gen_idsva_so_body_frame_floating_reference_inner(use_thread_group, use_qdd_input)
+        self.gen_idsva_so_body_frame_floating_reference_inner(use_qdd_input)
         return
 
     NV = self.robot.get_num_vel()
@@ -1372,7 +1372,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     # Load/update XImats INSIDE the inner, AFTER the repoint, so its s_temp-backed
     # sincos scratch follows the SCRATCH_IN_SMEM placement (no caller-side repoint).
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
 
 
     # MEMORY LAYOUT (s_temp):
@@ -1500,10 +1500,10 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line("if constexpr (!BC_IN_SMEM) { BC = d_workspace; }")
 
     self.gen_add_code_line("// Initialize output tensor; optimized assembly paths only write structurally nonzero entries.")
-    self.gen_add_parallel_loop('i', '4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS', use_thread_group)
+    self.gen_add_parallel_loop('i', '4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS')
     self.gen_add_code_line("s_idsva_so[i] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp([i for i in range(num_bodies)], NO_GRAD_FLAG = True)
     S_sign_cpp = self.gen_topology_S_sign_for_cpp([i for i in range(num_bodies)])
@@ -1519,17 +1519,17 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
         self.gen_add_code_line('for (int jid = 0; jid < NUM_BODIES; ++jid) {', 1)
         self.gen_add_code_line('// Compute Xup[joint]')
         self.gen_add_code_line('int X_idx = jid*XIMAT_SIZE;')
-        self.gen_add_parallel_loop('i','XIMAT_SIZE',use_thread_group)
+        self.gen_add_parallel_loop('i','XIMAT_SIZE')
         self.gen_add_code_line(f'if ({parent_ind_cpp } == -1) Xup[X_idx + i] = s_XImats[X_idx + i]; // Parent is base')
         self.gen_add_code_line(f'else matmul<T>(i, &Xup[{parent_ind_cpp} * XIMAT_SIZE], &s_XImats[X_idx], &Xup[X_idx], XIMAT_SIZE, 0);')
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         self.gen_add_end_control_flow()
     else:
         for bfs_level in range(n_bfs_levels):
             inds = self.robot.get_ids_by_bfs_level(bfs_level)
             self.gen_add_code_line(f'// Compute Xup for bfs_level {bfs_level}')
-            self.gen_add_parallel_loop('i', str(36*len(inds)), use_thread_group)
+            self.gen_add_parallel_loop('i', str(36*len(inds)))
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
@@ -1542,7 +1542,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
             if bfs_level == 0: self.gen_add_code_line(f'Xup[X_idx + i % XIMAT_SIZE] = s_XImats[X_idx + i % XIMAT_SIZE]; // Parent is base')
             else: self.gen_add_code_line(f'matmul<T>(i % 36, &Xup[{level_parent_ind_cpp} * XIMAT_SIZE], &s_XImats[X_idx], &Xup[X_idx], XIMAT_SIZE, 0);')
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
             
 
     # Next compute IC - Centroidal Rigid Body Inertia
@@ -1550,25 +1550,25 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line("// Compute IC - Centroidal Rigid Body Inertia")
     # First I @ Xup
     self.gen_add_code_line('// First I @ Xup')
-    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES')
     self.gen_add_code_line('// All involved matrices are 6x6')
     self.gen_add_code_line('matmul<T>(i, Xup, I, I_Xup, 36, false);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # Next Xup.T @ I
     self.gen_add_code_line('// Next Xup.T @ I')
-    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES')
     self.gen_add_code_line('// All involved matrices are 6x6')
     self.gen_add_code_line('int mat_idx = (i / 36) * 36;')
     self.gen_add_code_line("matmul_trans<T>(i % 36, &Xup[mat_idx], &I_Xup[mat_idx], &IC[mat_idx], 'a');")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Next compute Xdown transformations
     # Just the transpose of internal 3x3 submatrices
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line("// Compute Xdown - child to parent transformation matrices")
-    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES')
     self.gen_add_code_line('size_t idx = i % XIMAT_SIZE;')
     self.gen_add_code_line('size_t sub_idx = idx % 18;')
     # TODO fix magic numbers
@@ -1584,26 +1584,26 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('            sub_idx != 12 && sub_idx != 15)', True)
     self.gen_add_code_line(f'Xdown[i] = Xup[i];')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Transform S
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Transform S')
-    self.gen_add_parallel_loop('i','6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','6*NUM_BODIES')
     self.gen_add_code_line('int jid = i / 6;')
     self.gen_add_code_line(f'S[i] = ({S_sign_cpp}) * Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute vJ = S @ qd & aJ = S @ qdd in parallel
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Compute vJ = S @ qd & aJ = S @ qdd')
-    self.gen_add_parallel_loop('i','2*6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','2*6*NUM_BODIES')
     self.gen_add_code_line('int joint = i / 6;')
     self.gen_add_code_line('if (joint < NUM_BODIES) vJ[i] = S[i] * s_qd[joint];')
     self.gen_add_code_line('else aJ[i - 6*NUM_BODIES] = S[i - 6*NUM_BODIES] * s_qdd[joint - NUM_BODIES];')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute v = v[parent] + vJ
     self.gen_add_code_line("\n\n")
@@ -1611,17 +1611,17 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     if self.robot.is_serial_chain():
         self.gen_add_code_line('#pragma unroll')
         self.gen_add_code_line('for (int jid = 0; jid < NUM_BODIES; ++jid) {', 1)
-        self.gen_add_parallel_loop('i','6',use_thread_group)
+        self.gen_add_parallel_loop('i','6')
         self.gen_add_code_line(f'if ({parent_ind_cpp} == -1) v[jid*6 + i] = vJ[jid*6 + i];')
         self.gen_add_code_line(f'else v[jid*6 + i] = v[{parent_ind_cpp}*6 + i] + vJ[jid*6 + i];')
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         self.gen_add_end_control_flow()
     else:
         for bfs_level in range(n_bfs_levels):
             inds = self.robot.get_ids_by_bfs_level(bfs_level)
             self.gen_add_code_line(f'// Compute v for bfs_level {bfs_level}')
-            self.gen_add_parallel_loop('i', str(6*len(inds)), use_thread_group)
+            self.gen_add_parallel_loop('i', str(6*len(inds)))
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
@@ -1634,24 +1634,24 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
             if bfs_level == 0: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = vJ[{jid_cpp}*6 + idx]; // Parent is base')
             else: self.gen_add_code_line(f'v[{jid_cpp}*6 + idx] = v[{level_parent_ind_cpp}*6 + idx] + vJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
 
     # Finish aJ += crm(v[parent])@vJ
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Finish aJ += crm(v[parent])@vJ')
     self.gen_add_code_line('// For base, v[parent] = 0')
-    self.gen_add_parallel_loop('i','6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','6*NUM_BODIES')
     self.gen_add_code_line('int jid = i / 6;')
     self.gen_add_code_line('int index = i % 6;')
     self.gen_add_code_line(f'if ({parent_ind_cpp_for_jid} != -1) aJ[i] += crm_mul<T>(index, &v[{parent_ind_cpp_for_jid}*6], &vJ[jid*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute Sd = crm(v) @ S & psid = crm(v[parent]) @ S
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Compute Sd = crm(v) @ S & psid = crm(v[parent]) @ S')
     self.gen_add_code_line('// For base, v[parent] = 0')
-    self.gen_add_parallel_loop('i','2*6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','2*6*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 6) % NUM_BODIES;')
     self.gen_add_code_line('int index = i % 6;')
     self.gen_add_code_line('if (i < 6*NUM_BODIES) Sd[i] = crm_mul<T>(index, &v[jid*6], &S[jid*6]);')
@@ -1660,7 +1660,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'else psid[i - 6 * NUM_BODIES] = crm_mul<T>(index, &v[{parent_ind_cpp_for_jid}*6], &S[jid*6]);')   
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute a = a[parent] + aJ
     self.gen_add_code_line("\n\n")
@@ -1668,17 +1668,17 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     if self.robot.is_serial_chain():
         self.gen_add_code_line('#pragma unroll')
         self.gen_add_code_line('for (int jid = 0; jid < NUM_BODIES; ++jid) {', 1)
-        self.gen_add_parallel_loop('i','6',use_thread_group)
+        self.gen_add_parallel_loop('i','6')
         self.gen_add_code_line(f"if ({parent_ind_cpp} == -1) a[jid*6+ i] = aJ[jid*6 + i] + gravity * (i == 5); // Base joint's parent is the world")
         self.gen_add_code_line(f'else a[jid*6 + i] = a[{parent_ind_cpp}*6 + i] + aJ[jid*6 + i];')
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         self.gen_add_end_control_flow()
     else:
         for bfs_level in range(n_bfs_levels):
             inds = self.robot.get_ids_by_bfs_level(bfs_level)
             self.gen_add_code_line(f'// Compute a for bfs_level {bfs_level}')
-            self.gen_add_parallel_loop('i', str(6*len(inds)), use_thread_group)
+            self.gen_add_parallel_loop('i', str(6*len(inds)))
             if len(inds) > 1: 
                     select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
                     jid_cpp = "jid"
@@ -1691,22 +1691,22 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
             if bfs_level == 0: self.gen_add_code_line(f"a[{jid_cpp}*6+ idx] = aJ[{jid_cpp}*6 + idx] + gravity * (idx == 5); // Base joint's parent is the world")
             else: self.gen_add_code_line(f'a[{jid_cpp}*6 + idx] = a[{level_parent_ind_cpp}*6 + idx] + aJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
         
 
     # Initialize a_world
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Initialize a_world')
-    self.gen_add_parallel_loop('i','6',use_thread_group)
+    self.gen_add_parallel_loop('i','6')
     self.gen_add_code_line('if (i < 5) a_world[i] = 0;')
     self.gen_add_code_line('else a_world[5] = gravity;')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     
     # Compute psidd = crm(a[parent])@S + crm(v[parent])@psid & IC_v
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Compute psidd = crm(a[parent])@S + crm(v[:,i])@psid[:,i] & IC @ v (for BC) in parallel')
-    self.gen_add_parallel_loop('i','2*6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','2*6*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 6) % NUM_BODIES;')
     self.gen_add_code_line('int index = i % 6;')
     self.gen_add_code_line('if (i < 6*NUM_BODIES) {', True)
@@ -1715,26 +1715,26 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_end_control_flow()
     self.gen_add_code_line(f'else IC_v[i - 6*NUM_BODIES] = dot_prod<T, 6, 6, 1>(&IC[index + jid*36], &v[jid*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Begin BC Computation
     # First Compute crm(v) & crf(v)
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Need crm(v), crf(v) for BC computation')
-    self.gen_add_parallel_loop('i','2*36*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','2*36*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 36) % NUM_BODIES;')
     self.gen_add_code_line('int col = (i / 6) % 6;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('if (i < 36*NUM_BODIES) crm_v[i] = crm<T>(i % 36, &v[jid*6]);')
     self.gen_add_code_line('else crf_v[(jid*36) + row*6 + col] = -crm<T>(i % 36, &v[jid*6]); // crf is negative tranpose of crm')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Finish BC = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v)
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Finish BC = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v)')
-    self.gen_add_parallel_loop('i','36*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','36*NUM_BODIES')
     self.gen_add_code_line('int jid = i / 36;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('int col_idx = (i / 6) * 6;')
@@ -1742,18 +1742,18 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('        icrf<T>(i % 36, &IC_v[jid*6]) -')
     self.gen_add_code_line('        dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_v[col_idx]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Next f = IC @ a + crf(v) @ IC @ v
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Compute f = IC @ a + crf(v) @ IC @ v')
-    self.gen_add_parallel_loop('i','6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','6*NUM_BODIES')
     self.gen_add_code_line('int jid = i / 6;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('f[i] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &a[jid*6]) +')
     self.gen_add_code_line('        dot_prod<T, 6, 6, 1>(&crf_v[jid*36 + row], &IC_v[jid*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Forward Pass Completed
     self.gen_add_code_line("\n\n")
@@ -1767,14 +1767,14 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     if self.robot.is_serial_chain():
         self.gen_add_code_line('#pragma unroll')
         self.gen_add_code_line('for (int jid = NUM_BODIES-1; jid > 0; --jid) {', 1)
-        self.gen_add_parallel_loop('i','36*2 + 6',use_thread_group)
+        self.gen_add_parallel_loop('i','36*2 + 6')
         self.gen_add_code_line(f'if ({parent_ind_cpp} != -1) {{', True)
         self.gen_add_code_line(f'if (i < 36) IC[{parent_ind_cpp}*36 + i] += IC[jid*36 + i];')
         self.gen_add_code_line(f'else if (i < 36*2) BC[{parent_ind_cpp}*36 + i - 36] += BC[jid*36 + i - 36];')
         self.gen_add_code_line(f'else f[{parent_ind_cpp}*6 + i - 36*2] += f[jid*6 + i - 36*2];')
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         self.gen_add_end_control_flow()
     else:
         for bfs_level in range(n_bfs_levels-1, 0, -1):
@@ -1787,19 +1787,19 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                 self.gen_add_code_line(
                     f'// Accumulate joint {jid} into parent {parent_ind}'
                 )
-                self.gen_add_parallel_loop('i','36*2 + 6', use_thread_group)
+                self.gen_add_parallel_loop('i','36*2 + 6')
                 self.gen_add_code_line('int idx = i;')
                 self.gen_add_code_line(f'if (idx < 36) IC[{parent_ind}*36 + idx] += IC[{jid}*36 + idx];')
                 self.gen_add_code_line(f'else if (idx < 36*2) BC[{parent_ind}*36 + idx - 36] += BC[{jid}*36 + idx - 36];')
                 self.gen_add_code_line(f'else f[{parent_ind}*6 + idx - 36*2] += f[{jid}*6 + idx - 36*2];')
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
 
     # Begin B(IC, S) & B(IC, psid) computation
     # First compute crm(S), crf(S), IC @ S && crm(psid), crf(psid), IC @ psid, icrf(f), psid+Sd
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Need crm(S), crf(S), IC@S, crm(psid), crf(psid), IC@psid for B computations & icrf(f), psid+Sd for T3,T4')
-    self.gen_add_parallel_loop('i','5*36*NUM_BODIES + 3*6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','5*36*NUM_BODIES + 3*6*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 36) % NUM_BODIES;')
     self.gen_add_code_line('int jidMatmul = (i / 6) % NUM_BODIES;')
     self.gen_add_code_line('int col = (i / 6) % 6;')
@@ -1813,14 +1813,14 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('else if (i < 5*36*NUM_BODIES + 2*6*NUM_BODIES) psid_Sd[i - 5*36*NUM_BODIES - 6*NUM_BODIES] = psid[i - 5*36*NUM_BODIES - 6*NUM_BODIES] + Sd[i - 5*36*NUM_BODIES - 6*NUM_BODIES];')
     self.gen_add_code_line('else IC_psid[i - 5*36*NUM_BODIES - 2*6*NUM_BODIES] = dot_prod<T, 6, 6, 1>(&IC[row + jidMatmul*36], &psid[jidMatmul*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Finish B_IC_S, Start D2
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Finish B_IC_S, Start D2')
     self.gen_add_code_line('// B_IC_S = crf(S) @ IC + icrf(IC @ S) - IC @ crm(S)')
     self.gen_add_code_line('// D2 = crf(psid) @ IC + icrf(IC @ psid) - IC @ crm(psid)')
-    self.gen_add_parallel_loop('i','2*36*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','2*36*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 36) % NUM_BODIES;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('int col = (i / 6) % 6;')
@@ -1835,7 +1835,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('                                dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &crm_psid[jid*36 + col*6]);')
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute T2 = -BC.T @ S & T3 = BC @ psid + IC @ psidd + icrf(f) @ S, & T4 = BC @ S + IC @ (psid + Sd), & IC.T @ S for D4
     self.gen_add_code_line('\n\n')
@@ -1843,7 +1843,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('// Compute T3 = BC @ psid + IC @ psidd + icrf(f) @ S')
     self.gen_add_code_line('// Compute T4 = BC @ S + IC @ (psid + Sd)')
     self.gen_add_code_line('// Compute IC.T @ S for D4')
-    self.gen_add_parallel_loop('i','4*6*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','4*6*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 6) % NUM_BODIES;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('if (i < 6*NUM_BODIES) T2[i] = -dot_prod<T, 6, 1, 1>(&BC[jid*36 + row*6], &S[jid*6]);')
@@ -1858,12 +1858,12 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_end_control_flow()
     self.gen_add_code_line('else ICT_S[i - 3*6*NUM_BODIES] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &S[jid*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute D1..D4
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Compute D1, D2, D4, crf_S_IC')
-    self.gen_add_parallel_loop('i','4*36*NUM_BODIES',use_thread_group)
+    self.gen_add_parallel_loop('i','4*36*NUM_BODIES')
     self.gen_add_code_line('int jid = (i / 36) % NUM_BODIES;')
     self.gen_add_code_line('int row = i % 6;')
     self.gen_add_code_line('int col = (i / 6) % 6;')
@@ -1878,7 +1878,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('else if (i < 3*36*NUM_BODIES) D4[i - 2*36*NUM_BODIES] = icrf<T>(i % 36, &ICT_S[jid*6]);')
     self.gen_add_code_line('else crf_S_IC[i - 3*36*NUM_BODIES] = dot_prod<T, 6, 6, 1>(&crf_S[jid*36 + row], &IC[jid*36 + col*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     
 
 
@@ -1904,13 +1904,13 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
         self.gen_add_code_line("    { " + ", ".join("{:2}".format(x) for x in row) + " },")
     self.gen_add_code_line("};")
     
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[jid*6], &psid[ancestor_j*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t1
     self.gen_add_code_line('\n\n')
@@ -1923,7 +1923,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                              '// d2tau_dq[joint, ancestor, child] = np.dot(t1, D2[:, child])', \
                              '// d2tau_dq[joint, child, ancestor] = -np.dot(t1, D2[:, child])', \
                              '// d2tau_dvdq[joint, child, ancestor] = np.dot(t1, D3[:, child])'])
-    self.gen_add_parallel_loop('i',f'{4*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{4*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -1934,20 +1934,20 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'else if (i < {len(jids)*3} && jid != st_j) d2tau_dq2[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D2[st_j*36]);')
     self.gen_add_code_line(f'else if (jid != st_j) d2tau_dvdq[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Compute t2
     self.gen_add_code_line('\n\n')
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t2 = outer(S[j], S[ancestor])')
     self.gen_add_code_line('// t2[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[jid*6], &S[ancestor_j*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t2
     self.gen_add_code_line('\n\n')
@@ -1958,7 +1958,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                              '// for ancestor d2tau_dqd[child, joint, ancestor] = -np.dot(t2, D3[child])', \
                              '// for child d2tau_dqd[joint, child, ancestor] = np.dot(t2, D3[child])', \
                              '// for child d2tau_dvdq[joint, ancestor, child] = np.dot(t2, D2[child])'])
-    self.gen_add_parallel_loop('i',f'{5*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{5*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -1971,7 +1971,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'else if (i < {4*len(jids)} && jid != st_j) d2tau_dqd2[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_code_line(f'else if (i >= {4*len(jids)} && jid != st_j) d2tau_dvdq[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_j * SECOND_ORDER_COORDS + ancestor_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D2[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
 
@@ -1980,20 +1980,20 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t3 = outer(psid[j], psid[ancestor])')
     self.gen_add_code_line('// t3[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&psid[jid*6], &psid[ancestor_j*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t3
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Perform all computations with t3')
     self.gen_add_code_lines(['// for joint d2tau_dqd[child, joint, ancestor] = -np.dot(t3, D3[:, st_j])', \
                              '// for ancestor d2tau_dqd[child, ancestor, joint] = -np.dot(t3, D3[:, st_j])'])
-    self.gen_add_parallel_loop('i',f'{2*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{2*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2002,7 +2002,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'if (i < {len(jids)}) d2tau_dq2[st_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + jid] = -dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_code_line(f'else if (ancestor_j < jid) d2tau_dq2[st_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + ancestor_j] = -dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t4
@@ -2010,20 +2010,20 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t4 = outer(S[j], psidd[ancestor])')
     self.gen_add_code_line('// t4[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[jid*6], &psidd[ancestor_j*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t4
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Perform all computations with t4')
     self.gen_add_code_lines(['// for child d2tau_dq[dd, cc, succ_j] += np.dot(t4, D1[:, succ_j])', \
                              '// for child d2tau_dq[dd, succ_j, cc] += np.dot(t4, D1[:, succ_j])'])
-    self.gen_add_parallel_loop('i',f'{2*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{2*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2032,7 +2032,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'if (i < {len(jids)} && jid != st_j) d2tau_dq2[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_j * SECOND_ORDER_COORDS + ancestor_j] += dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_code_line(f'else if (jid != st_j) d2tau_dq2[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + st_j] += dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t5
@@ -2040,19 +2040,19 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t5 = outer(S[j], (Sd+psid)[ancestor])')
     self.gen_add_code_line('// t5[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[jid*6], &psid_Sd[ancestor_j*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t5
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Perform all computations with t5')
     self.gen_add_code_lines(['// for child d2tau_dvdq[dd, cc, succ_j] += np.dot(t5, D1[:, succ_j])'])
-    self.gen_add_parallel_loop('i',f'{len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2060,7 +2060,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line(f'if (st_j != jid) d2tau_dvdq[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_j * SECOND_ORDER_COORDS + ancestor_j] += dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t6
@@ -2068,13 +2068,13 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t6 = outer(S[ancestor], psid[joint])')
     self.gen_add_code_line('// t6[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[ancestor_j*6], &psid[jid*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t6
     self.gen_add_code_line('\n\n')
@@ -2082,7 +2082,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_lines(['// for ancestor d2tau_dvdq[st_j, cc, dd] = -np.dot(t6, D3[:, st_j])', \
                              '// for ancestor d2tau_dq[cc, st_j, dd] = np.dot(t6, D2[:, st_j])', \
                              '// for ancestor d2tau_dvdq[cc, st_j, dd] = np.dot(t6, D3[:, st_j])'])
-    self.gen_add_parallel_loop('i',f'{3*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{3*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2094,7 +2094,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line('else d2tau_dvdq[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D3[st_j*36]);')
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t7
@@ -2102,19 +2102,19 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t7 = outer(S[ancestor], psidd[joint])')
     self.gen_add_code_line('// t7[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[ancestor_j*6], &psidd[jid*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t7
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Perform all computations with t7')
     self.gen_add_code_lines(['// for ancestor d2tau_dq[cc, st_j, dd] += np.dot(t7, D1[:, st_j])'])
-    self.gen_add_parallel_loop('i',f'{len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2122,7 +2122,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line(f'if (ancestor_j < jid) d2tau_dq2[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + st_j] += dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t8
@@ -2130,13 +2130,13 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t8 = outer(S[ancestor], S[joint])')
     self.gen_add_code_line('// t8[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[ancestor_j*6], &S[jid*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t8
     self.gen_add_code_line('\n\n')
@@ -2148,7 +2148,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                              '// for child & ancestor d2tau_dqd[cc, succ_j, dd] = np.dot(t8, D3[:, succ_j])', \
                              '// for child & ancestor d2tau_dqd[cc, dd, succ_j] = np.dot(t8, D3[:, succ_j])', \
                              '// for child & ancestor d2tau_dvdq[cc, dd, succ_j] = np.dot(t8, D2[:, succ_j])'])
-    self.gen_add_parallel_loop('i',f'{7*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{7*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2166,7 +2166,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'if (jid != st_j && i < {6*len(jids)}) dM_dq[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_code_line(f'else if (jid != st_j) dM_dq[jid*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + ancestor_j * SECOND_ORDER_COORDS + st_j] = dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
     # Compute t9
@@ -2174,20 +2174,20 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t9 = outer(S[ancestor], (Sd+psid)[joint])')
     self.gen_add_code_line('// t9[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}*36')
     self.gen_add_code_line('int jid = jids[i / 36];')
     self.gen_add_code_line('int ancestor_j = ancestors_j[i / 36];')
     self.gen_add_code_line(f'int t_idx = t_index_map[jid][ancestor_j]*36;')
     self.gen_add_code_line('outerProduct<T>(&S[ancestor_j*6], &psid_Sd[jid*6], &t[t_idx], 6, 6, i%36);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Perform all computations with t9
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Perform all computations with t9')
     self.gen_add_code_lines(['// for ancestor & child d2tau_dvdq[cc, dd, succ_j] += np.dot(t9, D1[:, succ_j])', \
                              '// for ancestor & child d2tau_dq[cc, dd, succ_j] = d2tau_dq[cc, succ_j, dd]'])
-    self.gen_add_parallel_loop('i',f'{2*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{2*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2196,7 +2196,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'if (i < {len(jids)} && ancestor_j < jid && st_j != jid) d2tau_dvdq[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_j * SECOND_ORDER_COORDS + jid] += dot_prod<T, 36, 1, 1>(&t[t_idx], &D1[st_j*36]);')
     self.gen_add_code_line(f'else if (ancestor_j < jid & st_j != jid) d2tau_dq2[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_j * SECOND_ORDER_COORDS + jid] = d2tau_dq2[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + st_j];')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     
     # Compute p1..p6 in parallel
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
@@ -2208,7 +2208,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                              '// p4 = self.crm(Sd_c + psid_c) @ S_d - 2 * self.crm(psid_d) @ S_c', \
                              '// p5 = self.crm(S_d) @ S_c', \
                              '// p6 = IC_S[joint] @ crm(S[ancestor]) + S[ancestor] @ crf_S_IC[joint]'])
-    self.gen_add_parallel_loop('i',f'{6*6*len(jids_a)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{6*6*len(jids_a)}')
     self.gen_add_code_line(f'int index = i % {6*len(jids_a)};')
     self.gen_add_code_line(f'int jid = jids[index / 6];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j[index / 6];')
@@ -2220,7 +2220,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'else if (i < {5*len(jids_a)*6}) p5[p_idx + i % 6] = crm_mul<T>(i % 6, &S[jid*6], &S[ancestor_j*6]);')
     self.gen_add_code_line(f'else p6[p_idx + i % 6] = dot_prod<T, 6, 1, 1>(&IC_S[jid*6], &crm_S[ancestor_j*36 + (i % 6)*6]) + dot_prod<T, 6, 1, 1>(&S[ancestor_j*6], &crf_S_IC[jid*36 + (i % 6)*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Finish all computations with p1..p6
     self.gen_add_code_line('\n\n')
@@ -2231,7 +2231,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                              '// for ancestor d2tau_dq[cc, st_j, dd] -= np.dot(p5, T3[:, st_j])', \
                              '// for ancestor && child d2tau_dq[cc, dd, succ_j] -= np.dot(p5, T3[:, st_j])', \
                              '// for ancestor d2tau_dvdq[cc, st_j, dd] -= np.dot(p5, T4[:, st_j])'])
-    self.gen_add_parallel_loop('i',f'{6*len(jids)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{6*len(jids)}')
     self.gen_add_code_line(f'int index = i % {len(jids)};')
     self.gen_add_code_line(f'int jid = jids_compute[index];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j_compute[index];')
@@ -2246,27 +2246,27 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(f'else if (i >= {5*len(jids)}) d2tau_dvdq[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + st_j] -= dot_prod<T, 6, 1, 1>(&p5[p_idx], &T4[st_j*6]);')
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Finish computation with p6
     self.gen_add_code_line('\n\n')
     self.gen_add_code_line('// Finish computation with p6')
     self.gen_add_code_line('// d2tau_dqd[ancestor, joint, joint] = p6[joint][ancestor] @ S[joint]')
-    self.gen_add_parallel_loop('i',f'{len(jids_a)}',use_thread_group)
+    self.gen_add_parallel_loop('i',f'{len(jids_a)}')
     self.gen_add_code_line(f'int jid = jids[i];')
     self.gen_add_code_line(f'int ancestor_j = ancestors_j[i];')
     self.gen_add_code_line(f'int p_idx = t_index_map[jid][ancestor_j]*6;')
     self.gen_add_code_line(f'if (ancestor_j < jid) d2tau_dqd2[ancestor_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid * SECOND_ORDER_COORDS + jid] = dot_prod<T, 6, 1, 1>(&p6[p_idx], &S[jid*6]);')
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     if self.idsva_so_needs_reference_order_output_repair():
-        self.gen_idsva_so_body_frame_reference_order_output_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_reference_order_output_repair()
 
     self.gen_add_end_function()
 
         
-def gen_idsva_so_body_frame_public_dvdq_layout_repair(self, use_thread_group = False):
+def gen_idsva_so_body_frame_public_dvdq_layout_repair(self):
     """
     Emit a final public-output repair for the optimized IDSVA-SO assembly path.
 
@@ -2281,9 +2281,9 @@ def gen_idsva_so_body_frame_public_dvdq_layout_repair(self, use_thread_group = F
 
     NV = self.robot.get_num_vel()
     block_offset = 2 * NV**3
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_code_line("// Repair public d2tau_dvdq layout for optimized IDSVA-SO output")
-    self.gen_add_parallel_loop("dvdq_swap_idx", "SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS", use_thread_group)
+    self.gen_add_parallel_loop("dvdq_swap_idx", "SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS")
     self.gen_add_code_line("int dvdq_i = dvdq_swap_idx / (SECOND_ORDER_COORDS*SECOND_ORDER_COORDS);")
     self.gen_add_code_line("int dvdq_j = (dvdq_swap_idx / SECOND_ORDER_COORDS) % SECOND_ORDER_COORDS;")
     self.gen_add_code_line("int dvdq_k = dvdq_swap_idx % SECOND_ORDER_COORDS;")
@@ -2293,14 +2293,14 @@ def gen_idsva_so_body_frame_public_dvdq_layout_repair(self, use_thread_group = F
     self.gen_add_code_line(f"s_idsva_so[{block_offset} + dvdq_i*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dvdq_k*SECOND_ORDER_COORDS + dvdq_j] = dvdq_tmp;")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
 
 def gen_idsva_so_body_frame_device_temp_mem_size(self):
     return self.gen_idsva_so_body_frame_inner_temp_mem_size()
     
 
-def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input = False, single_call_timing=False):
+def gen_idsva_so_body_frame_device(self, use_qdd_input = False, single_call_timing=False):
     # Note: this body_frame-specific device wrapper is not emitted in
     # gen_idsva_so_body_frame (see line 2451 TODO). Inline-CUDA users should
     # call gen_idsva_so_device instead — a codegen-time dispatcher that picks
@@ -2332,12 +2332,12 @@ def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input
     # The inner loads/updates XImats internally (inner-owns-placement), so no external
     # XImats call here; this device wrapper keeps s_temp in smem (SCRATCH_IN_SMEM=true).
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-    self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
-    self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
+    self.gen_idsva_so_body_frame_inner_function_call()
+    self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
     self.gen_add_end_function()
 
 def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                    use_thread_group, use_global_output, s_temp_in_global, bc_in_global):
+                                                    use_global_output, s_temp_in_global, bc_in_global):
     """Emit the idsva_so body-frame kernel body for one tier's spill flags.
 
     Flags (see the per-tier ladder in GRiDCodeGenerator.py):
@@ -2391,43 +2391,43 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
 
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_input: # TODO
-            self.gen_kernel_load_inputs("q_qd","stride_q_qd",str(n + NUM_POS),use_thread_group,"qdd",str(n),str(n))
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
         else:
-            self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(2*n + NUM_POS),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd_u",str(2*n + NUM_POS),stride="stride_q_qd_u")
         _emit_spill_ptrs()
         self.gen_add_code_line("// compute (the inner loads/updates XImats internally, after its scratch repoint)")
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
-        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
-        if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),str(4*n**3),use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
+        if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),stride=str(4*n**3))
         self.gen_add_end_control_flow()
     else:
         if use_qdd_input: # TODO
-            self.gen_kernel_load_inputs_single_timing("q_qd",str(2*n),use_thread_group,"qdd",str(n))
+            self.gen_kernel_load_inputs("q_qd",str(2*n),"qdd",str(n))
         else:
-            self.gen_kernel_load_inputs_single_timing("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
+            self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n))
         _emit_spill_ptrs()
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
-            self.gen_anti_licm_input_reload("q_qd",str(2*n),use_thread_group,"qdd",str(n))
+            self.gen_anti_licm_input_reload("q_qd",str(2*n),"qdd",str(n))
         else:
-            self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n),use_thread_group)
+            self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n))
         # The inner loads/updates XImats internally each rep (after its scratch repoint).
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group, bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
-        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
         self.gen_add_end_control_flow()
-        if not use_global_output: self.gen_kernel_save_result_single_timing("idsva_so",str(4*n**3),use_thread_group)
+        if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3))
 
 
-def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input = False, single_call_timing = False):
+def gen_idsva_so_body_frame_kernel(self, use_qdd_input = False, single_call_timing = False):
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
     # define function def and params
@@ -2461,13 +2461,13 @@ def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input
         # Floating-base diagnostic path: single body, legacy gravity-shim spill.
         ugo = getattr(self, "idsva_so_body_frame_use_global_output", False)
         _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                             use_thread_group, ugo, False, False)
+                                                             ugo, False, False)
     else:
         picks = self.idsva_so_body_frame_spill_tier_3way
         if picks[0] == picks[1] == picks[2]:
             _, _, ugo, stg, bcg = table[picks[0]]
             _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                                 use_thread_group, ugo, stg, bcg)
+                                                                 ugo, stg, bcg)
         else:
             for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
                 _, _, ugo, stg, bcg = table[picks[tier_idx]]
@@ -2475,7 +2475,7 @@ def gen_idsva_so_body_frame_kernel(self, use_thread_group = False, use_qdd_input
                        ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
                 self.gen_add_code_line(head, True)
                 _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                                     use_thread_group, ugo, stg, bcg)
+                                                                     ugo, stg, bcg)
                 self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -2557,14 +2557,14 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("idsva_so_body_frame"))
     self.gen_add_end_function()
 
-def gen_idsva_so_body_frame(self, use_thread_group = False):
+def gen_idsva_so_body_frame(self):
     # gen the inner code
-    self.gen_idsva_so_body_frame_inner(use_thread_group)
+    self.gen_idsva_so_body_frame_inner()
     # gen the wrapper code for device fn
-    # self.gen_idsva_so_body_frame_device(use_thread_group,False) TODO
+    # self.gen_idsva_so_body_frame_device(False) TODO
     # and the kernels
-    self.gen_idsva_so_body_frame_kernel(use_thread_group,False,True)
-    self.gen_idsva_so_body_frame_kernel(use_thread_group,False,False)
+    self.gen_idsva_so_body_frame_kernel(False,True)
+    self.gen_idsva_so_body_frame_kernel(False,False)
     # and host wrapeprs
     self.gen_idsva_so_body_frame_host(0)
     self.gen_idsva_so_body_frame_host(1)
@@ -2598,7 +2598,7 @@ def gen_idsva_so_world_frame_temp_mem_size(self):
     return int(4 * 36 * NB + 3 * 6 * NB + 4 * 6 * NV + 10 * 36 + 12 * 6 + 6 + 9 * 6)
 
 
-def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input = False):
+def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     """Emit `idsva_so_world_frame_inner` — a clean world-frame IDSVA-SO.
 
     Mirrors `RBDReference.idsva_so_world_frame`:
@@ -2663,7 +2663,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     # XImats is loaded INSIDE the inner, AFTER the s_temp repoint — so its sincos
     # scratch (which uses s_temp) follows the same placement. Repoint FIRST, then load.
     # (load_update_XImats_helpers ends with its own sync, matching fdsva_so_device.)
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
     self.gen_add_code_lines([
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
         "// --- HOT region (always smem when SCRATCH_IN_SMEM) ---",
@@ -2741,23 +2741,23 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     ])
 
     # ---- Init: zero output tensor in parallel + init S_agrav with thread 0.
-    self.gen_add_parallel_loop("out_idx", "SECOND_ORDER_TENSOR_SIZE", use_thread_group)
+    self.gen_add_parallel_loop("out_idx", "SECOND_ORDER_TENSOR_SIZE")
     self.gen_add_code_line("s_idsva_so[out_idx] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     self.gen_add_code_line("// MATLAB convention: a_grav vector with a_grav[5] = GRAVITY (signed, e.g. -9.81).")
     self.gen_add_code_line("// The CUDA `gravity` parameter is the positive magnitude (+9.81) by GRiD convention,")
     self.gen_add_code_line("// so use -gravity here to match RBDReference.idsva_so_world_frame's `a_grav[5] = GRAVITY`.")
     self.gen_add_code_line("S_agrav[0] = static_cast<T>(0); S_agrav[1] = static_cast<T>(0); S_agrav[2] = static_cast<T>(0);")
     self.gen_add_code_line("S_agrav[3] = static_cast<T>(0); S_agrav[4] = static_cast<T>(0); S_agrav[5] = -gravity;")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Step 1: Build cumulative Xup. For floating-base root, Xup[0] = inv(X_local[0]).
     # BFS parent-dependent — keep sequential under thread-0 guard.
     self.gen_add_code_line("// Build cumulative Xup. Floating-base root: Xup[0] = inv(X_local[0]).")
     floating_base = self.robot.floating_base
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
     self.gen_add_code_line("int parent = wf_parent[jid];")
     self.gen_add_code_line("if (parent < 0) {", True)
@@ -2812,12 +2812,12 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # close thread-0 guard for Xup
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Step 2: Xdown[i] = inv(Xup[i]) — parallel over jid.
     self.gen_add_code_line("// Build Xdown[i] = inv(Xup[i]) using Plücker block inverse:")
     self.gen_add_code_line("// Xup = [E 0; B E]  =>  Xdown = [E^T 0; -E^T*B*E^T  E^T].")
-    self.gen_add_parallel_loop("jid", "NUM_BODIES", use_thread_group)
+    self.gen_add_parallel_loop("jid", "NUM_BODIES")
     self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) Xdown[jid*36 + idx] = static_cast<T>(0);")
     self.gen_add_code_line("// Top-left = E^T and Bottom-right = E^T.")
     self.gen_add_code_line("for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) {", True)
@@ -2837,11 +2837,11 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("Xdown[jid*36 + (a + 3) + 6*b] = -acc;")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Step 3: S_vel = Xdown @ S_local — parallel over vel.
     self.gen_add_code_line("// S_vel[vel] = Xdown[body(vel)] @ S_local[vel] = sign * Xdown[body][:, s_index].")
-    self.gen_add_parallel_loop("vel", "NUM_VEL", use_thread_group)
+    self.gen_add_parallel_loop("vel", "NUM_VEL")
     # vel_to_body deduce from wf_body_v_index. Easier: pre-compute a vel_to_body table.
     self.gen_add_code_line("// Find body containing this vel.")
     self.gen_add_code_line("int jid = -1;")
@@ -2854,12 +2854,12 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("T s_sign = static_cast<T>(wf_vel_s_sign[vel]);")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) S_vel[vel*6 + row] = s_sign * Xdown[jid*36 + s_col*6 + row];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Step 4: Forward sweep — v, a, f, IC, BC, psid, psidd, Sd.
     # Parent-dependent (sequential by jid); under thread-0 guard, sync after.
     self.gen_add_code_line("// Forward sweep: build v, a, f, IC, BC, psid, psidd, Sd.")
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
     self.gen_add_code_line("int parent = wf_parent[jid];")
     # Initialize v[jid], a[jid]
@@ -2941,7 +2941,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # end forward jid loop
     self.gen_add_end_control_flow()  # close thread-0 guard for Phase 4
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Step 5: Triple ancestor walk (reverse over bodies).
     # All threads run the outer (i, pp, j, tt) sequencing; inside, thread-0 builds
@@ -2966,7 +2966,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     # Helpers — small (6-vec each). Parallel over 7 "helper_id" × 6 "r" = 42 elements.
     # Each thread computes one element of one helper. A5_vec/A7_vec depend on
     # other helpers so they're emitted in a second parallel_loop after a sync.
-    self.gen_add_parallel_loop("h_idx", "42", use_thread_group)
+    self.gen_add_parallel_loop("h_idx", "42")
     self.gen_add_code_lines([
         "int helper_id = h_idx / 6;",
         "int r = h_idx % 6;",
@@ -2985,10 +2985,10 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "}",
     ])
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # A5_vec depends on S_BCi_psid + S_ICi_psidd + S_crf_S_f_i; A7_vec depends on S_BCi_S + IC@(psid+Sd).
     # Parallel over 12 = 6 (A5_vec) + 6 (A7_vec).
-    self.gen_add_parallel_loop("v_idx", "12", use_thread_group)
+    self.gen_add_parallel_loop("v_idx", "12")
     self.gen_add_code_lines([
         "int r = v_idx % 6;",
         "if (v_idx < 6) {",
@@ -3000,9 +3000,9 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "}",
     ])
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # Parallel build of A0/A1/Bphi/Bpsid (each over idx ∈ [0, 36)).
-    self.gen_add_parallel_loop("idx", "36", use_thread_group)
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_lines([
         "int row = idx % 6; int col = idx / 6;",
         "T crf_Sp_row[6]; for (int kk = 0; kk < 6; ++kk) crf_Sp_row[kk] = -crm<T>(kk + 6*row, S_p);",
@@ -3019,9 +3019,9 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "S_A1[idx] = t_crfSp_IC - t_IC_crmSp;",
     ])
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # Parallel build of A2/A3/A4/A5/A6/A7 (depends on prior A0/A1/Bphi/Bpsid).
-    self.gen_add_parallel_loop("idx", "36", use_thread_group)
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_lines([
         "int row = idx % 6; int col = idx / 6;",
         "// A2 = 2*A0 - Bphi",
@@ -3043,7 +3043,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "S_A7[idx] = icrf<T>(idx, S_A7_vec);",
     ])
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # j-loop (all threads run sequentially through ancestor chain).
     self.gen_add_code_line("int j = i;")
@@ -3056,7 +3056,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("T *Sd_t    = &Sd_vel[vel_j*6];")
     self.gen_add_code_line("T *psid_t  = &psid_v[vel_j*6];")
     self.gen_add_code_line("T *psidd_t = &psidd_v[vel_j*6];")
-    self.gen_add_parallel_loop("u_idx", "72", use_thread_group)
+    self.gen_add_parallel_loop("u_idx", "72")
     self.gen_add_code_lines([
         "int which_u = u_idx / 6;",
         "int r = u_idx % 6;",
@@ -3080,7 +3080,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "}",
     ])
     self.gen_add_end_control_flow()  # end parallel_loop u_idx
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Parallel inner (k, rr) walk ----
     # Each thread is assigned a unique kr_idx in [0, total_kr). The thread chases
@@ -3091,7 +3091,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("// Flatten (k, rr) iterations of the ancestor chain of j into a single index space.")
     self.gen_add_code_line("int wf_total_kr = 0;")
     self.gen_add_code_line("for (int _kk = j; _kk >= 0; _kk = wf_parent[_kk]) wf_total_kr += wf_body_v_start[_kk + 1] - wf_body_v_start[_kk];")
-    self.gen_add_parallel_loop("kr_idx", "wf_total_kr", use_thread_group)
+    self.gen_add_parallel_loop("kr_idx", "wf_total_kr")
     self.gen_add_code_lines([
         "// Map kr_idx -> (k, vel_k) by walking the chain.",
         "int k = -1; int vel_k = -1; int rr = -1;",
@@ -3172,7 +3172,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_end_control_flow()
 
     self.gen_add_end_control_flow()  # end parallel_loop over kr_idx
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     self.gen_add_end_control_flow()  # end tt loop
     self.gen_add_code_line("j = wf_parent[j];")
@@ -3184,7 +3184,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("// Bubble subtree-aggregated IC/BC/f up — parallel over 78 elements per body.")
     self.gen_add_code_line("int parent = wf_parent[i];")
     self.gen_add_code_line("if (parent >= 0) {", True)
-    self.gen_add_parallel_loop("agg_idx", "78", use_thread_group)
+    self.gen_add_parallel_loop("agg_idx", "78")
     self.gen_add_code_lines([
         "if (agg_idx < 36) {",
         "    IC[parent*36 + agg_idx] += IC[i*36 + agg_idx];",
@@ -3198,13 +3198,13 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     ])
     self.gen_add_end_control_flow()  # end parallel_loop agg_idx
     self.gen_add_end_control_flow()  # end if (parent >= 0)
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_end_control_flow()  # end i loop
 
     # Final transpose of d2tau_dvdq trailing axes: [τ, q, qd] -> [τ, qd, q].
     # Parallelize over (a_i, b_i) with each thread handling its (b_i, c_i) upper-triangle pairs.
     self.gen_add_code_line("// d2tau_dvdq was stored [τ, q, qd]; transpose trailing axes to match RBDReference convention.")
-    self.gen_add_parallel_loop("ab_i", "NUM_VEL*NUM_VEL", use_thread_group)
+    self.gen_add_parallel_loop("ab_i", "NUM_VEL*NUM_VEL")
     self.gen_add_code_line("int a_i = ab_i / NUM_VEL; int b_i = ab_i % NUM_VEL;")
     self.gen_add_code_line("for (int c_i = b_i + 1; c_i < NUM_VEL; ++c_i) {", True)
     self.gen_add_code_line("T x = d2tau_dvdq[(a_i*NUM_VEL + b_i)*NUM_VEL + c_i];")
@@ -3213,11 +3213,11 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line("d2tau_dvdq[(a_i*NUM_VEL + c_i)*NUM_VEL + b_i] = x;")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_end_function()
 
 
-def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False, scratch_in_smem_expr = "true",
+def gen_idsva_so_world_frame_inner_function_call(self, scratch_in_smem_expr = "true",
                                                  cold_in_smem_expr = "true"):
     """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper.
     scratch_in_smem_expr selects the inner's scratch placement (s_temp vs d_workspace);
@@ -3235,7 +3235,7 @@ def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False,
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
-def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group,
+def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing,
                                                      use_global_output, s_temp_in_global, cold_in_global = False):
     """Emit the idsva_so world-frame kernel body for one tier's spill flags.
 
@@ -3274,32 +3274,32 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
     if not single_call_timing:
-        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)
-        self.gen_kernel_load_inputs("q_qd_u", "stride_q_qd_u", str(2*n + NUM_POS), use_thread_group)
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q_qd_u",str(2*n + NUM_POS),stride="stride_q_qd_u")
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         if use_global_output:
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group, scratch_in_smem_expr, cold_in_smem_expr)
+        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr)
         if not use_global_output:
-            self.gen_kernel_save_result("idsva_so", str(4*n**3), str(4*n**3), use_thread_group)
+            self.gen_kernel_save_result("idsva_so",str(4*n**3),stride=str(4*n**3))
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs_single_timing("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
+        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n))
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u", str(NUM_POS + 2*n), use_thread_group)
+        self.gen_anti_licm_input_reload("q_qd_u", str(NUM_POS + 2*n))
         if use_global_output:
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group, scratch_in_smem_expr, cold_in_smem_expr)
+        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr)
         self.gen_add_end_control_flow()
         if not use_global_output:
-            self.gen_kernel_save_result_single_timing("idsva_so", str(4*n**3), use_thread_group)
+            self.gen_kernel_save_result("idsva_so",str(4*n**3))
 
 
-def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_timing = False):
+def gen_idsva_so_world_frame_kernel(self, single_call_timing = False):
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
     func_params = [
@@ -3327,14 +3327,14 @@ def gen_idsva_so_world_frame_kernel(self, use_thread_group = False, single_call_
     picks = self.idsva_so_world_frame_spill_tier_3way
     if picks[0] == picks[1] == picks[2]:
         _, _, ugo, stg, cig = table[picks[0]]
-        _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg, cig)
+        _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, ugo, stg, cig)
     else:
         for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
             _, _, ugo, stg, cig = table[picks[tier_idx]]
             head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
                    ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
             self.gen_add_code_line(head, True)
-            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, use_thread_group, ugo, stg, cig)
+            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, ugo, stg, cig)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -3405,21 +3405,21 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
     self.gen_add_end_function()
 
 
-def gen_idsva_so_world_frame(self, use_thread_group = False):
+def gen_idsva_so_world_frame(self):
     """Emit the complete world-frame IDSVA-SO path: inner, kernel, host wrappers.
 
     Co-exists with the existing `gen_idsva_so_body_frame` emission. Gated by the
     `enable_idsva_so_world_frame` flag in `gen_all_code`.
     """
-    self.gen_idsva_so_world_frame_inner(use_thread_group)
-    self.gen_idsva_so_world_frame_kernel(use_thread_group, single_call_timing=False)
-    self.gen_idsva_so_world_frame_kernel(use_thread_group, single_call_timing=True)
+    self.gen_idsva_so_world_frame_inner()
+    self.gen_idsva_so_world_frame_kernel(single_call_timing=False)
+    self.gen_idsva_so_world_frame_kernel(single_call_timing=True)
     self.gen_idsva_so_world_frame_host(0)
     self.gen_idsva_so_world_frame_host(1)
     self.gen_idsva_so_world_frame_host(2)
 
 
-def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
+def gen_idsva_so_device(self, use_qdd_input = True):
     """Emit `idsva_so_device` — a __device__ entry that picks the perf-winning
     frame at codegen time: body_frame_inner for fixed-base, world_frame_inner
     for floating-base (mirrors the host-level idsva_so dispatcher; same body /
@@ -3452,15 +3452,15 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
     self.gen_add_code_line(func_def, True)
     # add the shared memory variables (s_temp routes to d_workspace at LITE+)
     self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, tier_workspace_expr="d_workspace")
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
+    self.gen_load_update_XImats_helpers_function_call()
     # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr above, so the
     # inner's per-buffer spill pointer is unused here (pass nullptr).
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if self.robot.floating_base:
-        self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
+        self.gen_idsva_so_world_frame_inner_function_call()
     else:
-        self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
-        self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
+        self.gen_idsva_so_body_frame_inner_function_call()
+        self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
     self.gen_add_end_function()
 
 

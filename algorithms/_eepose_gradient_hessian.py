@@ -7,7 +7,7 @@ def gen_end_effector_pose_inner_temp_mem_size(self, fixed_target_name = ""):
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     return 2*16*num_ees
 
-def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, updated_var_names = None, fixed_target_name = "",
+def gen_end_effector_pose_inner_function_call(self, updated_var_names = None, fixed_target_name = "",
                                               temp_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
@@ -31,7 +31,7 @@ def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, up
     code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
-def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_name = ""):
+def gen_end_effector_pose_inner(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
     if fixed_target_name == "":
@@ -67,12 +67,12 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     # Initial Debug Prints if Requested
     #
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_line("printf(\"q\\n\"); printMat<T,1," + str(n) + ">(s_q,1);")
         self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++){printf(\"X[%d]\\n\",i); printMat<T,4,4>(&s_Xhom[16*i],4);}")
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     #
     # For each chain we need to (in parallel) multiply the Xmats
@@ -88,10 +88,10 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
             self.gen_add_code_line("// Serial chain manipulator so optimize as parent is jid-1")
             if bfs_level == 0:
                 self.gen_add_code_line("// First set to leaf (or fixed) transform")
-                self.gen_add_parallel_loop("ind",str(16),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(16))
                 self.gen_add_code_line("s_temp[ind] = s_Xhom[16*" + str(all_ees[0]) + " + ind];")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
                 if fixed_target_name == "":
                     parent = self.robot.get_parent_id(all_ees[0])
                 else:
@@ -104,25 +104,25 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 even = bfs_level % 2
                 tempDstOffset = 16*(even)
                 tempSrcOffset = 16*(not even)
-                self.gen_add_parallel_loop("ind",str(16),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(16))
                 self.gen_add_code_line("int row = ind % 4; int col = ind / 4;")
                 self.gen_add_code_line("s_temp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*" + str(parent) + " + row], &s_temp[" + str(tempSrcOffset) + " + 4*col]);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
                 # update parent for next loop (if there is one)
                 parent = self.robot.get_parent_id(parent)
         else:
             # if first loop then just set to transform at the leaf
             if bfs_level == 0:
                 self.gen_add_code_line("// First set to leaf transform")
-                self.gen_add_parallel_loop("ind",str(16*num_ees),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(16*num_ees))
                 self.gen_add_code_line("int rc = ind % 16;")
                 select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
                 self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
                 self.gen_add_code_line("s_temp[ind] = s_Xhom[16*eeInd + rc];")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
             else:
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
                 # get the parents we need at this level working backwards from all_ees
@@ -133,7 +133,7 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 even = bfs_level % 2
                 tempDstOffset = 16*num_ees*(even)
                 tempSrcOffset = 16*num_ees*(not even)
-                self.gen_add_parallel_loop("ind",str(16*num_ees),use_thread_group)
+                self.gen_add_parallel_loop("ind",str(16*num_ees))
                 self.gen_add_code_line("int row = ind % 4; int col = (ind / 4) % 4; int eeOffset = ind - (ind % 16);")
                 # get parents for this level
                 select_var_vals = [("int", "parent_jid", [str(jid) for jid in curr_parents])]
@@ -143,7 +143,7 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
                 self.gen_add_code_line("s_temp[ind + " + str(tempDstOffset) + "] = dot_prod<T,4,4,1>" + \
                                        "(&s_Xhom[16*parent_jid + row], &s_temp[" + str(tempSrcOffset) + " + eeOffset + 4*col]);")
                 self.gen_add_end_control_flow()
-                self.gen_add_sync(use_thread_group)
+                self.gen_add_sync()
     
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Now extract the eePos from the Tansforms")
@@ -151,7 +151,7 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     self.gen_add_code_line("//")
     tempOffset = 16*num_ees*(bfs_level % 2)
     # xyz position is easy (eePos_xyz1 = Xmat_hom * offset) where offset = [x,y,z,1]
-    self.gen_add_parallel_loop("ind",str(3*num_ees),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(3*num_ees))
     self.gen_add_code_line("// xyz is easy")
     self.gen_add_code_line("int xyzInd = ind % 3; int eeInd = ind / 3; T *s_Xmat_hom = &s_temp[" + str(tempOffset) + " + 16*eeInd];")
     self.gen_add_code_line("s_eePos[6*eeInd + xyzInd] = s_Xmat_hom[12 + xyzInd];")
@@ -162,7 +162,7 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     self.gen_add_code_line("s_eePos[6*eeInd + 4] = -atan2(s_Xmat_hom[2],sqrt(s_Xmat_hom[6]*s_Xmat_hom[6] + s_Xmat_hom[10]*s_Xmat_hom[10]));")
     self.gen_add_code_line("s_eePos[6*eeInd + 5] = atan2(s_Xmat_hom[1],s_Xmat_hom[0]);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_end_function()
 
 def gen_end_effector_pose_device_temp_mem_size(self, fixed_target_name = ""):
@@ -171,7 +171,7 @@ def gen_end_effector_pose_device_temp_mem_size(self, fixed_target_name = ""):
     wrapper_size = self.gen_topology_helpers_size() + XHom_size # for Xhom
     return self.gen_end_effector_pose_inner_temp_mem_size(fixed_target_name) + wrapper_size
 
-def gen_end_effector_pose_device(self, use_thread_group = False, fixed_target_name = ""):
+def gen_end_effector_pose_device(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     # construct the boilerplate and function definition
@@ -194,11 +194,11 @@ def gen_end_effector_pose_device(self, use_thread_group = False, fixed_target_na
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     # then load/update XI and run the algo
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
-    self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_inner_function_call(fixed_target_name = fixed_target_name)
     self.gen_add_end_function()
 
-def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_timing = False, fixed_target_name = ""):
+def gen_end_effector_pose_kernel(self, single_call_timing = False, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     # define function def and params
@@ -227,31 +227,31 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q",str(n),stride="stride_q")
         # compute
         self.gen_add_code_line("// compute")
         # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
-        self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
-        self.gen_add_sync(use_thread_group)
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_end_effector_pose_inner_function_call(fixed_target_name = fixed_target_name)
+        self.gen_add_sync()
         # save to global
-        self.gen_kernel_save_result("eePos",str(6*num_ees),str(6*num_ees),use_thread_group)
+        self.gen_kernel_save_result("eePos",str(6*num_ees),stride=str(6*num_ees))
         self.gen_add_end_control_flow()
     else:
         #repurpose NUM_TIMESTEPS for number of timing reps
-        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        self.gen_kernel_load_inputs("q",str(n))
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="eePos")
+        self.gen_anti_licm_input_reload("q",str(n),feedback_from="eePos")
         # then load/update X and run the algo
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group)
-        self.gen_end_effector_pose_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name)
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_end_effector_pose_inner_function_call(fixed_target_name = fixed_target_name)
         self.gen_anti_licm_output_write("eePos")
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("eePos",str(6*num_ees),use_thread_group)
+        self.gen_kernel_save_result("eePos",str(6*num_ees))
     self.gen_add_end_function()
 
 def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
@@ -336,7 +336,7 @@ def gen_end_effector_pose_gradient_inner_temp_mem_size(self, fixed_target_name =
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     return 16*n_joints + 2*3*nv*num_ees + 4*num_ees
 
-def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = False, updated_var_names = None, fixed_target_name = "",
+def gen_end_effector_pose_gradient_inner_function_call(self, updated_var_names = None, fixed_target_name = "",
                                                        temp_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
@@ -403,7 +403,7 @@ def _eepose_grad_chain_metadata(self, all_ees, fixed_target_name):
         jobs_all.append(jobs)
     return chains, anchors, jobs_all
 
-def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_target_name = ""):
+def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     """Shared-chain geometric (spatial) Jacobian for d(pose)/dv (tangent).
 
     Output `s_deePos` is sized 6 * nv * NUM_EE (NOT 6 * nq) so the floating-base
@@ -487,7 +487,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
             continue
         njs = len(ids_at_level)
         self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
-        self.gen_add_parallel_loop("ind", str(16 * njs), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(16 * njs))
         self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
         self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
         # bake the joint id and parent id per slot
@@ -505,16 +505,16 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
         self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # ============ Step 2: zero Jv, Jw ============
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 2: zero the J_v and J_w scratch (out-of-chain columns stay zero)")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(2 * 3 * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2 * 3 * nv * num_ees))
     self.gen_add_code_line("s_Jv[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ============ Step 3: per-ee, per-chain-joint, per-S-col column fills ============
     # Each (ee, vi) pair emits one block that:
@@ -534,7 +534,7 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
         self.gen_add_code_line("//")
         self.gen_add_code_line("// Step 3: per-chain-joint columns of J_v, J_w (one block per (ee, S-column))")
         self.gen_add_code_line("//")
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_serial_ops()
         # Use a serial single-thread emission per (ee, S-col) so each block can use
         # compile-time constants for the joint id, axis, etc. Total work per block is
         # ~10 FLOPs; total blocks ~chain_depth * num_ees * dofs_per_joint -- small.
@@ -574,13 +574,13 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
                     self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + r) + "] = axw_" + str(r) + ";")
             self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # ============ Step 4: per-ee rpy sincos ============
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 4: extract (cy, sy, cp, sp) from each ee's world rotation for E(rpy)^{-1}")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ee", str(num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ee", str(num_ees))
     # bake the ee anchor jid via select
     if num_ees > 1:
         select_var_vals = [("int", "ee_jid", [str(a) for a in anchors])]
@@ -604,13 +604,13 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     self.gen_add_code_line("s_E_sc[4*ee + 2] = cos(pitch);")
     self.gen_add_code_line("s_E_sc[4*ee + 3] = sin(pitch);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ============ Step 5: write s_deePos = [J_v ; E^{-1} J_w] ============
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 5: write s_deePos (rows 0..2 = J_v, rows 3..5 = E(rpy)^{-1} J_w)")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(6 * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(6 * nv * num_ees))
     self.gen_add_code_line("int row = ind % 6; int rem = ind / 6; int vi = rem % " + str(nv) + "; int ee = rem / " + str(nv) + ";")
     self.gen_add_code_line("int jv_base = 3 * (" + str(nv) + " * ee + vi);")
     self.gen_add_code_line("if (row < 3) {", True)
@@ -626,16 +626,16 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     self.gen_add_code_line("s_deePos[ind] = outv;")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     self.gen_add_end_function()
 
-def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, use_thread_group, ee_compact = False):
+def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, ee_compact = False):
     # Shared eePos extraction: reads the chained ee transform (s_eeTemp at ee_off)
     # and the gradient transform (s_deeTemp at dee_off) and writes s_deePos. When
     # ee_compact is True the ee transform is stored once per ee (slot = deeInd/n)
     # instead of redundantly per (ee, djid) pair (the serial/dense path used the
     # redundant layout and passes ee_off == dee_off, ee_compact == False).
-    self.gen_add_parallel_loop("ind",str(6*n*num_ees),use_thread_group)
+    self.gen_add_parallel_loop("ind",str(6*n*num_ees))
     self.gen_add_code_line("int outputInd = ind % 6; int deeInd = ind / 6;")
     if ee_compact:
         # ee transform stored once per ee (slot = deeInd / n); deeTemp still full
@@ -662,9 +662,9 @@ def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, use_thread_g
     self.gen_add_code_line("s_deePos[6*deeInd + outputInd] = (-x_prime*y + x*y_prime)/(x*x + y*y);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
-def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group):
+def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees):
     # ---- Compacted (in-chain only) gradient chain-up for the non-serial /
     # floating-base case. Replaces the dense n*num_ees-per-level sweep that
     # masked out-of-chain pairs. Numerically identical: out-of-chain gradients
@@ -718,21 +718,21 @@ def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
     self.gen_add_code_line("// NON-SERIAL: compacted in-chain chain-up (GLASS indexed batched 4x4 GEMM)")
     # zero s_deeTemp (both buffers) so out-of-chain (ee,djid) slots read as 0 in
     # extraction -> exactly the dense `inChain * ...` masked result.
-    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees))
     self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Level 0: seed eeTemp (per ee) and deeTemp (per in-chain pair).
     # eeTemp[ei] = Xhom[ee]; deeTemp[ei,djid] = (djid affects ee ? dXhom[djid] : Xhom[ee]).
     self.gen_add_code_line("// level 0: seed per-ee FK transform")
-    self.gen_add_parallel_loop("ind", str(16*num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*num_ees))
     self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
     select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
     self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
     self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # level-0 deeTemp seed: for each in-chain pair, the leaf factor.
     seed_pairs = []   # (dst_slot, src_matrix_slot_in_base, base) base in {"X","dX"}
@@ -747,12 +747,12 @@ def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
     self.gen_add_code_line("static const int grad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
     self.gen_add_code_line("static const int grad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
     self.gen_add_code_line("static const int grad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)))
     self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
     self.gen_add_code_line("const T *s_src = grad_seed_isdx[p] ? &s_dXhom[16*grad_seed_src[p]] : &s_Xhom[16*grad_seed_src[p]];")
     self.gen_add_code_line("s_deeTemp[16*grad_seed_dst[p] + rc] = s_src[rc];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ---- Levels 1..max_len-1: chain up by the parent factor at that level.
     for level in range(1, max_len):
@@ -823,19 +823,19 @@ def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
         if ee_carry_src:
             self.gen_add_code_line("static const int ee_csrc" + sfx + "[] = {" + ", ".join(map(str, ee_carry_src)) + "};")
             self.gen_add_code_line("static const int ee_cdst" + sfx + "[] = {" + ", ".join(map(str, ee_carry_dst)) + "};")
-            self.gen_add_parallel_loop("ind", str(16*len(ee_carry_src)), use_thread_group)
+            self.gen_add_parallel_loop("ind", str(16*len(ee_carry_src)))
             self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
             self.gen_add_code_line("s_eeTemp[16*ee_cdst" + sfx + "[c] + rc] = s_eeTemp[16*ee_csrc" + sfx + "[c] + rc];")
             self.gen_add_end_control_flow()
         if dee_carry_src:
             self.gen_add_code_line("static const int dee_csrc" + sfx + "[] = {" + ", ".join(map(str, dee_carry_src)) + "};")
             self.gen_add_code_line("static const int dee_cdst" + sfx + "[] = {" + ", ".join(map(str, dee_carry_dst)) + "};")
-            self.gen_add_parallel_loop("ind", str(16*len(dee_carry_src)), use_thread_group)
+            self.gen_add_parallel_loop("ind", str(16*len(dee_carry_src)))
             self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
             self.gen_add_code_line("s_deeTemp[16*dee_cdst" + sfx + "[c] + rc] = s_deeTemp[16*dee_csrc" + sfx + "[c] + rc];")
             self.gen_add_end_control_flow()
         if ee_carry_src or dee_carry_src:
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
         # NOTE: grid_linalg_indexed_batched_gemm already issues a trailing
         # __syncthreads(); the three calls in this level read distinct buffers /
         # disjoint c_idx slots so they are independent. The carry-forward copies
@@ -850,7 +850,7 @@ def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
     self.gen_add_code_line("//")
     # extraction reads eeTemp per-ee (slot deeInd/n) at ee_final_off and deeTemp
     # at the full (ee*n+djid) layout at dee_final_off.
-    _emit_eepose_grad_extraction(self, n, num_ees, ee_final_off, dee_final_off, use_thread_group, ee_compact = True)
+    _emit_eepose_grad_extraction(self, n, num_ees, ee_final_off, dee_final_off, ee_compact = True)
 
 def _eepose_chain_metadata(self, all_ees):
     # Shared topology pre-compute for the compacted non-serial ee chains.
@@ -880,7 +880,7 @@ def _eepose_chain_metadata(self, all_ees):
         ee_qinds.append(sorted(qset))
     return ee_chains, ee_qinds, max_len, affects
 
-def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_group):
+def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees):
     # ---- Compacted (in-chain only) gradient + hessian chain-up for the
     # non-serial / floating-base case. Replaces the dense n*n*num_ees-per-level
     # quadratic sweep that masked out-of-chain (i,j,ee) triples. Numerically
@@ -895,19 +895,19 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
 
     # ============ Phase 1: gradient chain (eeTemp + deeTemp) ============
     self.gen_add_code_line("// NON-SERIAL: compacted gradient chain (GLASS indexed batched 4x4 GEMM)")
-    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees))
     self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # level 0 eeTemp seed
     self.gen_add_code_line("// level 0: seed per-ee FK transform")
-    self.gen_add_parallel_loop("ind", str(16*num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*num_ees))
     self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
     select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
     self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
     self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # level 0 deeTemp seed
     seed_pairs = []
     for ei, ee in enumerate(all_ees):
@@ -918,12 +918,12 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
     self.gen_add_code_line("static const int hgrad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
     self.gen_add_code_line("static const int hgrad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
     self.gen_add_code_line("static const int hgrad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)))
     self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
     self.gen_add_code_line("const T *s_src = hgrad_seed_isdx[p] ? &s_dXhom[16*hgrad_seed_src[p]] : &s_Xhom[16*hgrad_seed_src[p]];")
     self.gen_add_code_line("s_deeTemp[16*hgrad_seed_dst[p] + rc] = s_src[rc];")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # gradient chain-up levels
     for level in range(1, max_len):
         even = level % 2
@@ -952,20 +952,20 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
         _emit_idx_gemm(self, "ee" + sfx, ee_a, ee_b, ee_c, "s_Xhom", "s_eeTemp", "s_eeTemp")
         _emit_idx_gemm(self, "dx" + sfx, dee_x_a, dee_x_b, dee_x_c, "s_Xhom", "s_deeTemp", "s_deeTemp")
         _emit_idx_gemm(self, "dd" + sfx, dee_dx_a, dee_dx_b, dee_dx_c, "s_dXhom", "s_deeTemp", "s_deeTemp")
-        _emit_carry_copy(self, "eec" + sfx, ee_csrc, ee_cdst, "s_eeTemp", use_thread_group)
-        _emit_carry_copy(self, "dec" + sfx, dee_csrc, dee_cdst, "s_deeTemp", use_thread_group)
+        _emit_carry_copy(self, "eec" + sfx, ee_csrc, ee_cdst, "s_eeTemp")
+        _emit_carry_copy(self, "dec" + sfx, dee_csrc, dee_cdst, "s_deeTemp")
         if ee_csrc or dee_csrc:
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
     final_even = (max_len - 1) % 2
     ee_final = 16*num_ees*final_even
     dee_final = 16*n*num_ees*final_even
 
     # ============ Phase 2: hessian chain (d2eeTemp) ============
     self.gen_add_code_line("// NON-SERIAL: compacted hessian chain (GLASS indexed batched 4x4 GEMM)")
-    self.gen_add_parallel_loop("ind", str(2*16*n*n*num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(2*16*n*n*num_ees))
     self.gen_add_code_line("s_d2eeTemp[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # in-chain (ei, i, j) triples. The d2Xhom matrix slot must match
     # grid_d2xhom_offset: floating base stores a dense (q_i,q_j) block (slot
     # i*n+j); fixed base stores only the diagonal (slot i, and i==j there since a
@@ -992,11 +992,11 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
                 elif kind == "dxj": seed_dxj.append((dst, src))
                 else: seed_x.append((dst, src))
     self.gen_add_code_line("// hessian level 0: seed per-(ee,i,j) transform (in-chain only)")
-    _emit_seed_copy(self, "hs_d2", seed_d2, "s_d2Xhom", "s_d2eeTemp", use_thread_group)
-    _emit_seed_copy(self, "hs_di", seed_dxi, "s_dXhom", "s_d2eeTemp", use_thread_group)
-    _emit_seed_copy(self, "hs_dj", seed_dxj, "s_dXhom", "s_d2eeTemp", use_thread_group)
-    _emit_seed_copy(self, "hs_x", seed_x, "s_Xhom", "s_d2eeTemp", use_thread_group)
-    self.gen_add_sync(use_thread_group)
+    _emit_seed_copy(self, "hs_d2", seed_d2, "s_d2Xhom", "s_d2eeTemp")
+    _emit_seed_copy(self, "hs_di", seed_dxi, "s_dXhom", "s_d2eeTemp")
+    _emit_seed_copy(self, "hs_dj", seed_dxj, "s_dXhom", "s_d2eeTemp")
+    _emit_seed_copy(self, "hs_x", seed_x, "s_Xhom", "s_d2eeTemp")
+    self.gen_add_sync()
     # hessian chain-up levels
     for level in range(1, max_len):
         even = level % 2
@@ -1021,9 +1021,9 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
         _emit_idx_gemm(self, "di" + sfx, g["dxi"][0], g["dxi"][1], g["dxi"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
         _emit_idx_gemm(self, "dj" + sfx, g["dxj"][0], g["dxj"][1], g["dxj"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
         _emit_idx_gemm(self, "xx" + sfx, g["x"][0], g["x"][1], g["x"][2], "s_Xhom", "s_d2eeTemp", "s_d2eeTemp")
-        _emit_carry_copy(self, "d2c" + sfx, carry_src, carry_dst, "s_d2eeTemp", use_thread_group)
+        _emit_carry_copy(self, "d2c" + sfx, carry_src, carry_dst, "s_d2eeTemp")
         if carry_src:
-            self.gen_add_sync(use_thread_group)
+            self.gen_add_sync()
     d2_final = 16*n*n*num_ees*final_even
 
     # ============ Phase 3: extraction (rebase pointers to final parity) ============
@@ -1031,7 +1031,7 @@ def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees, use_thread_
     self.gen_add_code_line("s_eeTemp = &s_eeTemp[" + str(ee_final) + "];")
     self.gen_add_code_line("s_deeTemp = &s_deeTemp[" + str(dee_final) + "];")
     self.gen_add_code_line("s_d2eeTemp = &s_d2eeTemp[" + str(d2_final) + "];")
-    _emit_eepose_hess_extraction(self, n, num_ees, use_thread_group)
+    _emit_eepose_hess_extraction(self, n, num_ees)
 
 def _emit_idx_gemm(self, name, a, b, c, A_base, B_base, C_base):
     if not a:
@@ -1041,24 +1041,24 @@ def _emit_idx_gemm(self, name, a, b, c, A_base, B_base, C_base):
     self.gen_add_code_line("static const int " + name + "_c[] = {" + ", ".join(map(str, c)) + "};")
     self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(a)) + ", " + name + "_a, " + name + "_b, " + name + "_c, " + A_base + ", " + B_base + ", " + C_base + ");")
 
-def _emit_seed_copy(self, name, pairs, src_base, dst_base, use_thread_group):
+def _emit_seed_copy(self, name, pairs, src_base, dst_base):
     # pairs: list of (dst_slot, src_slot). Copies 4x4 from src_base[src] to dst_base[dst].
     if not pairs:
         return
     self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(str(p[0]) for p in pairs) + "};")
     self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(str(p[1]) for p in pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(pairs)), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*len(pairs)))
     self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
     self.gen_add_code_line(dst_base + "[16*" + name + "_dst[p] + rc] = " + src_base + "[16*" + name + "_src[p] + rc];")
     self.gen_add_end_control_flow()
 
-def _emit_carry_copy(self, name, src, dst, base, use_thread_group):
+def _emit_carry_copy(self, name, src, dst, base):
     # carry-forward: copy already-finished slots into the other parity half.
     if not src:
         return
     self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(map(str, src)) + "};")
     self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(map(str, dst)) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(src)), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16*len(src)))
     self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
     self.gen_add_code_line(base + "[16*" + name + "_dst[c] + rc] = " + base + "[16*" + name + "_src[c] + rc];")
     self.gen_add_end_control_flow()
@@ -1069,7 +1069,7 @@ def gen_end_effector_pose_gradient_device_temp_mem_size(self, fixed_target_name 
     wrapper_size = self.gen_topology_helpers_size() + XHom_size + dXhom_size # for Xhom and dXhom
     return self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name) + wrapper_size
 
-def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_target_name = ""):
+def gen_end_effector_pose_gradient_device(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
@@ -1097,8 +1097,8 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_gradients = False, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     # then load/update XI and run the algo
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
-    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
+    self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False)
+    self.gen_end_effector_pose_gradient_inner_function_call(fixed_target_name = fixed_target_name,
         updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_end_function()
 
@@ -1111,7 +1111,7 @@ _EE_GRAD_PICK_FLAGS = [
 
 def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
                                             use_workspace_temp, use_workspace_dxhom,
-                                            single_call_timing, use_thread_group):
+                                            single_call_timing):
     """Emit the EE_POSE_GRAD kernel body specialized for one tier's spill flags.
     Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
     Used by gen_end_effector_pose_gradient_kernel to emit either a single body
@@ -1136,8 +1136,8 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     if use_workspace_dxhom:
         eegrad_temp_off += " + sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT)"
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q",str(n),stride="stride_q")
         if use_workspace_dxhom:
             self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
@@ -1147,20 +1147,20 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
             # spilled workspace so the XmatsHom helper's sincos scratch is backed.
             self.gen_add_code_line("s_temp = s_eegrad_temp;")
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
+        self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False)
         # Inner-controlled: pass both arenas + placement; the inner picks where
         # the chain workspace lives via TEMP_IN_SMEM. s_dXhom is unused by the
         # shared-chain geometric-Jacobian inner -> pass nullptr.
         updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else {}
         updated["s_dXhom_name"] = "nullptr"
-        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
+        self.gen_end_effector_pose_gradient_inner_function_call(fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         if not use_workspace_temp:
-            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),stride=str(6*nv*num_ees))
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        self.gen_kernel_load_inputs("q",str(n))
         if use_workspace_dxhom:
             self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
@@ -1171,19 +1171,19 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         # TODO(licm-eepose-grad): sm_86-specific, deprioritized. See pre-Phase-3d note in git history.
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="deePos")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False)
+        self.gen_anti_licm_input_reload("q",str(n),feedback_from="deePos")
+        self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False)
         updated = {"d_workspace_name": "s_eegrad_temp"} if use_workspace_temp else {}
         updated["s_dXhom_name"] = "nullptr"
-        self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group, fixed_target_name = fixed_target_name,
+        self.gen_end_effector_pose_gradient_inner_function_call(fixed_target_name = fixed_target_name,
             updated_var_names = updated, temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_anti_licm_output_write("deePos")
         self.gen_add_end_control_flow()
         if not use_workspace_temp:
-            self.gen_kernel_save_result_single_timing("deePos",str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees))
 
 
-def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single_call_timing = False, fixed_target_name = ""):
+def gen_end_effector_pose_gradient_kernel(self, single_call_timing = False, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     func_params = ["d_deePos is the vector of end effector positions gradients", \
@@ -1211,7 +1211,7 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
     picks = getattr(self, "ee_grad_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
         uwt, uwd = _EE_GRAD_PICK_FLAGS[picks[0]]
-        _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing, use_thread_group)
+        _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
@@ -1219,7 +1219,7 @@ def gen_end_effector_pose_gradient_kernel(self, use_thread_group = False, single
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing, use_thread_group)
+            _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -1331,7 +1331,7 @@ def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
     num_ees = self.robot.get_total_leaf_nodes()
     return 16*n_joints + 16*nv*num_ees + 4*num_ees
 
-def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+def gen_end_effector_pose_gradient_hessian_inner_function_call(self, updated_var_names = None,
                                                                out_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
@@ -1420,7 +1420,7 @@ def _eepose_hessian_chain_metadata(self, all_ees):
     return chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee
 
 
-def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False):
+def gen_end_effector_pose_gradient_hessian_inner(self):
     """Analytic d^2(pose)/dv^2 of the end-effector pose via per-chain second-
     order Taylor expansion (see docs/d2ee_analytic_derivation.md).
 
@@ -1524,7 +1524,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
             continue
         njs = len(ids_at_level)
         self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
-        self.gen_add_parallel_loop("ind", str(16 * njs), use_thread_group)
+        self.gen_add_parallel_loop("ind", str(16 * njs))
         self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
         self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
         jid_list = [str(j) for j in ids_at_level]
@@ -1538,7 +1538,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
         self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # ===== Step 2: per-DOF world-frame generator s_Sworld =====
     # Layout: s_Sworld[16 * (ee*nv + vi) + ele] (4x4 per DOF per ee, column-major)
@@ -1551,13 +1551,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("// Step 2: build per-DOF world-frame 4x4 generator S_i_world")
     self.gen_add_code_line("//")
     # First zero all of s_Sworld (out-of-chain DOFs stay zero — they contribute nothing).
-    self.gen_add_parallel_loop("ind", str(16 * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(16 * nv * num_ees))
     self.gen_add_code_line("s_Sworld[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
     # Then emit per (ee, chain-joint, S-col) the explicit 4x4 fill. Serial-ops
     # per slot — total work is small (chain_depth * dofs_per_joint * num_ees blocks).
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     for ee_idx in range(num_ees):
         for dof in per_ee_dof_info[ee_idx]:
             vi = dof["vi"]
@@ -1612,13 +1612,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                 self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = axw_2;")
             self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ===== Step 3: extract (cy, sy, cp, sp) from each ee's world rotation =====
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 3: extract (cy, sy, cp, sp) for E(rpy)^-1 / dE/drpy")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ee", str(num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ee", str(num_ees))
     if num_ees > 1:
         select_var_vals = [("int", "ee_jid", [str(a) for a in anchors])]
         self.gen_add_multi_threaded_select("ee", "<", [str(i+1) for i in range(num_ees)], select_var_vals)
@@ -1637,7 +1637,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("s_E_sc[4*ee + 2] = cos(pitch);")
     self.gen_add_code_line("s_E_sc[4*ee + 3] = sin(pitch);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ===== Step 4: emit s_deePos = [J_v; E^-1 * J_w] from s_Sworld and s_Xworld =====
     # J_w[:, vi] = skew_inv(S_world[:3, :3]) = (axw_x, axw_y, axw_z) (the angular axis)
@@ -1651,7 +1651,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 4: write s_deePos = [J_v ; E(rpy)^-1 * J_w] from S_world")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(6 * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(6 * nv * num_ees))
     self.gen_add_code_line("int row = ind % 6; int rem = ind / 6; int vi = rem % " + str(nv) + "; int ee = rem / " + str(nv) + ";")
     self.gen_add_code_line("int s_base = 16 * (ee * " + str(nv) + " + vi);")
     # angular axis components (top-left skew of S_world, read out)
@@ -1690,7 +1690,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("s_deePos[ind] = outv;")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ===== Step 5: per (ee, i, j) pair compute d2M, extract H_xyz + d2R_R^T =====
     # Strategy:
@@ -1709,10 +1709,10 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 5a: zero the full d2eePos output (out-of-chain pairs stay zero)")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(6 * nv * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(6 * nv * nv * num_ees))
     self.gen_add_code_line("s_d2eePos[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # Step 5b: per-pair d2M -> H_xyz + (temporarily, into d2eePos rpy rows) d2R_R^T
     # We use the rpy rows (c=3,4,5 of s_d2eePos) as a SCRATCH BUFFER for d2R_R^T's
@@ -1727,7 +1727,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//")
     # Emit per-ee per-pair code. For each ee, we have len(chain_dofs)^2 pairs.
     # Each pair fires once with explicit constants (chain_pos, S_col, joint_jid).
-    self.gen_add_serial_ops(use_thread_group)
+    self.gen_add_serial_ops()
     for ee_idx in range(num_ees):
         ee_jid = anchors[ee_idx]
         chain_dofs = per_ee_dof_info[ee_idx]
@@ -1817,7 +1817,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
                                                 ee_idx, vi, vj, nv, num_ees, si_base, sj_base)
                 self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ===== Step 6: rpy chain rule on rows 3..5 =====
     # Currently rows 3..5 hold H_w[:, i, j]. We want H_rpy[:, i, j] =
@@ -1833,7 +1833,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 6: rpy chain rule -- replace rows 3..5 with H_rpy = dEinv/dv_j @ J_w_i + Einv @ H_w")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(nv * nv * num_ees), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(nv * nv * num_ees))
     self.gen_add_code_line("int vj = ind % " + str(nv) + ";")
     self.gen_add_code_line("int vi = (ind / " + str(nv) + ") % " + str(nv) + ";")
     self.gen_add_code_line("int ee = ind / " + str(nv * nv) + ";")
@@ -1900,7 +1900,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("s_d2eePos[out_base + 1 * " + str(nv * nv) + "] = H_rpy_1;")
     self.gen_add_code_line("s_d2eePos[out_base + 2 * " + str(nv * nv) + "] = H_rpy_2;")
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     # ===== Step 7: symmetrize rows 3..5 over (i, j) =====
     # H_xyz is symmetric by construction. H_rpy is computed asymmetrically (the
@@ -1909,7 +1909,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Step 7: symmetrize H_rpy (rows 3..5) over (i, j)")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(num_ees * 3 * nv * nv), use_thread_group)
+    self.gen_add_parallel_loop("ind", str(num_ees * 3 * nv * nv))
     self.gen_add_code_line("int e = ind / " + str(3 * nv * nv) + ";")
     self.gen_add_code_line("int cji = ind % " + str(3 * nv * nv) + ";")
     self.gen_add_code_line("int rrow = cji / " + str(nv * nv) + ";   // 0..2 -> c = 3 + rrow")
@@ -1924,7 +1924,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     self.gen_add_code_line("if (i != j) { s_d2eePos[idx_ji] = avg; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_sync()
 
     self.gen_add_end_function()
 
@@ -2185,7 +2185,7 @@ def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
     wrapper_size = self.gen_topology_helpers_size() + XHom_size
     return self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + wrapper_size
 
-def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False):
+def gen_end_effector_pose_gradient_hessian_device(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes()
@@ -2219,10 +2219,10 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     # At TIER_PERF s_d2eePos is allocated by the caller; at LITE/MINIMAL it's
     # the inner's job to repoint via OUT_IN_SMEM=false + d_workspace.
     # then load Xhom (Jacobian only needs local transforms) and run the algo
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False, include_hessians = False)
+    self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False, include_hessians = False)
     # Inner-owns placement: pass d_workspace + the per-tier flag. When the flag is
     # false the inner repoints s_d2eePos at d_workspace.
-    self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+    self.gen_end_effector_pose_gradient_hessian_inner_function_call(
         updated_var_names = {"d_workspace_name": "d_workspace", "s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"},
         out_in_smem_expr = "D2EE_OUT_IN_SMEM<RESOURCE_TIER>()")
     self.gen_add_end_function()
@@ -2238,7 +2238,7 @@ _D2EE_PICK_FLAGS = [
 ]
 
 def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
-                                     single_call_timing, use_thread_group):
+                                     single_call_timing):
     """Emit the d2ee kernel body specialized for one tier's spill flags.
     Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
     Used by gen_end_effector_pose_gradient_hessian_kernel to emit either a
@@ -2253,8 +2253,8 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     out_in_smem_expr = "false" if use_workspace_output else "true"
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q",str(n),stride="stride_q")
         if use_workspace_output:
             self.gen_add_code_line("T *s_d2eePos = nullptr;  // inner repoints at d_workspace slice")
             self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*nv*num_ees) + "];")
@@ -2263,22 +2263,22 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False, include_hessians = False)
+        self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False, include_hessians = False)
         updated = {"s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"}
         if use_workspace_output:
             updated["d_workspace_name"] = "s_d2eePos_ws"
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(
             updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
         if not use_workspace_output:
-            self.gen_kernel_save_result("d2eePos",str(output_count),str(output_count),use_thread_group)
-            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("d2eePos",str(output_count),stride=str(output_count))
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),stride=str(6*nv*num_ees))
         else:
             # gradient still needs the smem -> global copy; the Hessian was already written to d_d2eePos directly via s_d2eePos_ws.
-            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees),stride=str(6*nv*num_ees))
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs_single_timing("q",str(n),use_thread_group)
+        self.gen_kernel_load_inputs("q",str(n))
         if use_workspace_output:
             self.gen_add_code_line("T *s_d2eePos = nullptr;  // inner repoints at d_workspace")
             self.gen_add_code_line("T *s_deePos = d_deePos;")
@@ -2287,23 +2287,23 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q",str(n),use_thread_group,feedback_from="d2eePos")
-        self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group, include_gradients = False, include_hessians = False)
+        self.gen_anti_licm_input_reload("q",str(n),feedback_from="d2eePos")
+        self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False, include_hessians = False)
         updated = {"s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"}
         if use_workspace_output:
             updated["d_workspace_name"] = "s_d2eePos_ws"
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(use_thread_group,
+        self.gen_end_effector_pose_gradient_hessian_inner_function_call(
             updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
         self.gen_anti_licm_output_write("d2eePos")
         self.gen_add_end_control_flow()
         if not use_workspace_output:
-            self.gen_kernel_save_result_single_timing("d2eePos",str(output_count),use_thread_group)
-            self.gen_kernel_save_result_single_timing("deePos",str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("d2eePos",str(output_count))
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees))
         else:
-            self.gen_kernel_save_result_single_timing("deePos",str(6*nv*num_ees),use_thread_group)
+            self.gen_kernel_save_result("deePos",str(6*nv*num_ees))
 
 
-def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False, single_call_timing = False):
+def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = False):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
     func_params = ["d_d2eePos is the vector of end effector pose Hessians (6 x nv x nv per ee)", \
@@ -2332,7 +2332,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
     picks = getattr(self, "d2ee_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
         uwo = _D2EE_PICK_FLAGS[picks[0]]
-        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing, use_thread_group)
+        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
@@ -2340,7 +2340,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, use_thread_group = False
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing, use_thread_group)
+            _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -2701,7 +2701,7 @@ def gen_X_warp(self, fixed_target_name = ""):
 
     self.gen_add_end_function()
 
-def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name = "",
+def gen_eepose_and_derivatives(self, fixed_target_name = "",
                                include_pose = True, include_gradient = True, include_hessian = True):
     ee_target_names = [""]
     if fixed_target_name == "all":
@@ -2711,12 +2711,12 @@ def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name
     for target in ee_target_names:
         if include_pose:
             # first generate the inner helpers
-            self.gen_end_effector_pose_inner(use_thread_group, fixed_target_name = target)
+            self.gen_end_effector_pose_inner(fixed_target_name = target)
             # then generate the device wrappers
-            self.gen_end_effector_pose_device(use_thread_group, fixed_target_name = target)
+            self.gen_end_effector_pose_device(fixed_target_name = target)
             # then generate the kernels
-            self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = True, fixed_target_name = target)
-            self.gen_end_effector_pose_kernel(use_thread_group, single_call_timing = False, fixed_target_name = target)
+            self.gen_end_effector_pose_kernel(single_call_timing = True, fixed_target_name = target)
+            self.gen_end_effector_pose_kernel(single_call_timing = False, fixed_target_name = target)
             # then the host launch wrappers
             self.gen_end_effector_pose_host(0, fixed_target_name = target)
             self.gen_end_effector_pose_host(1, fixed_target_name = target)
@@ -2724,12 +2724,12 @@ def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name
 
         if include_gradient:
             # then for the gradient first generate the inner helpers
-            self.gen_end_effector_pose_gradient_inner(use_thread_group, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_inner(fixed_target_name = target)
             # then generate the device wrappers
-            self.gen_end_effector_pose_gradient_device(use_thread_group, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_device(fixed_target_name = target)
             # then generate the kernels
-            self.gen_end_effector_pose_gradient_kernel(use_thread_group,True, fixed_target_name = target)
-            self.gen_end_effector_pose_gradient_kernel(use_thread_group,False, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_kernel(True, fixed_target_name = target)
+            self.gen_end_effector_pose_gradient_kernel(False, fixed_target_name = target)
             # then the host launch wrappers
             self.gen_end_effector_pose_gradient_host(0, fixed_target_name = target)
             self.gen_end_effector_pose_gradient_host(1, fixed_target_name = target)
@@ -2737,12 +2737,12 @@ def gen_eepose_and_derivatives(self, use_thread_group = False, fixed_target_name
 
     if include_hessian:
         # then for the hessian first generate the inner helpers
-        self.gen_end_effector_pose_gradient_hessian_inner(use_thread_group)
+        self.gen_end_effector_pose_gradient_hessian_inner()
         # then generate the device wrappers
-        self.gen_end_effector_pose_gradient_hessian_device(use_thread_group)
+        self.gen_end_effector_pose_gradient_hessian_device()
         # then generate the kernels
-        self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,True)
-        self.gen_end_effector_pose_gradient_hessian_kernel(use_thread_group,False)
+        self.gen_end_effector_pose_gradient_hessian_kernel(True)
+        self.gen_end_effector_pose_gradient_hessian_kernel(False)
         # then the host launch wrappers
         self.gen_end_effector_pose_gradient_hessian_host(0)
         self.gen_end_effector_pose_gradient_hessian_host(1)

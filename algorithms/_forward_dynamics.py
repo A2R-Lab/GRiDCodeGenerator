@@ -18,7 +18,7 @@ def gen_forward_dynamics_inner_temp_mem_size(self, minv_f_in_smem = True):
         return n*n + max(minv_footprint,
                          19*n + self.gen_inverse_dynamics_inner_temp_mem_size())
 
-def gen_forward_dynamics_finish_function_call(self, use_thread_group = False, updated_var_names = None):
+def gen_forward_dynamics_finish_function_call(self, updated_var_names = None):
     var_names = dict( \
         s_qdd_name = "s_qdd", \
         s_u_name = "s_u", \
@@ -32,7 +32,7 @@ def gen_forward_dynamics_finish_function_call(self, use_thread_group = False, up
                                            var_names["s_c_name"] + ", " + var_names["s_Minv_name"] + ");"
     self.gen_add_code_line(code)
 
-def gen_forward_dynamics_finish(self, use_thread_group = False):
+def gen_forward_dynamics_finish(self):
     n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_qdd is a pointer to memory for the final result", \
@@ -49,7 +49,7 @@ def gen_forward_dynamics_finish(self, use_thread_group = False):
 
     # compute the final answer qdd = Minv * (u - c)
     # remember that Minv is an SYMMETRIC_UPPER triangular matrix
-    self.gen_add_parallel_loop("row",str(n),use_thread_group)
+    self.gen_add_parallel_loop("row",str(n))
     self.gen_add_code_line("T val = static_cast<T>(0);")
     self.gen_add_code_line("for(int col = 0; col < " + str(n) + "; col++) {", True)
     self.gen_add_code_line("// account for the fact that Minv is an SYMMETRIC_UPPER triangular matrix")
@@ -60,7 +60,7 @@ def gen_forward_dynamics_finish(self, use_thread_group = False):
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
-def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, updated_var_names = None,
+def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,
                                              minv_f_in_smem_expr = "true"):
     var_names = dict( \
         s_q_name = "s_q", \
@@ -85,7 +85,7 @@ def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, upd
     fd_code = fd_code_start + fd_code_middle + fd_code_end
     self.gen_add_code_line(fd_code)
 
-def gen_forward_dynamics_inner(self, use_thread_group = False):
+def gen_forward_dynamics_inner(self):
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
     # construct the boilerplate and function definition
@@ -115,25 +115,25 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     updated_var_names = dict(s_Minv_name = "s_temp",
                              s_temp_name = "&s_temp[" + str(n*n) + "]",
                              d_workspace_name = "d_workspace")
-    self.gen_direct_minv_inner_function_call(use_thread_group, updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
+    self.gen_direct_minv_inner_function_call(updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
     updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
-    self.gen_inverse_dynamics_inner_function_call(use_thread_group, compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
+    self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
     
     if self.DEBUG_MODE:
-        self.gen_add_sync(use_thread_group)
-        self.gen_add_serial_ops(use_thread_group)
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
         self.gen_add_code_lines(["printf(\"Minv\\n\"); printMat<T," + str(n) + "," + str(n) + ">(s_temp," + str(n) + ");",
                                  "printf(\"u\\n\"); printMat<T,1," + str(n) + ">(s_u,1);"
                                  "printf(\"c\\n\"); printMat<T,1," + str(n) + ">(&s_temp[" + str(n*n) + "],1);"])
         self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
+        self.gen_add_sync()
 
     # finally compute the final answer qdd = Minv * (u - c)
     updated_var_names = dict(s_Minv_name = "s_temp", s_c_name = "&s_temp[" + str(n*n) + "]")
-    self.gen_forward_dynamics_finish_function_call(use_thread_group, updated_var_names)
+    self.gen_forward_dynamics_finish_function_call(updated_var_names)
     self.gen_add_end_function()
 
-def gen_forward_dynamics_device(self, use_thread_group = False):
+def gen_forward_dynamics_device(self):
     n = self.robot.get_num_vel()
     # construct the boilerplate and function definition
     func_params = ["s_qdd is a pointer to memory for the final result", \
@@ -157,11 +157,11 @@ def gen_forward_dynamics_device(self, use_thread_group = False):
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
     # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-    self.gen_forward_dynamics_inner_function_call(use_thread_group, minv_f_in_smem_expr = "true")
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_forward_dynamics_inner_function_call(minv_f_in_smem_expr = "true")
     self.gen_add_end_function()
 
-def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, use_thread_group):
+def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
     """Emit forward_dynamics_kernel body for one tier's Minv-F spill flag.
     spill_minv_F=False: s_minv_F lives in extra smem (at start of s_temp);
     spill_minv_F=True:  s_minv_F lives in L2-pinned workspace."""
@@ -173,41 +173,41 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n+self.robot.floating_base) + "]; T *s_u = &s_q_qd_u[" + str(2*n+self.robot.floating_base) + "];")
     minv_f_expr = "false" if spill_minv_F else "true"
     if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
-        self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q_qd_u",str(3*n),stride="stride_q_qd_u")
         if spill_minv_F:
             self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_forward_dynamics_inner_function_call(use_thread_group,
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_forward_dynamics_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
-        self.gen_add_sync(use_thread_group)
-        self.gen_kernel_save_result("qdd",str(n),str(n),use_thread_group)
+        self.gen_add_sync()
+        self.gen_kernel_save_result("qdd",str(n),stride=str(n))
         self.gen_add_end_control_flow()
     else:
         input_count = 3*n + self.robot.floating_base
-        self.gen_kernel_load_inputs_single_timing("q_qd_u",str(input_count))
+        self.gen_kernel_load_inputs("q_qd_u",str(input_count))
         if spill_minv_F:
             self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u",str(input_count),use_thread_group,feedback_from="qdd")
-        self.gen_load_update_XImats_helpers_function_call(use_thread_group)
-        self.gen_forward_dynamics_inner_function_call(use_thread_group,
+        self.gen_anti_licm_input_reload("q_qd_u",str(input_count),feedback_from="qdd")
+        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_forward_dynamics_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result_single_timing("qdd",str(n),use_thread_group)
+        self.gen_kernel_save_result("qdd",str(n))
 
 
-def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timing = False):
+def gen_forward_dynamics_kernel(self, single_call_timing = False):
     n = self.robot.get_num_vel()
     func_params = ["d_qdd is a pointer to memory for the final result", \
                    "d_workspace is the L2-pinned global spill buffer (used when Minv-F overflows smem)", \
@@ -230,14 +230,14 @@ def gen_forward_dynamics_kernel(self, use_thread_group = False, single_call_timi
     # smem block); Level 1 = Minv-F in L2-pinned workspace.
     picks = getattr(self, "fd_spill_tier_3way", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
-        _emit_fd_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing, use_thread_group)
+        _emit_fd_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing)
     else:
         tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
             self.gen_add_code_line(head, True)
-            _emit_fd_kernel_body_for_flags(self, n, bool(pick), single_call_timing, use_thread_group)
+            _emit_fd_kernel_body_for_flags(self, n, bool(pick), single_call_timing)
             self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -303,15 +303,15 @@ def gen_forward_dynamics_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("fd"))
     self.gen_add_end_function()
 
-def gen_forward_dynamics(self, use_thread_group = False):
+def gen_forward_dynamics(self):
     # first helpers
-    self.gen_forward_dynamics_finish(use_thread_group)
-    self.gen_forward_dynamics_inner(use_thread_group)
+    self.gen_forward_dynamics_finish()
+    self.gen_forward_dynamics_inner()
     # then device wrapper
-    self.gen_forward_dynamics_device(use_thread_group)
+    self.gen_forward_dynamics_device()
     # then kernels
-    self.gen_forward_dynamics_kernel(use_thread_group,True)
-    self.gen_forward_dynamics_kernel(use_thread_group,False)
+    self.gen_forward_dynamics_kernel(True)
+    self.gen_forward_dynamics_kernel(False)
     # then host launch
     self.gen_forward_dynamics_host(0)
     self.gen_forward_dynamics_host(1)
