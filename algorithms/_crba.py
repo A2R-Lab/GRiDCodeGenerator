@@ -5,7 +5,12 @@ import copy
 def gen_crba_inner_temp_mem_size(self):
     if self.robot.floating_base:
         NJ = self.robot.get_num_joints()
-        return 36*NJ + 36 + 36 + 6
+        # IC (36*NJ) + alpha slab (36 * max BFS width) — the alpha slab is
+        # per-sibling so all gemms at a BFS level can run with one shared
+        # forward/backward sync (BFS-parallel body recursion). On a 1-wide
+        # level the slab is exactly 36 (same as the old single-alpha buffer).
+        max_bfs_width = max(1, self.robot.get_max_bfs_width())
+        return 36*NJ + 36*max_bfs_width
     n = self.robot.get_num_pos()
     return 140*n
 
@@ -193,10 +198,11 @@ def gen_crba_inner(self):
 def gen_crba_inner_floating(self):
     NJ = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
     ICOffset = 0
+    # Per-sibling alpha slab (one 6x6 block per joint at the current BFS level).
+    # Slot i in [0, len(inds)) lives at alphaOffset + 36*i.
     alphaOffset = 36 * NJ
-    betaOffset = alphaOffset + 36
-    fhOffset = betaOffset + 36
 
     func_params = [ "s_q is the vector of joint positions", \
                     "s_qd is the vector of joint velocities", \
@@ -230,16 +236,109 @@ def gen_crba_inner_floating(self):
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
-    # Phase 1 — body recursions (sequential by tree, unchanged).
-    # For each jid NJ-1..1: alpha = X^T IC[jid]; IC[parent] += alpha X.
-    # This is data-dependent in jid (each iter feeds the parent's IC), so it
-    # stays sequential. Each iter is a single GLASS gemm pair — already
-    # block-cooperative within the gemm — no per-pair sync churn.
-    for jid in range(NJ - 1, 0, -1):
-        parent = self.robot.get_parent_id(jid)
-        self.gen_add_code_line("// CRBA body " + str(jid))
-        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{ICOffset + 36*jid}], &s_temp[{alphaOffset}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
-        self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+    # Phase 1 — BFS-level body recursions.
+    # For each BFS level (deepest to root, level 0 = floating root is skipped):
+    #   alpha[i] = X[jid_i]^T * IC[jid_i]               (forward, per sibling slot i)
+    #   IC[parent[jid_i]] += alpha[i] * X[jid_i]        (backward)
+    # Levels are data-dependent (each writes its parents' IC), so the LEVEL loop is
+    # sequential. WITHIN a level, sibling joints are independent (their alpha slots
+    # are disjoint, and their parents are typically disjoint too). Fusing the
+    # per-sibling 6x6 gemms into one block-cooperative pass per phase collapses
+    # 2 * len(inds) syncs down to 2 per BFS level on branched robots
+    # (go2-floating bfs widths 4,4,4 → 24 syncs → 6; g1-floating → 58 → 20).
+    # Single-sibling levels (entire iiwa14 chain) emit the same byte-identical
+    # GLASS gemm pair as before, so chain robots are unchanged.
+    for bfs_level in range(n_bfs_levels - 1, 0, -1):
+        inds = self.robot.get_ids_by_bfs_level(bfs_level)
+        k = len(inds)
+        joint_names = [self.robot.get_joint_by_id(j).get_name() for j in inds]
+        self.gen_add_code_line(f"// CRBA Phase 1 BFS level {bfs_level} (jids {inds})")
+        self.gen_add_code_line(f"//     joints: {', '.join(joint_names)}")
+
+        if k == 1:
+            # Serial-chain fast path: unchanged from prior emit. iiwa14 floating
+            # falls entirely here (BFS levels 1..7 each have exactly one jid).
+            jid = inds[0]
+            parent = self.robot.get_parent_id(jid)
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_temp[{ICOffset + 36*jid}], &s_temp[{alphaOffset}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{alphaOffset}], &s_XImats[{36*jid}], &s_temp[{ICOffset + 36*parent}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+            continue
+
+        # k siblings ≥ 2 — fused per-level forward + backward. Wrap in a block
+        # scope so per-level compile-time tables (s_jid_lvl, s_par_lvl) don't
+        # collide across BFS levels emitted into the same function body.
+        jids_csv = ", ".join(str(j) for j in inds)
+        parents_csv = ", ".join(str(self.robot.get_parent_id(j)) for j in inds)
+
+        self.gen_add_code_line("{", True)
+        # Forward: alpha[slot] = X[jid]^T * IC[jid] for slot in [0, k).
+        # Thread `el` owns one (slot, row, col) triple → one output scalar.
+        # 6x6 gemm with transposed A (= X^T): C[r,c] = sum_p X[p,r] * IC[p,c]
+        # X is column-major in s_XImats: X[p,r] = s_XImats[36*jid + p + 6*r],
+        # so X^T[r,p] = X[p,r] is read via Xj[p + 6*r] in the column-major slab.
+        # IC is also column-major: IC[p,c] = s_temp[ICOffset + 36*jid + p + 6*c].
+        self.gen_add_code_line(f"// fused forward: {k} siblings, each computes 36 outputs (alpha[slot] = X[jid_slot]^T * IC[jid_slot])")
+        self.gen_add_code_line(f"const int s_jid_lvl[{k}] = {{{jids_csv}}};")
+        self.gen_add_code_line(f"const int s_par_lvl[{k}] = {{{parents_csv}}};")
+        self.gen_add_parallel_loop("el", str(36 * k))
+        self.gen_add_code_line("int slot = el / 36;")
+        self.gen_add_code_line("int rc = el % 36;")
+        self.gen_add_code_line("int row = rc % 6;")
+        self.gen_add_code_line("int col = rc / 6;")
+        self.gen_add_code_line("int jid_l = s_jid_lvl[slot];")
+        self.gen_add_code_line("const T *Xj = &s_XImats[36*jid_l];")
+        self.gen_add_code_line(f"const T *ICj = &s_temp[{ICOffset} + 36*jid_l];")
+        # X^T row `row` = X column `row` reading; dot with IC column `col`.
+        self.gen_add_code_line("T acc = static_cast<T>(0);")
+        self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += Xj[p + 6*row] * ICj[p + 6*col]; }")
+        self.gen_add_code_line(f"s_temp[{alphaOffset} + 36*slot + row + 6*col] = acc;")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+        # Backward: IC[parent] += alpha[slot] * X[jid].
+        # When siblings share a parent (e.g. quadruped legs all feeding the
+        # floating-base body), the accumulation cells COLLIDE and we must
+        # atomicAdd into IC[parent]. When parents are disjoint (the common
+        # case below the root), each (slot, r, c) writes a unique cell.
+        if self.robot.has_repeated_parents(inds):
+            self.gen_add_code_line(f"// fused backward (shared parents → atomicAdd): IC[parent] += alpha[slot] * X[jid_slot]")
+            self.gen_add_parallel_loop("el", str(36 * k))
+            self.gen_add_code_line("int slot = el / 36;")
+            self.gen_add_code_line("int rc = el % 36;")
+            self.gen_add_code_line("int row = rc % 6;")
+            self.gen_add_code_line("int col = rc / 6;")
+            self.gen_add_code_line("int jid_l = s_jid_lvl[slot];")
+            self.gen_add_code_line("int par_l = s_par_lvl[slot];")
+            self.gen_add_code_line(f"const T *alphaSlot = &s_temp[{alphaOffset} + 36*slot];")
+            self.gen_add_code_line("const T *Xj = &s_XImats[36*jid_l];")
+            # alpha is row-major effectively but stored col-major as a 6x6: alpha[r, p] at offset r + 6*p.
+            # X column-major: X[p, c] at p + 6*c. Result[r, c] = sum_p alpha[r,p] * X[p,c].
+            self.gen_add_code_line("T acc = static_cast<T>(0);")
+            self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += alphaSlot[row + 6*p] * Xj[p + 6*col]; }")
+            self.gen_add_code_line(f"atomicAdd(&s_temp[{ICOffset} + 36*par_l + row + 6*col], acc);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_end_control_flow()  # close the per-level scope
+        else:
+            # Disjoint parents → no collisions; one fused parallel loop over
+            # (slot, r, c) writes IC[par[slot]] += alpha[slot] * X[jid_slot]
+            # in registers, then commits to its unique IC cell.
+            self.gen_add_code_line(f"// fused backward (disjoint parents): IC[parent] += alpha[slot] * X[jid_slot]")
+            self.gen_add_parallel_loop("el", str(36 * k))
+            self.gen_add_code_line("int slot = el / 36;")
+            self.gen_add_code_line("int rc = el % 36;")
+            self.gen_add_code_line("int row = rc % 6;")
+            self.gen_add_code_line("int col = rc / 6;")
+            self.gen_add_code_line("int jid_l = s_jid_lvl[slot];")
+            self.gen_add_code_line("int par_l = s_par_lvl[slot];")
+            self.gen_add_code_line(f"const T *alphaSlot = &s_temp[{alphaOffset} + 36*slot];")
+            self.gen_add_code_line("const T *Xj = &s_XImats[36*jid_l];")
+            self.gen_add_code_line("T acc = static_cast<T>(0);")
+            self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += alphaSlot[row + 6*p] * Xj[p + 6*col]; }")
+            self.gen_add_code_line(f"s_temp[{ICOffset} + 36*par_l + row + 6*col] += acc;")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_end_control_flow()  # close the per-level scope
 
     # Phase 2 — per-jid thread-parallel walk for M's diagonal + scalar-joint
     # off-diagonal + floating-root coupling cells. ONE __syncthreads at the
