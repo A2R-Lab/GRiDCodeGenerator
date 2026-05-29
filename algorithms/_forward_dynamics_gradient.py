@@ -215,7 +215,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if use_qdd_Minv_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
     else:

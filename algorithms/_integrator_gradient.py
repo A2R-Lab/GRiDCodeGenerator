@@ -801,7 +801,7 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         spill_flag = "true" if inner_level == 1 else "false"
         # d_temp_spill is the id_du da_df band region (rung 1); always declared so the
         # device call can reference it (nullptr unless inner_level==1).
-        self.gen_add_code_line("T *d_temp_spill = nullptr;")
+        self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
         if use_thread_group:
             self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
 

@@ -320,7 +320,7 @@ def gen_fdsva_so_device(self, use_thread_group = False):
     # Inner owns the pool placement; the repoint covers every consumer below
     # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
-    self.gen_add_code_line("T *d_temp_spill = nullptr;  // idsva uses the (placed) s_temp pool directly")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;  // idsva uses the (placed) s_temp pool directly")
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_direct_minv_inner_function_call(use_thread_group, f_in_smem_expr = "true")
     self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, gravity);")
@@ -397,7 +397,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if use_thread_group:
         self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F

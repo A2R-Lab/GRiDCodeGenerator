@@ -2342,7 +2342,7 @@ def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
     # The inner loads/updates XImats internally (inner-owns-placement), so no external
     # XImats call here; this device wrapper keeps s_temp in smem (SCRATCH_IN_SMEM=true).
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     self.gen_idsva_so_body_frame_inner_function_call(use_thread_group)
     self.gen_idsva_so_body_frame_public_dvdq_layout_repair(use_thread_group)
     self.gen_add_end_function()
@@ -2383,7 +2383,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     # `d_workspace` arg. The inner does the s_temp/BC repoint itself (inner-owns
     # placement): whole-arena rung -> inner sets s_temp = d_temp_spill; surgical rung ->
     # inner sets BC = d_temp_spill; floating shim -> gravity-Hessian uses it directly.
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     needs_workspace = self.robot.floating_base or s_temp_in_global or bc_in_global
     if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
@@ -3280,7 +3280,7 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers=extra_t_buffers)
     # `d_temp_spill` is the inner's d_workspace param: the whole-arena base (s_temp_in_global)
     # or the cold-trio base / d_cold (cold_in_global). nullptr at the full rung.
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     needs_workspace = s_temp_in_global or cold_in_global
     if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
@@ -3474,7 +3474,7 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr above, so the
     # inner's per-buffer spill pointer is unused here (pass nullptr).
-    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if self.robot.floating_base:
         self.gen_idsva_so_world_frame_inner_function_call(use_thread_group)
     else:
