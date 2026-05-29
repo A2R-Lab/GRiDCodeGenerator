@@ -1893,19 +1893,25 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
     self.gen_add_code_line('// Compute t1 = outer(S[j], psid[ancestor])')
     self.gen_add_code_line('// t1[j][k] is stored at t[((j*(j+1)/2) + k)*36]')
-    self.gen_add_code_line(f'static const int jids[] = {{ {", ".join(map(str, jids_a))} }}; // Joints with ancestor at equivalent index of ancestors_j') 
+    self.gen_add_code_line(f'static const int jids[] = {{ {", ".join(map(str, jids_a))} }}; // Joints with ancestor at equivalent index of ancestors_j')
     self.gen_add_code_line(f'static const int ancestors_j[] = {{ {", ".join(map(str, ancestors))} }}; // Joint or ancestor of joint at equivalent index of jids_a')
-    
-    # Create t indexing map
+
+    # Create t indexing map. Sized by NJ (raw joint count), NOT NV (DoF count),
+    # because get_jid_ancestor_ids returns joint IDs in range [0, NJ). When the
+    # mimic-aware URDFParser keeps fixed/mimic joints (e.g. h1_2 fixed-base:
+    # NJ=51 > NV=39), indexing by jid into an NV-sized map raises IndexError.
+    # S/psid/etc. are also jid-indexed downstream, so we keep this jid-indexed
+    # too rather than rewriting to v-indexed (see Option B in bug notes).
+    NJ = self.robot.get_num_joints()
     # Initialize the matrix with -1
-    t_index_map = [[-1 for _ in range(NV)] for _ in range(NV)]
+    t_index_map = [[-1 for _ in range(NJ)] for _ in range(NJ)]
 
     # Fill in the map with t_idx
     for t_idx, (j, a) in enumerate(zip(jids_a, ancestors)):
         t_index_map[j][a] = t_idx
 
-    # Emit CUDA code
-    self.gen_add_code_line("const int t_index_map[{}][{}] = {{".format(NV, NV))
+    # Emit CUDA code (NJ x NJ to match Python-side sizing above)
+    self.gen_add_code_line("const int t_index_map[{}][{}] = {{".format(NJ, NJ))
     for row in t_index_map:
         self.gen_add_code_line("    { " + ", ".join("{:2}".format(x) for x in row) + " },")
     self.gen_add_code_line("};")
