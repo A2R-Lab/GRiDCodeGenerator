@@ -35,7 +35,21 @@ def _global_hom_derivative_matrices_by_q(self):
 def _global_hom_second_derivative_matrices(self):
     n = self.robot.get_num_pos()
     if not self.robot.floating_base:
-        return self.robot.get_d2Xmats_hom_ordered_by_id(), list(range(n))
+        # mats has one entry per JOINT (length NJ); owners maps each entry to
+        # its joint's q-index. NJ != n_pos when fixed sub-joints are present
+        # (e.g. h1_2 has 51 joints but 39 DoF positions); the prior `list(
+        # range(n))` form length-mismatched, raising IndexError on the
+        # zero-d2Xhom fixed-joint entries. The None sentinel for non-DoF
+        # joints is handled by the consumer's `owner_jid if owner_jid is not
+        # None else ind` fallback (the d2Xhom for fixed joints is the zero
+        # matrix, so the inner code is dead anyway — owner is unread).
+        mats = self.robot.get_d2Xmats_hom_ordered_by_id()
+        owners = [None] * len(mats)
+        for jid in range(self.robot.get_num_joints()):
+            qinds = _qinds_to_list(self, self.robot.get_joint_index_q(jid))
+            if qinds:
+                owners[jid] = qinds[0]
+        return mats, owners
 
     mats = [sp.zeros(4, 4) for _ in range(n*n)]
     owners = [None for _ in range(n*n)]
