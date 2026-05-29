@@ -1321,7 +1321,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     """
     Generates the inner device function to compute the second order idsva.
 
-    Inner-owns-placement (mirrors fdsva_so_full_inner / crba_inner): two compile-time
+    Inner-owns-placement (mirrors fdsva_so_device / crba_inner): two compile-time
     spill levers select where scratch lives, decided at the very top of the function so
     every consumer (including the internal load_update_XImats helper's sincos scratch)
     follows the placement:
@@ -1354,14 +1354,14 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
                    "gravity is the gravity constant"]
     func_def_start = "void idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
     # The inner now loads/updates XImats internally, so it takes d_robotModel (mirrors
-    # fdsva_so_full_inner). It still receives s_XImats/s_topology_helpers (the smem dest
+    # fdsva_so_device). It still receives s_XImats/s_topology_helpers (the smem dest
     # buffers) via gen_insert_helpers_func_def_params.
     func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
     func_params.insert(-1, "d_robotModel holds XImats/topology (the inner loads s_XImats internally)")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     # Inner-owns-placement: the whole s_temp pool placement (and the XImats helper's
     # sincos scratch, since the helper now runs INSIDE after the repoint) is the inner's
-    # call. Mirrors fdsva_so_full_inner / crba_inner.
+    # call. Mirrors fdsva_so_device / crba_inner.
     func_notes = ["Loads/updates s_XImats from s_q internally (helper runs after the SCRATCH_IN_SMEM repoint so its scratch follows the placement)"]
     if use_thread_group:
         func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
@@ -1376,7 +1376,7 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     self.gen_add_code_line(func_def, True)
     # Inner owns the pool placement; the repoint goes FIRST, before the offset-derived
     # pointer declarations below, so every consumer (incl. the XImats helper's sincos
-    # scratch) follows the placement. Mirrors fdsva_so_full_inner / crba_inner.
+    # scratch) follows the placement. Mirrors fdsva_so_device / crba_inner.
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     # Load/update XImats INSIDE the inner, AFTER the repoint, so its s_temp-backed
     # sincos scratch follows the SCRATCH_IN_SMEM placement (no caller-side repoint).
@@ -2666,7 +2666,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     self.gen_add_code_line(func_def, True)
     # Inner owns the XImats load too: the s_temp repoint below covers the helper's
     # sincos scratch, so every consumer (incl. XImats) follows the placement and the
-    # kernel never repoints s_temp. Mirrors fdsva_so_full_inner (the canon).
+    # kernel never repoints s_temp. Mirrors fdsva_so_device (the canon).
     self.gen_add_code_lines([
         "// world-frame IDSVA-SO shared-memory layout.",
         "// Inner owns scratch placement: SCRATCH_IN_SMEM picks s_temp (shared) vs",
@@ -2676,7 +2676,7 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
     ])
     # XImats is loaded INSIDE the inner, AFTER the s_temp repoint — so its sincos
     # scratch (which uses s_temp) follows the same placement. Repoint FIRST, then load.
-    # (load_update_XImats_helpers ends with its own sync, matching fdsva_so_full_inner.)
+    # (load_update_XImats_helpers ends with its own sync, matching fdsva_so_device.)
     self.gen_load_update_XImats_helpers_function_call(use_thread_group)
     self.gen_add_code_lines([
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
@@ -3262,7 +3262,7 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
       - s_temp_in_global:  whole world inner s_temp arena -> d_workspace (inner
                            SCRATCH_IN_SMEM=false; guaranteed-fit fallback).
     The inner now OWNS its scratch placement AND the XImats load (inner-owns-placement,
-    mirrors fdsva_so_full_inner): the kernel no longer repoints s_temp nor calls
+    mirrors fdsva_so_device): the kernel no longer repoints s_temp nor calls
     load_update_XImats — it just forwards the flags + the d_temp_spill region.
     """
     extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]

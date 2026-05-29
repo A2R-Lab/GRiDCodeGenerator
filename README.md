@@ -22,22 +22,25 @@ This package also depends on our [URDFParser](https://github.com/robot-accelerat
 Running the CUDA C++ code output by the GRiDCodegenerator also requires CUDA to be installed on your system. Please see the [README.md in the GRID](https://github.com/robot-acceleration/GRiD) wrapper package for instalation notes for CUDA.
 
 ## C++ API
-To enable GRiD to be used by both expert and novice GPU programmers we provide the following API interface for each rigid body dynamics algorithm:
-+ ```ALGORITHM_inner```: a device function that computes the core computation. These functions assume that inputs are already loaded into GPU shared memory, require a pointer to additional scratch shared memory, and store the result back in shared memory.
-+ ```ALGORITHM_device```: a device function that handles the shared memory allocation for the ```\_inner``` function. These functions assume that inputs are already loaded into, and return results to, GPU shared memory.
-+ ```ALGORITHM_kernel```: a kernel that handles the shared memory allocation for the ```\_inner``` function. These functions assume that inputs are loaded into, and return results to, the global GPU memory.
-+ ```ALGORITHM```: a host function that wraps the ```_kernel``` and handles the transfer of inputs to the GPU and the results back to the CPU.
+GRiD emits **three layers** per algorithm. Each layer has a single, clear responsibility:
++ ```ALGORITHM_device```: the canonical ``__device__`` function. It takes caller-supplied buffer pointers (inputs, outputs, the ``s_temp`` shared scratch pool, and ``d_workspace`` for the spilled tiers) and owns its scratch placement. A single ``if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; }`` at the top routes the whole pool to global for spilled tiers; every consumer below (XImats helper, sub-inners) inherits the placement. This is what inline-CUDA users embed inside their own kernel.
++ ```ALGORITHM_kernel```: a ``__global__`` entry point that handles batch scheduling (grid-stride loop over timesteps) and global ↔ shared memory transfer. It allocates ``__shared__`` smem for inputs/outputs/``s_temp`` from the per-tier ``*_DYNAMIC_SHARED_MEM_BYTES`` macro and calls ``ALGORITHM_device``. Per-tier dispatch is via the ``RESOURCE_TIER`` template parameter.
++ ```ALGORITHM```: a host function that wraps ``_kernel`` and handles H↔D copies for inputs and outputs.
+
+Internal helpers (``ALGORITHM_inner`` for single-step computational cores, role-specific sub-step helpers like ``fdsva_so_contract``) still exist where useful — they are **internal to ``_device``** and not part of the external surface. Higher-level algorithms call other algorithms' ``_inner`` directly so that one expensive ``XImats`` load is amortized across all sub-algorithms.
+
+Pre-2026 the emitter shipped a fourth, auto-allocating ``_device`` training-wheels wrapper. It was dropped — the only consumer (the equivalence runner) is migrated to allocate smem itself. See ``docs/source/user_guide/concepts/codegen_architecture.rst`` for the rename history.
 
 ## Code Generation API
 
 For each algorithm (written as a ```_algorithm.py``` file in the ```algorithms``` folder) the following functions are generally written:
 + ```gen_algorithm_temp_mem_size```: returns a Python number noting the shared memory array size needed for all temporary variables
 + ```gen_algorithm_function_call```: generates a function call for that algorithm and is intended to be used inside other algorithms
-+ ```gen_algorithm_inner```: generates a device function which computes the core computation. These functions assume that inputs are already loaded into GPU shared memory, require a pointer to additional scratch shared memory, and store the result back in shared memory.
-+ ```gen_algorithm_device```: generates a device function which handles the shared memory allocation for the ```_inner``` function. These functions still assume that inputs are already loaded into, and return results to, GPU shared memory.
-+ ```gen_algorithm_kernel```: generates a a kernel that handles the shared memory allocation for the ```_inner```  function. These functions assume that input are loaded into, and return results to, the global GPU memory.
-+ ```gen_algorithm_host```: generates a host function that wraps the ```_kernel``` and handles the transfer of inputs to the GPU and the results back to the CPU.
-+ ```gen_algorithm```: runs all of the above mention function generators
++ ```gen_algorithm_inner```: emits the placement-free single-step computational core (called from inside this algorithm's ``_device`` and from composing algorithms). Inputs are already in shared memory; takes ``s_temp`` (already placed).
++ ```gen_algorithm_device```: emits the canonical ``__device__`` orchestrator. Templated on placement flags (``SCRATCH_IN_SMEM`` etc.); owns its ``s_temp`` pool placement via the top-of-body ``if constexpr`` repoint; calls the algorithm's sub-inners (and other algorithms' ``_inner``) to produce the output.
++ ```gen_algorithm_kernel```: emits the ``__global__`` entry point. Allocates ``__shared__`` smem from the per-tier macro, loads inputs, calls ``_device`` with the per-tier flags, writes outputs back.
++ ```gen_algorithm_host```: emits the host function that wraps ``_kernel`` and handles H↔D transfer.
++ ```gen_algorithm```: runs all of the above generators in the right order.
 
 **Codegeneration helper functions are as follows:**
 

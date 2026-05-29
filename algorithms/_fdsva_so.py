@@ -146,12 +146,6 @@ def gen_fdsva_so_inner(self, use_thread_group = False):
 
     self.gen_add_end_function()
 
-def gen_fdsva_so_device_temp_mem_size(self):
-    # Same as idsva_so because idsva_so is called and takes more memory
-    NV = self.robot.get_num_vel()
-    jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
-    return int(36 * NV * 10 + 30 * NV + 6 + len(jids_a)*36)
-    
 def gen_fdsva_so_inner_temp_mem_size(self):
     n = self.robot.get_num_vel()
     return 4*n**3
@@ -252,18 +246,18 @@ def gen_fdsva_so_inner_function_call(self, use_thread_group = False, updated_var
     fdsva_so_code = fdsva_so_code_start + fdsva_so_code_middle + fdsva_so_code_end
     self.gen_add_code_line(fdsva_so_code)
 
-def gen_fdsva_so_full_inner_function_call(self, use_thread_group = False,
+def gen_fdsva_so_device_function_call(self, use_thread_group = False,
                                           scratch_in_smem_expr = "true",
                                           fd_grad_use_spill_expr = "false",
                                           contract_in_smem_expr = "true",
                                           d_workspace_pool_name = "nullptr",
                                           d_fd_grad_spill_name = "nullptr",
                                           s_fdsva_temp_name = "nullptr"):
-    """Emit the call to `fdsva_so_full_inner`. Arg order MUST match the def in
-    gen_fdsva_so_full_inner. Pool/spill regions default to nullptr (unused under
+    """Emit the call to `fdsva_so_device`. Arg order MUST match the def in
+    gen_fdsva_so_device. Pool/spill regions default to nullptr (unused under
     the matching if-constexpr); the kernel passes real pointers per tier."""
     tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + ">"
-    start = "fdsva_so_full_inner" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
+    start = "fdsva_so_device" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
            + s_fdsva_temp_name + ", d_robotModel, gravity);")
@@ -271,8 +265,8 @@ def gen_fdsva_so_full_inner_function_call(self, use_thread_group = False,
         start = start.replace("(", "(tgrp, ")
     self.gen_add_code_line(start + middle + end)
 
-def gen_fdsva_so_full_inner(self, use_thread_group = False):
-    """Emit `fdsva_so_full_inner` — the whole fdsva_so orchestration as ONE
+def gen_fdsva_so_device(self, use_thread_group = False):
+    """Emit `fdsva_so_device` — the whole fdsva_so orchestration as ONE
     inner that OWNS its scratch (s_temp) placement (inner-owns-placement; see
     docs/idsva_so_inner_refactor_notes.md). It wraps, in order:
       load_update_XImats -> direct_minv_inner -> forward_dynamics_inner ->
@@ -302,7 +296,7 @@ def gen_fdsva_so_full_inner(self, use_thread_group = False):
         "s_fdsva_temp is the 4*NV^3 contraction scratch (smem or workspace per CONTRACT_IN_SMEM)",
         "d_robotModel holds XImats/topology; gravity is the gravity constant",
     ]
-    func_def_start = "void fdsva_so_full_inner("
+    func_def_start = "void fdsva_so_device("
     func_def_middle = ("T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, "
                        "const T *s_q, const T *s_qd, const T *s_u, ")
     func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
@@ -349,65 +343,6 @@ def gen_fdsva_so_full_inner(self, use_thread_group = False):
         scratch_in_smem_expr = "CONTRACT_IN_SMEM")
     self.gen_add_end_function()
 
-def gen_fdsva_so_device(self, use_thread_group = False):
-    # NUM_VEL is the SO tensor dimension. See gen_fdsva_so_kernel for details.
-    n = self.robot.get_num_vel()
-    # construct the boilerplate and function definition
-    func_params = ["s_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
-                   "s_df_du is a pointer to memory for the derivative of forward dynamics WRT q,qd of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
-                   "s_q is the vector of joint positions", \
-                   "s_qd is the vector of joint velocities", \
-                   "s_u is the vector of joint control inputs", \
-                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "gravity is the gravity constant"]
-    func_notes = []
-    func_def_start = "void fdsva_so_device("
-    func_def_middle = "T *s_df2, T *s_df_du, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
-    func_def = func_def_start + func_def_middle + func_def_end
-
-    # then generate the code
-    self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dyamics with Spacial Vector Algebra)",\
-                          func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-
-    shared_mem_size = max(
-        self.gen_fdsva_so_device_temp_mem_size(),
-        self.gen_fdsva_so_inner_temp_mem_size(),
-        self.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
-    )
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_Minv", n*n), ("s_qdd", n), ("s_idsva_so", n*n*n*4)])
-    # NOTE: the device wrapper no longer declares a d_temp_spill local — the
-    # orchestration (incl. its own d_temp_spill placement) now lives entirely
-    # inside fdsva_so_full_inner below, so a wrapper-local one would be an unused
-    # variable. nvcc's -Werror build treats the resulting #177-D ("declared but
-    # never referenced") as an error, so the declaration is omitted here.
-
-    # The whole orchestration is the all-smem instantiation of the canonical
-    # fdsva_so_full_inner: SCRATCH_IN_SMEM=true (s_temp pool stays in smem),
-    # FD_GRAD_USE_SPILL=false (fd-gradient band stays in smem), CONTRACT_IN_SMEM=
-    # true (the 4*NV^3 contraction scratch stays in smem). The pool/spill device
-    # pointers are unused under these flags, so they pass as nullptr; the
-    # contraction nullptr (s_fdsva_temp_name) also routes through unused. Because
-    # full_inner is __forceinline__, this inlines to the exact code the device
-    # path used to hand-roll inline (load_update_XImats -> direct_minv_inner ->
-    # forward_dynamics_inner -> fd-gradient-inline -> idsva_so_{world,body}_inner
-    # -> fdsva_so_inner), so the emitted device path is byte-identical. The single
-    # call removes the duplicated orchestration this wrapper used to carry.
-    self.gen_fdsva_so_full_inner_function_call(use_thread_group,
-                                               scratch_in_smem_expr = "true",
-                                               fd_grad_use_spill_expr = "false",
-                                               contract_in_smem_expr = "true",
-                                               d_workspace_pool_name = "nullptr",
-                                               d_fd_grad_spill_name = "nullptr",
-                                               s_fdsva_temp_name = "nullptr")
-    self.gen_add_end_function()
-
 _FDSVA_SO_PICK_FLAGS = [
     # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv, use_workspace_idsva_temp)
     (False, False, False, False, False, False),   # pick 0: full smem
@@ -437,7 +372,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         else self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
     )
     if use_workspace_idsva_temp:
-        # Pool -> global: fdsva_so_full_inner runs with SCRATCH_IN_SMEM=false, so the
+        # Pool -> global: fdsva_so_device runs with SCRATCH_IN_SMEM=false, so the
         # WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad + idsva) lives
         # in d_workspace. The smem s_temp slot is unused -> size 0.
         shared_temp_size = 0
@@ -493,7 +428,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
         # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
         # contraction uses the same region in its later phase. See full inner.
-        self.gen_fdsva_so_full_inner_function_call(use_thread_group,
+        self.gen_fdsva_so_device_function_call(use_thread_group,
             scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
             fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
             contract_in_smem_expr = "false" if use_workspace_temp else "true",
@@ -519,7 +454,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
         if use_workspace_Minv:
             self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
-        self.gen_fdsva_so_full_inner_function_call(use_thread_group,
+        self.gen_fdsva_so_device_function_call(use_thread_group,
             scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
             fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
             contract_in_smem_expr = "false" if use_workspace_temp else "true",
@@ -621,9 +556,9 @@ def gen_fdsva_so_host(self, mode = 0):
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*" + ("1" if single_call_timing else "num_timesteps")
-    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_TEMP) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_TEMP) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
@@ -637,16 +572,14 @@ def gen_fdsva_so_host(self, mode = 0):
     self.gen_add_end_function()
 
 def gen_fdsva_so(self, use_thread_group = False):
-    # first generate the inner helper
+    # first the contraction sub-inner used by the orchestration _device
     self.gen_fdsva_so_inner(use_thread_group)
-    # then the orchestration inner (owns s_temp placement; used by the kernel)
-    self.gen_fdsva_so_full_inner(use_thread_group)
-    # then generate the device wrapper
+    # then the canonical _device (orchestrator: owns s_temp placement; called from kernel)
     self.gen_fdsva_so_device(use_thread_group)
-    # then generate the kernels
+    # then the kernels (call _device with caller-allocated smem)
     self.gen_fdsva_so_kernel(use_thread_group, True)
     self.gen_fdsva_so_kernel(use_thread_group, False)
-    # then generate the host wrappers
+    # then the host wrappers
     self.gen_fdsva_so_host(0)
     self.gen_fdsva_so_host(1)
     self.gen_fdsva_so_host(2)

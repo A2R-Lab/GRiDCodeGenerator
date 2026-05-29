@@ -28,13 +28,13 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_kernel, gen_forward_dynamics_host, gen_forward_dynamics, \
                             gen_inverse_dynamics_gradient_inner_temp_mem_size, gen_inverse_dynamics_gradient_temp_layout, \
                             gen_inverse_dynamics_gradient_kernel_max_temp_mem_size, \
-                            gen_inverse_dynamics_gradient_inner_function_call, gen_inverse_dynamics_gradient_inner, gen_inverse_dynamics_gradient_device, \
-                            gen_inverse_dynamics_gradient_full_inner, gen_inverse_dynamics_gradient_full_inner_function_call, \
+                            gen_inverse_dynamics_gradient_inner_function_call, gen_inverse_dynamics_gradient_inner, \
+                            gen_inverse_dynamics_gradient_device, gen_inverse_dynamics_gradient_device_function_call, \
                             gen_inverse_dynamics_gradient_kernel, gen_inverse_dynamics_gradient_host, gen_inverse_dynamics_gradient, \
                             gen_forward_dynamics_gradient_inner_temp_mem_size, gen_forward_dynamics_gradient_kernel_max_temp_mem_size, \
-                            gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_kernel, \
-                            gen_forward_dynamics_gradient_full_inner, gen_forward_dynamics_gradient_full_inner_function_call, \
-                            gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, gen_forward_dynamics_gradient_device_function_call, \
+                            gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_kernel, \
+                            gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_device_function_call, \
+                            gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, \
                             gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
@@ -55,15 +55,14 @@ class GRiDCodeGenerator:
                             gen_idsva_so_device, gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
                             gen_floating_gravity_d2tau_dq_temp_mem_size, gen_floating_gravity_d2tau_dq_shared_count, \
                             gen_floating_gravity_d2tau_dq_spill_count, gen_floating_gravity_d2tau_dq_lie_inline, \
-                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, gen_fdsva_so_device_temp_mem_size, \
-                            gen_fdsva_so_full_inner, gen_fdsva_so_full_inner_function_call, \
-                            gen_fdsva_so_device, gen_fdsva_so_kernel, gen_fdsva_so_host, \
+                            gen_fdsva_so, gen_fdsva_so_inner_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_inner_function_call, gen_fdsva_so_inner, \
+                            gen_fdsva_so_device, gen_fdsva_so_device_function_call, gen_fdsva_so_kernel, gen_fdsva_so_host, \
                             gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
                             gen_integrator_kernel, gen_integrator_host, gen_integrator, gen_lie_group_helpers, \
                             gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
                             gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, \
-                            gen_integrator_gradient_full_inner, gen_integrator_gradient_full_inner_function_call, gen_integrator_gradient_device, \
+                            gen_integrator_gradient_device, gen_integrator_gradient_device_function_call, \
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient
 
     # finally import the test code
@@ -639,7 +638,7 @@ class GRiDCodeGenerator:
         # (2*NV²); Level 5 also pushes s_Minv (NV²).
         fdsva_so_base_no_df_du = fdsva_so_base_t_count - 2*nv*nv
         fdsva_so_base_no_df_du_no_Minv = fdsva_so_base_no_df_du - nv*nv
-        # Level 6: pool -> global. fdsva_so_full_inner runs with SCRATCH_IN_SMEM=false,
+        # Level 6: pool -> global. fdsva_so_device runs with SCRATCH_IN_SMEM=false,
         # routing the WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad +
         # idsva) to d_workspace (reusing the non-concurrent contraction SO-temp region).
         # Smem then holds only the base: inputs + s_qdd + s_Minv + s_df_du + XI
@@ -740,7 +739,13 @@ class GRiDCodeGenerator:
                                  "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
                                  "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_body_frame_use_global_output)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_GLOBAL_TENSORS = " + str(int(self.fdsva_so_use_global_tensors)) + ";", \
+                                 # Single-bool kept for inline-CUDA back-compat (reflects PERF-pick only).
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_TEMP = " + str(int(self.fdsva_so_use_workspace_temp)) + ";", \
+                                 # Per-tier-aware gate (true if ANY of PERF/LITE/MINIMAL spills any band
+                                 # of the s_temp pool to d_workspace; picks >= 2 cover spill_temp,
+                                 # spill_fd_grad_band, spill_df_du, spill_Minv, pool_global). The host
+                                 # uses this to pin L2 persistence on d_workspace for the per-tier path.
+                                 "const int GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 2 for p in self.fdsva_so_spill_tier_3way) else 0) + ";", \
                                  # GRID_D2EE_USES_WORKSPACE_TEMP: 1 if the PERF tier spills the d2ee output
                                  # (the only large buffer in the new FD-on-Jacobian path) to global memory.
                                  # When spilled, the inner writes directly into d_d2eePos (the persistent
@@ -871,8 +876,6 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t ID_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FD_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t ID_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t FD_DU_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t ABA_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_PERF)    return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.aba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
