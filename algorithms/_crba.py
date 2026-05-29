@@ -454,8 +454,13 @@ def gen_crba_device(self):
     shared_mem_size = self.gen_crba_device_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
 
-    # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call()
+    # then load/update XI and run the algo.
+    # A.3 surgical lever: CRBA never reads s_XImats[0..35] (the floating root
+    # spatial transform X[0]) — Phase 1 BFS starts at level 1, and Phase 2's
+    # chain walk only dereferences X[X_id] for X_id in {jid, ancestors[:-1]};
+    # the root id 0 only appears as `anc`, never as `X_id`. So we skip
+    # recomputing X[0] from the floating-base quaternion on every call.
+    self.gen_load_update_XImats_helpers_function_call(skip_floating_base_X=True)
     self.gen_crba_inner_function_call()
     self.gen_add_end_function()
 
@@ -479,8 +484,10 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
         else:
             self.gen_add_code_line("(void)d_workspace;")
         # compute
+        # A.3 surgical lever: skip the floating-base X[0] recompute on every
+        # CRBA call (see gen_crba_device for the trace argument).
         self.gen_add_code_line("// compute")
-        self.gen_load_update_XImats_helpers_function_call()
+        self.gen_load_update_XImats_helpers_function_call(skip_floating_base_X=True)
         self.gen_crba_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
@@ -503,7 +510,8 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd",str(input_count),feedback_from="M")
-        self.gen_load_update_XImats_helpers_function_call()
+        # A.3 surgical lever: skip floating-base X[0] recompute (CRBA-safe).
+        self.gen_load_update_XImats_helpers_function_call(skip_floating_base_X=True)
         self.gen_crba_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"))

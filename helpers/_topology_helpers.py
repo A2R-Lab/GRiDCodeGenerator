@@ -173,7 +173,21 @@ def gen_load_update_XImats_helpers_temp_mem_size(self):
     n = self.robot.get_num_pos()
     return 2*n
 
-def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None):
+def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None,
+                                                 skip_floating_base_X = False):
+    """Emit a call to load_update_XImats_helpers.
+
+    skip_floating_base_X (CRBA-only surgical lever, A.3): when True AND the robot
+    has a floating base, the called specialization elides the per-call
+    recomputation of the floating root spatial transform X[0] (the heavy
+    quaternion->rotation block emitted on the single-thread serial path).
+    CRBA never dereferences s_XImats[0..35] (Phase-1 BFS starts at level 1, and
+    Phase-2's chain walk only reads X[X_id] for X_id in {jid} ∪ ancestors[:-1]
+    — the root 0 only appears as `anc`, never as `X_id`), so the work is dead
+    for CRBA. Other algorithms (ID/FD/Minv/ABA/integrator/IDSVA-SO/EE-pose)
+    keep the default False — they walk the root X. Has no effect on fixed-base
+    robots.
+    """
     var_names = dict( \
         s_XImats_name = "s_XImats", \
         d_robotModel_name = "d_robotModel", \
@@ -184,7 +198,8 @@ def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None)
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "load_update_XImats_helpers<T>(" + var_names["s_XImats_name"] + ", " + var_names["s_q_name"] + ", "
+    tparams = "<T, true>" if (skip_floating_base_X and self.robot.floating_base) else "<T>"
+    code_start = "load_update_XImats_helpers" + tparams + "(" + var_names["s_XImats_name"] + ", " + var_names["s_q_name"] + ", "
     code_end = var_names["d_robotModel_name"] + ", " + var_names["s_temp_name"] + ");"
     n = self.robot.get_num_pos()
     # Always pass s_topology_helpers (uniform signature; nullptr for serial chains).
@@ -230,7 +245,14 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
     func_def = func_def_start + func_def_middle + func_def_end
     # then genearte the code
     self.gen_add_func_doc("Updates the Xmats in (shared) GPU memory acording to the configuration",[],func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    # SKIP_FLOATING_BASE_X: A.3 surgical lever. When true AND the robot has a
+    # floating base, elide the per-call recomputation of X[0] (the floating
+    # root spatial transform's heavy quaternion->rotation block). CRBA never
+    # reads s_XImats[0..35] (the BFS body recursion starts at level 1 and the
+    # M-fill chain walk only uses X[X_id] for X_id != 0). Fixed-base robots
+    # ignore the flag (X[0] is a regular joint). Default false keeps every
+    # other algorithm (ID/FD/Minv/ABA/IDSVA-SO/integrator/EE-pose) unchanged.
+    self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false>")
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # test to see if we need to compute any trig functions
@@ -264,6 +286,15 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
     # loop through Xmats and update all non-constant values serially
     self.gen_add_serial_ops()
     for ind in range(n):
+        # A.3 lever: skip the floating-base root X[0] block under
+        # SKIP_FLOATING_BASE_X. The quat->rot expansion below is the bulk of
+        # this serial section; it's dead for CRBA (see function docstring).
+        # Includes the X_hom / dX_hom / d2X_hom emits below for ind==0 since
+        # CRBA doesn't request hom transforms anyway, and skipping them all
+        # together keeps the elision a single contiguous if-constexpr block.
+        wrap_skip = self.robot.floating_base and ind == 0
+        if wrap_skip:
+            self.gen_add_code_line("if constexpr (!SKIP_FLOATING_BASE_X) {", True)
         self.gen_add_code_line("// X[" + str(ind) + "]")
         for col in range(3): # TL and BR are identical so only update TL and BL serially
             for row in range(6):
@@ -360,11 +391,18 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                         # then output the code
                         cpp_ind = str(baseXI_size + Xhom_size + dXhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
+        if wrap_skip:
+            # close A.3 SKIP_FLOATING_BASE_X if-constexpr block (opened above)
+            self.gen_add_end_control_flow()
 
     # end the serial section
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    # then copy the TL to BR in parallel across all 6x6 X
+    # then copy the TL to BR in parallel across all 6x6 X.
+    # CRBA also never reads s_XImats[21..35] (X[0] BR block) but the parallel
+    # loop is a thin coalesced shared->shared copy (negligible cost) and
+    # keeping it joint-uniform avoids per-tier branching; intentionally not
+    # gated by SKIP_FLOATING_BASE_X.
     self.gen_add_parallel_loop("kcr",str(9*self.robot.get_num_joints()))
     self.gen_add_code_line("int k = kcr / 9; int cr = kcr % 9; int c = cr / 3; int r = cr % 3;")
     self.gen_add_code_line("int srcInd = k*36 + c*6 + r; int dstInd = srcInd + 21; // 3 more rows and cols")
