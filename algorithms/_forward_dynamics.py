@@ -135,30 +135,48 @@ def gen_forward_dynamics_inner(self):
 
 def gen_forward_dynamics_device(self):
     n = self.robot.get_num_vel()
-    # construct the boilerplate and function definition
+    # Inline-CUDA device path. Tier-aware via tier_workspace_expr (mirrors
+    # idsva_so_device / d2ee_device / id_du_device): at TIER_PERF the whole
+    # FD inner s_temp arena lives in shared memory (with MINV_F at its tail);
+    # at TIER_LITE/TIER_MINIMAL the WHOLE arena is routed to L2-pinned
+    # d_workspace, freeing smem for the caller's outer kernel. The inner is
+    # called with MINV_F_IN_SMEM=true in both cases because the arena pointer
+    # (s_temp or d_workspace) already holds the F tail correctly.
+    shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
     func_params = ["s_qdd is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                    "s_u is the vector of joint input torques", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "gravity is the gravity constant"]
+                   "gravity is the gravity constant", \
+                   "d_workspace is the global scratch buffer; size FD_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
     func_def_start = "void forward_dynamics_device(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    func_notes = []
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
+    func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the whole FD inner scratch (~" + str(shared_mem_size) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel.",
+                  "The inner-temp arena holds the (6*NUM_VEL*NUM_VEL) Minv-F band at its tail, so routing the whole arena to d_workspace also spills the F-band; this is the device-path analog of the kernel's MINV_F_IN_SMEM lever (which surgically spills only F)."]
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # Inline-CUDA device path keeps the internal Minv F in smem (MINV_F_IN_SMEM
-    # =true); the inner slices it from s_temp itself, so the arena is sized to
-    # include it.
-    shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
-    # then load/update XI and run the algo
+    # Tier-aware arena: at TIER_PERF s_temp lives in the smem arena; at
+    # TIER_LITE/MINIMAL the s_temp slot is sourced from d_workspace and the
+    # arena allocation skips it entirely (freeing ~120 KB on humanoid-scale
+    # robots so an inline caller can fit FD into a 100 KB box).
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True,
+                                                    tier_workspace_expr="d_workspace")
+    # then load/update XI and run the algo. The XImats helper writes its
+    # sincos scratch through s_temp, which has already been repointed at the
+    # workspace under non-PERF tiers, so the helper still has a valid pointer.
     self.gen_load_update_XImats_helpers_function_call()
-    self.gen_forward_dynamics_inner_function_call(minv_f_in_smem_expr = "true")
+    # The inner is called with MINV_F_IN_SMEM=true because the s_temp pointer
+    # itself already routes per tier (smem at PERF, workspace at LITE+); the
+    # inner's MINV_F lever stays "true" in both cases, treating s_temp as the
+    # backing arena. d_workspace is not separately dereferenced by the inner
+    # under this PERF=smem / non-PERF=workspace whole-arena routing.
+    self.gen_forward_dynamics_inner_function_call(minv_f_in_smem_expr = "true",
+                                                  updated_var_names = dict(d_workspace_name = "nullptr"))
     self.gen_add_end_function()
 
 def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
