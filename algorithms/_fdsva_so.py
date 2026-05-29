@@ -23,9 +23,6 @@ def gen_fdsva_so_contract(self, use_thread_group = False):
                   "kernel/device caller just sizes both arenas from the exposed *_BYTES constants",
                   "and hands both pointers in. Codegen maps each RESOURCE_TIER to a SCRATCH_IN_SMEM",
                   "value per robot (small robots keep all tiers in smem; large robots spill)."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -3)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Second Order of Forward Dynamics with Spatial Vector Algebra", func_notes, func_params, None)
@@ -240,8 +237,6 @@ def gen_fdsva_so_contract_function_call(self, use_thread_group = False, updated_
             var_names[key] = value
     fdsva_so_code_start = "fdsva_so_contract<T, " + scratch_in_smem_expr + ">(" + var_names["s_df2_name"] + ", " + var_names["s_idsva_so_name"] + ", " + var_names["s_Minv_name"] + ", " + var_names["s_df_du_name"] + ", "
     fdsva_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
-    if use_thread_group:
-        id_code_start = id_code_start.replace("(","(tgrp, ")
     fdsva_so_code_middle = self.gen_insert_helpers_function_call()
     fdsva_so_code = fdsva_so_code_start + fdsva_so_code_middle + fdsva_so_code_end
     self.gen_add_code_line(fdsva_so_code)
@@ -261,8 +256,6 @@ def gen_fdsva_so_device_function_call(self, use_thread_group = False,
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
            + s_fdsva_temp_name + ", d_robotModel, gravity);")
-    if use_thread_group:
-        start = start.replace("(", "(tgrp, ")
     self.gen_add_code_line(start + middle + end)
 
 def gen_fdsva_so_device(self, use_thread_group = False):
@@ -301,9 +294,6 @@ def gen_fdsva_so_device(self, use_thread_group = False):
                        "const T *s_q, const T *s_qd, const T *s_u, ")
     func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
                     "const robotModel<T> *d_robotModel, const T gravity) {")
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
@@ -398,8 +388,6 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("(void)d_idsva_so;")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F
     # from s_temp (smem; this kernel does not surgically spill Minv/FD-F — its
     # tiers spill the SO outputs / df_du / Minv instead).

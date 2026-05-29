@@ -209,12 +209,7 @@ class GRiDCodeGenerator:
             "#define GRID_CUB_HEADER_AVAILABLE 0",
             "#endif",
         ])
-        if use_thread_group:
-            self.gen_add_code_line("#include <cooperative_groups.h>")
-            self.gen_add_code_line("#include <cooperative_groups/memcpy_async.h>")
         # then any namespaces
-        if use_thread_group:
-            self.gen_add_code_line("namespace cgrps = cooperative_groups;")
         # then any #defines
         self.gen_add_code_lines(["// single kernel timing helper code", \
             "#define time_delta_us_timespec(start,end) (1e6*static_cast<double>(end.tv_sec - start.tv_sec)+1e-3*static_cast<double>(end.tv_nsec - start.tv_nsec))"])

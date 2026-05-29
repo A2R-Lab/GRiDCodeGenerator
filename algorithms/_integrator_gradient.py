@@ -587,8 +587,6 @@ def gen_integrator_gradient_device_function_call(self, use_thread_group=False, c
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
            + "d_robotModel, gravity, dt);")
-    if use_thread_group:
-        start = start.replace("(", "(tgrp, ", 1)
     self.gen_add_code_line(start + middle + end)
 
 
@@ -650,9 +648,6 @@ def gen_integrator_gradient_device(self, use_thread_group=False, compute_x_kp1=F
                        "T *s_D_qdd_stage, T *s_dInt_q_6x6, T *s_dInt_v_6x6, ")
     func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
                     "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("integrator gradient orchestration as a single inner-owns-placement device function",
@@ -802,8 +797,6 @@ def gen_integrator_gradient_kernel(self, use_thread_group=False, compute_x_kp1=F
         # d_temp_spill is the id_du da_df band region (rung 1); always declared so the
         # device call can reference it (nullptr unless inner_level==1).
         self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-        if use_thread_group:
-            self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
 
         def _emit_spill_pointers(slot_expr):
             # Slice the de-aliased multi-band workspace base pointers. The 3 distinct

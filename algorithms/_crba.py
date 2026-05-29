@@ -25,8 +25,6 @@ def gen_crba_inner_function_call(self, use_thread_group = False, updated_var_nam
             var_names[key] = value
     crba_code_start = "crba_inner<T, " + temp_in_smem_expr + ">(" + var_names["s_M_name"] + ", " +  var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
     crba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
-    if use_thread_group:
-        id_code_start = id_code_start.replace("(","(tgrp, ")
     crba_code_middle = self.gen_insert_helpers_function_call()
     crba_code = crba_code_start + crba_code_middle + crba_code_end
     self.gen_add_code_line(crba_code)
@@ -53,9 +51,6 @@ def gen_crba_inner(self, use_thread_group = False):
     func_def_start = "void crba_inner("
     func_def_middle = "T *s_M, const T *s_q, const T *s_qd, "
     func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
 
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
@@ -215,9 +210,6 @@ def gen_crba_inner_floating(self, use_thread_group = False):
     func_def_start = "void crba_inner("
     func_def_middle = "T *s_M, const T *s_q, const T *s_qd, "
     func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Compute the Floating-Base Composite Rigid Body Algorithm", func_notes, func_params, None)
@@ -349,9 +341,6 @@ def gen_crba_device(self, use_thread_group = False):
     func_def_start = "void crba_device("
     func_def_middle = "T *s_M, const T *s_q, const T *s_qd,"
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
 
     func_def = func_def_start + func_def_middle + func_def_end
 
@@ -378,8 +367,6 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
     shared_mem_size = 0 if use_workspace_temp else self.gen_crba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)

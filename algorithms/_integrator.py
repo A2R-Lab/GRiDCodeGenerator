@@ -302,8 +302,6 @@ def gen_integrator_finish_function_call(self, integrator_type="IT", use_thread_g
             var_names["s_qd_name"] + ", " +
             var_names["s_qdd_name"] + ", " +
             var_names["dt_name"] + ");")
-    if use_thread_group:
-        code = code.replace("(", "(tgrp, ", 1)
     self.gen_add_code_line(code)
 
 
@@ -328,9 +326,6 @@ def gen_integrator_finish(self, use_thread_group=False):
     func_notes = ["Assumes s_qdd is already computed for the current (s_q, s_qd, s_u)",
                   "Floating-base: q-update uses an SE(3) Lie-group retract (grid_integrate_floating_q)",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values"]
-    if use_thread_group:
-        func_def = func_def.replace("(", "(cgrps::thread_group tgrp, ", 1)
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Finish the integrator step: write x_{k+1} from (q, qd, qdd) per the integrator type",
                           func_notes, func_params, None)
     self.gen_add_code_line("template <typename T, IntegratorType IT>")
@@ -406,8 +401,6 @@ def gen_integrator_inner_function_call(self, integrator_type="IT", use_thread_gr
                 var_names["gravity_name"] + ", " +
                 var_names["dt_name"] + ");")
     code_middle = self.gen_insert_helpers_function_call()
-    if use_thread_group:
-        code_start = code_start.replace("(", "(tgrp, ", 1)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 
@@ -470,9 +463,6 @@ def gen_integrator_inner(self, use_thread_group=False):
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "MINV_F_IN_SMEM selects where the FD inner's Minv 6*NV*NV F-region lives (s_temp vs d_workspace)",
                   "For Midpoint/RK3/RK4, re-runs forward_dynamics at intermediate states and weights stage qdd outputs."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ", 1)
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Computes a single integrator step (x_{k+1} = integrator(x_k, u_k, dt))",
                           func_notes, func_params, None)
     self.gen_add_code_line("template <typename T, IntegratorType IT, bool MINV_F_IN_SMEM = true>")
@@ -650,9 +640,6 @@ def gen_integrator_device(self, use_thread_group=False):
                    "dt is the integration timestep"]
     func_def_start = "void integrator_device(T *s_x_kp1, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt) {"
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ", 1)
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Computes a single integrator step using the precomputed robotModel",
                           [], func_params, None)
     self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER>")
@@ -695,8 +682,6 @@ def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_ti
         "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
     )
     minv_f_expr = "false" if spill_minv_F else "true"
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     out_count = 2 * n + fb  # nq + nv
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", use_thread_group, block_level=True)

@@ -37,9 +37,6 @@ def gen_aba_inner_floating(self, use_thread_group = False):
                   "  TEMP_IN_SMEM=true, COLD_IN_SMEM=true  : PERF, everything in s_temp (byte-identical to the original).",
                   "  TEMP_IN_SMEM=true, COLD_IN_SMEM=false : SURGICAL -- hot recursion stays in s_temp, only the cold vcross slab [36*NJ,72*NJ) and the fb* root tail [140*NJ,140*NJ+138) spill to d_cold (=d_workspace sub-offset), packed back-to-back.",
                   "Caller sizes the arenas from ABA_INNER_{SMEM,WORKSPACE,COLD}_BYTES."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Floating-Base Articulated Body Algorithm", func_notes, func_params, None)
@@ -289,9 +286,6 @@ def gen_aba_inner(self, use_thread_group = False):
                   "  TEMP_IN_SMEM=true, COLD_IN_SMEM=true  : PERF, everything in s_temp (byte-identical to the original).",
                   "  TEMP_IN_SMEM=true, COLD_IN_SMEM=false : SURGICAL -- hot recursion stays in s_temp, only the cold tempMat slab [98*NJ,140*NJ) spills to d_cold (=d_workspace sub-offset).",
                   "Caller sizes the arenas from ABA_INNER_{SMEM,WORKSPACE,COLD}_BYTES."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Articulated Body Algorithm", func_notes, func_params, None)
@@ -723,8 +717,6 @@ def gen_aba_inner_function_call(self, use_thread_group = False, updated_var_name
             var_names[key] = value
     aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ", " + cold_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
     aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
-    if use_thread_group:
-        id_code_start = id_code_start.replace("(","(tgrp, ")
     aba_code_middle = self.gen_insert_helpers_function_call()
     aba_code = aba_code_start + aba_code_middle + aba_code_end
     self.gen_add_code_line(aba_code)
@@ -743,9 +735,6 @@ def gen_aba_device(self, use_thread_group = False):
     func_def_start = "void aba_device("
     func_def_middle = "T *s_qdd, const T *s_q, const T *s_qd, const T *s_tau, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
 
     # then generate the code
@@ -793,8 +782,6 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_
         shared_mem_size = self.gen_aba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", nv), ("s_q_qd_tau", input_count), ("s_va", 12*n)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(nq + nv) + "];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     # per-timestep workspace base expr (k-indexed in the batched kernel, slot 0 for single-timing)
     ws_base = "&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]" if not single_call_timing else "d_workspace"
     if not single_call_timing:

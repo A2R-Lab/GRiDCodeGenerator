@@ -88,8 +88,6 @@ def gen_inverse_dynamics_gradient_inner_function_call(self, use_thread_group = F
     id_du_code_start = "inverse_dynamics_gradient_inner<T, " + var_names["temp_spill_flag_name"] + ">(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
     id_du_code_middle = var_names["s_vaf_name"] + ", " + self.gen_insert_helpers_function_call()
     id_du_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
-    if use_thread_group:
-        id_du_code_start = id_du_code_start.replace("(","(tgrp, ")
     id_du_code = id_du_code_start + id_du_code_middle + id_du_code_end
     self.gen_add_code_line(id_du_code)
 
@@ -113,9 +111,6 @@ def gen_inverse_dynamics_gradient_inner(self, use_thread_group = False):
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "This is the id_du band sub-inner (the stable surface composed by fd_du / integrator_gradient). It does NOT own s_temp placement; the USE_DA_DF_SPILL band selectively spills its da_dq..fxvi band to d_temp_spill via grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>. The whole-pool placement is owned by the wrapping inverse_dynamics_gradient_device."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
@@ -960,8 +955,6 @@ def gen_inverse_dynamics_gradient_device_function_call(self, use_thread_group = 
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
            + "d_robotModel, gravity);")
-    if use_thread_group:
-        start = start.replace("(", "(tgrp, ")
     self.gen_add_code_line(start + middle + end)
 
 def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd_input = False):
@@ -1006,9 +999,6 @@ def gen_inverse_dynamics_gradient_device(self, use_thread_group = False, use_qdd
         func_def_start += "const T *s_qdd, "
     func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
                     "const robotModel<T> *d_robotModel, const T gravity) {")
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     if use_qdd_input:
         func_params.insert(4, "s_qdd is the vector of joint accelerations")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
@@ -1061,8 +1051,6 @@ def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         if use_qdd_input:

@@ -67,25 +67,15 @@ def gen_add_func_doc(self, func_desc, notes = [], params = [], return_val = None
     self.gen_add_code_line(" */")
 
 def gen_add_serial_ops(self, use_thread_group = False):
-    if use_thread_group:
-        self.gen_add_code_line("if(tgrp.thread_rank() == 0){", True)
-    else:
-        self.gen_add_code_line("if(threadIdx.x == 0 && threadIdx.y == 0){", True)
+    self.gen_add_code_line("if(threadIdx.x == 0 && threadIdx.y == 0){", True)
 
 def gen_add_parallel_loop(self, var_name, max_val, use_thread_group = False, block_level = False):
     if block_level:
-        if use_thread_group:
-            print("![ERROR]: BLOCK LEVEL THREAD GROUP LOOP NOT IMPLEMENTED YET")
-        else:
-            code = "for(int " + var_name + " = blockIdx.x + blockIdx.y*gridDim.x; " + \
-                        var_name + " < " + max_val + "; " + var_name + " += gridDim.x*gridDim.y){"
+        code = "for(int " + var_name + " = blockIdx.x + blockIdx.y*gridDim.x; " + \
+                    var_name + " < " + max_val + "; " + var_name + " += gridDim.x*gridDim.y){"
     else:
-        if use_thread_group:
-            code = "for(int " + var_name + " = tgrp.thread_rank(); " + \
-                        var_name + " < " + max_val + "; " + var_name + " += tgrp.size()){"
-        else:
-            code = "for(int " + var_name + " = threadIdx.x + threadIdx.y*blockDim.x; " + \
-                        var_name + " < " + max_val + "; " + var_name + " += blockDim.x*blockDim.y){"
+        code = "for(int " + var_name + " = threadIdx.x + threadIdx.y*blockDim.x; " + \
+                    var_name + " < " + max_val + "; " + var_name + " += blockDim.x*blockDim.y){"
     self.gen_add_code_line(code, True)
 
 def gen_static_array_ind_2d(self, col, row, col_stride = 6):
@@ -95,10 +85,7 @@ def gen_static_array_ind_3d(self, ind, col, row, ind_stride = 36, col_stride = 6
     return ind_stride*ind + col_stride*col + row
 
 def gen_add_sync(self, use_thread_group = False):
-    if use_thread_group:
-        self.gen_add_code_line("tgrp.sync();")
-    else:
-        self.gen_add_code_line("__syncthreads();")
+    self.gen_add_code_line("__syncthreads();")
 
 def gen_add_debug_print_code_line(self, print_code_string, use_thread_group = False):
     self.gen_add_sync(use_thread_group)

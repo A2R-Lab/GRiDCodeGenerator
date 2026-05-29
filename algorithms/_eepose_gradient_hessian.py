@@ -25,8 +25,6 @@ def gen_end_effector_pose_inner_function_call(self, use_thread_group = False, up
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end =  var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group and serial chains
-    if use_thread_group:
-        code_start = code_start.replace("(","(tgrp, ")
     # Canonical: append the shared topology-helper arg via the central helper
     # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
     # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
@@ -53,9 +51,6 @@ def gen_end_effector_pose_inner(self, use_thread_group = False, fixed_target_nam
     func_def_start = "void end_effector_pose_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_eePos, const T *s_q, const T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
     # now generate the code
@@ -187,9 +182,6 @@ def gen_end_effector_pose_device(self, use_thread_group = False, fixed_target_na
     func_def_start = "void end_effector_pose_device" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_eePos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the End Effector Position",\
@@ -233,8 +225,6 @@ def gen_end_effector_pose_kernel(self, use_thread_group = False, single_call_tim
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n), ("s_eePos", 6*num_ees)],
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
@@ -365,8 +355,6 @@ def gen_end_effector_pose_gradient_inner_function_call(self, use_thread_group = 
     code_middle = var_names["s_Xhom_name"] + ", " + var_names["s_dXhom_name"] + ", "
     code_end =  var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
-    if use_thread_group:
-        code_start = code_start.replace("(","(tgrp, ")
     # Canonical: append the shared topology-helper arg via the central helper
     # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
     # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
@@ -468,9 +456,6 @@ def gen_end_effector_pose_gradient_inner(self, use_thread_group = False, fixed_t
     func_def_start = "void end_effector_pose_gradient_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, "
     func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to generalized velocity (d/dv tangent, pinocchio convention)",
@@ -1096,9 +1081,6 @@ def gen_end_effector_pose_gradient_device(self, use_thread_group = False, fixed_
     func_def_start = "void end_effector_pose_gradient_device" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_deePos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the Gradient of the End Effector Pose with respect to joint position",\
@@ -1153,8 +1135,6 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     eegrad_temp_off = "GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()"
     if use_workspace_dxhom:
         eegrad_temp_off += " + sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT)"
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)
@@ -1371,8 +1351,6 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_robotModel_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
-    if use_thread_group:
-        code_start = code_start.replace("(","(tgrp, ")
     # Canonical: append the shared topology-helper arg via the central helper
     # (NO_XI: the ee_pose family takes s_Xhom, not s_XImats). Mirrors the def's
     # gen_insert_helpers_func_def_params(NO_XI_FLAG=True) so def + call can't drift.
@@ -1517,9 +1495,6 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, unsigned char *s_linalg_smem) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc(
@@ -2226,9 +2201,6 @@ def gen_end_effector_pose_gradient_hessian_device(self, use_thread_group = False
     func_def_start = "void end_effector_pose_gradient_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the Hessian (and Jacobian) of the End Effector Pose with respect to generalized velocity (d^2/dv^2 tangent, pinocchio convention)",\
@@ -2280,8 +2252,6 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     out_in_smem_expr = "false" if use_workspace_output else "true"
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q","stride_q",str(n),use_thread_group)

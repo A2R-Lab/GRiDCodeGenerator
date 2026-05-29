@@ -91,8 +91,6 @@ def gen_forward_dynamics_gradient_device_function_call(self, use_thread_group = 
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
            + "d_robotModel, gravity);")
-    if use_thread_group:
-        start = start.replace("(", "(tgrp, ")
     self.gen_add_code_line(start + middle + end)
 
 def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd_Minv_input = False):
@@ -156,9 +154,6 @@ def gen_forward_dynamics_gradient_device(self, use_thread_group = False, use_qdd
         func_def_start += "T *s_vaf, T *s_dc_du, T *s_qdd, T *s_Minv, "
     func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
                     "const robotModel<T> *d_robotModel, const T gravity) {")
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("fd_du orchestration as a single inner-owns-placement device function",
@@ -220,8 +215,6 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
         self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
     else:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         if use_qdd_Minv_input:

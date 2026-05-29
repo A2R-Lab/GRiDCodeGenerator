@@ -777,8 +777,6 @@ def gen_idsva_so_body_frame_inner_function_call(self, use_thread_group = False, 
     # (s_temp, d_workspace, d_robotModel, gravity). `d_temp_spill` is the kernel-local
     # typed view into d_workspace; the inner loads s_XImats from d_robotModel internally.
     id_so_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["d_robotModel_name"] + ", " + var_names["gravity_name"] + ");"
-    if use_thread_group:
-        id_so_code_start = id_so_code_start.replace("(","(tgrp, ")
     id_so_code = id_so_code_start + id_so_code_middle + id_so_code_end
     self.gen_add_code_line(id_so_code)
 
@@ -963,9 +961,6 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_thread_group = Fa
         "Floating diagnostic path: body-indexed spatial state plus packed velocity-indexed derivative columns.",
         "d2tau_dq is assembled analytically in velocity-coordinate tensor space.",
     ]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
 
     self.gen_add_func_doc("Computes floating-base second-order inverse dynamics diagnostics",func_notes,func_params,None)
@@ -1363,9 +1358,6 @@ def gen_idsva_so_body_frame_inner(self, use_thread_group = False, use_qdd_input 
     # sincos scratch, since the helper now runs INSIDE after the repoint) is the inner's
     # call. Mirrors fdsva_so_device / crba_inner.
     func_notes = ["Loads/updates s_XImats from s_q internally (helper runs after the SCRATCH_IN_SMEM repoint so its scratch follows the placement)"]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
@@ -2324,9 +2316,6 @@ def gen_idsva_so_body_frame_device(self, use_thread_group = False, use_qdd_input
     func_def_start = "void idsva_so_body_frame_device(T *s_idsva_so, const T *s_q, const T *s_qd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
     func_notes = []
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     if use_qdd_input:
         func_def_start += "const T *s_qdd, "
         func_params.insert(-2,"s_qdd is the vector of joint accelerations")
@@ -2652,9 +2641,6 @@ def gen_idsva_so_world_frame_inner(self, use_thread_group = False, use_qdd_input
         "Mirrors RBDReference.idsva_so_world_frame (port of spatial_v2_extended ID_SO_derivatives.m).",
         "SIMT-parallel: pleasingly parallel phases distribute across threads; sequential phases (Xup, forward sweep, per-(i,p)/(j,t) intermediates) run under a thread-0 guard.",
     ]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(", "(cgrps::thread_group tgrp, ")
-        func_params.insert(0, "tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
 
     self.gen_add_func_doc(
@@ -3246,8 +3232,6 @@ def gen_idsva_so_world_frame_inner_function_call(self, use_thread_group = False,
     # `d_temp_spill` is the kernel-local typed view into d_workspace (nullptr at the full
     # rung). d_robotModel is forwarded so the inner can own the XImats load.
     id_so_code_end = "s_temp, d_temp_spill, d_robotModel, gravity);"
-    if use_thread_group:
-        id_so_code_start = id_so_code_start.replace("(", "(tgrp, ")
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
@@ -3461,9 +3445,6 @@ def gen_idsva_so_device(self, use_thread_group = False, use_qdd_input = True):
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
     func_notes = ["Dispatches to " + frame_label + "_inner at codegen time (" + ("world for floating-base" if self.robot.floating_base else "body for fixed-base") + ").",
                   "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the inner scratch moves from s_temp to d_workspace, freeing shared memory for the caller's outer kernel"]
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics (frame picked at codegen time)", func_notes, func_params, None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")

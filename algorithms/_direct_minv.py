@@ -40,8 +40,6 @@ def gen_direct_minv_inner_function_call(self, use_thread_group = False, updated_
     minv_code_start = "direct_minv_inner<T, " + f_in_smem_expr + ">(" + var_names["s_Minv_name"] + ", " + var_names["s_q_name"] + ", "
     minv_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ");"
     minv_code_middle = self.gen_insert_helpers_function_call()
-    if use_thread_group:
-        minv_code_start = minv_code_start.replace("(","(tgrp, ")
     minv_code = minv_code_start + minv_code_middle + minv_code_end
     self.gen_add_code_line(minv_code)
 
@@ -68,9 +66,6 @@ def gen_direct_minv_inner(self, use_thread_group = False):
     func_def_end = "T *s_temp, T *d_workspace) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -1)
     func_def = func_def_start + func_def_end
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Compute the inverse of the mass matrix",\
                           func_notes,func_params,None)
     self.gen_add_code_line("template <typename T, bool F_IN_SMEM = true>")
@@ -536,9 +531,6 @@ def gen_direct_minv_device(self, use_thread_group = False):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
     func_def = "void direct_minv_device(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel){"
     func_notes = ["Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
-    if use_thread_group:
-        func_def = func_def.replace("(","(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     # then generate the code
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
@@ -565,8 +557,6 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing, u
     else:
         shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n_pos), ("s_Minv", n*n)], include_linalg_scratch=True)
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q","stride_q",str(n_pos),use_thread_group)

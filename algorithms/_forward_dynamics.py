@@ -30,8 +30,6 @@ def gen_forward_dynamics_finish_function_call(self, use_thread_group = False, up
             var_names[key] = value
     code = "forward_dynamics_finish<T>(" + var_names["s_qdd_name"] + ", " + var_names["s_u_name"] + ", " + \
                                            var_names["s_c_name"] + ", " + var_names["s_Minv_name"] + ");"
-    if use_thread_group:
-        code = code.replace("(","(tgrp, ")
     self.gen_add_code_line(code)
 
 def gen_forward_dynamics_finish(self, use_thread_group = False):
@@ -44,9 +42,6 @@ def gen_forward_dynamics_finish(self, use_thread_group = False):
     func_def = "void forward_dynamics_finish(T *s_qdd, const T *s_u, const T *s_c, const T *s_Minv) {"
     func_notes = ["Assumes s_Minv and s_c are already computed", 
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values"]
-    if use_thread_group:
-        func_def = func_def.replace("(","(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     self.gen_add_func_doc("Finish the forward dynamics computation with qdd = Minv*(u-c)",func_notes,func_params,None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
@@ -87,8 +82,6 @@ def gen_forward_dynamics_inner_function_call(self, use_thread_group = False, upd
                                                    var_names["s_qd_name"] + ", " + var_names["s_u_name"] + ", "
     fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
     fd_code_middle = self.gen_insert_helpers_function_call()
-    if use_thread_group:
-        fd_code_start = fd_code_start.replace("(","(tgrp, ")
     fd_code = fd_code_start + fd_code_middle + fd_code_end
     self.gen_add_code_line(fd_code)
 
@@ -109,9 +102,6 @@ def gen_forward_dynamics_inner(self, use_thread_group = False):
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values",
                   "Inner-controlled placement: MINV_F_IN_SMEM selects where the internal Minv 6*NV*NV F-region lives (s_temp tail vs d_workspace). Decided here; caller sizes both arenas from FD_INNER_*_BYTES and hands both pointers in."]
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(","(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
@@ -155,9 +145,6 @@ def gen_forward_dynamics_device(self, use_thread_group = False):
     func_def_start = "void forward_dynamics_device(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
     func_notes = []
-    if use_thread_group:
-        func_def_start = func_def_start.replace("(","(cgrps::thread_group tgrp, ")
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
@@ -185,8 +172,6 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing, us
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", 3*n+self.robot.floating_base), ("s_qdd", n)], include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n+self.robot.floating_base) + "]; T *s_u = &s_q_qd_u[" + str(2*n+self.robot.floating_base) + "];")
     minv_f_expr = "false" if spill_minv_F else "true"
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
         self.gen_kernel_load_inputs("q_qd_u","stride_q_qd_u",str(3*n),use_thread_group)

@@ -189,8 +189,6 @@ def gen_load_update_XImats_helpers_function_call(self, use_thread_group = False,
     n = self.robot.get_num_pos()
     # Always pass s_topology_helpers (uniform signature; nullptr for serial chains).
     code_start += var_names["s_topology_helpers_name"] + ", "
-    if use_thread_group:
-        code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
 
 def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_base_inertia = False,
@@ -224,9 +222,6 @@ def gen_load_update_XImats_helpers(self, use_thread_group = False, include_base_
         "d_robotModel is the pointer to the initialized model specific helpers (XImats, mxfuncs, topology_helpers, etc.)", \
         "s_temp is temporary (shared) memory used to compute sin and cos if needed of size: " + \
                 str(self.gen_load_update_XImats_helpers_temp_mem_size())]
-    if use_thread_group:
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
-        func_def_start += "cgrps::thread_group tgrp, "
     # Always emit s_topology_helpers for a uniform signature; serial chains with
     # identical Ss don't read it (they pass nullptr and skip the topology-copy body
     # below). -Wunused-parameter is off in our builds.
@@ -413,8 +408,6 @@ def gen_load_update_XmatsHom_helpers_function_call(self, use_thread_group = Fals
         code_start += var_names["s_d2XmatsHom_name"] + ", "
     if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         code_start += var_names["s_topology_helpers_name"] + ", "
-    if use_thread_group:
-        code_start = code_start.replace("(","(tgrp, ")
     self.gen_add_code_line(code_start + code_end)
 
 def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_gradients = False,
@@ -461,9 +454,6 @@ def gen_load_update_XmatsHom_helpers(self, use_thread_group = False, include_bas
     if include_hessians:
         func_params.insert(1,"s_d2XmatsHom is the (shared) memory destination location for the d2XmatsHom")
         func_def_middle += "T *s_d2XmatsHom, "
-    if use_thread_group:
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
-        func_def_start += "cgrps::thread_group tgrp, "
     if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         func_def_middle += "int *s_topology_helpers, "
         func_params.insert(-2,"s_topology_helpers is the (shared) memory destination location for the topology_helpers")

@@ -22,8 +22,6 @@ def gen_inverse_dynamics_inner_function_call(self, use_thread_group = False, com
     else:
         id_code_start = id_code_start.replace("<T>","_vaf<T>")
     # account for thread group and qdd
-    if use_thread_group:
-        id_code_start = id_code_start.replace("(","(tgrp, ")
     if use_qdd_input:
         id_code_start += var_names["s_qdd_name"] + ", "
     id_code_middle = self.gen_insert_helpers_function_call()
@@ -45,9 +43,6 @@ def gen_inverse_dynamics_inner(self, use_thread_group = False, compute_c = False
     func_def_start = "void inverse_dynamics_inner("
     func_def_middle = "T *s_vaf, const T *s_q, const T *s_qd, "
     func_def_end = "T *s_temp, const T gravity) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     if compute_c:
         func_def_start += "T *s_c,  "
         func_params.insert(0,"s_c is the vector of output torques")
@@ -360,9 +355,6 @@ def gen_inverse_dynamics_device(self, use_thread_group = False, compute_c = Fals
     func_def_start = "void inverse_dynamics_device("
     func_def_middle = "const T *s_q, const T *s_qd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    if use_thread_group:
-        func_def_start += "cgrps::thread_group tgrp, "
-        func_params.insert(0,"tgrp is the handle to the thread_group running this function")
     if compute_c:
         func_def_start += "T *s_c,  "
         func_params.insert(0,"s_c is the vector of output torques")
@@ -426,8 +418,6 @@ def gen_inverse_dynamics_kernel(self, use_thread_group = False, use_qdd_input = 
     shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
-    if use_thread_group:
-        self.gen_add_code_line("cgrps::thread_group tgrp = TBD;")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",use_thread_group,block_level = True)
