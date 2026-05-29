@@ -1331,19 +1331,25 @@ def gen_end_effector_pose_gradient_hessian_output_count(self):
     return 6 * nv * nv * num_ees
 
 def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
-    """Size (in T elements) of the FD-on-d/dv-Jacobian d2ee inner's s_temp.
+    """Size (in T elements) of the analytic d2ee inner's s_temp.
 
-    Layout (sequential):
-      [0 .. EE_GRAD_TEMP)              ee_pose_gradient_inner's scratch
-      [+ 6*nv*num_ees, twice)          s_J_plus, s_J_minus  (per-FD Jacobian buffers)
-      [+ nq)                           s_q_pert  (perturbed q)
-      [+ nv)                           s_v_dt    (h * e_i FD direction)
+    The closed-form per-chain second-order Taylor algorithm (see
+    docs/d2ee_analytic_derivation.md) needs:
+
+      [0 .. 16*n_joints)               s_Xworld     world transform of every joint
+                                                    (shared FK pass, identical to
+                                                    end_effector_pose_gradient_inner)
+      [+ 16*nv*num_ees)                s_Sworld     per-DOF world-frame 4x4 generator
+                                                    L_a * A_i_local * L_a^{-1}
+                                                    (top-left 3x3 = skew for revolute /
+                                                    zeros for prismatic; column 3 = the
+                                                    "twist origin offset" piece)
+      [+ 4*num_ees)                    s_E_sc       cy, sy, cp, sp per ee for E(rpy)^-1
     """
+    n_joints = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
-    nq = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
-    ee_grad_temp = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
-    return ee_grad_temp + 2*6*nv*num_ees + nq + nv
+    return 16*n_joints + 16*nv*num_ees + 4*num_ees
 
 def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_group = False, updated_var_names = None,
                                                                out_in_smem_expr = "true"):
@@ -1373,58 +1379,140 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, use_thread_
     code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
+def _eepose_hessian_chain_metadata(self, all_ees):
+    """Per-ee chain bookkeeping for the analytic d2ee inner.
+
+    Returns (chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee):
+      chains[ee_idx]                 = sorted list of joint ids on the chain root..ee
+      anchors[ee_idx]                = the joint id whose Xworld is the EE world transform
+      per_ee_dof_info[ee_idx]        = list of dicts:
+        {vi, chain_pos, S_col, joint_jid, ang (3), lin (3), revolute (bool)}
+        one entry per chain DOF; vi is the v-space index, S_col is the column of
+        the joint's S matrix (0 for single-DOF joints, 0..5 for the floating base).
+      intra_joint_pairs_per_ee[ee_idx] = list of (vi_a, vi_b, joint_chain_pos, c_a, c_b, joint_jid)
+        for every UNORDERED pair (a, b) of DOFs that live in the same multi-DOF
+        joint on the chain. For typical revolute/prismatic 1-DOF joints there are
+        no such pairs; only the floating-base jid=0 contributes (15 unique pairs
+        for nv >= 6 of the 6 base DOFs).
+    """
+    import numpy as _np
+    chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee = [], [], [], []
+    for ee in all_ees:
+        chain = sorted(self.robot.get_ancestors_by_id(ee)) + [ee]
+        chains.append(chain)
+        anchors.append(ee)
+        dof_info = []
+        intra_pairs = []
+        for chain_pos, j in enumerate(chain):
+            S = _np.asarray(self.robot.get_S_by_id(j), dtype=_np.float64)
+            if S.ndim == 1:
+                S = S.reshape(-1, 1)
+            try:
+                vinds = self.robot.get_joint_index_v(j)
+            except Exception:
+                vinds = self.robot.get_joint_index_q(j)
+            if not isinstance(vinds, (list, tuple, _np.ndarray)):
+                vinds = [vinds]
+            vinds = list(vinds)
+            this_joint_dofs = []
+            for c in range(S.shape[1]):
+                vi = vinds[c] if c < len(vinds) else vinds[-1]
+                ang_local = [float(x) for x in S[:3, c]]
+                lin_local = [float(x) for x in S[3:6, c]]
+                revolute = max(abs(x) for x in ang_local) > 0.5
+                dof_info.append({
+                    "vi": int(vi),
+                    "chain_pos": chain_pos,
+                    "S_col": c,
+                    "joint_jid": int(j),
+                    "ang": ang_local,
+                    "lin": lin_local,
+                    "revolute": bool(revolute),
+                })
+                this_joint_dofs.append((int(vi), c))
+            # collect intra-joint UNORDERED pairs (a <= b in S column order)
+            if len(this_joint_dofs) > 1:
+                for ai, (vi_a, c_a) in enumerate(this_joint_dofs):
+                    for bi, (vi_b, c_b) in enumerate(this_joint_dofs):
+                        if ai > bi:
+                            continue
+                        intra_pairs.append((vi_a, vi_b, chain_pos, c_a, c_b, int(j)))
+        per_ee_dof_info.append(dof_info)
+        intra_joint_pairs_per_ee.append(intra_pairs)
+    return chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee
+
+
 def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False):
-    """FD-on-d/dv-Jacobian Hessian of the end-effector pose.
+    """Analytic d^2(pose)/dv^2 of the end-effector pose via per-chain second-
+    order Taylor expansion (see docs/d2ee_analytic_derivation.md).
 
-    Replaces the old analytic d^2/dq^2 chain-up (whose rpy-row 2nd derivatives
-    via atan2 were wrong at non-small joint angles -- the same bug that Python
-    fixed by switching to FD-on-d/dv-Jacobian). Algorithm now mirrors
-    RBDReference.end_effector_pose_hessian exactly:
-
-      1. Compute J at q via end_effector_pose_gradient_inner -> s_deePos.
-      2. For each i in [0, nv):
-         - q_plus  = integrate(q, +h*e_i);  J_plus  at q_plus
-         - q_minus = integrate(q, -h*e_i);  J_minus at q_minus
-         - H[:, :, i] = (J_plus - J_minus) / (2h)
-      3. Symmetrize: H[:, j, i] = 0.5 * (H[:, j, i] + H[:, i, j]).
+    Replaces the previous FD-on-d/dv-Jacobian implementation (2*nv + 1 gradient
+    calls) with a single closed-form pass. Mirrors
+    `RBDReference.end_effector_pose_hessian_analytic` (validated to ~1e-9 vs
+    the FD oracle on iiwa14-fixed / floating + go2-floating).
 
     Output convention: d^2(pose)/dv^2 (TANGENT, pinocchio convention), shape
     (num_ees, 6, nv, nv) in row-major (C-order): linear index
-    e*6*nv*nv + c*nv*nv + j*nv + i. For fixed-base nv == nq so the shape is
-    unchanged numerically; floating-base now produces the spatial-twist
-    Hessian instead of the non-standard quaternion-derivative Hessian.
+    e*6*nv*nv + c*nv*nv + j*nv + i.
 
-    OVERWRITES s_Xhom internally for each perturbed q (so the caller must
-    treat s_Xhom as scratch after this inner returns).
+    Algorithm summary:
+      1. Forward kinematics: world transform of every joint (s_Xworld).
+      2. Build per-DOF world-frame 4x4 generator S_i_world = L_a*A_i_local*L_a^{-1}.
+         For revolute axis a_local (chain joint a with world transform Xw_a):
+           S_world = [[ [Rw_a a_local]_x, -[Rw_a a_local]_x * pw_a ],
+                      [ 0,                0                       ]]
+         For prismatic (linear) axis a_local:
+           S_world = [[ 0, Rw_a a_local ], [ 0, 0 ]]
+         The per-DOF angular axis is then skew_inv(S_world[:3,:3]) = Rw_a*ang_local
+         (revolute) or 0 (prismatic). J_v = S_world[:3,3] + S_world[:3,:3]*p_ee.
+      3. Emit s_deePos = [J_v; E^{-1}*J_w] using the same closed-form E^{-1}
+         the gradient inner uses.
+      4. For each DOF pair (i, j) with proximal/distal joints (a<=b in chain):
+           if a < b: d2M = S_prox_world * S_dist_world * X_ee
+           if a == b (intra-joint, only floating base): d2M = B_world * X_ee
+             where B_world = L_a*B_local*L_a^{-1} (closed form -- see comments).
+         Then:
+           H_xyz[:, i, j]      = (d2M * ee_offset)[:3]  with ee_offset = [0,0,0,1]
+           d2R_R^T            = d2M[:3,:3]_top_of_factor  (the X_ee factor cancels
+                                with R_chain^T since they are equal for joint-EEs)
+           H_w[:, i, j]       = skew_inv(d2R_R^T - [J_w_i]_x * [J_w_j]_x)
+           H_rpy[:, i, j]     = (dEinv/dv_j) * J_w[:, i] + Einv * H_w[:, i, j]
+                                (closed-form dE/drpy chain rule)
+      5. Symmetrize H_rpy over the (i, j) Hessian axes; H_xyz is symmetric by
+         construction (d2M[i,j] == d2M[j,i] in the formula above).
+
+    No FD step; no perturbed q recomputes; no integrate(). Pure closed-form,
+    O(nv^2 * const) per ee.
     """
     nv = self.robot.get_num_vel()
     nq = self.robot.get_num_pos()
+    n_joints = self.robot.get_num_joints()
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
     all_ees = self.robot.get_leaf_nodes()
     num_ees = len(all_ees)
-    fb = self.robot.floating_base
-    ee_grad_temp_size = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
-    # scratch offsets in s_temp (kept in lock-step with gen_..._inner_temp_mem_size)
-    off_ee_grad = 0
-    off_J_plus  = ee_grad_temp_size
-    off_J_minus = off_J_plus + 6 * nv * num_ees
-    off_q_pert  = off_J_minus + 6 * nv * num_ees
-    off_v_dt    = off_q_pert + nq
+    chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee = \
+        _eepose_hessian_chain_metadata(self, all_ees)
+
+    # scratch offsets
+    off_Xworld = 0
+    off_Sworld = off_Xworld + 16 * n_joints
+    off_Esc    = off_Sworld + 16 * nv * num_ees
 
     func_params = [
         "s_d2eePos is a pointer to memory of size 6*NUM_VEL*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees) +
             " (d^2(pose)/dv^2 tangent-space Hessian, pinocchio convention)",
         "s_deePos is a pointer to memory of size 6*NUM_VEL*NUM_EE (the d/dv tangent Jacobian at q)",
-        "s_q is the vector of joint positions (size NUM_POS = " + str(nq) + ")",
-        "s_Xhom is the mutable per-joint LOCAL homogeneous-transform buffer (the inner repopulates it for each FD-perturbed q)",
+        "s_q is the vector of joint positions (size NUM_POS = " + str(nq) + "; kept for signature compatibility, unused by the analytic path)",
+        "s_Xhom is the per-joint LOCAL homogeneous-transform buffer (read-only)",
         "s_temp is helper shared memory of size " + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()) +
-            " (ee_pose_gradient scratch + two 6*nv*num_ees J buffers + q_pert + v_dt; always kept in smem)",
+            " (s_Xworld | s_Sworld | s_E_sc; always kept in smem)",
         "d_workspace is the global spill arena s_d2eePos is repointed at when !OUT_IN_SMEM (else unused)",
-        "d_robotModel is the model-specific helper struct (used to repopulate s_Xhom for each FD-perturbed q)",
-        "s_linalg_smem is optional byte-addressed shared memory (forwarded to end_effector_pose_gradient_inner)",
+        "d_robotModel is the model-specific helper struct (kept for signature compatibility, unused by the analytic path)",
+        "s_linalg_smem is optional byte-addressed shared memory (reserved; unused by this inner)",
     ]
     func_notes = [
-        "Computes d^2(pose)/dv^2 via central-difference FD on the d/dv pose Jacobian; matches RBDReference.end_effector_pose_hessian.",
-        "Inner-owns scratch placement: the large nv^2 output s_d2eePos moves to d_workspace when !OUT_IN_SMEM. FD scratch in s_temp stays in smem at every tier.",
+        "Closed-form analytic d2(pose)/dv2; matches RBDReference.end_effector_pose_hessian_analytic (validated ~1e-9 vs the FD oracle on iiwa14 fixed/floating + go2 floating).",
+        "Inner-owns scratch placement: the large nv^2 output s_d2eePos moves to d_workspace when !OUT_IN_SMEM. The s_Xworld+s_Sworld+s_E_sc scratch in s_temp stays in smem at every tier.",
     ]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, T *s_Xhom, "
@@ -1444,153 +1532,675 @@ def gen_end_effector_pose_gradient_hessian_inner(self, use_thread_group = False)
     # d_workspace when !OUT_IN_SMEM. Reassigning s_d2eePos here keeps every
     # s_d2eePos[...] reference below unchanged.
     self.gen_add_code_line("if constexpr (!OUT_IN_SMEM) { s_d2eePos = d_workspace; } else { (void)d_workspace; }")
-    self.gen_add_code_line("// scratch in s_temp: ee_pose_gradient_inner scratch | s_J_plus (6*nv*num_ees) | s_J_minus (6*nv*num_ees) | s_q_pert (nq) | s_v_dt (nv)")
-    self.gen_add_code_line("T *s_ee_grad_temp = &s_temp[" + str(off_ee_grad) + "];")
-    self.gen_add_code_line("T *s_J_plus       = &s_temp[" + str(off_J_plus)  + "];")
-    self.gen_add_code_line("T *s_J_minus      = &s_temp[" + str(off_J_minus) + "];")
-    self.gen_add_code_line("T *s_q_pert       = &s_temp[" + str(off_q_pert)  + "];")
-    self.gen_add_code_line("T *s_v_dt         = &s_temp[" + str(off_v_dt)    + "];")
-    # FD step. Float32 + h=1e-5 (what the Python double oracle uses) gives roundoff
-    # ~eps_f/h ~ 6e-3 -- enough to fail tight equivalence. h=1e-3 in float32 trades
-    # negligibly more truncation (O(h^2)=1e-6) for ~100x less roundoff (eps_f/h~6e-5);
-    # float64 stays safely truncation-dominated either way. Comparison vs the
-    # float64-h-1e-5 oracle is well within the test's rtol=2e-4.
-    self.gen_add_code_line("constexpr T H_STEP = static_cast<T>(1e-3);")
-    self.gen_add_code_line("constexpr T INV_2H = static_cast<T>(5e2); // 0.5 / 1e-3")
+    self.gen_add_code_line("(void)s_q; (void)d_robotModel; (void)s_linalg_smem;")
+    self.gen_add_code_line("// scratch in s_temp: s_Xworld (16*n_joints) | s_Sworld (16*nv*num_ees) | s_E_sc (4*num_ees)")
+    self.gen_add_code_line("T *s_Xworld = &s_temp[" + str(off_Xworld) + "];")
+    self.gen_add_code_line("T *s_Sworld = &s_temp[" + str(off_Sworld) + "];  // per-DOF world-frame 4x4 generator (S_i_world)")
+    self.gen_add_code_line("T *s_E_sc   = &s_temp[" + str(off_Esc)    + "];  // cy, sy, cp, sp per ee")
 
-    # ---- zero s_v_dt once (parallel) ----
-    self.gen_add_parallel_loop("ind", str(nv), use_thread_group)
-    self.gen_add_code_line("s_v_dt[ind] = static_cast<T>(0);")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
-
-    # ---- Step 1: gradient at original q -> s_deePos. Caller pre-populated s_Xhom for q. ----
+    # ===== Step 1: forward kinematics — world transforms by BFS level =====
+    # (identical to the gradient inner's Step 1; populates s_Xworld[16*j] for every j)
     self.gen_add_code_line("//")
-    self.gen_add_code_line("// Step 1: gradient at the original q (caller has pre-populated s_Xhom for q).")
+    self.gen_add_code_line("// Step 1: forward kinematics -- build s_Xworld[16*j] for every joint via BFS-level chain-up")
     self.gen_add_code_line("//")
-    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group,
-        updated_var_names = {
-            "s_deePos_name": "s_deePos",
-            "s_q_name": "s_q",
-            "s_Xhom_name": "s_Xhom",
-            "s_dXhom_name": "nullptr",
-            "s_temp_name": "s_ee_grad_temp",
-            "d_workspace_name": "nullptr",
-            "s_linalg_smem_name": "s_linalg_smem",
-        })
-    self.gen_add_sync(use_thread_group)
-
-    # ---- Step 2: FD-on-d/dv-Jacobian central-difference loop ----
-    self.gen_add_code_line("//")
-    self.gen_add_code_line("// Step 2: per-v_i central-difference FD on the d/dv Jacobian.")
-    self.gen_add_code_line("//")
-    self.gen_add_code_line("#pragma unroll 1")
-    self.gen_add_code_line("for (int i_fd = 0; i_fd < " + str(nv) + "; ++i_fd) {", True)
-
-    # --- +h * e_i_fd ---
-    self.gen_add_serial_ops(use_thread_group)
-    self.gen_add_code_line("s_v_dt[i_fd] = H_STEP;")
-    if fb:
-        self.gen_add_code_line("grid_integrate_floating_q<T, " + str(nq) + ">(s_q, s_v_dt, s_q_pert);")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
-    if not fb:
-        # parallel q + v_dt (nq == nv for fixed)
-        self.gen_add_parallel_loop("ind", str(nq), use_thread_group)
-        self.gen_add_code_line("s_q_pert[ind] = s_q[ind] + s_v_dt[ind];")
+    for level in range(n_bfs_levels):
+        ids_at_level = self.robot.get_ids_by_bfs_level(level)
+        if not ids_at_level:
+            continue
+        njs = len(ids_at_level)
+        self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
+        self.gen_add_parallel_loop("ind", str(16 * njs), use_thread_group)
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        jid_list = [str(j) for j in ids_at_level]
+        par_list = [str(self.robot.get_parent_id(j)) for j in ids_at_level]
+        select_var_vals = [("int", "jid", jid_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(njs)], select_var_vals)
+        self.gen_add_code_line("if (par == -1) {", True)
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = s_Xhom[16*jid + ele];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
+        self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_sync(use_thread_group)
 
-    # Repopulate s_Xhom for q_pert, then run gradient inner -> s_J_plus.
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group,
-        updated_var_names = {"s_XmatsHom_name": "s_Xhom", "s_q_name": "s_q_pert", "s_temp_name": "s_ee_grad_temp"},
-        include_gradients = False)
-    self.gen_add_sync(use_thread_group)
-    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group,
-        updated_var_names = {
-            "s_deePos_name": "s_J_plus",
-            "s_q_name": "s_q_pert",
-            "s_Xhom_name": "s_Xhom",
-            "s_dXhom_name": "nullptr",
-            "s_temp_name": "s_ee_grad_temp",
-            "d_workspace_name": "nullptr",
-            "s_linalg_smem_name": "s_linalg_smem",
-        })
-    self.gen_add_sync(use_thread_group)
-
-    # --- -h * e_i_fd ---
-    self.gen_add_serial_ops(use_thread_group)
-    self.gen_add_code_line("s_v_dt[i_fd] = -H_STEP;")
-    if fb:
-        self.gen_add_code_line("grid_integrate_floating_q<T, " + str(nq) + ">(s_q, s_v_dt, s_q_pert);")
+    # ===== Step 2: per-DOF world-frame generator s_Sworld =====
+    # Layout: s_Sworld[16 * (ee*nv + vi) + ele] (4x4 per DOF per ee, column-major)
+    # For revolute axis a_local in chain joint a (world Xw_a = (Rw_a, pw_a)):
+    #   ω_w = Rw_a @ a_local
+    #   S[:3,:3] = [ω_w]_×; S[:3,3] = -[ω_w]_× * pw_a = pw_a × ω_w; bottom row = 0
+    # For prismatic axis a_local:
+    #   S[:3,:3] = 0; S[:3,3] = Rw_a @ a_local; bottom row = 0
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 2: build per-DOF world-frame 4x4 generator S_i_world")
+    self.gen_add_code_line("//")
+    # First zero all of s_Sworld (out-of-chain DOFs stay zero — they contribute nothing).
+    self.gen_add_parallel_loop("ind", str(16 * nv * num_ees), use_thread_group)
+    self.gen_add_code_line("s_Sworld[ind] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    if not fb:
-        self.gen_add_parallel_loop("ind", str(nq), use_thread_group)
-        self.gen_add_code_line("s_q_pert[ind] = s_q[ind] + s_v_dt[ind];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync(use_thread_group)
-
-    self.gen_load_update_XmatsHom_helpers_function_call(use_thread_group,
-        updated_var_names = {"s_XmatsHom_name": "s_Xhom", "s_q_name": "s_q_pert", "s_temp_name": "s_ee_grad_temp"},
-        include_gradients = False)
+    # Then emit per (ee, chain-joint, S-col) the explicit 4x4 fill. Serial-ops
+    # per slot — total work is small (chain_depth * dofs_per_joint * num_ees blocks).
+    self.gen_add_serial_ops(use_thread_group)
+    for ee_idx in range(num_ees):
+        for dof in per_ee_dof_info[ee_idx]:
+            vi = dof["vi"]
+            j = dof["joint_jid"]
+            ang = dof["ang"]
+            lin = dof["lin"]
+            rev = dof["revolute"]
+            base = 16 * (ee_idx * nv + vi)
+            ax = ang if rev else lin
+            self.gen_add_code_line(
+                "// ee=" + str(ee_idx) + " vi=" + str(vi) + " jid=" + str(j) +
+                (" rev" if rev else " prism") + " ax_local=" + str(ax))
+            self.gen_add_code_line("{", True)
+            # axis_world = R_j_world @ ax_local
+            # R_j_world is column-major in s_Xworld[16*j]: R[r,c] = s_Xworld[16*j + r + 4*c]
+            for r in range(3):
+                terms = []
+                for c in range(3):
+                    if abs(ax[c]) < 1e-15:
+                        continue
+                    coef = "static_cast<T>(" + "{:.17g}".format(ax[c]) + ")"
+                    terms.append("s_Xworld[" + str(16*j + r + 4*c) + "] * " + coef)
+                expr = " + ".join(terms) if terms else "static_cast<T>(0)"
+                self.gen_add_code_line("T axw_" + str(r) + " = " + expr + ";")
+            # p_j_world (last column, rows 0..2)
+            self.gen_add_code_line("T pjx = s_Xworld[" + str(16*j + 12) + "];")
+            self.gen_add_code_line("T pjy = s_Xworld[" + str(16*j + 13) + "];")
+            self.gen_add_code_line("T pjz = s_Xworld[" + str(16*j + 14) + "];")
+            if rev:
+                # S[:3, :3] = [axw]_x, S[:3, 3] = p_j x axw (= -[axw]_x p_j)
+                # Column-major: S[r + 4*c] = S[r, c]
+                # [axw]_x  =  [[0, -wz,  wy],
+                #              [wz, 0,  -wx],
+                #              [-wy, wx, 0]]
+                self.gen_add_code_line("s_Sworld[" + str(base +  0) + "] = static_cast<T>(0);")  # S[0,0]
+                self.gen_add_code_line("s_Sworld[" + str(base +  1) + "] =  axw_2;")             # S[1,0] =  wz
+                self.gen_add_code_line("s_Sworld[" + str(base +  2) + "] = -axw_1;")             # S[2,0] = -wy
+                self.gen_add_code_line("s_Sworld[" + str(base +  4) + "] = -axw_2;")             # S[0,1] = -wz
+                self.gen_add_code_line("s_Sworld[" + str(base +  5) + "] = static_cast<T>(0);")  # S[1,1]
+                self.gen_add_code_line("s_Sworld[" + str(base +  6) + "] =  axw_0;")             # S[2,1] =  wx
+                self.gen_add_code_line("s_Sworld[" + str(base +  8) + "] =  axw_1;")             # S[0,2] =  wy
+                self.gen_add_code_line("s_Sworld[" + str(base +  9) + "] = -axw_0;")             # S[1,2] = -wx
+                self.gen_add_code_line("s_Sworld[" + str(base + 10) + "] = static_cast<T>(0);")  # S[2,2]
+                # Column 3: p_j x axw  (= -[axw]_x p_j)
+                self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = pjy*axw_2 - pjz*axw_1;")
+                self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = pjz*axw_0 - pjx*axw_2;")
+                self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = pjx*axw_1 - pjy*axw_0;")
+            else:
+                # Prismatic: S[:3, 3] = axis_world, rest zero
+                self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = axw_0;")
+                self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = axw_1;")
+                self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = axw_2;")
+            self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
-    self.gen_end_effector_pose_gradient_inner_function_call(use_thread_group,
-        updated_var_names = {
-            "s_deePos_name": "s_J_minus",
-            "s_q_name": "s_q_pert",
-            "s_Xhom_name": "s_Xhom",
-            "s_dXhom_name": "nullptr",
-            "s_temp_name": "s_ee_grad_temp",
-            "d_workspace_name": "nullptr",
-            "s_linalg_smem_name": "s_linalg_smem",
-        })
+
+    # ===== Step 3: extract (cy, sy, cp, sp) from each ee's world rotation =====
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 3: extract (cy, sy, cp, sp) for E(rpy)^-1 / dE/drpy")
+    self.gen_add_code_line("//")
+    self.gen_add_parallel_loop("ee", str(num_ees), use_thread_group)
+    if num_ees > 1:
+        select_var_vals = [("int", "ee_jid", [str(a) for a in anchors])]
+        self.gen_add_multi_threaded_select("ee", "<", [str(i+1) for i in range(num_ees)], select_var_vals)
+    else:
+        self.gen_add_code_line("const int ee_jid = " + str(anchors[0]) + ";")
+    self.gen_add_code_line("T R20 = s_Xworld[16*ee_jid + 2];")
+    self.gen_add_code_line("T R21 = s_Xworld[16*ee_jid + 6];")
+    self.gen_add_code_line("T R22 = s_Xworld[16*ee_jid + 10];")
+    self.gen_add_code_line("T R10 = s_Xworld[16*ee_jid + 1];")
+    self.gen_add_code_line("T R00 = s_Xworld[16*ee_jid + 0];")
+    self.gen_add_code_line("T cp_term = sqrt(R22*R22 + R21*R21);")
+    self.gen_add_code_line("T yaw = atan2(R10, R00);")
+    self.gen_add_code_line("T pitch = atan2(-R20, cp_term);")
+    self.gen_add_code_line("s_E_sc[4*ee + 0] = cos(yaw);")
+    self.gen_add_code_line("s_E_sc[4*ee + 1] = sin(yaw);")
+    self.gen_add_code_line("s_E_sc[4*ee + 2] = cos(pitch);")
+    self.gen_add_code_line("s_E_sc[4*ee + 3] = sin(pitch);")
+    self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
-    # --- write H[c, j, i_fd] = (J_plus - J_minus) / (2h) ---
-    # H layout: e*6*nv*nv + c*nv*nv + j*nv + i_fd  (C-order [e][c][j][i])
-    # J layout: e*6*nv + 6*j + c                   (gradient inner's [e][j][c])
+    # ===== Step 4: emit s_deePos = [J_v; E^-1 * J_w] from s_Sworld and s_Xworld =====
+    # J_w[:, vi] = skew_inv(S_world[:3, :3]) = (axw_x, axw_y, axw_z) (the angular axis)
+    #   In our column-major layout: skew[2,1] = wx -> s_Sworld[base+6]; skew[0,2] = wy -> s_Sworld[base+8]; skew[1,0] = wz -> s_Sworld[base+1].
+    # J_v[:, vi] = (S_world @ p_ee_world)[:3] - hmm actually J_v[:, vi] = dM[vi][:3, 3] = (S_world @ X_ee)[:3, 3]
+    #   = S_world[:3, :3] @ X_ee[:3, 3] + S_world[:3, 3]
+    #   = [w_world]_x @ p_ee_world + (pj_world x w_world)     (revolute)
+    #   = ω × p_ee_world - ω × pj_world = ω × (p_ee - pj)     ✓ matches the gradient inner
+    #   = 0                       + Rw_a @ ax_local           (prismatic)
+    # Use the latter expansion directly.
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 4: write s_deePos = [J_v ; E(rpy)^-1 * J_w] from S_world")
+    self.gen_add_code_line("//")
     self.gen_add_parallel_loop("ind", str(6 * nv * num_ees), use_thread_group)
-    self.gen_add_code_line("int c = ind % 6; int rem = ind / 6; int j = rem % " + str(nv) + "; int e = rem / " + str(nv) + ";")
-    self.gen_add_code_line("int j_idx = e * " + str(6 * nv) + " + 6 * j + c;")
-    self.gen_add_code_line("int h_idx = e * " + str(6 * nv * nv) + " + c * " + str(nv * nv) + " + j * " + str(nv) + " + i_fd;")
-    self.gen_add_code_line("s_d2eePos[h_idx] = (s_J_plus[j_idx] - s_J_minus[j_idx]) * INV_2H;")
+    self.gen_add_code_line("int row = ind % 6; int rem = ind / 6; int vi = rem % " + str(nv) + "; int ee = rem / " + str(nv) + ";")
+    self.gen_add_code_line("int s_base = 16 * (ee * " + str(nv) + " + vi);")
+    # angular axis components (top-left skew of S_world, read out)
+    self.gen_add_code_line("T wx = s_Sworld[s_base + 6];   // S[2,1]")
+    self.gen_add_code_line("T wy = s_Sworld[s_base + 8];   // S[0,2]")
+    self.gen_add_code_line("T wz = s_Sworld[s_base + 1];   // S[1,0]")
+    # Column 3 of S_world (the "translation" piece in the world-frame generator)
+    self.gen_add_code_line("T s03 = s_Sworld[s_base + 12]; // S[0,3]")
+    self.gen_add_code_line("T s13 = s_Sworld[s_base + 13]; // S[1,3]")
+    self.gen_add_code_line("T s23 = s_Sworld[s_base + 14]; // S[2,3]")
+    self.gen_add_code_line("if (row < 3) {", True)
+    # J_v = S[:3,:3] @ p_ee + S[:3,3]
+    # = ([w]_x @ p_ee) + s03/13/23
+    # Compose ee_anchor index for current ee via select (one of `anchors`)
+    if num_ees > 1:
+        sel_vals = [("int", "ee_jid", [str(a) for a in anchors])]
+        self.gen_add_multi_threaded_select("ee", "<", [str(i+1) for i in range(num_ees)], sel_vals)
+    else:
+        self.gen_add_code_line("const int ee_jid = " + str(anchors[0]) + ";")
+    self.gen_add_code_line("T pex = s_Xworld[16*ee_jid + 12]; T pey = s_Xworld[16*ee_jid + 13]; T pez = s_Xworld[16*ee_jid + 14];")
+    # [w]_x @ pe + s_col3
+    self.gen_add_code_line("T Jv0 = (wy*pez - wz*pey) + s03;")
+    self.gen_add_code_line("T Jv1 = (wz*pex - wx*pez) + s13;")
+    self.gen_add_code_line("T Jv2 = (wx*pey - wy*pex) + s23;")
+    self.gen_add_code_line("T outv;")
+    self.gen_add_code_line("if (row == 0) outv = Jv0; else if (row == 1) outv = Jv1; else outv = Jv2;")
+    self.gen_add_code_line("s_deePos[ind] = outv;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    # rows 3..5 = E^-1 @ J_w with closed form (same as gradient inner)
+    self.gen_add_code_line("T cy = s_E_sc[4*ee + 0]; T sy = s_E_sc[4*ee + 1]; T cp = s_E_sc[4*ee + 2]; T sp = s_E_sc[4*ee + 3];")
+    self.gen_add_code_line("T outv;")
+    self.gen_add_code_line("if (row == 3) { outv = (cy*wx + sy*wy) / cp; }")
+    self.gen_add_code_line("else if (row == 4) { outv = -sy*wx + cy*wy; }")
+    self.gen_add_code_line("else { outv = (sp / cp) * (cy*wx + sy*wy) + wz; }")
+    self.gen_add_code_line("s_deePos[ind] = outv;")
+    self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
-    # --- reset s_v_dt[i_fd] = 0 (so the next iteration starts from all-zero v_dt) ---
+    # ===== Step 5: per (ee, i, j) pair compute d2M, extract H_xyz + d2R_R^T =====
+    # Strategy:
+    #  - For each ee, iterate over all (i, j) DOF pairs with i, j on the chain.
+    #  - Determine chain ordering: a (i's chain pos) vs b (j's chain pos).
+    #  - If a < b: d2M[i,j] = S_i_world * S_j_world * X_ee
+    #    H_xyz: column 3 of d2M.
+    #    d2R_R^T: top-left 3x3 of (S_i_world * S_j_world).
+    #  - If a > b: swap (proximal/distal).
+    #  - If a == b (intra-joint, only floating base): handle separately.
+    #  - We write d2M values into s_d2eePos. We'll do the rpy rows in a second
+    #    pass once H_w / E^-1 are known.
+    #
+    # We pre-zero s_d2eePos (covers out-of-chain entries and is also needed
+    # because the intra-joint case only writes the unique (i, j) ordered pair).
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 5a: zero the full d2eePos output (out-of-chain pairs stay zero)")
+    self.gen_add_code_line("//")
+    self.gen_add_parallel_loop("ind", str(6 * nv * nv * num_ees), use_thread_group)
+    self.gen_add_code_line("s_d2eePos[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
+
+    # Step 5b: per-pair d2M -> H_xyz + (temporarily, into d2eePos rpy rows) d2R_R^T
+    # We use the rpy rows (c=3,4,5 of s_d2eePos) as a SCRATCH BUFFER for d2R_R^T's
+    # skew axis (a 3-vector per pair). Specifically we write the WORLD-ANGULAR
+    # kinematic Hessian H_w[:, i, j] into rows 3,4,5 here, and overwrite with
+    # rpy in Step 6 via the chain rule.
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 5b: per (ee, i, j) pair: d2M = S_i_world * S_j_world * X_ee (for a < b)")
+    self.gen_add_code_line("//   or B_world * X_ee (intra-joint). Writes H_xyz to rows 0..2 and (temporarily)")
+    self.gen_add_code_line("//   the world-angular Hessian H_w to rows 3..5; the rpy chain rule in Step 6")
+    self.gen_add_code_line("//   then overwrites rows 3..5 with the proper H_rpy.")
+    self.gen_add_code_line("//")
+    # Emit per-ee per-pair code. For each ee, we have len(chain_dofs)^2 pairs.
+    # Each pair fires once with explicit constants (chain_pos, S_col, joint_jid).
     self.gen_add_serial_ops(use_thread_group)
-    self.gen_add_code_line("s_v_dt[i_fd] = static_cast<T>(0);")
+    for ee_idx in range(num_ees):
+        ee_jid = anchors[ee_idx]
+        chain_dofs = per_ee_dof_info[ee_idx]
+        chain_jids = chains[ee_idx]
+        intra_pairs = intra_joint_pairs_per_ee[ee_idx]
+        # Index by (vi_a, vi_b) for quick lookup
+        intra_pair_lookup = {(p[0], p[1]): p for p in intra_pairs}
+        intra_pair_lookup.update({(p[1], p[0]): p for p in intra_pairs})
+
+        # Pair iteration: per (vi_i, vi_j), with i,j enumerated over chain DOFs.
+        for di in chain_dofs:
+            vi = di["vi"]
+            for dj in chain_dofs:
+                vj = dj["vi"]
+                # Determine ordering: a = di['chain_pos'], b = dj['chain_pos']
+                a = di["chain_pos"]; b = dj["chain_pos"]
+                # H index: c*nv*nv + i*nv + j  with i = "outer" (Hessian row j_v),
+                # j = "inner" (Hessian col i_v).  Our chosen layout from the FD
+                # path was: idx = e*6*nv*nv + c*nv*nv + j_outer*nv + i_inner.
+                # The C-order (6, nv, nv) tensor here is H[c, i_h, j_h] with the
+                # convention that mid axis = i, last axis = j. Match the FD path
+                # (which writes h_idx = ... + j*nv + i_fd) so the public layout
+                # is identical: index = e*6*nv*nv + c*nv*nv + vi*nv + vj.
+                # Per-pair scoped block — local names don't collide across pairs.
+                self.gen_add_code_line(
+                    "// ee=" + str(ee_idx) + " pair (vi=" + str(vi) + ", vj=" + str(vj) +
+                    ", a=" + str(a) + ", b=" + str(b) + ")")
+                self.gen_add_code_line("{", True)
+                # Read X_ee column 3 (p_ee) and X_ee R block (used in skew/inv)
+                self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
+                self.gen_add_code_line("T pey = s_Xworld[" + str(16*ee_jid + 13) + "];")
+                self.gen_add_code_line("T pez = s_Xworld[" + str(16*ee_jid + 14) + "];")
+                # Read S_i_world and S_j_world skew axis components and column 3
+                si_base = 16 * (ee_idx * nv + vi)
+                sj_base = 16 * (ee_idx * nv + vj)
+                # We need the top-left 3x3 product (S_prox @ S_dist)[:3,:3] and
+                # the column-3 expansion (S_prox @ S_dist @ X_ee)[:3, 3].
+                # Compute it for the proximal/distal ordering.
+                if a == b:
+                    # Same chain joint. For single-DOF joints, B_local = 0 (revolute or
+                    # prismatic intra-pair doesn't exist except for the diagonal where
+                    # B = A_x^2 for revolute, 0 for prismatic). For multi-DOF (floating
+                    # base) joints, use the closed form B_world below.
+                    # Diagonal vi == vj case (always present): B_local at v=0 = A_x^2.
+                    # For revolute, A = [[ω_×, 0]; 0] so A^2 = [[ω_×^2, 0]; 0]: this is
+                    # the "centripetal" term.
+                    # We handle this via the intra-pair lookup (which includes c_a == c_b).
+                    if vi == vj:
+                        # Diagonal: B_local for column c_a alone.
+                        dof = di  # same as dj
+                        c_a = dof["S_col"]
+                        c_b = dof["S_col"]
+                        is_intra_multi = (vi, vj) in intra_pair_lookup
+                        # Even for single-DOF joints we hit this code path on the
+                        # diagonal. Handle revolute / prismatic / floating-base
+                        # uniformly via the on-the-fly B formula.
+                        _emit_d2M_same_joint_block(self, dof, dof,
+                                                   ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                                   chain_jids[a],
+                                                   si_base, sj_base)
+                    else:
+                        # Off-diagonal same-joint pair: only exists for multi-DOF
+                        # (floating base) joints.
+                        if (vi, vj) in intra_pair_lookup:
+                            # Look up which is c_a, c_b by S_col
+                            _emit_d2M_same_joint_block(self, di, dj,
+                                                       ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                                       chain_jids[a],
+                                                       si_base, sj_base)
+                        else:
+                            # Shouldn't happen (a == b but DOFs not in same joint)
+                            # Emit a zero-write defensively (rows 0..5 already zero
+                            # from the bulk zero in Step 5a).
+                            pass
+                else:
+                    # Different chain joints: pick the proximal/distal.
+                    # Proximal = the one with smaller chain_pos.
+                    if a < b:
+                        prox_base = si_base
+                        dist_base = sj_base
+                    else:
+                        prox_base = sj_base
+                        dist_base = si_base
+                    # Read all 4x4 entries of S_prox and S_dist (column-major)
+                    # (Skip the bottom row — known zero)
+                    _emit_d2M_cross_joint_block(self, prox_base, dist_base,
+                                                ee_idx, vi, vj, nv, num_ees, si_base, sj_base)
+                self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
-    self.gen_add_end_control_flow()  # end for i_fd
+    # ===== Step 6: rpy chain rule on rows 3..5 =====
+    # Currently rows 3..5 hold H_w[:, i, j]. We want H_rpy[:, i, j] =
+    # (dEinv/dv_j) * J_w[:, i] + Einv * H_w[:, i, j], with closed-form Einv
+    # and dE/drpy. Recall the gradient inner already wrote drpy/dv = Einv*J_w
+    # to s_deePos rows 3..5: but we need that for each (ee, vj).
+    #
+    # NOTE on race-safety: each thread owns a single (ee, vi, vj) cell and reads
+    # all 3 components of H_w[:, vi, vj] from rows 3..5 of s_d2eePos BEFORE
+    # writing any rpy. We then write all 3 rpy components. There's no read-after-
+    # write hazard within the parallel pass because each (ee, vi, vj) is owned by
+    # exactly one thread (no thread reads another thread's writes).
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Step 6: rpy chain rule -- replace rows 3..5 with H_rpy = dEinv/dv_j @ J_w_i + Einv @ H_w")
+    self.gen_add_code_line("//")
+    self.gen_add_parallel_loop("ind", str(nv * nv * num_ees), use_thread_group)
+    self.gen_add_code_line("int vj = ind % " + str(nv) + ";")
+    self.gen_add_code_line("int vi = (ind / " + str(nv) + ") % " + str(nv) + ";")
+    self.gen_add_code_line("int ee = ind / " + str(nv * nv) + ";")
+    self.gen_add_code_line("T cy = s_E_sc[4*ee + 0]; T sy = s_E_sc[4*ee + 1]; T cp = s_E_sc[4*ee + 2]; T sp = s_E_sc[4*ee + 3];")
+    # Einv (closed form):
+    # E = [[cy*cp, -sy, 0], [sy*cp, cy, 0], [-sp, 0, 1]]
+    # det(E) = cp; Einv = (1/cp) * [[cy, sy, 0], [-sy*cp, cy*cp, 0], [cy*sp, sy*sp, cp]]
+    self.gen_add_code_line("T inv_cp = static_cast<T>(1) / cp;")
+    self.gen_add_code_line("// Einv (3x3); row 0 = roll, row 1 = pitch, row 2 = yaw")
+    self.gen_add_code_line("T Einv00 = cy * inv_cp;       T Einv01 = sy * inv_cp;       T Einv02 = static_cast<T>(0);")
+    self.gen_add_code_line("T Einv10 = -sy;               T Einv11 = cy;                T Einv12 = static_cast<T>(0);")
+    self.gen_add_code_line("T Einv20 = cy * sp * inv_cp;  T Einv21 = sy * sp * inv_cp;  T Einv22 = static_cast<T>(1);")
+    # drpy_j (from s_deePos rows 3,4,5)
+    self.gen_add_code_line("int dee_base_j = ee * " + str(6 * nv) + " + 6 * vj;")
+    self.gen_add_code_line("T drpy_j0 = s_deePos[dee_base_j + 3];")
+    self.gen_add_code_line("T drpy_j1 = s_deePos[dee_base_j + 4];")
+    self.gen_add_code_line("T drpy_j2 = s_deePos[dee_base_j + 5];")
+    # drpy_i (also from s_deePos)
+    self.gen_add_code_line("int dee_base_i = ee * " + str(6 * nv) + " + 6 * vi;")
+    self.gen_add_code_line("T drpy_i0 = s_deePos[dee_base_i + 3];")
+    self.gen_add_code_line("T drpy_i1 = s_deePos[dee_base_i + 4];")
+    self.gen_add_code_line("T drpy_i2 = s_deePos[dee_base_i + 5];")
+    # READ ALL 3 H_w components BEFORE any rpy writes (critical for correctness:
+    # we will overwrite rows 3..5 below; if we read after writing the race would
+    # silently corrupt the other two components in this thread's row).
+    self.gen_add_code_line("int hw_base = ee * " + str(6 * nv * nv) + " + 3 * " + str(nv * nv) + " + vi * " + str(nv) + " + vj;")
+    self.gen_add_code_line("T Hw_x = s_d2eePos[hw_base + 0 * " + str(nv * nv) + "];")
+    self.gen_add_code_line("T Hw_y = s_d2eePos[hw_base + 1 * " + str(nv * nv) + "];")
+    self.gen_add_code_line("T Hw_z = s_d2eePos[hw_base + 2 * " + str(nv * nv) + "];")
+    # dE_total = sum_k dE/drpy_k * drpy_j[k]:
+    # dE/droll = 0 (irrelevant; drops out)
+    # dE/dpitch = [[-cy*sp, 0, 0], [-sy*sp, 0, 0], [-cp, 0, 0]]
+    # dE/dyaw   = [[-sy*cp, -cy, 0], [cy*cp, -sy, 0], [0, 0, 0]]
+    # dE_total[r,c] = drpy_j1 * dE/dpitch[r,c] + drpy_j2 * dE/dyaw[r,c]
+    self.gen_add_code_line("T dE00 = -cy * sp * drpy_j1 - sy * cp * drpy_j2;")
+    self.gen_add_code_line("T dE01 = -cy * drpy_j2;")
+    self.gen_add_code_line("// dE02 = 0")
+    self.gen_add_code_line("T dE10 = -sy * sp * drpy_j1 + cy * cp * drpy_j2;")
+    self.gen_add_code_line("T dE11 = -sy * drpy_j2;")
+    self.gen_add_code_line("// dE12 = 0")
+    self.gen_add_code_line("T dE20 = -cp * drpy_j1;")
+    self.gen_add_code_line("// dE21 = dE22 = 0")
+    # For each row r of the rpy Hessian: H_rpy_r = -(U_r @ drpy_i) + (Einv_r @ Hw)
+    # where U_r = Einv[r,:] @ dE_total (a 3-vector; only U_r[0] and U_r[1] are nonzero
+    # because dE_total's columns 2, and entries with r==2,c=1, etc., are zero).
+    # We just unroll all three rows.
+    self.gen_add_code_line("// row 0 (roll): U_0 = Einv[0,:] @ dE_total")
+    self.gen_add_code_line("T U0_0 = Einv00 * dE00 + Einv01 * dE10 + Einv02 * dE20;")
+    self.gen_add_code_line("T U0_1 = Einv00 * dE01 + Einv01 * dE11;")
+    self.gen_add_code_line("// row 1 (pitch)")
+    self.gen_add_code_line("T U1_0 = Einv10 * dE00 + Einv11 * dE10 + Einv12 * dE20;")
+    self.gen_add_code_line("T U1_1 = Einv10 * dE01 + Einv11 * dE11;")
+    self.gen_add_code_line("// row 2 (yaw)")
+    self.gen_add_code_line("T U2_0 = Einv20 * dE00 + Einv21 * dE10 + Einv22 * dE20;")
+    self.gen_add_code_line("T U2_1 = Einv20 * dE01 + Einv21 * dE11;")
+    # H_rpy[r] = -(U_r[0]*drpy_i0 + U_r[1]*drpy_i1 + U_r[2]*drpy_i2) + Einv[r,:] @ Hw
+    # U_r[2] = Einv[r,0]*dE[0,2] + Einv[r,1]*dE[1,2] + Einv[r,2]*dE[2,2] = 0 (all zero)
+    self.gen_add_code_line("T H_rpy_0 = -(U0_0 * drpy_i0 + U0_1 * drpy_i1) + (Einv00 * Hw_x + Einv01 * Hw_y + Einv02 * Hw_z);")
+    self.gen_add_code_line("T H_rpy_1 = -(U1_0 * drpy_i0 + U1_1 * drpy_i1) + (Einv10 * Hw_x + Einv11 * Hw_y + Einv12 * Hw_z);")
+    self.gen_add_code_line("T H_rpy_2 = -(U2_0 * drpy_i0 + U2_1 * drpy_i1) + (Einv20 * Hw_x + Einv21 * Hw_y + Einv22 * Hw_z);")
+    # Write all three rpy components (rows 3, 4, 5)
+    self.gen_add_code_line("int out_base = ee * " + str(6 * nv * nv) + " + 3 * " + str(nv * nv) + " + vi * " + str(nv) + " + vj;")
+    self.gen_add_code_line("s_d2eePos[out_base + 0 * " + str(nv * nv) + "] = H_rpy_0;")
+    self.gen_add_code_line("s_d2eePos[out_base + 1 * " + str(nv * nv) + "] = H_rpy_1;")
+    self.gen_add_code_line("s_d2eePos[out_base + 2 * " + str(nv * nv) + "] = H_rpy_2;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync(use_thread_group)
 
-    # ---- Step 3: symmetrize H[c, j, i] = 0.5 * (H[c, j, i] + H[c, i, j]) ----
-    # Each thread owns one (e, c, j, i) cell; only j <= i threads do work, and
-    # they read both diagonal mirrors and write the average to both. No races
-    # (each (j, i) pair is owned by exactly one thread).
+    # ===== Step 7: symmetrize rows 3..5 over (i, j) =====
+    # H_xyz is symmetric by construction. H_rpy is computed asymmetrically (the
+    # dEinv_dvj branch only sees the j-direction), so we average with the
+    # transpose. The Python reference does the same final symmetrization.
     self.gen_add_code_line("//")
-    self.gen_add_code_line("// Step 3: symmetrize H over the (j, i) Hessian axes.")
-    self.gen_add_code_line("// FD is not exactly symmetric due to roundoff; mirror to suppress per-pair noise.")
+    self.gen_add_code_line("// Step 7: symmetrize H_rpy (rows 3..5) over (i, j)")
     self.gen_add_code_line("//")
-    self.gen_add_parallel_loop("ind", str(num_ees * 6 * nv * nv), use_thread_group)
-    self.gen_add_code_line("int e = ind / " + str(6 * nv * nv) + ";")
-    self.gen_add_code_line("int cji = ind % " + str(6 * nv * nv) + ";")
-    self.gen_add_code_line("int c = cji / " + str(nv * nv) + ";")
+    self.gen_add_parallel_loop("ind", str(num_ees * 3 * nv * nv), use_thread_group)
+    self.gen_add_code_line("int e = ind / " + str(3 * nv * nv) + ";")
+    self.gen_add_code_line("int cji = ind % " + str(3 * nv * nv) + ";")
+    self.gen_add_code_line("int rrow = cji / " + str(nv * nv) + ";   // 0..2 -> c = 3 + rrow")
     self.gen_add_code_line("int ji = cji % " + str(nv * nv) + ";")
-    self.gen_add_code_line("int j = ji / " + str(nv) + "; int i = ji % " + str(nv) + ";")
-    self.gen_add_code_line("if (j <= i) {", True)
-    self.gen_add_code_line("int idx_ji = e * " + str(6 * nv * nv) + " + c * " + str(nv * nv) + " + j * " + str(nv) + " + i;")
+    self.gen_add_code_line("int i = ji / " + str(nv) + "; int j = ji % " + str(nv) + ";")
+    self.gen_add_code_line("if (i <= j) {", True)
+    self.gen_add_code_line("int c = 3 + rrow;")
     self.gen_add_code_line("int idx_ij = e * " + str(6 * nv * nv) + " + c * " + str(nv * nv) + " + i * " + str(nv) + " + j;")
-    self.gen_add_code_line("T avg = static_cast<T>(0.5) * (s_d2eePos[idx_ji] + s_d2eePos[idx_ij]);")
-    self.gen_add_code_line("s_d2eePos[idx_ji] = avg;")
-    self.gen_add_code_line("if (j != i) { s_d2eePos[idx_ij] = avg; }")
+    self.gen_add_code_line("int idx_ji = e * " + str(6 * nv * nv) + " + c * " + str(nv * nv) + " + j * " + str(nv) + " + i;")
+    self.gen_add_code_line("T avg = static_cast<T>(0.5) * (s_d2eePos[idx_ij] + s_d2eePos[idx_ji]);")
+    self.gen_add_code_line("s_d2eePos[idx_ij] = avg;")
+    self.gen_add_code_line("if (i != j) { s_d2eePos[idx_ji] = avg; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync(use_thread_group)
 
     self.gen_add_end_function()
+
+
+def _emit_d2M_cross_joint_block(self, prox_base, dist_base,
+                                 ee_idx, vi, vj, nv, num_ees, si_base, sj_base):
+    """Emit explicit per-pair scalar code for d2M = S_prox * S_dist * X_ee in a
+    cross-joint pair (chain ordering a < b after prox/dist resolution).
+
+    Writes:
+      - rows 0..2 of s_d2eePos[(ee, vi, vj)]   = (d2M @ ee_offset)[:3] with
+        ee_offset = [0, 0, 0, 1] -> just column 3 of d2M.
+      - rows 3..5 of s_d2eePos[(ee, vi, vj)]   = H_w[:, vi, vj] =
+        skew_inv(d2R @ R_chain^T - [Jw_i]_x @ [Jw_j]_x)
+        with d2R_R^T = (S_prox * S_dist)[:3, :3]
+        and [Jw_i]_x = S_i_world[:3, :3]
+        and [Jw_j]_x = S_j_world[:3, :3]
+
+    Caller has already declared and set: pex, pey, pez (X_ee column 3 in world).
+    """
+    # Read S_prox and S_dist top 3 rows (column-major: S[r + 4*c]).
+    # S has zero bottom row so we only need rows 0..2.
+    self.gen_add_code_line("// Read S_prox (chain proximal) rows 0..2")
+    for c in range(4):
+        for r in range(3):
+            self.gen_add_code_line("T P" + str(r) + str(c) + " = s_Sworld[" + str(prox_base + r + 4*c) + "];")
+    self.gen_add_code_line("// Read S_dist (chain distal) rows 0..2")
+    for c in range(4):
+        for r in range(3):
+            self.gen_add_code_line("T D" + str(r) + str(c) + " = s_Sworld[" + str(dist_base + r + 4*c) + "];")
+    # Compute M = S_prox * S_dist  (4x4, but bottom row of result is 0).
+    # M[r, c] = sum_k P[r, k] * D[k, c]; since P[3, :] = 0 and D[3, :] = 0,
+    # we only need top 3 rows of M, and for each (r, c) we sum k = 0..2.
+    # M[r, c] = P[r, 0]*D[0, c] + P[r, 1]*D[1, c] + P[r, 2]*D[2, c]
+    self.gen_add_code_line("// M = S_prox * S_dist (top 3 rows, all 4 cols)")
+    for r in range(3):
+        for c in range(4):
+            self.gen_add_code_line(
+                "T M" + str(r) + str(c) + " = P" + str(r) + "0*D0" + str(c) +
+                " + P" + str(r) + "1*D1" + str(c) +
+                " + P" + str(r) + "2*D2" + str(c) + ";")
+    # d2M = M * X_ee. Top-left 3x3 of d2M = M[:3, :3] * X_ee[:3, :3] (since
+    # M[:3, 3] only enters column 3 of d2M times X_ee[3, :3] which is 0).
+    # Column 3 of d2M[:3] = M[:3, :3] * X_ee[:3, 3] + M[:3, 3] * X_ee[3, 3]
+    #                     = M[:3, :3] * p_ee + M[:3, 3].
+    # We only need column 3 (for H_xyz) — the top-left 3x3 of d2R_R^T cancels
+    # to M[:3, :3] anyway (since R_chain^T = X_ee[:3,:3]^T cancels with the
+    # X_ee[:3, :3] factor on the right).
+    self.gen_add_code_line("// H_xyz[:, vi, vj] = (S_prox*S_dist*X_ee)[:3, 3] = M[:3,:3] * p_ee + M[:3, 3]")
+    self.gen_add_code_line("T Hxyz_x = M00*pex + M01*pey + M02*pez + M03;")
+    self.gen_add_code_line("T Hxyz_y = M10*pex + M11*pey + M12*pez + M13;")
+    self.gen_add_code_line("T Hxyz_z = M20*pex + M21*pey + M22*pez + M23;")
+    # d2R @ R_chain^T = M[:3, :3]. Need [Jw_i]_x and [Jw_j]_x = S_i_world[:3,:3] and
+    # S_j_world[:3,:3]. Note: the "prox"/"dist" assignment may have swapped i↔j,
+    # but H_w is the same value either way (the formula skew_inv(d2R_R^T - [Jwi]_x [Jwj]_x)
+    # uses the original i,j indexing). So we read S_i_world, S_j_world directly via si_base/sj_base.
+    self.gen_add_code_line("// Read [Jw_i]_x (S_i_world top-left)")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[" + str(si_base + r + 4*c) + "];")
+    self.gen_add_code_line("// Read [Jw_j]_x (S_j_world top-left)")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[" + str(sj_base + r + 4*c) + "];")
+    # Compute SiSj = S_i_world[:3,:3] * S_j_world[:3,:3]
+    self.gen_add_code_line("// SiSj = [Jw_i]_x @ [Jw_j]_x")
+    for r in range(3):
+        for c in range(3):
+            self.gen_add_code_line(
+                "T SiSj" + str(r) + str(c) + " = Si" + str(r) + "0*Sj0" + str(c) +
+                " + Si" + str(r) + "1*Sj1" + str(c) +
+                " + Si" + str(r) + "2*Sj2" + str(c) + ";")
+    # H_w_skew = M[:3,:3] - SiSj  (note: M[:3,:3] is d2R @ R_chain^T = top-left 3x3 of S_prox*S_dist).
+    # skew_inv(A) = 0.5 * (A[2,1] - A[1,2], A[0,2] - A[2,0], A[1,0] - A[0,1])
+    self.gen_add_code_line("// H_w[:, vi, vj] = skew_inv(M[:3,:3] - SiSj)")
+    self.gen_add_code_line("T HW_x = static_cast<T>(0.5) * ((M21 - SiSj21) - (M12 - SiSj12));")
+    self.gen_add_code_line("T HW_y = static_cast<T>(0.5) * ((M02 - SiSj02) - (M20 - SiSj20));")
+    self.gen_add_code_line("T HW_z = static_cast<T>(0.5) * ((M10 - SiSj10) - (M01 - SiSj01));")
+    # Write into s_d2eePos: idx = ee*6*nv*nv + c*nv*nv + vi*nv + vj
+    base = "(" + str(ee_idx * 6 * nv * nv) + " + " + str(vi * nv + vj) + ")"
+    self.gen_add_code_line("s_d2eePos[" + base + " + 0 * " + str(nv*nv) + "] = Hxyz_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 1 * " + str(nv*nv) + "] = Hxyz_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 2 * " + str(nv*nv) + "] = Hxyz_z;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
+
+
+def _emit_d2M_same_joint_block(self, di, dj, ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                joint_jid, si_base, sj_base):
+    """Emit per-pair code for the SAME-JOINT (a == b) case: d2M = L_a * B_local * L_a^-1 * X_ee
+    where the joint at chain position a contributes its intrinsic
+    second-order Lie-group term B_local (a 4x4).
+
+    For 1-DOF revolute joints with axis a_local and vi == vj:
+       B_local = [[ [a]_x^2, 0 ], [ 0, 0 ]]
+    For 1-DOF prismatic: B_local = 0.
+    For multi-DOF (floating base, jid=0) intra-joint pairs (c_a, c_b):
+       - lin-lin: B_local = 0
+       - lin-ang or ang-lin: B_local[:3, 3] = 0.5 * (ang_local x lin_local) (third col only)
+       - ang-ang: B_local[:3, :3] = 0.5 * ([a]_x [b]_x + [b]_x [a]_x); col 3 = 0.
+
+    We resolve to (c_a = di['S_col'], c_b = dj['S_col']), grab the body-frame
+    ang/lin axes from the metadata, and inline emit the world-frame B (after
+    L_a conjugation) -> d2M = B_world * X_ee.
+
+    Closed-form world-frame B_world (= L_a B_local L_a^{-1}):
+      Let L_a = [[Ra, pa], [0, 1]]; L_a^-1 = [[Ra^T, -Ra^T pa], [0, 1]].
+      Let B_local = [[Br, Bt], [0, 0]] (top-left rotation 3x3 Br, top-right col Bt).
+      Then L_a B_local = [[Ra Br, Ra Bt], [0, 0]]
+           L_a B_local L_a^-1 = [[(Ra Br) Ra^T, -(Ra Br)(Ra^T pa) + (Ra Bt)], [0, 0]]
+                              = [[ Ra Br Ra^T, Ra Bt - (Ra Br Ra^T) pa ], [ 0, 0 ]]
+      So B_world[:3, :3] = Ra @ Br @ Ra^T
+         B_world[:3, 3]  = Ra @ Bt - B_world[:3, :3] @ pa
+
+    Then d2M = B_world * X_ee, exactly the same final step as the cross-joint
+    case (apart from the B_world matrix sourcing).
+
+    Writes:
+      - rows 0..2 of s_d2eePos[(ee, vi, vj)] = (d2M)[:3, 3]
+      - rows 3..5                                = H_w[:, vi, vj] =
+        skew_inv(B_world[:3, :3] - [Jwi]_x @ [Jwj]_x)
+    """
+    c_a = di["S_col"]
+    c_b = dj["S_col"]
+    ang_a = di["ang"]; lin_a = di["lin"]; rev_a = di["revolute"]
+    ang_b = dj["ang"]; lin_b = dj["lin"]; rev_b = dj["revolute"]
+
+    # We need Ra, pa for chain joint a. Since a == b == di['chain_pos'] (and the
+    # joint is joint_jid), L_a is s_Xworld[16*joint_jid].
+    self.gen_add_code_line("// same-joint pair (intra-joint), joint_jid=" + str(joint_jid) +
+                           " c_a=" + str(c_a) + " c_b=" + str(c_b))
+    # Compute B_world[:3, :3] (Br_w) and B_world[:3, 3] (Bt_w) symbolically.
+    # We branch on (rev_a, rev_b) configurations:
+    #   rev-rev:   Br_local = 0.5 * ([a]_x [b]_x + [b]_x [a]_x); Bt_local = 0
+    #     Br_world = Ra @ Br_local @ Ra^T;  Bt_world = -Br_world @ pa
+    #     But Ra @ [a]_x @ Ra^T = [Ra a]_x = [a_w]_x (the world axis). So:
+    #     Br_world = 0.5 * ([a_w]_x [b_w]_x + [b_w]_x [a_w]_x)  -- can be expressed
+    #     using S_world top-left for both DOFs (already stored).
+    #   rev-pris (a rev, b pris): Br_local = 0; Bt_local = 0.5 * (a × b_lin)
+    #     Br_world = 0; Bt_world = 0.5 * Ra @ (a × b_lin) = 0.5 * (a_w × b_lin_w)
+    #     where a_w = Ra @ a (rotational axis), b_lin_w = Ra @ b_lin (lin axis).
+    #     Both a_w and b_lin_w can be read from the corresponding S_world entries.
+    #   pris-rev: symmetric to rev-pris (we treat B as symmetric in c_a, c_b).
+    #   pris-pris: B_local = 0 → d2M = 0 (no contribution).
+    a_w = "Ra @ ang_a"  # placeholder; we emit via S_world entries
+    # Get world axes from stored S entries:
+    # If revolute: skew block in S_world has axis (wx, wy, wz) = (S[2,1], S[0,2], S[1,0]).
+    # If prismatic: S_world[:3, 3] = R_a @ ax_local = axis_world.
+    # For the "ang_a" axis we need it whether a is revolute or whether it
+    # contributes only via the cross-product term. We'll compute axis_world
+    # FROM s_Xworld[16*joint_jid] @ ax_local for each axis we need.
+    # That keeps the code uniform and doesn't depend on extra interim variables.
+    def _emit_world_axis(name, ax_local):
+        # ax_world = Ra @ ax_local where Ra = top-left 3x3 of s_Xworld[16*joint_jid] (column-major)
+        for r in range(3):
+            terms = []
+            for c in range(3):
+                if abs(ax_local[c]) < 1e-15:
+                    continue
+                coef = "static_cast<T>(" + "{:.17g}".format(ax_local[c]) + ")"
+                terms.append("s_Xworld[" + str(16*joint_jid + r + 4*c) + "] * " + coef)
+            expr = " + ".join(terms) if terms else "static_cast<T>(0)"
+            self.gen_add_code_line("T " + name + "_" + str(r) + " = " + expr + ";")
+    self.gen_add_code_line("// Compute joint-a world frame axes of c_a and c_b body axes")
+    # For Br computation we need rotational world axes for revolute DOFs.
+    # For Bt (lin-ang) we need lin world axis and ang world axis. Compute both
+    # always (cheap) so the branching logic below is straightforward.
+    _emit_world_axis("aw", ang_a)  # ang_a in world
+    _emit_world_axis("bw", ang_b)
+    _emit_world_axis("alw", lin_a)  # lin_a in world
+    _emit_world_axis("blw", lin_b)
+    # pa = column 3 of s_Xworld[16*joint_jid]
+    self.gen_add_code_line("T pax = s_Xworld[" + str(16*joint_jid + 12) + "];")
+    self.gen_add_code_line("T pay = s_Xworld[" + str(16*joint_jid + 13) + "];")
+    self.gen_add_code_line("T paz = s_Xworld[" + str(16*joint_jid + 14) + "];")
+
+    if rev_a and rev_b:
+        # Br_world = 0.5 * ([a_w]_x @ [b_w]_x + [b_w]_x @ [a_w]_x)
+        # Using axw cross product identity:  [a]_x @ [b]_x = b @ a^T - (a . b) I
+        # So 0.5 * ([a]_x [b]_x + [b]_x [a]_x) = 0.5 * (a b^T + b a^T) - (a . b) I
+        # (the symmetric symmetric product of skews equals the symmetrized outer minus dot*I)
+        self.gen_add_code_line("// Br_world = 0.5 * ([aw]_x [bw]_x + [bw]_x [aw]_x)")
+        self.gen_add_code_line("//   = 0.5 * (aw bw^T + bw aw^T) - (aw . bw) I")
+        self.gen_add_code_line("T adotb = aw_0*bw_0 + aw_1*bw_1 + aw_2*bw_2;")
+        for r in range(3):
+            for c in range(3):
+                # Br[r, c] = 0.5 * (aw[r]*bw[c] + bw[r]*aw[c]) - adotb * (r == c)
+                diag = " - adotb" if r == c else ""
+                self.gen_add_code_line("T Br_" + str(r) + str(c) +
+                                       " = static_cast<T>(0.5) * (aw_" + str(r) + "*bw_" + str(c) +
+                                       " + bw_" + str(r) + "*aw_" + str(c) + ")" + diag + ";")
+        # Bt_world = -Br_world @ pa
+        for r in range(3):
+            self.gen_add_code_line(
+                "T Bt_" + str(r) + " = -(Br_" + str(r) + "0*pax + Br_" + str(r) + "1*pay + Br_" + str(r) + "2*paz);")
+    elif (rev_a and not rev_b) or ((not rev_a) and rev_b):
+        # Mixed lin-ang. Choose: a is rot if rev_a else b is rot.
+        if rev_a:
+            ang_var_x, ang_var_y, ang_var_z = "aw_0", "aw_1", "aw_2"
+            lin_var_x, lin_var_y, lin_var_z = "blw_0", "blw_1", "blw_2"
+        else:
+            ang_var_x, ang_var_y, ang_var_z = "bw_0", "bw_1", "bw_2"
+            lin_var_x, lin_var_y, lin_var_z = "alw_0", "alw_1", "alw_2"
+        # Br_world = 0; Bt_world = 0.5 * (ang_world x lin_world)
+        for r in range(3):
+            for c in range(3):
+                self.gen_add_code_line("T Br_" + str(r) + str(c) + " = static_cast<T>(0);")
+        self.gen_add_code_line(
+            "T Bt_0 = static_cast<T>(0.5) * (" + ang_var_y + "*" + lin_var_z + " - " + ang_var_z + "*" + lin_var_y + ");")
+        self.gen_add_code_line(
+            "T Bt_1 = static_cast<T>(0.5) * (" + ang_var_z + "*" + lin_var_x + " - " + ang_var_x + "*" + lin_var_z + ");")
+        self.gen_add_code_line(
+            "T Bt_2 = static_cast<T>(0.5) * (" + ang_var_x + "*" + lin_var_y + " - " + ang_var_y + "*" + lin_var_x + ");")
+    else:
+        # pris-pris: B_local = 0
+        for r in range(3):
+            for c in range(3):
+                self.gen_add_code_line("T Br_" + str(r) + str(c) + " = static_cast<T>(0);")
+        for r in range(3):
+            self.gen_add_code_line("T Bt_" + str(r) + " = static_cast<T>(0);")
+    # Now d2M = B_world * X_ee. We need d2M[:3, 3] (for H_xyz) and (d2R @ R_chain^T) = B_world[:3,:3].
+    # d2M[:3, 3] = B_world[:3, :3] @ p_ee + B_world[:3, 3] (since X_ee[3, 3] = 1).
+    self.gen_add_code_line("T Hxyz_x = Br_00*pex + Br_01*pey + Br_02*pez + Bt_0;")
+    self.gen_add_code_line("T Hxyz_y = Br_10*pex + Br_11*pey + Br_12*pez + Bt_1;")
+    self.gen_add_code_line("T Hxyz_z = Br_20*pex + Br_21*pey + Br_22*pez + Bt_2;")
+    # [Jwi]_x and [Jwj]_x from S_i_world / S_j_world top-left
+    self.gen_add_code_line("// Read [Jw_i]_x and [Jw_j]_x for the H_w correction")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[" + str(si_base + r + 4*c) + "];")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[" + str(sj_base + r + 4*c) + "];")
+    for r in range(3):
+        for c in range(3):
+            self.gen_add_code_line(
+                "T SiSj" + str(r) + str(c) + " = Si" + str(r) + "0*Sj0" + str(c) +
+                " + Si" + str(r) + "1*Sj1" + str(c) +
+                " + Si" + str(r) + "2*Sj2" + str(c) + ";")
+    # H_w = skew_inv(Br_world - SiSj)
+    self.gen_add_code_line("T HW_x = static_cast<T>(0.5) * ((Br_21 - SiSj21) - (Br_12 - SiSj12));")
+    self.gen_add_code_line("T HW_y = static_cast<T>(0.5) * ((Br_02 - SiSj02) - (Br_20 - SiSj20));")
+    self.gen_add_code_line("T HW_z = static_cast<T>(0.5) * ((Br_10 - SiSj10) - (Br_01 - SiSj01));")
+    base = "(" + str(ee_idx * 6 * nv * nv) + " + " + str(vi * nv + vj) + ")"
+    self.gen_add_code_line("s_d2eePos[" + base + " + 0 * " + str(nv*nv) + "] = Hxyz_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 1 * " + str(nv*nv) + "] = Hxyz_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 2 * " + str(nv*nv) + "] = Hxyz_z;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
 
 def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
     XHom_size, _dXhom_unused, _d2Xhom_unused = self.gen_get_Xhom_size()
