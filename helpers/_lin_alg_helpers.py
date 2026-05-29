@@ -18,6 +18,7 @@ _GLASS_BASE_FILES = [
     "src/base/L3/gemm.cuh",
     "src/base/L3/gemm_strided.cuh",
     "src/base/L3/gemm_batched_indexed.cuh",
+    "src/base/L3/inv.cuh",            # used by invert_matrix (floating-base 6x6 root invert)
 ]
 
 
@@ -196,50 +197,44 @@ def gen_grid_linalg_backend_helpers(self):
 
 
 def gen_invert_matrix(self, use_thread_group=False):
-    """
-    This function generates a matrix inversion function for cuda.
-    The function employs Gaussian elimination.
-    """
+    """Emits a thin wrapper around `glass::invertMatrix_dense` (block-
+    cooperative Gauss-Jordan; `GLASS/src/base/L3/inv.cuh`).
 
-    self.gen_add_func_doc("Compute the inverse of a matrix", ["Uses gaussian elimination"], \
-                          ['dimA is number of rows in A', \
-                           'A is a pointer to the original invertible matrix. It is turned into an identity matrix', \
-                           'Ainv is a pointer to an identity matrix that will be transformed into the inverse of A', \
-                            's_temp is a pointer to temporary memory of size 4*dimA'])
+    Why a wrapper rather than re-implementing here: GLASS is the first-party
+    linalg layer (memory `project_grid_glass_first_party.md`); pinning the
+    primitive there means future GLASS improvements (e.g. swapping to
+    Cholesky/LDLT for SPD inputs, vectorizing the save loop, lifting the
+    pivot loop) auto-propagate on the next vendor without re-touching the
+    emitter.
+
+    The base `glass::invertMatrix` (also embedded) takes the classic
+    augmented `[A | I]` n×(2n) layout; that doesn't fit the GRiD callers
+    which pre-allocate separate A and Ainv buffers, so we use the dense
+    in-place variant `glass::invertMatrix_dense(dimA, A, Ainv, s_temp)`
+    added in GLASS 2026-05-29 (3*dimA scratch, A → A^-1 AND Ainv → A^-1).
+
+    Signature preserved for caller compatibility:
+        invert_matrix(dimA, A, Ainv, s_temp)
+    On return: A := A^-1 (in-place — old code also overwrote A to identity,
+    which no caller depended on); Ainv := A^-1 (alias of A's inverse).
+    Callers that wrote a pre-init to Ainv = I before calling are now
+    paying redundant work; clean those up in a follow-up commit.
+    s_temp must hold at least (3*dimA) elements; the legacy callers reserve
+    4*dimA so there is headroom.
+    """
+    self.gen_add_func_doc(
+        "Compute the inverse of a matrix (wraps glass::invertMatrix_dense)",
+        ["Block-cooperative Gauss-Jordan via GLASS.",
+         "Both A and Ainv hold A^-1 on return (dual-output for caller compat).",
+         "s_temp must hold at least 3*dimA elements."],
+        ['dimA is the matrix dimension',
+         'A is the original invertible matrix (overwritten with A^-1 on return)',
+         'Ainv is workspace; on return it also holds A^-1',
+         's_temp is shared scratch of size >= 3*dimA'])
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void invert_matrix(uint32_t dimA, T *A, T *Ainv, T *s_temp) {", True)
-    self.gen_add_serial_ops(use_thread_group)
-    self.gen_add_code_line("for (unsigned pivRC = 0; pivRC < dimA; pivRC++) {", True)   # iterate over diagonal
-    self.gen_add_code_line("unsigned pivColOffset = pivRC*dimA;")
-    self.gen_add_code_line("T pvInv = static_cast<T>(1)/A[pivRC + pivColOffset];")      # 1/pivot
-
-    # save the pivot row and column values
-    self.gen_add_code_line("for (unsigned ind = 0; ind < dimA; ind++) {", True)
-    self.gen_add_code_line("s_temp[ind] = static_cast<T>(A[pivRC + dimA * ind]);")
-    self.gen_add_code_line("s_temp[ind+dimA] = static_cast<T>(Ainv[pivRC + dimA * ind]);")
-    self.gen_add_code_line("s_temp[ind+dimA*2] = static_cast<T>(A[ind + pivColOffset]);")
-    self.gen_add_end_control_flow()
-
-    # run gaussian elimination for the pivot row and column. Matrices are stored column-major.
-    self.gen_add_code_line("for (unsigned ind = 0; ind < dimA*dimA; ind++) {", True)
-    self.gen_add_code_line("unsigned row = ind % dimA, col = ind / dimA;")
-    # apply to the pivot row
-    self.gen_add_code_line("if (row == pivRC) {", True)
-    self.gen_add_code_line("A[row + dimA * col] = s_temp[col] * pvInv;") # put 1 on the diagonal by multiplying row by inverse
-    self.gen_add_code_line("Ainv[row + dimA * col] = s_temp[col+dimA] * pvInv;")
-    self.gen_add_end_control_flow()
-    # apply to other rows by reducing entries on the pivot column to 0s
-    self.gen_add_code_line("else {", True)
-    self.gen_add_code_line("T multiplier = s_temp[row+dimA*2] / s_temp[pivRC];")
-    self.gen_add_code_line("A[row + dimA * col] -= multiplier * s_temp[col];")
-    self.gen_add_code_line("Ainv[row + dimA * col] -= multiplier * s_temp[col+dimA];")
-    self.gen_add_end_control_flow()
-
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_sync(use_thread_group)
+    self.gen_add_code_line("glass::invertMatrix_dense<T>(dimA, A, Ainv, s_temp);")
     self.gen_add_end_function()
     return
 
