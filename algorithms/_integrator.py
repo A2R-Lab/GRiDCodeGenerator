@@ -841,8 +841,11 @@ def gen_integrator(self, use_thread_group=False):
     # Emit finish + inner (templated on IT), then EULER-typed device/kernel/host.
     # For floating-base, also emit SE(3) Lie-group helpers used by the
     # q-update Lie retract (the fixed-base path doesn't reference them).
-    if self.robot.floating_base:
+    # The d2ee kinematic codegen may also emit these helpers; only emit here
+    # if they weren't already emitted (avoid C++ redefinition).
+    if self.robot.floating_base and not getattr(self, "_lie_helpers_emitted", False):
         self.gen_lie_group_helpers()
+        self._lie_helpers_emitted = True
     self.gen_integrator_finish(use_thread_group)
     self.gen_integrator_inner(use_thread_group)
     self.gen_integrator_device(use_thread_group)

@@ -39,7 +39,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
                             gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, gen_end_effector_pose_gradient_kernel, \
-                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_d2_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
+                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_output_count, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
                             gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, gen_X_single_thread, gen_X_warp, \
                             gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
@@ -487,20 +487,29 @@ class GRiDCodeGenerator:
         self.ee_grad_use_workspace_dxhom = self.ee_grad_spill_tier >= 2
         dee_t_count = _ee_grad_arenas[self.ee_grad_spill_tier]
         self.ee_grad_t_count_per_tier = tuple(_ee_grad_arenas[i] for i in self.ee_grad_spill_tier_3way)
-        d2ee_inner_temp_count_full = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
-        d2ee_inner_temp_count_shared = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(include_d2_temp=False)
-        d2ee_workspace_temp_count = self.gen_end_effector_pose_gradient_hessian_d2_temp_mem_size()
-        d2ee_full_t_count = n + 6*n*n*self.robot.get_total_leaf_nodes() + 6*n*self.robot.get_total_leaf_nodes() + d2ee_inner_temp_count_full + XHom_size + dXhom_size + d2Xhom_size
-        d2ee_spill_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size
-        d2ee_spill_d2xhom_t_count = n + d2ee_inner_temp_count_shared + XHom_size + dXhom_size
-        _d2ee_arenas = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_d2xhom_t_count)
+        # D2EE (FD-on-d/dv-Jacobian): two spill levels (the nv^2 output is the only
+        # large buffer that can move out of smem). dXhom/d2Xhom are no longer used
+        # by the geometric-Jacobian gradient inner the d2ee inner runs internally.
+        _d2ee_num_ees = self.robot.get_total_leaf_nodes()
+        d2ee_inner_temp_count = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
+        d2ee_output_count = self.gen_end_effector_pose_gradient_hessian_output_count()
+        d2ee_grad_count = 6 * nv * _d2ee_num_ees
+        # full smem: q + grad + d2ee_output + inner_temp + Xhom
+        d2ee_full_t_count   = n + d2ee_grad_count + d2ee_output_count + d2ee_inner_temp_count + XHom_size
+        # output spilled: drop d2ee_output from smem (still need q + grad + inner_temp + Xhom)
+        d2ee_spill_t_count  = n + d2ee_grad_count                     + d2ee_inner_temp_count + XHom_size
+        _d2ee_arenas = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_t_count)
         if "ee_pose_hessian" in getattr(self, "generated_algorithms", set()):
             self.d2ee_spill_tier_3way = select_shared_tier_3way(*_d2ee_arenas)
         else:
             self.d2ee_spill_tier_3way = (0, 0, 0)
         self.d2ee_spill_tier = self.d2ee_spill_tier_3way[0]
-        self.d2ee_use_workspace_temp = self.d2ee_spill_tier >= 1
-        self.d2ee_use_workspace_d2xhom = self.d2ee_spill_tier >= 2
+        self.d2ee_use_workspace_output = self.d2ee_spill_tier >= 1
+        # Legacy aliases (older surfaces / tests still read these names; both now
+        # mean "output spilled to workspace"). d2xhom flag is permanently false:
+        # the FD inner never uses d2Xhom.
+        self.d2ee_use_workspace_temp = self.d2ee_use_workspace_output
+        self.d2ee_use_workspace_d2xhom = False
         d2ee_t_count = _d2ee_arenas[self.d2ee_spill_tier]
         self.d2ee_t_count_per_tier = tuple(_d2ee_arenas[i] for i in self.d2ee_spill_tier_3way)
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
@@ -675,18 +684,12 @@ class GRiDCodeGenerator:
                                            _minv_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_du_workspace_count)
-        # Max workspace required by D2EE across ANY tier (mirrors the EE_POSE_GRAD
-        # per-tier accounting just below). The PERF pick may be 0 while LITE/MINIMAL
-        # spill the d2eeTemp (and d2Xhom) arenas to d_workspace; the allocation must
-        # cover what any instantiated tier needs at runtime, else the d2ee kernel
-        # writes past the per-timestep slice (OOB) when the user switches tier via
-        # the kernel template. Keying off the single-valued PERF-pick macros here
-        # under-allocates for divergent 3-way picks (e.g. go2 d2ee = (0,1,2)).
+        # D2EE no longer needs d_workspace: under the FD-on-Jacobian inner the
+        # ONLY large buffer is the nv^2 output, and when it's spilled the inner
+        # writes directly into d_d2eePos (the persistent output buffer) -- not
+        # into a per-timestep workspace slice. The new spill thus costs no extra
+        # workspace allocation.
         d2ee_workspace_t_count = 0
-        if any(p >= 1 for p in self.d2ee_spill_tier_3way):
-            d2ee_workspace_t_count += d2ee_workspace_temp_count
-        if any(p >= 2 for p in self.d2ee_spill_tier_3way):
-            d2ee_workspace_t_count += d2Xhom_size
         # Phase 3d: max workspace required by EE_POSE_GRAD across any tier (PERF
         # may pick 0, but the workspace allocation must cover what LITE/MINIMAL
         # need at runtime when the user switches tier via the kernel template).
@@ -738,12 +741,13 @@ class GRiDCodeGenerator:
                                  "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_body_frame_use_global_output)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_GLOBAL_TENSORS = " + str(int(self.fdsva_so_use_global_tensors)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_TEMP = " + str(int(self.fdsva_so_use_workspace_temp)) + ";", \
-                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_temp)) + ";", \
-                                 "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = " + str(int(self.d2ee_use_workspace_d2xhom)) + ";", \
-                                 # Per-tier L2-persisting gate: 1 if ANY tier spills the d2eeTemp arena to
-                                 # d_workspace. The host gate must arm L2 persistence whenever a runtime
-                                 # tier switch could route d2eeTemp through global memory (not just the
-                                 # PERF-pick single-valued GRID_D2EE_USES_WORKSPACE_TEMP).
+                                 # GRID_D2EE_USES_WORKSPACE_TEMP: 1 if the PERF tier spills the d2ee output
+                                 # (the only large buffer in the new FD-on-Jacobian path) to global memory.
+                                 # When spilled, the inner writes directly into d_d2eePos (the persistent
+                                 # output buffer) -- no extra per-timestep workspace slice is used. The old
+                                 # d2xhom-spill bit is permanently 0 (the FD inner never touches d2Xhom).
+                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_output)) + ";", \
+                                 "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = 0;", \
                                  "const int GRID_D2EE_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.d2ee_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_D2EE_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
                                  "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP = " + str(int(self.ee_grad_use_workspace_temp)) + ";", \
@@ -958,9 +962,9 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.ee_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ee_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ee_grad_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "// --- end_effector_pose_gradient_hessian_inner (large n^2 d2eeTemp arena) ---",
-                                 "// Per-tier placement of the inner's s_d2eeTemp scratch: true => smem, false => d_workspace.",
-                                 "template <int TIER> __host__ __device__ constexpr bool D2EE_D2TEMP_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.d2ee_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.d2ee_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.d2ee_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "// --- end_effector_pose_gradient_hessian_inner (large nv^2 d2eePos output) ---",
+                                 "// Per-tier placement of the d2ee inner's OUTPUT s_d2eePos: true => smem, false => d_workspace (which the kernel sets to d_d2eePos directly).",
+                                 "template <int TIER> __host__ __device__ constexpr bool D2EE_OUT_IN_SMEM() { return (TIER == TIER_PERF) ? " + ("true" if self.d2ee_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.d2ee_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.d2ee_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
@@ -968,13 +972,11 @@ class GRiDCodeGenerator:
                                  "        : grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count - fd_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(fd_du_temp_count) + "); }",
-                                 "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_PERF d2eeTemp lives in the shared arena; at TIER_LITE/MINIMAL it moves to d_workspace, freeing " + str(d2ee_workspace_temp_count) + "*sizeof(T) bytes of smem.",
+                                 "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_PERF the smem arena keeps only the FD scratch + s_Xhom; at TIER_LITE/MINIMAL the device contract is unchanged (smem arena is the same -- the caller-provided s_d2eePos is what shifts), and the inner writes its " + str(d2ee_output_count) + "*sizeof(T) output bytes to d_workspace instead.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_SMEM_BYTES() {",
-                                 "    return (TIER == TIER_PERF)",
-                                 "        ? grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + d2ee_workspace_temp_count + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>())",
-                                 "        : grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count_shared + XHom_size + dXhom_size + d2Xhom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
+                                 "    return grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count + XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
                                  "}",
-                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(d2ee_workspace_temp_count) + "); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_PERF) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(d2ee_output_count) + "); }",
                                  "// Per-tier sizes for inverse_dynamics_gradient_device (inline-CUDA users only). At TIER_PERF temp lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing " + str(id_du_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t ID_DU_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return (TIER == TIER_PERF)",
@@ -1009,9 +1011,13 @@ class GRiDCodeGenerator:
                                  # is far smaller than GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP, so it fits at
                                  # offset 0 without growing GRID_WORKSPACE_BYTES_PER_TIMESTEP.
                                  "template <typename T> __host__ __device__ inline size_t GRID_ABA_COLD_OFFSET_BYTES() { return static_cast<size_t>(0); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES<T>() + (GRID_D2EE_USES_WORKSPACE_D2XHOM ? sizeof(T) * static_cast<size_t>(D2XHOM_T_COUNT) : 0); }",
+                                 # D2EE no longer uses a per-timestep d_workspace slice (the spilled
+                                 # s_d2eePos is written directly into d_d2eePos); these offset macros are
+                                 # retained as 0 for backward compatibility with any inline-CUDA caller
+                                 # pattern that still references them. New code should not use them.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
                                  # Phase 3d: EE_POSE_GRAD reuses the SO section (the kernels don't
                                  # run concurrently — d_workspace bytes are safely repurposed). When
                                  # the MINIMAL tier spills dXmatsHom, it sits before the temp arena.
@@ -1154,11 +1160,11 @@ class GRiDCodeGenerator:
                       "if (needs_kinematics) {", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    if ((GRID_D2EE_USES_WORKSPACE_TEMP || GRID_EE_GRAD_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "return hd_data;"]
         # generate as templated or not function
@@ -1733,8 +1739,16 @@ class GRiDCodeGenerator:
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True)
             if "ee_pose_hessian" in algorithms:
                 self.gen_load_update_XmatsHom_helpers(use_thread_group,include_base_inertia,include_gradients = True, include_hessians = True)
-        # then generate kinematic algorithms
+        # then generate kinematic algorithms.
+        # SE(3) Lie-group helpers (grid_integrate_floating_q, grid_so3_*, grid_quat_*)
+        # are needed by the FD-on-Jacobian d2ee inner on floating base. Emit them
+        # here too so callers that skip the integrator codegen still get them; track
+        # the emission so gen_integrator skips its own emit (avoiding redefinitions).
+        self._lie_helpers_emitted = False
         if include_any_kinematics:
+            if self.robot.floating_base and "ee_pose_hessian" in algorithms:
+                self.gen_lie_group_helpers()
+                self._lie_helpers_emitted = True
             self.gen_eepose_and_derivatives(use_thread_group, fixed_target_name = fixed_target_name,
                                             include_pose = "ee_pose" in algorithms,
                                             include_gradient = "ee_pose_gradient" in algorithms,
