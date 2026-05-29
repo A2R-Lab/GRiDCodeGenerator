@@ -154,14 +154,7 @@ def gen_direct_minv_inner(self, use_thread_group = False):
         if self.robot.floating_base and bfs_level == 0:
             # U = IA because S is identity, so Dinv = IA^{-1}, Top left 6x6 in minv = Dinv
             self.gen_add_code_line("// U = IA*S = IA, D = S^T*U = U = IA => Minv[:6, :6] = IA^{-1}")
-            # Fill in an identity matrix to store inverse
-            self.gen_add_parallel_loop("ind", '36', use_thread_group)
-            self.gen_add_code_line("if (ind % 7 == 0) {s_temp[" +  str(fb_DinvOffset) + " + ind] = static_cast<T>(1);}")
-            self.gen_add_code_line("else {s_temp[" +  str(fb_DinvOffset) + " + ind] = static_cast<T>(0);}")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync(use_thread_group)
-
-            # Invert IA
+            # Ainv=I pre-init dropped 2026-05-29: glass::invertMatrix_dense seeds Ainv internally.
             self.gen_add_code_line(f"invert_matrix(6, &s_temp[{str(IAOffset)}], &s_temp[{str(fb_DinvOffset)}], &s_temp[{IaTempOffset}]);")
 
             # Top left 6x6 in minv <- Dinv

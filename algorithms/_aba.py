@@ -148,7 +148,7 @@ def gen_aba_inner_floating(self, use_thread_group = False):
             self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
             self.gen_add_code_line("s_fb_cold[" + str(fbUOffset) + " + ind] = s_temp[" + str(IAOffset) + " + row + 6*S_col];")
             self.gen_add_code_line("s_fb_cold[" + str(fbDOffset) + " + ind] = s_temp[" + str(IAOffset) + " + S_row + 6*S_col];")
-            self.gen_add_code_line("s_fb_cold[" + str(fbDinvOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+            # Ainv=I pre-init dropped 2026-05-29: glass::invertMatrix_dense seeds Ainv internally.
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             self.gen_add_code_line("invert_matrix(6, &s_fb_cold[" + str(fbDOffset) + "], &s_fb_cold[" + str(fbDinvOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
@@ -217,9 +217,8 @@ def gen_aba_inner_floating(self, use_thread_group = False):
         if bfs_level == 0:
             self.gen_add_code_line("// root acceleration from gravity, then solve root qdd")
             self.gen_add_parallel_loop("ind", "36", use_thread_group)
-            self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + ind] = s_XImats[ind];")
-            self.gen_add_code_line("s_temp[" + str(tempVecOffset) + " + ind] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+            # Ainv=I pre-init (and row/col) dropped 2026-05-29: glass::invertMatrix_dense seeds Ainv internally.
             self.gen_add_end_control_flow()
             self.gen_add_sync(use_thread_group)
             self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
