@@ -361,6 +361,10 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         self.gen_add_code_line("//")
         self.gen_add_code_line("// s_c extracted serially (mimic-aware S*f accumulate into v-slot)")
         self.gen_add_code_line("//")
+        # The backward pass writes parent forces into s_vaf via block-cooperative
+        # GEMVs (all threads). Sync so thread 0's serial fold below sees every
+        # thread's f writes — without this the root bodies' c races on stale f.
+        self.gen_add_sync()
         self.gen_add_serial_ops()
         for vs in range(self.robot.get_num_vel()):
             self.gen_add_code_line("s_c[" + str(vs) + "] = static_cast<T>(0);")
