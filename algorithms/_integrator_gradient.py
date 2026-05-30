@@ -860,7 +860,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     if picks[0] == picks[1] == picks[2]:
         _emit_body(dqdd_smem[0], dab_smem[0], inner_lvl[0])
     else:
-        for tier_idx, tier_name in enumerate(("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")):
+        for tier_idx, tier_name in enumerate(("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")):
             head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
                    ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
             self.gen_add_code_line(head, True)

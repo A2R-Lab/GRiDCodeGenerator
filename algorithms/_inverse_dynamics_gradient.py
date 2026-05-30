@@ -1128,7 +1128,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
         uss, ugt = _ID_DU_PICK_FLAGS[picks[0]]
         _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             uss, ugt = _ID_DU_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \

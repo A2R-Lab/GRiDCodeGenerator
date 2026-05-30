@@ -483,7 +483,7 @@ def gen_fdsva_so_kernel(self, single_call_timing = False):
         ugt, uwt, fgs, uwdfdu, uwminv, uwit = _FDSVA_SO_PICK_FLAGS[picks[0]]
         _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, uwit)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             ugt, uwt, fgs, uwdfdu, uwminv, uwit = _FDSVA_SO_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
