@@ -578,20 +578,17 @@ def gen_direct_minv_device(self):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
     func_def = "void direct_minv_device(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel){"
     func_notes = ["Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
-    # then generate the code
-    self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-    # add the shared memory variables (full smem layout: no_F + F packed contiguously)
+    # then generate the code (shared device-wrapper skeleton; B+C §1.1).
+    # Full smem layout: no_F + F packed contiguously. Inner-callable device path
+    # keeps F in smem (F_IN_SMEM=true); the inner slices s_F from the tail of
+    # s_temp itself.
     n = self.robot.get_num_vel()
     shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()  # no_F + F
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
-    # then load/update XI and run the algo. Inner-callable device path keeps F in
-    # smem (F_IN_SMEM=true); the inner slices s_F from the tail of s_temp itself.
-    self.gen_load_update_XImats_helpers_function_call()
-    self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
-    self.gen_add_end_function()
+    self.gen_device_wrapper(
+        "Compute the inverse of the mass matrix", func_def, shared_mem_size,
+        lambda: self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true"),
+        func_notes = func_notes, func_params = func_params,
+        include_linalg_scratch = True)
 
 def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
     """Emit direct_minv_kernel body for one tier's spill flag.

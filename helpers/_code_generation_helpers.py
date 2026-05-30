@@ -638,3 +638,87 @@ def gen_shared_arena_t_count(self, t_buffers, temp_mem_size, helper_size):
     for _, region_count in t_buffers:
         count += int(region_count)
     return count
+
+def gen_device_wrapper(self, func_desc, func_def, shared_mem_size, inner_call_fn,
+                       template_line = "template <typename T>",
+                       func_notes = None, func_params = None,
+                       extra_t_buffers = None, include_linalg_scratch = True,
+                       tier_workspace_expr = None, skip_floating_base_X = False):
+    """Emit the shared `__device__` wrapper skeleton common to the simple
+    inline-CUDA device entry points (id / fd / aba / crba / direct_minv /
+    idsva_so / integrator). Each of these repeats the identical sequence:
+
+        gen_add_func_doc(...)
+        gen_add_code_line(<template line>)
+        gen_add_code_line("__device__")
+        gen_add_code_line(func_def, True)
+        gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, ...)
+        gen_load_update_XImats_helpers_function_call(...)
+        <per-algo inner call(s)>
+        gen_add_end_function()
+
+    The genuinely per-algo parts are kept as parameters, NOT erased:
+      - `func_def`        : the full signature string (built by the caller).
+      - `template_line`   : `<typename T>` vs the tier-aware /
+                            IntegratorType variants.
+      - `extra_t_buffers` : the algo's extra smem t-regions (default none).
+      - `include_linalg_scratch` : whether the algo reserves linalg scratch
+                            (True for all but idsva_so).
+      - `tier_workspace_expr` : the LITE/MINIMAL whole-arena repoint target
+                            (only the tier-aware device paths set this).
+      - `skip_floating_base_X` : CRBA-only surgical lever on the XImats load.
+      - `inner_call_fn`   : a 0-arg closure that emits the per-algo inner
+                            call(s) between the XImats load and the function
+                            end (the irreducibly per-algo body).
+
+    The (B+C §1.1) consolidation: every matching `gen_*_device` shrinks to
+    building its `func_def`/params then ONE call here. Output is byte-identical
+    to the pre-collapse hand-rolled wrappers."""
+    self.gen_add_func_doc(func_desc, func_notes if func_notes is not None else [],
+                          func_params if func_params is not None else [], None)
+    self.gen_add_code_line(template_line)
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    self.gen_XImats_helpers_temp_shared_memory_code(
+        shared_mem_size, extra_t_buffers = extra_t_buffers,
+        include_linalg_scratch = include_linalg_scratch,
+        tier_workspace_expr = tier_workspace_expr)
+    self.gen_load_update_XImats_helpers_function_call(skip_floating_base_X = skip_floating_base_X)
+    inner_call_fn()
+    self.gen_add_end_function()
+
+def gen_tier_dispatch(self, picks, emit_body_fn):
+    """Emit the per-tier spill-pick dispatch scaffolding shared by ~10 kernel
+    emitters (crba / fd / fd_du / aba / fdsva_so / integrator / minv / id_du /
+    ee_grad / d2ee). Every site repeated the identical scaffolding (B+C §1.2):
+
+        picks = getattr(self, "<algo>_spill_tier_3way", (...))
+        if picks[0] == picks[1] == picks[2]:
+            <emit body for picks[0]>
+        else:
+            tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
+            for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+                head = "if constexpr (RESOURCE_TIER == "+tier_name+") {" if tier_idx==0
+                       else "else if constexpr (RESOURCE_TIER == "+tier_name+") {"
+                self.gen_add_code_line(head, True)
+                <emit body for pick>
+                self.gen_add_end_control_flow()
+
+    `picks` is the (perf, lite, minimal) 3-tuple. `emit_body_fn(pick)` is the
+    per-algo closure that unpacks `pick` (e.g. `bool(pick)`, or
+    `_<ALGO>_PICK_FLAGS[pick]`) and emits that tier's
+    `_emit_<algo>_kernel_body_for_flags(...)`. When all three picks agree the
+    body is emitted once with no if-constexpr guard (byte-identical to the
+    collapsed-single-body original); otherwise the three-branch constexpr
+    ladder is emitted. The tier-name tuple is single-sourced here (T5's
+    TIER_SHARED/TIER_LITE/TIER_MINIMAL symbols)."""
+    if picks[0] == picks[1] == picks[2]:
+        emit_body_fn(picks[0])
+    else:
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
+        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
+            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
+                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
+            self.gen_add_code_line(head, True)
+            emit_body_fn(pick)
+            self.gen_add_end_control_flow()

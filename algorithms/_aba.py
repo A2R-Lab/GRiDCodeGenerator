@@ -814,21 +814,13 @@ def gen_aba_device(self):
     func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity) {"
     func_def = func_def_start + func_def_middle + func_def_end
 
-    # then generate the code
-    self.gen_add_func_doc("Compute the ABA (Articulated Body Algorithm)",\
-                          func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-
-    # add the shared memory variables
+    # then generate the code (shared device-wrapper skeleton; B+C §1.1)
     shared_mem_size = self.gen_aba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_va", 12*n)], include_linalg_scratch=True)
-
-    # then load/update XI and run the algo
-    self.gen_load_update_XImats_helpers_function_call()
-    self.gen_aba_inner_function_call()
-    self.gen_add_end_function()
+    self.gen_device_wrapper(
+        "Compute the ABA (Articulated Body Algorithm)", func_def, shared_mem_size,
+        lambda: self.gen_aba_inner_function_call(),
+        func_notes = func_notes, func_params = func_params,
+        extra_t_buffers = [("s_va", 12*n)], include_linalg_scratch = True)
 
 def _aba_surgical_inner_smem_size(self):
     """Float count the smem s_temp arena needs at the SURGICAL rung. The cold

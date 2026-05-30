@@ -3444,22 +3444,23 @@ def gen_idsva_so_device(self, use_qdd_input = True):
     func_notes = ["Dispatches to " + frame_label + "_inner at codegen time (" + ("world for floating-base" if self.robot.floating_base else "body for fixed-base") + ").",
                   "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the inner scratch moves from s_temp to d_workspace, freeing shared memory for the caller's outer kernel"]
     func_def = func_def_start + func_def_end
-    self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics (frame picked at codegen time)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_SHARED>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-    # add the shared memory variables (s_temp routes to d_workspace at LITE+)
-    self.gen_XImats_helpers_temp_shared_memory_code(inner_temp_size, tier_workspace_expr="d_workspace")
-    self.gen_load_update_XImats_helpers_function_call()
-    # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr above, so the
-    # inner's per-buffer spill pointer is unused here (pass nullptr).
-    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-    if self.robot.floating_base:
-        self.gen_idsva_so_world_frame_inner_function_call()
-    else:
-        self.gen_idsva_so_body_frame_inner_function_call()
-        self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
-    self.gen_add_end_function()
+    # shared device-wrapper skeleton (B+C §1.1); s_temp routes to d_workspace at
+    # LITE+ via tier_workspace_expr. idsva_so does NOT reserve linalg scratch.
+    def _emit_idsva_so_inner():
+        # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr, so the
+        # inner's per-buffer spill pointer is unused here (pass nullptr).
+        self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
+        if self.robot.floating_base:
+            self.gen_idsva_so_world_frame_inner_function_call()
+        else:
+            self.gen_idsva_so_body_frame_inner_function_call()
+            self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
+    self.gen_device_wrapper(
+        "Computes the second order derivatives of inverse dynamics (frame picked at codegen time)",
+        func_def, inner_temp_size, _emit_idsva_so_inner,
+        template_line = "template <typename T, int RESOURCE_TIER = TIER_SHARED>",
+        func_notes = func_notes, func_params = func_params,
+        include_linalg_scratch = False, tier_workspace_expr = "d_workspace")
 
 
 def gen_idsva_so_dispatcher_host(self, mode = 0):

@@ -640,11 +640,6 @@ def gen_integrator_device(self):
                    "dt is the integration timestep"]
     func_def_start = "void integrator_device(T *s_x_kp1, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt) {"
-    self.gen_add_func_doc("Computes a single integrator step using the precomputed robotModel",
-                          [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def_start + func_def_end, True)
     # Device wrapper keeps the FD Minv-F region in smem (the default PERF
     # placement); the spill ladder is exercised through the kernel path.
     shared_mem_size = self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=True)
@@ -654,10 +649,14 @@ def gen_integrator_device(self):
         ("s_stage_qdd", (max_stages - 1) * n),
         ("s_stage_point", (max_stages - 1) * 2 * n),
     ]
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
-    self.gen_load_update_XImats_helpers_function_call()
-    self.gen_integrator_inner_function_call(integrator_type="IT")
-    self.gen_add_end_function()
+    # shared device-wrapper skeleton (B+C §1.1)
+    self.gen_device_wrapper(
+        "Computes a single integrator step using the precomputed robotModel",
+        func_def_start + func_def_end, shared_mem_size,
+        lambda: self.gen_integrator_inner_function_call(integrator_type="IT"),
+        template_line = "template <typename T, IntegratorType IT = IntegratorType::EULER>",
+        func_notes = [], func_params = func_params,
+        extra_t_buffers = extra_t_buffers, include_linalg_scratch = True)
 
 
 def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):

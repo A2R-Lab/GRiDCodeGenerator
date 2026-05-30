@@ -9,7 +9,7 @@ class GRiDCodeGenerator:
                          gen_anti_licm_input_reload, gen_anti_licm_output_write, \
                          gen_static_array_ind_2d, gen_static_array_ind_3d, gen_add_debug_print_code_lines, \
                          gen_mx_func_call_for_cpp, gen_add_shared_memory_helpers, gen_declare_shared_arena, \
-                         gen_shared_arena_t_count, gen_spatial_algebra_helpers, \
+                         gen_shared_arena_t_count, gen_device_wrapper, gen_tier_dispatch, gen_spatial_algebra_helpers, \
                          gen_get_XI_size, gen_init_XImats, gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \

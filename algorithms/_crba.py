@@ -530,26 +530,18 @@ def gen_crba_device(self):
 
     func_def = func_def_start + func_def_middle + func_def_end
 
-    # then generate the code
-    self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)",\
-                          func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-
-    # add the shared memory variables
-    shared_mem_size = self.gen_crba_device_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True)
-
-    # then load/update XI and run the algo.
+    # then generate the code (shared device-wrapper skeleton; B+C §1.1).
     # A.3 surgical lever: CRBA never reads s_XImats[0..35] (the floating root
     # spatial transform X[0]) — Phase 1 BFS starts at level 1, and Phase 2's
     # chain walk only dereferences X[X_id] for X_id in {jid, ancestors[:-1]};
     # the root id 0 only appears as `anc`, never as `X_id`. So we skip
     # recomputing X[0] from the floating-base quaternion on every call.
-    self.gen_load_update_XImats_helpers_function_call(skip_floating_base_X=True)
-    self.gen_crba_inner_function_call()
-    self.gen_add_end_function()
+    shared_mem_size = self.gen_crba_device_temp_mem_size()
+    self.gen_device_wrapper(
+        "Compute the CRBA (Composite Rigid Body Algorithm)", func_def, shared_mem_size,
+        lambda: self.gen_crba_inner_function_call(),
+        func_notes = func_notes, func_params = func_params,
+        include_linalg_scratch = True, skip_floating_base_X = True)
 
 def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing):
     """Emit crba_kernel body for one tier's spill flag.
