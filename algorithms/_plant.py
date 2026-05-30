@@ -508,6 +508,185 @@ def gen_plant_barriers(self):
 
 
 # ---------------------------------------------------------------------------
+# Kernels + host wrappers (the binding layer: G1 grid_plant Python surface).
+#
+# Each plant kernel runs ONE BLOCK PER TIMESTEP (block-level grid-stride loop)
+# and calls the auto-allocating `grid_plant::`/`grid::` device functions, which
+# own the WHOLE `extern __shared__` arena. The kernel therefore passes GLOBAL
+# device pointers for state / input / output straight through to the device
+# function — the device fn reads/writes through whatever pointer it is given,
+# so the heavy RBD scratch stays internal and we never collide with it.
+#
+# Reduction-style cost / barrier device functions additionally take an
+# `s_scratch` shared buffer; the kernel declares a tiny `__shared__` array for
+# it (these kernels do no RBD arena work, so a static shared array is fine).
+#
+# The host wrappers take raw device pointers for the plant-specific in/out
+# buffers (desired states, weights, bounds, scalar outputs). The grid_rbd C ABI
+# (wrapper_template.cu) allocates those device buffers and stages H<->D copies.
+# ---------------------------------------------------------------------------
+
+def gen_plant_step_kernel(self):
+    """`plant_step_kernel` — one block/timestep, calls grid_plant::plant_step.
+
+    Inputs/outputs are global; the device fn (-> grid::integrator_device) owns
+    the shared arena. Reuses grid::INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES.
+    """
+    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
+    nv = self.robot.get_num_vel()
+    self.gen_add_func_doc("plant_step kernel: x_{k+1} = integrator(x_k, u_k, dt) per timestep",
+                          [],
+                          ["d_x_kp1 is the next-state output (NUM_POS+NUM_VEL per timestep)",
+                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
+                           "d_u is the packed control torque (NUM_VEL per timestep)",
+                           "stride_x / stride_u are the per-timestep strides",
+                           "d_robotModel / gravity / dt as for plant_step",
+                           "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void plant_step_kernel(T *d_x_kp1, const T *d_x, const T *d_u, "
+                           "const int stride_x, const int stride_u, "
+                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_code_line("plant_step<T, IT>(&d_x_kp1[k*" + str(nx) + "], &d_x[k*stride_x], &d_u[k*stride_u], d_robotModel, gravity, dt);")
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_quadratic_cost_kernel(self, which):
+    """`<base>_kernel` — one block/timestep value+grad+GN-diag-hess.
+
+    No RBD arena needed; a small static `__shared__` reduction scratch suffices.
+    """
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    if which == "state":
+        size = nq + nv
+        var, des, w = "x", "x_des", "Q"
+        base = "quadratic_state_cost"
+    else:
+        size = nv
+        var, des, w = "u", "u_des", "R"
+        base = "quadratic_input_cost"
+    N = str(size)
+    self.gen_add_func_doc(base + "_kernel: value + gradient + GN-diag hessian per timestep",
+                          [], ["d_out scalar cost (1 per timestep)",
+                               "d_grad gradient (" + N + " per timestep)",
+                               "d_hess dense col-major hessian (" + N + "*" + N + " per timestep)",
+                               "d_" + var + " / d_" + des + " / d_" + w + " inputs (" + N + " per timestep)",
+                               "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void " + base + "_kernel(T *d_out, T *d_grad, T *d_hess, "
+                           "const T *d_" + var + ", const T *d_" + des + ", const T *d_" + w + ", const int NUM_TIMESTEPS) {", True)
+    self.gen_add_code_line("__shared__ T s_scratch[" + N + "];")
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_code_line(base + "_value_grad_hess<T>(&d_out[k], &d_grad[k*" + N + "], &d_hess[k*" + str(size*size) + "], "
+                           "&d_" + var + "[k*" + N + "], &d_" + des + "[k*" + N + "], &d_" + w + "[k*" + N + "], s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_ee_pos_cost_kernel(self):
+    """`ee_pos_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
+
+    Calls grid_plant::ee_pos_cost[_gradient/_hessian], which call the
+    auto-allocating grid::end_effector_pose[_gradient]_device. Global in/out;
+    reuses grid::EE_POS_DYNAMIC_SHARED_MEM_BYTES for the launch smem.
+    """
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    num_ees = self.robot.get_total_leaf_nodes()
+    nx = nq + nv
+    self.gen_add_func_doc("ee_pos_cost_kernel: value + grad_x + GN hess_x per timestep (EE=0)",
+                          [], ["d_out scalar cost (1 per timestep)",
+                               "d_grad grad over x (" + str(nx) + " per timestep)",
+                               "d_hess dense col-major x-hessian (" + str(nx*nx) + " per timestep)",
+                               "d_q joint positions (NUM_POS per timestep)",
+                               "d_p_des desired EE position (3 per timestep)",
+                               "d_W per-axis weight (3 per timestep)",
+                               "d_eePos / d_deePos global scratch (6*NUM_EES / 6*NUM_VEL*NUM_EES per timestep)",
+                               "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T, int EE = 0>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
+                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_eePos, T *d_deePos, "
+                           "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
+    self.gen_add_code_line("T *s_eePos = &d_eePos[k*" + str(6*num_ees) + "]; T *s_deePos = &d_deePos[k*" + str(6*nv*num_ees) + "];")
+    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], s_q, s_p_des, s_W, s_eePos, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("ee_pos_cost_gradient<T, EE>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_eePos, s_deePos, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("ee_pos_cost_hessian<T, EE>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_deePos, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_barrier_kernel(self, base, count, var_offset):
+    """`<base>_kernel` — one block/timestep value+grad+hess-diag for a barrier.
+
+    `count` bounded DOFs, reading the var slice at `var_offset`. Grad/hess are
+    written into standalone packed buffers (offset 0) since the Python surface
+    returns the per-DOF gradient/hessian-diagonal directly.
+    """
+    N = str(count)
+    self.gen_add_func_doc(base + "_kernel: value + grad + hess-diagonal per timestep",
+                          [], ["d_out scalar barrier cost (1 per timestep)",
+                               "d_grad per-DOF gradient (" + N + " per timestep)",
+                               "d_hess_diag per-DOF hessian diagonal (" + N + " per timestep)",
+                               "d_var variable vector (" + N + " per timestep)",
+                               "d_lower / d_upper per-DOF bounds (" + N + " per timestep)",
+                               "mu barrier weight; NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void " + base + "_kernel(T *d_out, T *d_grad, T *d_hess_diag, "
+                           "const T *d_var, const T *d_lower, const T *d_upper, const T mu, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_code_line("__shared__ T s_scratch[" + N + "];")
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    # zero the scalar out (the value fn ADDS into it), then run the three fns.
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("d_out[k] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_code_line("const T *s_var = &d_var[k*" + N + "]; const T *s_lo = &d_lower[k*" + N + "]; const T *s_hi = &d_upper[k*" + N + "];")
+    # value reads s_var[VAR_OFFSET + i]; we pass an offset-0 view, so call with VAR_OFFSET=0 semantics.
+    self.gen_add_code_line(base + "<T>(&d_out[k], s_var, s_lo, s_hi, mu, s_scratch);")
+    self.gen_add_sync()
+    # grad/hess templates default VAR_OFFSET to the packed slice offset; we pass an
+    # offset-0 view of s_var and want offset-0 writes, so force both offsets to 0.
+    self.gen_add_parallel_loop("i", N)
+    self.gen_add_code_line("d_grad[k*" + N + " + i] = grid_plant_log_barrier_grad<T>(s_var[i], s_lo[i], s_hi[i], mu);")
+    self.gen_add_code_line("d_hess_diag[k*" + N + " + i] = grid_plant_log_barrier_hess<T>(s_var[i], s_lo[i], s_hi[i], mu);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_plant_kernels(self, algorithms):
+    """Emit the binding-layer kernels for the plant value surface."""
+    self.gen_quadratic_cost_kernel("state")
+    self.gen_quadratic_cost_kernel("input")
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    gen_barrier_kernel(self, "joint_position_barrier", nq, 0)
+    gen_barrier_kernel(self, "joint_velocity_barrier", nv, nq)
+    gen_barrier_kernel(self, "joint_torque_barrier",   nv, 0)
+    if "integrator" in algorithms:
+        gen_plant_step_kernel(self)
+        # Signal to the binding layer (wrapper_template.cu) that plant_step exists.
+        self.gen_add_code_line("#define GRID_PLANT_HAS_STEP 1")
+    if ("ee_pose" in algorithms) and ("ee_pose_gradient" in algorithms):
+        gen_ee_pos_cost_kernel(self)
+        self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
+
+
+# ---------------------------------------------------------------------------
 # Top-level emit: open the sibling namespace and gate each sub-emit on deps.
 # ---------------------------------------------------------------------------
 
@@ -546,5 +725,9 @@ def gen_grid_plant(self, algorithms):
         self.gen_ee_pos_cost()
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'ee_pose' and 'ee_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
+
+    # Binding layer (G1): emit the per-timestep kernels that wrap the device
+    # functions above, so the grid_rbd Python/C-ABI surface can launch them.
+    self.gen_plant_kernels(algorithms)
 
     self.gen_add_end_control_flow()  # close namespace grid_plant
