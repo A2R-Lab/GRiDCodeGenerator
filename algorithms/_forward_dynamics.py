@@ -138,7 +138,7 @@ def gen_forward_dynamics_inner(self):
 def gen_forward_dynamics_device(self):
     n = self.robot.get_num_vel()
     # Inline-CUDA device path. Tier-aware via tier_workspace_expr (mirrors
-    # idsva_so_device / d2ee_device / id_du_device): at TIER_PERF the whole
+    # idsva_so_device / d2ee_device / id_du_device): at TIER_SHARED the whole
     # FD inner s_temp arena lives in shared memory (with MINV_F at its tail);
     # at TIER_LITE/TIER_MINIMAL the WHOLE arena is routed to L2-pinned
     # d_workspace, freeing smem for the caller's outer kernel. The inner is
@@ -152,7 +152,7 @@ def gen_forward_dynamics_device(self):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant", \
-                   "d_workspace is the global scratch buffer; size FD_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+                   "d_workspace is the global scratch buffer; size FD_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_SHARED, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_def_start = "void forward_dynamics_device(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, T *d_workspace = nullptr) {"
     func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the whole FD inner scratch (~" + str(shared_mem_size) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel.",
@@ -160,10 +160,10 @@ def gen_forward_dynamics_device(self):
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_SHARED>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    # Tier-aware arena: at TIER_PERF s_temp lives in the smem arena; at
+    # Tier-aware arena: at TIER_SHARED s_temp lives in the smem arena; at
     # TIER_LITE/MINIMAL the s_temp slot is sourced from d_workspace and the
     # arena allocation skips it entirely (freeing ~120 KB on humanoid-scale
     # robots so an inline caller can fit FD into a 100 KB box).
@@ -254,7 +254,7 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
     if picks[0] == picks[1] == picks[2]:
         _emit_fd_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"

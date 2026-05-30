@@ -662,7 +662,7 @@ def gen_direct_minv_kernel(self, single_call_timing = False):
     if picks[0] == picks[1] == picks[2]:
         _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(picks[0]), single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
                    "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"

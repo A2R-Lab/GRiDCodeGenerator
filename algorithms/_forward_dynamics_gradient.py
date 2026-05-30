@@ -309,7 +309,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
         uss, ugt = _FD_DU_PICK_FLAGS[picks[0]]
         _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             uss, ugt = _FD_DU_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \

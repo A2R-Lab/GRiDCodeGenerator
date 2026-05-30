@@ -541,7 +541,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
     """Emit the shared-memory arena layout.
 
     When ``tier_workspace_expr`` is non-None, the ``s_temp`` slot becomes
-    tier-aware: at TIER_PERF the slot is allocated from the arena as usual;
+    tier-aware: at TIER_SHARED the slot is allocated from the arena as usual;
     at TIER_LITE+/MINIMAL the slot is sourced from the supplied workspace
     pointer expression (e.g. ``"d_workspace"``) and the arena allocation
     skips the temp slot entirely, freeing that smem for the caller's outer
@@ -567,7 +567,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("//   T " + ximat_name + "[" + str(ximat_size) + "]")
     if temp_size_int != 0:
         if tier_workspace_expr is not None:
-            self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "] (TIER_PERF only; LITE/MINIMAL route to " + tier_workspace_expr + ")")
+            self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "] (TIER_SHARED only; LITE/MINIMAL route to " + tier_workspace_expr + ")")
         else:
             self.gen_add_code_line("//   T " + temp_name + "[" + str(temp_mem_size) + "]")
     if topology_count > 0:
@@ -587,7 +587,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
     if temp_size_int != 0:
         if tier_workspace_expr is not None:
             self.gen_add_code_line("T *" + temp_name + ";")
-            self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
+            self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_SHARED) {", True)
             self.gen_add_code_line("(void)" + tier_workspace_expr + ";")
             self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")
             self.gen_add_code_line(temp_name + " = grid_arena_ptr<T>(s_arena, s_arena_offset);")
@@ -620,7 +620,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
     self.gen_add_code_line("#ifdef GRID_CUDA_DEBUG_LAYOUT")
     if tier_workspace_expr is not None and temp_size_int != 0:
         # Different t_region_count per tier: PERF includes temp; LITE+ excludes it
-        self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_PERF) {", True)
+        self.gen_add_code_line("if constexpr (RESOURCE_TIER == TIER_SHARED) {", True)
         self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
         self.gen_add_end_control_flow()
         self.gen_add_code_line("else {", True)

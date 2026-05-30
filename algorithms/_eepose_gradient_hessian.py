@@ -1207,7 +1207,7 @@ def gen_end_effector_pose_gradient_kernel(self, single_call_timing = False, fixe
         uwt, uwd = _EE_GRAD_PICK_FLAGS[picks[0]]
         _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             uwt, uwd = _EE_GRAD_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
@@ -2182,7 +2182,7 @@ def gen_end_effector_pose_gradient_hessian_device(self):
                    "s_deePos is a pointer to shared memory of size 6*NUM_VEL*NUM_EE (d/dv tangent Jacobian)", \
                    "s_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "d_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(output_count) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
+                   "d_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_SHARED, " + str(output_count) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the large s_d2eePos output (~" + str(output_count) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel"]
     func_def_start = "void end_effector_pose_gradient_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
@@ -2191,18 +2191,18 @@ def gen_end_effector_pose_gradient_hessian_device(self):
     # then generate the code
     self.gen_add_func_doc("Computes the Hessian (and Jacobian) of the End Effector Pose with respect to generalized velocity (d^2/dv^2 tangent, pinocchio convention)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_PERF>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = TIER_SHARED>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Smem arena: s_temp is always the inner-temp size. The output s_d2eePos lives
-    # in smem at TIER_PERF (carved from the arena tail) and in d_workspace at
+    # in smem at TIER_SHARED (carved from the arena tail) and in d_workspace at
     # TIER_LITE/MINIMAL (inner repoints internally). Note: the geometric-Jacobian
     # path uses ONLY s_Xhom (LOCAL transforms); s_dXmatsHom and s_d2XmatsHom are
     # no longer needed (saves substantial smem on big robots).
     self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_temp_size, include_gradients = False, include_hessians = False,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
-    # At TIER_PERF s_d2eePos is allocated by the caller; at LITE/MINIMAL it's
+    # At TIER_SHARED s_d2eePos is allocated by the caller; at LITE/MINIMAL it's
     # the inner's job to repoint via OUT_IN_SMEM=false + d_workspace.
     # then load Xhom (Jacobian only needs local transforms) and run the algo
     self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False, include_hessians = False)
@@ -2320,7 +2320,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = Fal
         uwo = _D2EE_PICK_FLAGS[picks[0]]
         _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
     else:
-        tier_names = ("TIER_PERF", "TIER_LITE", "TIER_MINIMAL")
+        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
         for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
             uwo = _D2EE_PICK_FLAGS[pick]
             head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
