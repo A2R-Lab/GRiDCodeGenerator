@@ -13,6 +13,58 @@ def _no_licm_barrier() -> bool:
     return os.environ.get("GRID_NO_LICM_BARRIER", "0") == "1"
 
 
+def robot_has_mimic_joints(self):
+    """True if the model has any URDF ``<mimic>`` joint.
+
+    This is the master gate for every mimic-aware codegen branch: when False,
+    every emit site below MUST produce character-identical CUDA to the legacy
+    (pre-mimic) codegen, so non-mimic robots' generated headers are byte-
+    identical (=> identical PTX => no perf regression). When True, the codegen
+    folds mimic joints into their target's velocity slot exactly as the
+    mimic-aware RBDReference does.
+    """
+    return any(getattr(j, "is_mimic", False) for j in self.robot.joints)
+
+def _v_slot_cpp(self, jid):
+    """Return the (single) reduced velocity-space slot index for body ``jid``.
+
+    For a non-mimic joint this is its own dense v-offset, which equals ``jid``
+    for fixed-base single-DoF chains and ``jid + 5`` for floating-base ones —
+    i.e. byte-identical to the legacy hardcoded index. For a mimic joint it is
+    the mimicked target's v-slot (mimic + target share one generalized
+    coordinate). Asserts single-DoF: multi-DoF mimic joints don't exist in the
+    URDF spec, and the floating root (the only multi-DoF joint) is never mimic.
+    """
+    inds = self.robot.get_joint_index_v(jid)
+    if isinstance(inds, (list, tuple)):
+        assert len(inds) == 1, (
+            "_v_slot_cpp assumes a single-DoF joint; got multi-DoF v-index "
+            + str(inds) + " for jid " + str(jid)
+        )
+        return inds[0]
+    return inds
+
+def _alpha_for_jid(self, jid):
+    """Return body ``jid``'s mimic multiplier (1.0 for non-mimic joints).
+
+    Mirrors RBDReference._mimic_multiplier: a mimic joint's generalized
+    velocity is ``multiplier * v_target``, so every ``qd``/``qdd`` read and
+    every ``c``/``M`` write for the body is scaled by this factor.
+    """
+    j = self.robot.get_joint_by_id(jid)
+    if getattr(j, "is_mimic", False):
+        return float(j.get_mimic_multiplier())
+    return 1.0
+
+def _alpha_prefix_cpp(self, jid):
+    """Return a C++ multiplicative prefix ``"<alpha> * "`` for body ``jid``,
+    or the empty string when alpha == 1.0 (non-mimic). Used so non-mimic emit
+    is byte-identical (no spurious ``1.0 *``)."""
+    alpha = self._alpha_for_jid(jid)
+    if alpha == 1.0:
+        return ""
+    return "static_cast<T>(" + repr(alpha) + ") * "
+
 def gen_add_code_line(self, new_code_line, add_indent_after = False):
     self.code_str += self.indent_level * "    " + new_code_line + "\n"
     if add_indent_after:

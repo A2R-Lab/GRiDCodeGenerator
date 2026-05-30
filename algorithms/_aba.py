@@ -268,6 +268,53 @@ def gen_aba_inner_floating(self):
     self.gen_add_end_function()
 
 
+def _gen_aba_inner_mimic_fixed(self, NB):
+    """Mimic fixed-base aba_inner = ID(bias) + Minv + qdd = Minv*(tau - bias).
+
+    Composes the already-mimic-aware inverse_dynamics_inner (compute_c) and
+    direct_minv_inner (= inv(CRBA)). s_temp layout (sized in
+    gen_aba_inner_temp_mem_size):
+      [0, NV)                  s_c       (bias / generalized force)
+      [NV, NV+18*NB)           s_vaf     (ID intermediate band)
+      [NV+18*NB, +NV*NV)       s_Minv
+      [..., +work)             s_work    (ID inner temp, then minv inner temp)
+    Final qdd[i] = sum_j Minv[i,j] * (tau[j] - c[j]); Minv is symmetric-upper
+    from invert_matrix (dense), so we read it symmetric.
+    """
+    nv = self.robot.get_num_vel()
+    c_off = 0
+    vaf_off = c_off + nv
+    minv_off = vaf_off + 18 * NB
+    work_off = minv_off + nv * nv
+    self.gen_add_code_line("// mimic ABA: qdd = Minv * (tau - rnea(q,qd,0))")
+    self.gen_add_code_line("T *s_aba_c = &s_temp[" + str(c_off) + "];")
+    self.gen_add_code_line("T *s_aba_vaf = &s_temp[" + str(vaf_off) + "];")
+    self.gen_add_code_line("T *s_aba_Minv = &s_temp[" + str(minv_off) + "];")
+    self.gen_add_code_line("T *s_aba_work = &s_temp[" + str(work_off) + "];")
+    # bias c = rnea(q, qd, qdd=0): inverse_dynamics_inner(compute_c, no qdd)
+    self.gen_inverse_dynamics_inner_function_call(
+        compute_c=True, use_qdd_input=False,
+        updated_var_names=dict(s_c_name="s_aba_c", s_vaf_name="s_aba_vaf",
+                               s_temp_name="s_aba_work"))
+    self.gen_add_sync()
+    # Minv = inv(CRBA(q)) via the mimic direct_minv_inner path.
+    self.gen_direct_minv_inner_function_call(
+        updated_var_names=dict(s_Minv_name="s_aba_Minv", s_temp_name="s_aba_work",
+                               d_workspace_name="nullptr"),
+        f_in_smem_expr="true")
+    self.gen_add_sync()
+    # qdd[i] = sum_j Minv[i,j] * (tau[j] - c[j]); Minv symmetric (read upper/lower).
+    self.gen_add_parallel_loop("i", str(nv))
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int j = 0; j < " + str(nv) + "; j++) {", True)
+    self.gen_add_code_line("int r = i <= j ? i : j; int col = i <= j ? j : i;")
+    self.gen_add_code_line("acc += s_aba_Minv[col * " + str(nv) + " + r] * (s_tau[j] - s_aba_c[j]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("s_qdd[i] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_aba_inner(self):
     if self.robot.floating_base:
         return gen_aba_inner_floating(self)
@@ -309,6 +356,15 @@ def gen_aba_inner(self):
     self.gen_add_code_line("if constexpr (TEMP_IN_SMEM && !COLD_IN_SMEM) { s_cold = d_workspace - " + str(98 * n) + "; }")
     temp_size = self.gen_aba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
+
+    if self.robot_has_mimic_joints():
+        # Mimic ABA via algebraic decomposition (mirrors RBDReference.aba mimic
+        # fast path): qdd = Minv * (tau - rnea(q, qd, 0)). The per-body U/d ABA
+        # recursion does not fold for mimic joints (Ia += U U^T / d scales by
+        # alpha^2), so compose the already-mimic-aware ID bias + Minv instead.
+        _gen_aba_inner_mimic_fixed(self, n)
+        self.gen_add_end_function()
+        return
 
     #
     # Initial Debug Prints if Requested
@@ -690,6 +746,15 @@ def gen_aba_inner(self):
 
 def gen_aba_inner_temp_mem_size(self):
     n = self.robot.get_num_joints()
+    if self.robot_has_mimic_joints():
+        # Mimic aba composes ID(bias c) + Minv(=inv CRBA) + qdd=Minv*(tau-c).
+        # Layout: s_c[NV] | s_vaf[18*NJ] | s_Minv[NV*NV] | s_work[...] where
+        # s_work is shared by ID's inner temp (6*NJ) and minv's full inner band
+        # (F = 6*NV*NV + no_F), which run sequentially.
+        nv = self.robot.get_num_vel()
+        minv_full = self.gen_direct_minv_inner_temp_mem_size()  # 6*NV*NV + no_F
+        work = max(self.gen_inverse_dynamics_inner_temp_mem_size(), minv_full)
+        return nv + 18 * n + nv * nv + work
     if self.robot.floating_base:
         return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
     return 140 * n

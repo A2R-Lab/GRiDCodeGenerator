@@ -69,6 +69,27 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     self.gen_add_code_line(func_def, True)
     temp_size = self.gen_inverse_dynamics_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
+    # Mimic-aware velocity/accel reads. Each BODY jid's joint velocity is read
+    # from its reduced v-slot scaled by its mimic multiplier (alpha): a mimic
+    # joint sees alpha * v_target. For non-mimic robots v_slot(jid)==jid and
+    # alpha==1.0, so _id_qd below returns the legacy `s_qd[jid]` verbatim
+    # (byte-identical). For mimic robots we emit compile-time per-body lookup
+    # tables so the existing parallel fpass structure (with runtime jid select
+    # vars on branched levels) folds correctly without restructuring.
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    if HAS_MIMIC and (compute_c or True):
+        vslot_arr = ", ".join(str(self._v_slot_cpp(j)) for j in range(n))
+        alpha_arr = ", ".join(repr(self._alpha_for_jid(j)) for j in range(n))
+        self.gen_add_code_line("// mimic per-body v-slot + multiplier tables")
+        self.gen_add_code_line("const int s_mimic_vslot[" + str(n) + "] = {" + vslot_arr + "};")
+        self.gen_add_code_line("const T s_mimic_alpha[" + str(n) + "] = {" + alpha_arr + "};")
+        self.gen_add_code_line("(void)s_mimic_vslot; (void)s_mimic_alpha;")
+
+    def _id_qd(jid_expr, qd_name="s_qd"):
+        # Read body `jid_expr`'s joint velocity/accel, mimic-folded.
+        if HAS_MIMIC:
+            return "s_mimic_alpha[" + str(jid_expr) + "] * " + qd_name + "[s_mimic_vslot[" + str(jid_expr) + "]]"
+        return qd_name + "[" + str(jid_expr) + "]"
     #
     # Initial Debug Prints if Requested
     #
@@ -132,12 +153,12 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             if S_ind_cpp == '-1': # floating base uses the root motion subspace, not raw row-wise copies
                 qd_qdd_code = "int fb_col = row < 3 ? row + 3 : row - 3; s_vaf[jid6 + row] = s_qd[fb_col];"
             else:
-                qd_qdd_code = "if (row == " + S_ind_cpp + "){s_vaf[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qd[" + jid + "];}"
+                qd_qdd_code = "if (row == " + S_ind_cpp + "){s_vaf[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * " + _id_qd(jid) + ";}"
             if use_qdd_input:
                 if S_ind_cpp == '-1':
                     qd_qdd_code += " s_vaf[" + str(n*6) + " + jid6 + row] += s_qdd[fb_col];"
                 else:
-                    qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qdd[" + jid + "];}")
+                    qd_qdd_code = qd_qdd_code.replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * " + _id_qd(jid, "s_qdd") + ";}")
             self.gen_add_code_line(qd_qdd_code)
             self.gen_add_end_control_flow()
             self.gen_add_sync()
@@ -190,9 +211,14 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line(f"static const int seg_s_off_{tag}[{seg}] = {{{', '.join(str(6*i) for i in range(seg))}}};")
             self.gen_add_code_line(f"static const T S_sel_{tag}[{6*seg}] = {{{', '.join(sel_vals)}}};")
             # build scalar[seg] = s_qd[qd_idx] in s_temp (free during the forward pass)
+            # Mimic: scalar = alpha_jid * s_qd[v_slot(jid)] (fold the multiplier into
+            # the scalar; the S_sel selector keeps just the sign).
             self.gen_add_serial_ops()
             for i in range(seg):
-                self.gen_add_code_line(f"s_temp[{i}] = s_qd[{qd_idxs[i]}];")
+                if HAS_MIMIC:
+                    self.gen_add_code_line(f"s_temp[{i}] = {_id_qd(inds[i])};")
+                else:
+                    self.gen_add_code_line(f"s_temp[{i}] = s_qd[{qd_idxs[i]}];")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
             # s_v[k] = X[k]*v[parent_k] (+= sign*qd[k] at S index) for all level joints at once
@@ -206,7 +232,10 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 # rebuild scalar[seg] = s_qdd[qd_idx] in s_temp, then fuse the += S*qdd
                 self.gen_add_serial_ops()
                 for i in range(seg):
-                    self.gen_add_code_line(f"s_temp[{i}] = s_qdd[{qd_idxs[i]}];")
+                    if HAS_MIMIC:
+                        self.gen_add_code_line(f"s_temp[{i}] = {_id_qd(inds[i], 's_qdd')};")
+                    else:
+                        self.gen_add_code_line(f"s_temp[{i}] = s_qdd[{qd_idxs[i]}];")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
                 self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_a_x_off_{tag}, seg_a_y_off_{tag}, s_XImats, s_vaf, s_vaf, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, s_temp, s_linalg_smem);")
@@ -236,12 +265,14 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 dst_name = "&s_vaf[" + str(6*n) + " + 6*jid]"
                 src_name = "&s_vaf[6*jid]"
                 if self.robot.floating_base: scale_name = "(" + S_sign_cpp + ") * s_qd[jid + 5]" # dof offset for fb
+                elif HAS_MIMIC: scale_name = "(" + S_sign_cpp + ") * " + _id_qd("jid")
                 else: scale_name = "(" + S_sign_cpp + ") * s_qd[jid]"
             else:
                 jid = inds[0]
                 dst_name = "&s_vaf[" + str(6*n + 6*jid) + "]"
                 src_name = "&s_vaf[" + str(6*jid) + "]"
                 if self.robot.floating_base: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid + 5) + "]" # dof offset due to fb
+                elif HAS_MIMIC: scale_name = "(" + S_sign_cpp + ") * " + _id_qd(jid)
                 else: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid) + "]"
             updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = dst_name, s_src_name = src_name, s_scale_name = scale_name)
             self.gen_mx_func_call_for_cpp(inds, PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
@@ -332,6 +363,37 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_end_control_flow()
             self.gen_add_sync()
 
+    if compute_c and self.robot_has_mimic_joints():
+        # Mimic-aware c extraction (serial fold). Multiple bodies can share one
+        # velocity slot (a mimicked joint and its mimics), so c[v_slot] is an
+        # ACCUMULATE over bodies scaled by each body's mimic multiplier alpha
+        # (1.0 for non-mimic). This mirrors RBDReference.rnea_bpass:
+        #   c[v_slot(jid)] += alpha_jid * (S_sign * f[jid][S_ind]).
+        # Serial (thread 0) because v-slots collide; this path runs only for
+        # mimic robots where correctness — not perf — is the goal.
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// s_c extracted serially (mimic-aware S*f accumulate into v-slot)")
+        self.gen_add_code_line("//")
+        # The backward pass writes parent forces into s_vaf via block-cooperative
+        # GEMVs (all threads). Sync so thread 0's serial fold below sees every
+        # thread's f writes — without this the root bodies' c races on stale f.
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
+        for vs in range(self.robot.get_num_vel()):
+            self.gen_add_code_line("s_c[" + str(vs) + "] = static_cast<T>(0);")
+        for jid in range(n):
+            vs = self._v_slot_cpp(jid)
+            s_ind = self.robot.get_S_index_by_id(jid)
+            s_sign = self.robot.get_S_sign_by_id(jid)
+            alpha = self._alpha_for_jid(jid)
+            coeff = float(s_sign) * float(alpha)
+            self.gen_add_code_line(
+                "s_c[" + str(vs) + "] += static_cast<T>(" + repr(coeff) + ") * s_vaf["
+                + str(12*n + 6*jid + s_ind) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_function()
+        return
     if compute_c:
         # then extract all c in parallel
         _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(NO_GRAD_FLAG = True)

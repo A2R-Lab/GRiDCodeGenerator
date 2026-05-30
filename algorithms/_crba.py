@@ -35,6 +35,89 @@ def gen_crba_inner_function_call(self, updated_var_names = None,
     self.gen_add_code_line(crba_code)
 
 
+def _gen_crba_inner_mimic_fixed(self, NB):
+    """Mimic-aware fixed-base CRBA inner (serial fold).
+
+    Mirrors RBDReference.crba (fixed-base, mimic path): composite inertia up
+    the chain, then H assembled in REDUCED velocity space with each joint's
+    column scaled by its mimic multiplier alpha and ACCUMULATED (+=) into its
+    v-slot. A mimic body and its target share a v-slot, so the parallel
+    thread-per-jid chain walk of the non-mimic path (which writes M cells by
+    jid and would collide / index out of NV range) is replaced by a serial
+    accumulate. Runs only for mimic robots — correctness, not perf, is the
+    goal here. s_M is NV x NV column-major.
+    """
+    nv = self.robot.get_num_vel()
+    ImatOffset = 36 * NB  # Imats start here in s_XImats
+    # Use s_temp as IC scratch: 36*NB floats (composite inertias, column-major
+    # 6x6 per body). gen_crba_inner_temp_mem_size() = 140*nq >= 36*NB.
+    self.gen_add_code_line("// === mimic-aware CRBA (serial reduced-space fold) ===")
+    self.gen_add_code_line("// Clear reduced mass matrix M (NV x NV)")
+    self.gen_add_parallel_loop("i", str(nv * nv))
+    self.gen_add_code_line("s_M[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// IC[ind] = I[ind] (composite inertia init), column-major 6x6 per body")
+    self.gen_add_parallel_loop("i", str(36 * NB))
+    self.gen_add_code_line("s_temp[i] = s_XImats[" + str(ImatOffset) + " + i];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # Composite inertia up the chain: IC[parent] += X[ind]^T IC[ind] X[ind].
+    # Serial over bodies deepest-first (mirror oracle ind = NB-1 .. 1).
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T s_tmp6x6[36];")
+    for ind in range(NB - 1, 0, -1):
+        parent = self.robot.get_parent_id(ind)
+        if parent == -1:
+            continue
+        # tmp = IC[ind] * X[ind]  (col-major 6x6 * 6x6)
+        self.gen_add_code_line("// IC[" + str(parent) + "] += X[" + str(ind) + "]^T IC[" + str(ind) + "] X[" + str(ind) + "]")
+        self.gen_add_code_line("for (int c = 0; c < 6; c++) { for (int r = 0; r < 6; r++) {", True)
+        self.gen_add_code_line("T acc = static_cast<T>(0);")
+        self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += s_temp[" + str(36*ind) + " + r + 6*p] * s_XImats[" + str(36*ind) + " + p + 6*c]; }")
+        self.gen_add_code_line("s_tmp6x6[r + 6*c] = acc;")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("}")
+        # IC[parent] += X[ind]^T * tmp
+        self.gen_add_code_line("for (int c = 0; c < 6; c++) { for (int r = 0; r < 6; r++) {", True)
+        self.gen_add_code_line("T acc = static_cast<T>(0);")
+        self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += s_XImats[" + str(36*ind) + " + p + 6*r] * s_tmp6x6[p + 6*c]; }")
+        self.gen_add_code_line("s_temp[" + str(36*parent) + " + r + 6*c] += acc;")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("}")
+    # H assembly: for each body, diagonal + ancestor chain, alpha-scaled into v-slots.
+    self.gen_add_code_line("T s_fh[6];")
+    self.gen_add_code_line("T s_fh2[6];")
+    for ind in range(NB):
+        vi = self._v_slot_cpp(ind)
+        alpha_i = self._alpha_for_jid(ind)
+        s_ind = self.robot.get_S_index_by_id(ind)
+        s_sign = self.robot.get_S_sign_by_id(ind)
+        # fh = IC[ind] * S[ind] = S_sign * column s_ind of IC[ind]
+        self.gen_add_code_line("// body " + str(ind) + " -> v-slot " + str(vi) + " (alpha=" + repr(alpha_i) + ")")
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_fh[r] = static_cast<T>(" + repr(float(s_sign)) + ") * s_temp[" + str(36*ind + 6*s_ind) + " + r]; }")
+        # diagonal: H[vi,vi] += alpha_i^2 * (S^T fh) = alpha_i^2 * S_sign * fh[s_ind]
+        diag_coeff = float(alpha_i) * float(alpha_i) * float(s_sign)
+        self.gen_add_code_line("s_M[" + str(vi + nv*vi) + "] += static_cast<T>(" + repr(diag_coeff) + ") * s_fh[" + str(s_ind) + "];")
+        # walk ancestors
+        j = ind
+        cur = "s_fh"
+        nxt = "s_fh2"
+        while self.robot.get_parent_id(j) > -1:
+            # fh = X[j]^T fh
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { " + nxt + "[r] = static_cast<T>(0); for (int p = 0; p < 6; p++) { " + nxt + "[r] += s_XImats[" + str(36*j) + " + p + 6*r] * " + cur + "[p]; } }")
+            j = self.robot.get_parent_id(j)
+            vj = self._v_slot_cpp(j)
+            alpha_j = self._alpha_for_jid(j)
+            sj_ind = self.robot.get_S_index_by_id(j)
+            sj_sign = self.robot.get_S_sign_by_id(j)
+            contrib_coeff = float(alpha_i) * float(alpha_j) * float(sj_sign)
+            self.gen_add_code_line("{ T contribution = static_cast<T>(" + repr(contrib_coeff) + ") * " + nxt + "[" + str(sj_ind) + "];")
+            self.gen_add_code_line("  s_M[" + str(vi + nv*vj) + "] += contribution; s_M[" + str(vj + nv*vi) + "] += contribution; }")
+            cur, nxt = nxt, cur
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_crba_inner(self):
     if self.robot.floating_base:
         return gen_crba_inner_floating(self)
@@ -70,6 +153,10 @@ def gen_crba_inner(self):
     temp_size = self.gen_crba_inner_temp_mem_size()
     self.gen_linalg_smem_setup(temp_size)
 
+    if self.robot_has_mimic_joints():
+        _gen_crba_inner_mimic_fixed(self, n)
+        self.gen_add_end_function()
+        return
 
     # first clear the matrix
     self.gen_add_parallel_loop("i",str(n*n))

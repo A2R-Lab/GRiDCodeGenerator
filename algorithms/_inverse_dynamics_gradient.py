@@ -118,6 +118,22 @@ def gen_inverse_dynamics_gradient_inner(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
+    if self.robot_has_mimic_joints():
+        # MIMIC: the sparse NJ-indexed gradient assembly below writes
+        # s_dc_du columns by raw body id and would write past the reduced
+        # 2*NV*NV output (NB > NV) and read the mis-sized topology helpers.
+        # The mimic-aware reduced gradient (alpha-scaled velocity reads +
+        # per-body v-slot fold) is a later phase (T3 P3). Until it lands,
+        # emit a SAFE zeroed output so the kernel runs without an OOB write
+        # (the value is gated out of equivalence comparison for mimic robots).
+        self.gen_add_code_line("// T3 P3 PENDING: mimic ID-gradient not yet folded; zero output (safe stub).")
+        self.gen_add_parallel_loop("ind", str(2*n*n))
+        self.gen_add_code_line("s_dc_du[ind] = static_cast<T>(0);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_function()
+        return
+
     #
     # Optimize memory requirements due to sparsity induced by branching
     # requires more complex pointer math but/and saves a lot of space
@@ -907,8 +923,19 @@ def gen_inverse_dynamics_gradient_inner(self):
             non_zero_inds = [i for (i, x) in enumerate(is_in_subtree_or_ancestor) if x == True]
             # then set the if statement (if applicable)
             if len(non_zero_inds) != n:
-                if len(non_zero_inds) > n/2:
-                    zero_inds = list(set(list(range(n))).difference(set(non_zero_inds)))
+                zero_inds = list(set(list(range(n))).difference(set(non_zero_inds)))
+                if len(non_zero_inds) == 0:
+                    # No body in [0,n) has djid in its subtree/ancestor set: this
+                    # du-column contributes nothing. gen_var_in_list([]) would emit
+                    # an empty "()" expression, so hardcode flag=false.
+                    jid_du_check_for_jid = "false"
+                elif len(zero_inds) == 0:
+                    # Every body in [0,n) couples to djid (non_zero_inds covers the
+                    # whole reduced range, e.g. when a mimic body extends the raw
+                    # body set past NV): gen_var_not_in_list([]) would emit "()";
+                    # the flag is unconditionally true.
+                    jid_du_check_for_jid = "true"
+                elif len(non_zero_inds) > n/2:
                     jid_du_check_for_jid = self.gen_var_not_in_list("jid",[str(i) for i in zero_inds])
                 else:
                     jid_du_check_for_jid = self.gen_var_in_list("jid",[str(i) for i in non_zero_inds])
