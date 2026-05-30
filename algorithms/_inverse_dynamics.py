@@ -10,13 +10,14 @@ def gen_inverse_dynamics_inner_function_call(self, compute_c = False, use_qdd_in
         s_qd_name = "s_qd", \
         s_qdd_name = "s_qdd", \
         s_temp_name = "s_temp", \
+        d_f_ext_name = "d_f_ext", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     id_code_start = "inverse_dynamics_inner<T>(" + var_names["s_vaf_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
-    id_code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    id_code_end = var_names["s_temp_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
     if compute_c:
         id_code_start = id_code_start.replace("(", "(" + var_names["s_c_name"] + ", ")
     else:
@@ -42,7 +43,11 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     func_notes = ["Assumes the XI matricies have already been updated for the given q"]
     func_def_start = "void inverse_dynamics_inner("
     func_def_middle = "T *s_vaf, const T *s_q, const T *s_qd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    # d_f_ext: optional GLOBAL per-body external forces (defaults nullptr); the
+    # trailing pointer sits just before gravity so the no-fext call is a literal
+    # nullptr (dead-code-eliminated) and shared-memory bytes are unchanged.
+    func_def_end = "T *s_temp, T *d_f_ext, const T gravity) {"
+    func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     if compute_c:
         func_def_start += "T *s_c,  "
         func_params.insert(0,"s_c is the vector of output torques")
@@ -279,6 +284,14 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     self.gen_add_parallel_loop("jid",str(len(inds)))
     self.gen_add_code_line("int jid6 = 6*jid;")
     self.gen_add_code_line("fx_times_v_peq<T>(&s_vaf[" + str(12*n) + " + jid6], &s_vaf[jid6], &s_temp[jid6]);")
+    # External forces (opt-in): subtract the per-body local-frame f_ext from
+    # the just-finished per-body force. d_f_ext is GLOBAL, body-major, length
+    # 6*NUM_BODIES, ordered [angular; linear] (same layout as s_vaf force).
+    # Reading it here (the single force-finish site) keeps every byte of
+    # shared memory unchanged; nullptr -> no-op (dead-code-eliminated).
+    self.gen_add_code_line("if (d_f_ext != nullptr) {")
+    self.gen_add_code_line("    for (int r = 0; r < 6; r++) { s_vaf[" + str(12*n) + " + jid6 + r] -= d_f_ext[jid6 + r]; }")
+    self.gen_add_code_line("}")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     if self.DEBUG_MODE:
@@ -350,11 +363,12 @@ def gen_inverse_dynamics_device(self, compute_c = False, use_qdd_input = False):
     func_params = ["s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant"]
     func_notes = []
     func_def_start = "void inverse_dynamics_device("
     func_def_middle = "const T *s_q, const T *s_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity) {"
     if compute_c:
         func_def_start += "T *s_c,  "
         func_params.insert(0,"s_c is the vector of output torques")
@@ -391,11 +405,12 @@ def gen_inverse_dynamics_kernel(self, use_qdd_input = False, single_call_timing 
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant,"
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
     func_def_start = "void inverse_dynamics_kernel(T *d_c, const T *d_q_qd, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def_end = "T *d_f_ext, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     if use_qdd_input:
         func_def_start += "const T *d_qdd, "
         func_params.insert(-3,"d_qdd is the vector of joint accelerations")
@@ -483,7 +498,7 @@ def gen_inverse_dynamics_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics requires all-data or dynamics gridData\");")
     func_call_start = "inverse_dynamics_kernel<T><<<block_dimms,thread_dimms,ID_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
-    func_call_end = "d_robotModel,gravity,num_timesteps);"
+    func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
