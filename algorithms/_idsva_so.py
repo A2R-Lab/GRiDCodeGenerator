@@ -799,33 +799,52 @@ def idsva_so_needs_reference_order_output_repair(self):
 
 def gen_idsva_so_body_frame_reference_order_output_repair(self):
     """
-    Emits a serial final tensor assembly pass that mirrors RBDReference.idsva_so.
+    Emits the final second-order tensor assembly for branched fixed-base robots,
+    block-cooperatively parallelized over the (jid, ancestor) work-pairs.
 
     The preceding generated code computes all reusable intermediates in
-    parallel. The final second-order tensors, however, have many symmetry and
-    duplicate-write relationships. Those writes are order-dependent for
-    branched topologies, so replay the reference loop order with one thread.
+    parallel. The final second-order tensors have many symmetry and
+    duplicate-write relationships, so the original implementation replayed the
+    reference loop order on thread 0 to respect write ordering.
+
+    That replay-order dependency is unnecessary: each (jid, ancestor_j) pair
+    writes a DISJOINT set of destination cells (verified by enumerating every
+    write across the full iteration space — g1 fixed, the branched robot that
+    actually triggers this repair, has zero cross-pair cell conflicts), so the
+    outer (jid, anc) loop can run one work-item per pair with no inter-item
+    races. The only same-cell writes are intra-pair (e.g. block-D's `dM[anc,
+    jid,succ]` then its mirror `dM[jid,anc,succ]`, which coincide only when
+    anc==jid) and stay correctly ordered within a single thread. Each thread
+    owns private rt1..rt9 / rp1..rp6 scratch, so there is no shared state to
+    sync between pairs — the trailing __syncthreads() is the only barrier
+    needed. The output is zeroed first in a separate block-parallel pass (with a
+    sync) since every pair only writes the cells it owns and leaves the rest at
+    their zeroed value.
     """
     num_bodies = self.robot.get_num_bodies()
     st_start = [0]
     st_values = []
     succ_start = [0]
     succ_values = []
-    anc_start = [0]
-    anc_values = []
+    # Flatten the serial (jid desc, anc in reversed [jid]+ancestors) iteration
+    # into a list of disjoint work-pairs; one device thread handles one pair.
+    pair_jid = []
+    pair_anc = []
     for jid in range(num_bodies):
         subtree = list(self.robot.get_subtree_by_id(jid))
         successors = [st_j for st_j in subtree if st_j != jid]
-        ancestors = list(self.robot.get_ancestors_by_id(jid))
-        ancestors.insert(0, jid)
-        ancestors = ancestors[::-1]
-
         st_values.extend(subtree)
         st_start.append(len(st_values))
         succ_values.extend(successors)
         succ_start.append(len(succ_values))
-        anc_values.extend(ancestors)
-        anc_start.append(len(anc_values))
+    for jid in range(num_bodies - 1, -1, -1):
+        ancestors = list(self.robot.get_ancestors_by_id(jid))
+        ancestors.insert(0, jid)
+        ancestors = ancestors[::-1]
+        for ancestor_j in ancestors:
+            pair_jid.append(jid)
+            pair_anc.append(ancestor_j)
+    num_pairs = len(pair_jid)
 
     def int_array(values):
         if values:
@@ -834,26 +853,28 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
 
     self.gen_add_sync()
     self.gen_add_code_line("\n\n")
-    self.gen_add_code_line("// Reference-order final IDSVA-SO tensor assembly")
+    self.gen_add_code_line("// Final IDSVA-SO tensor assembly (block-parallel over disjoint (jid, ancestor) work-pairs)")
     self.gen_add_code_line(f"static const int idsva_ref_st_start[] = {{ {int_array(st_start)} }};")
     self.gen_add_code_line(f"static const int idsva_ref_st_values[] = {{ {int_array(st_values)} }};")
     self.gen_add_code_line(f"static const int idsva_ref_succ_start[] = {{ {int_array(succ_start)} }};")
     self.gen_add_code_line(f"static const int idsva_ref_succ_values[] = {{ {int_array(succ_values)} }};")
-    self.gen_add_code_line(f"static const int idsva_ref_anc_start[] = {{ {int_array(anc_start)} }};")
-    self.gen_add_code_line(f"static const int idsva_ref_anc_values[] = {{ {int_array(anc_values)} }};")
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
-    self.gen_add_code_line("for (int out_idx = 0; out_idx < SECOND_ORDER_TENSOR_SIZE; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
+    self.gen_add_code_line(f"static const int idsva_ref_pair_jid[] = {{ {int_array(pair_jid)} }};")
+    self.gen_add_code_line(f"static const int idsva_ref_pair_anc[] = {{ {int_array(pair_anc)} }};")
+    # Pass 1: zero the whole output tensor in parallel.
+    self.gen_add_parallel_loop("out_idx", "SECOND_ORDER_TENSOR_SIZE")
+    self.gen_add_code_line("s_idsva_so[out_idx] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # Pass 2: one work-item per disjoint (jid, ancestor_j) pair.
+    self.gen_add_parallel_loop("pair_idx", str(num_pairs))
     self.gen_add_code_line("T rt1[36], rt2[36], rt3[36], rt4[36], rt5[36], rt6[36], rt7[36], rt8[36], rt9[36];")
     self.gen_add_code_line("T rp1[6], rp2[6], rp3[6], rp4[6], rp5[6], rp6[6];")
-    self.gen_add_code_line("for (int jid = NUM_BODIES - 1; jid >= 0; --jid) {", True)
+    self.gen_add_code_line("int jid = idsva_ref_pair_jid[pair_idx];")
+    self.gen_add_code_line("int ancestor_j = idsva_ref_pair_anc[pair_idx];")
     self.gen_add_code_line("int st_begin = idsva_ref_st_start[jid];")
     self.gen_add_code_line("int st_end = idsva_ref_st_start[jid + 1];")
     self.gen_add_code_line("int succ_begin = idsva_ref_succ_start[jid];")
     self.gen_add_code_line("int succ_end = idsva_ref_succ_start[jid + 1];")
-    self.gen_add_code_line("int anc_begin = idsva_ref_anc_start[jid];")
-    self.gen_add_code_line("int anc_end = idsva_ref_anc_start[jid + 1];")
-    self.gen_add_code_line("for (int anc_pos = anc_begin; anc_pos < anc_end; ++anc_pos) {", True)
-    self.gen_add_code_line("int ancestor_j = idsva_ref_anc_values[anc_pos];")
     self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
     self.gen_add_code_line("int row = idx % 6;")
     self.gen_add_code_line("int col = idx / 6;")
@@ -916,11 +937,9 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_j = idsva_ref_st_values[st_pos];")
     self.gen_add_code_line("d2tau_dqd2[st_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid*SECOND_ORDER_COORDS + ancestor_j] = -dot_prod<T, 36, 1, 1>(rt2, &D1[st_j*36]);")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # close for st_pos (block E)
+    self.gen_add_end_control_flow()  # close if (ancestor_j == jid)
+    self.gen_add_end_control_flow()  # close parallel loop over (jid, ancestor) pairs
     self.gen_add_sync()
 
 def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False):
@@ -2817,11 +2836,27 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_sync()
 
     # ---- Step 4: Forward sweep — v, a, f, IC, BC, psid, psidd, Sd.
-    # Parent-dependent (sequential by jid); under thread-0 guard, sync after.
+    # Parent-dependent ACROSS bodies (v_w[jid]/a_w[jid] read the parent), so the
+    # outer jid loop stays serial. WITHIN each body the work is distributed across
+    # the block: the inherently-sequential 6-vector chain (v/a init, vJ/aJ, psid,
+    # the v/a update, Sd) runs on thread 0, while the two dominant 36-element
+    # matrix builds (IC = Xup^T I Xup, and BC) run as block-parallel idx-over-36
+    # loops between syncs. Per-body temporaries that the parallel loops read across
+    # threads (vJ, aJ, I_Xup, IC_v) live in the otherwise-idle Step-5 `scratch`
+    # region rather than thread-0 stack. All threads execute the jid loop body so
+    # every thread reaches each sync; the trailing sync closes the phase.
     self.gen_add_code_line("// Forward sweep: build v, a, f, IC, BC, psid, psidd, Sd.")
-    self.gen_add_serial_ops()
+    self.gen_add_code_lines([
+        "// Per-body forward-sweep temporaries borrowed from the (dead-until-Step-5) scratch region.",
+        "T *fs_vJ   = scratch;        // 6",
+        "T *fs_aJ   = fs_vJ   + 6;    // 6",
+        "T *fs_I_Xup = fs_aJ  + 6;    // 36 (Ipool @ Xup, intermediate for IC)",
+        "T *fs_IC_v = fs_I_Xup + 36;  // 6  (IC[jid] @ v[jid])",
+    ])
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
     self.gen_add_code_line("int parent = wf_parent[jid];")
+    # --- Sequential 6-vector chain on thread 0 (v/a init, vJ/aJ, psid/psidd, v/a update, Sd).
+    self.gen_add_serial_ops()
     # Initialize v[jid], a[jid]
     self.gen_add_code_line("if (parent < 0) {", True)
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) { v_w[jid*6 + row] = static_cast<T>(0); a_w[jid*6 + row] = -S_agrav[row]; }")
@@ -2832,13 +2867,13 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
 
     # vJ, aJ, psid, psidd (referring to v[jid], a[jid] which haven't been updated yet).
     self.gen_add_code_line("// vJ = sum_p S_vel[p] * qd[p]; aJ = sum_p S_vel[p] * qdd[p].")
-    self.gen_add_code_line("T vJ[6] = {0,0,0,0,0,0}; T aJ[6] = {0,0,0,0,0,0};")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) { fs_vJ[row] = static_cast<T>(0); fs_aJ[row] = static_cast<T>(0); }")
     self.gen_add_code_line("for (int pos = wf_body_v_start[jid]; pos < wf_body_v_start[jid + 1]; ++pos) {", True)
     self.gen_add_code_line("int vel = wf_body_v_index[pos];")
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) { vJ[row] += S_vel[vel*6 + row] * s_qd[vel]; aJ[row] += S_vel[vel*6 + row] * s_qdd[vel]; }")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) { fs_vJ[row] += S_vel[vel*6 + row] * s_qd[vel]; fs_aJ[row] += S_vel[vel*6 + row] * s_qdd[vel]; }")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("// aJ += crm(v[jid]) @ vJ.")
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) aJ[row] += crm_mul<T>(row, &v_w[jid*6], vJ);")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) fs_aJ[row] += crm_mul<T>(row, &v_w[jid*6], fs_vJ);")
 
     # psid[vel] = crm(v[jid]) @ S_vel[vel], psidd[vel] = crm(a[jid]) @ S + crm(v) @ psid
     self.gen_add_code_line("// psid[vel] = crm(v[jid]) @ S; psidd[vel] = crm(a[jid]) @ S + crm(v[jid]) @ psid.")
@@ -2849,58 +2884,61 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_end_control_flow()
 
     # Update v[jid] += vJ, a[jid] += aJ
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) { v_w[jid*6 + row] += vJ[row]; a_w[jid*6 + row] += aJ[row]; }")
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) { v_w[jid*6 + row] += fs_vJ[row]; a_w[jid*6 + row] += fs_aJ[row]; }")
 
     # Sd[vel] = crm(v[jid]_new) @ S
     self.gen_add_code_line("for (int pos = wf_body_v_start[jid]; pos < wf_body_v_start[jid + 1]; ++pos) {", True)
     self.gen_add_code_line("int vel = wf_body_v_index[pos];")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) Sd_vel[vel*6 + row] = crm_mul<T>(row, &v_w[jid*6], &S_vel[vel*6]);")
     self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # close thread-0 guard (sequential 6-vector chain)
+    self.gen_add_sync()
 
-    # IC[jid] = Xup[jid]^T @ I_body @ Xup[jid].
-    self.gen_add_code_line("// IC[jid] = Xup[jid]^T @ I_body @ Xup[jid].")
-    self.gen_add_code_line("T I_Xup[36];")
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    # --- IC[jid] = Xup[jid]^T @ I_body @ Xup[jid]: two block-parallel idx-over-36 builds.
+    self.gen_add_code_line("// IC[jid] = Xup[jid]^T @ I_body @ Xup[jid] (block-parallel over the 36 elements).")
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += Ipool[jid*36 + row + 6*kk] * Xup[jid*36 + kk + 6*col];")
-    self.gen_add_code_line("I_Xup[idx] = acc;")
+    self.gen_add_code_line("fs_I_Xup[idx] = acc;")
     self.gen_add_end_control_flow()
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
     self.gen_add_code_line("T acc = static_cast<T>(0);")
-    self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += Xup[jid*36 + kk + 6*row] * I_Xup[kk + 6*col];")
+    self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += Xup[jid*36 + kk + 6*row] * fs_I_Xup[kk + 6*col];")
     self.gen_add_code_line("IC[jid*36 + idx] = acc;")
     self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
+    # --- IC_v (6-vec), then BC[jid] (36, block-parallel), then f[jid] (6-vec).
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) fs_IC_v[row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &v_w[jid*6]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
     # BC[jid] = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v).
-    self.gen_add_code_line("// BC[jid] = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v).  (crf(v) = -crm(v)^T.)")
-    self.gen_add_code_line("T IC_v[6];")
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) IC_v[row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &v_w[jid*6]);")
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("// BC[jid] = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v) (block-parallel over the 36 elements).")
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
-    # crf(v) @ IC: row r of crf(v) is row r of -crm(v)^T = -(crm(v)[:, r]). So (crf(v) @ IC)[r, c]
-    # = sum_k crf(v)[r,k] * IC[k,c] = -sum_k crm(v)[k,r] * IC[k,c]. In column-major,
-    # crm(v)[k,r] = crm<T>(k + 6*r, v).
-    # Easier: form crf_v[r,c] = -crm<T>(c + 6*r, v) and dot it with IC[jid][:, c].
-    # The existing shim does this — copy pattern.
     self.gen_add_code_line("T crf_v_row[6];  T crm_v_col[6];")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) crf_v_row[kk] = -crm<T>(kk + 6*row, &v_w[jid*6]);")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) crm_v_col[kk] = crm<T>(kk + 6*col, &v_w[jid*6]);")
     self.gen_add_code_line("T t_crfv_IC = dot_prod<T, 6, 1, 1>(crf_v_row, &IC[jid*36 + 6*col]);")
     self.gen_add_code_line("T t_IC_crmv = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], crm_v_col);")
-    self.gen_add_code_line("BC[jid*36 + idx] = t_crfv_IC + icrf<T>(idx, IC_v) - t_IC_crmv;")
+    self.gen_add_code_line("BC[jid*36 + idx] = t_crfv_IC + icrf<T>(idx, fs_IC_v) - t_IC_crmv;")
     self.gen_add_end_control_flow()
-
+    self.gen_add_sync()
     # f[jid] = IC @ a + crf(v) @ IC @ v.
     self.gen_add_code_line("// f[jid] = IC[jid] @ a[jid] + crf(v[jid]) @ (IC[jid] @ v[jid]).")
+    self.gen_add_serial_ops()
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
     self.gen_add_code_line("T crf_v_row2[6];")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) crf_v_row2[kk] = -crm<T>(kk + 6*row, &v_w[jid*6]);")
-    self.gen_add_code_line("f_w[jid*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &a_w[jid*6]) + dot_prod<T, 6, 1, 1>(crf_v_row2, IC_v);")
+    self.gen_add_code_line("f_w[jid*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &a_w[jid*6]) + dot_prod<T, 6, 1, 1>(crf_v_row2, fs_IC_v);")
     self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # close thread-0 guard (f build)
+    self.gen_add_sync()
     self.gen_add_end_control_flow()  # end forward jid loop
-    self.gen_add_end_control_flow()  # close thread-0 guard for Phase 4
     self.gen_add_sync()
 
     # ---- Step 5: Triple ancestor walk (reverse over bodies).
