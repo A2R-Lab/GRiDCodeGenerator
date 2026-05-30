@@ -79,6 +79,13 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Second-Order"),
     AlgoEntry("fdsva_so",             "FDSVA_SO (2nd-order FD)",
               "Second-Order", legacy_labels=("fd_so",)),
+
+    # Plant (T6): cost / constraint / plant-step primitives emitted in the
+    # sibling `grid_plant` namespace. No standalone benchmarked kernel — this
+    # entry exists so the family has a registry key (display / sectioning) and
+    # so future per-primitive bench wrappers can reference it.
+    AlgoEntry("plant",                "Plant (cost/constraint/step primitives)",
+              "Plant"),
 )
 
 

@@ -63,7 +63,9 @@ class GRiDCodeGenerator:
                             gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
                             gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, \
                             gen_integrator_gradient_device, gen_integrator_gradient_device_function_call, \
-                            gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient
+                            gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient, \
+                            gen_plant_step, gen_plant_step_gradient, gen_quadratic_state_cost, gen_quadratic_input_cost, \
+                            gen_ee_pos_cost, gen_plant_barriers, gen_grid_plant
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -1796,6 +1798,10 @@ class GRiDCodeGenerator:
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
         self.gen_add_end_control_flow()
+        # T6: emit the sibling `grid_plant` namespace (cost/constraint/plant-step
+        # primitives composed over the grid:: surface). Additive: this runs AFTER
+        # the grid namespace closes and makes ZERO edits to any grid:: emit path.
+        self.gen_grid_plant(algorithms)
         # then output to a file
         if output_path is None:
             output_path = self.file_namespace + ".cuh"

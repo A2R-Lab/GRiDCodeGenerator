@@ -10,3 +10,4 @@ from ._idsva_so import *
 from ._fdsva_so import *
 from ._integrator import *
 from ._integrator_gradient import *
+from ._plant import *
