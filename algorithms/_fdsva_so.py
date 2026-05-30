@@ -193,6 +193,7 @@ def gen_fdsva_so_fd_gradient_inline(self, use_spill = False, spill_ptr_expr = "n
             s_qd_name = "s_qd",
             s_qdd_name = "s_qdd",
             s_temp_name = "s_fd_temp",
+            d_f_ext_name = "nullptr",  # fdsva_so does not support external forces
             gravity_name = "gravity",
         ),
     )
@@ -311,7 +312,7 @@ def gen_fdsva_so_device(self):
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;  // idsva uses the (placed) s_temp pool directly")
     self.gen_load_update_XImats_helpers_function_call()
     self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
-    self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, gravity);")
+    self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, nullptr, gravity);")
     self.gen_add_sync()
     # fd-gradient inline; the band-spill variant is a compile-time choice.
     self.gen_add_code_line("if constexpr (FD_GRAD_USE_SPILL) {", True)
@@ -397,7 +398,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     # (was a bespoke "make a def-params string then .replace() the types out" hack,
     # which silently dropped/duplicated args when the helper signature changed).
     fd_start = "forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call()
-    fd_end = "s_temp, nullptr, gravity);"
+    fd_end = "s_temp, nullptr, nullptr, gravity);"  # trailing nullptr = no external forces
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n),stride="stride_q_qd_u")

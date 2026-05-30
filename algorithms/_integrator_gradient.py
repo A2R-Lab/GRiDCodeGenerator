@@ -326,6 +326,7 @@ def gen_integrator_gradient_multistage(self, compute_x_kp1=False,
             s_df_du_name="s_df_du",
             d_temp_spill_name=d_temp_spill_name,
             temp_spill_flag_name=temp_spill_flag_name,
+            d_f_ext_name="nullptr",  # integrator gradient does not thread external forces
         )
         self.gen_add_sync()
 
@@ -528,6 +529,7 @@ def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
         s_df_du_name="s_df_du",
         d_temp_spill_name=d_temp_spill_name,
         temp_spill_flag_name=temp_spill_flag_name,
+        d_f_ext_name="nullptr",  # integrator gradient does not thread external forces
     )
     self.gen_add_sync()
     if fb:

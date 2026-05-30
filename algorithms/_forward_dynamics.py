@@ -69,6 +69,7 @@ def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,
         s_u_name = "s_u", \
         s_temp_name = "s_temp", \
         d_workspace_name = "nullptr", \
+        d_f_ext_name = "d_f_ext", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
@@ -80,7 +81,7 @@ def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,
     # sizes come from FD_INNER_{SMEM,WORKSPACE}_BYTES<T, MINV_F_IN_SMEM>().
     fd_code_start = "forward_dynamics_inner<T, " + minv_f_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_q_name"] + ", " + \
                                                    var_names["s_qd_name"] + ", " + var_names["s_u_name"] + ", "
-    fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
+    fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
     fd_code_middle = self.gen_insert_helpers_function_call()
     fd_code = fd_code_start + fd_code_middle + fd_code_end
     self.gen_add_code_line(fd_code)
@@ -95,9 +96,10 @@ def gen_forward_dynamics_inner(self):
                    "s_u is the vector of joint input torques", \
                    "s_temp is the (shared) scratch; size FD_INNER_SMEM_BYTES<T, MINV_F_IN_SMEM>()", \
                    "d_workspace is the global scratch; size FD_INNER_WORKSPACE_BYTES<T, MINV_F_IN_SMEM>() (= 6*NV*NV when !MINV_F_IN_SMEM, else 0). Pass nullptr when MINV_F_IN_SMEM", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant"]
     func_def_start = "void forward_dynamics_inner(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values",
@@ -148,10 +150,11 @@ def gen_forward_dynamics_device(self):
                    "s_qd is the vector of joint velocities", \
                    "s_u is the vector of joint input torques", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant", \
                    "d_workspace is the global scratch buffer; size FD_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_PERF, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_PERF"]
     func_def_start = "void forward_dynamics_device(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, T *d_workspace = nullptr) {"
     func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the whole FD inner scratch (~" + str(shared_mem_size) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel.",
                   "The inner-temp arena holds the (6*NUM_VEL*NUM_VEL) Minv-F band at its tail, so routing the whole arena to d_workspace also spills the F-band; this is the device-path analog of the kernel's MINV_F_IN_SMEM lever (which surgically spills only F)."]
     func_def = func_def_start + func_def_end
@@ -231,10 +234,11 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
                    "d_workspace is the L2-pinned global spill buffer (used when Minv-F overflows smem)", \
                    "d_q_qd_u is the vector of joint positions, velocities, and input torques", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_def_start = "void forward_dynamics_kernel(T *d_qdd, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def_end = "T *d_f_ext, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_notes = []
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -289,7 +293,7 @@ def gen_forward_dynamics_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics requires all-data or dynamics gridData\");")
     func_call_start = "forward_dynamics_kernel<T><<<block_dimms,thread_dimms,FD_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
-    func_call_end = "d_robotModel,gravity,num_timesteps);"
+    func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     self.gen_add_code_line("int stride_q_qd_u = 3*NUM_JOINTS;")

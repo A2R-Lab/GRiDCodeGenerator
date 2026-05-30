@@ -29,7 +29,8 @@ def gen_aba_inner_floating(self):
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
+    func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
                   "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly.",
                   "Inner-controlled placement, two orthogonal levers decided at the top:",
@@ -128,6 +129,10 @@ def gen_aba_inner_floating(self):
     self.gen_add_code_line("int row = ind % 6; int jid = ind / 6;")
     self.gen_add_code_line("int jid6 = 6 * jid;")
     self.gen_add_code_line("s_temp[" + str(pAOffset) + " + jid6 + row] = dot_prod<T,6,6,1>(&s_temp[" + str(tempMatOffset) + " + 6*jid6 + row], &s_va[jid6]);")
+    # External forces (opt-in): subtract the per-body local-frame f_ext from the
+    # bias pA (single subtract site). d_f_ext is GLOBAL, body-major 6*NUM_BODIES,
+    # ordered [angular; linear]. nullptr -> no-op (dead-code-eliminated).
+    self.gen_add_code_line("if (d_f_ext != nullptr) { s_temp[" + str(pAOffset) + " + jid6 + row] -= d_f_ext[jid6 + row]; }")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
@@ -279,7 +284,8 @@ def gen_aba_inner(self):
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, T *d_workspace, const T gravity) {"
+    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
+    func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
                   "Inner-controlled placement, two orthogonal levers decided at the top:",
                   "  TEMP_IN_SMEM=false                : whole scratch band -> d_workspace (blunt MINIMAL fallback).",
@@ -436,6 +442,10 @@ def gen_aba_inner(self):
     self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int jid = comp % " + str(n) + ";")
     self.gen_add_code_line("int jid6 = 6 * jid;")
     self.gen_add_code_line("s_temp[78 * " + str(n) + " + jid6 + row] = dot_prod<T,6,6,1>(&s_cold[98 * " + str(n) + " + 6*jid6+row], &s_va[jid6]);")
+    # External forces (opt-in): subtract the per-body local-frame f_ext from the
+    # bias pA (single subtract site). d_f_ext is GLOBAL, body-major 6*NUM_BODIES,
+    # ordered [angular; linear]. nullptr -> no-op (dead-code-eliminated).
+    self.gen_add_code_line("if (d_f_ext != nullptr) { s_temp[78 * " + str(n) + " + jid6 + row] -= d_f_ext[jid6 + row]; }")
 
     self.gen_add_end_control_flow()
 
@@ -710,13 +720,14 @@ def gen_aba_inner_function_call(self, updated_var_names = None,
         s_tau_name = "s_tau", \
         s_temp_name = "s_temp", \
         d_workspace_name = "nullptr", \
+        d_f_ext_name = "d_f_ext", \
         gravity_name = "gravity"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ", " + cold_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
-    aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["gravity_name"] + ");"
+    aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
     aba_code_middle = self.gen_insert_helpers_function_call()
     aba_code = aba_code_start + aba_code_middle + aba_code_end
     self.gen_add_code_line(aba_code)
@@ -730,11 +741,12 @@ def gen_aba_device(self):
                    "s_qd is the vector of joint velocities", \
                     "s_tau is the vector of joint torques", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant"]
     func_notes = []
     func_def_start = "void aba_device("
     func_def_middle = "T *s_qdd, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity) {"
     func_def = func_def_start + func_def_middle + func_def_end
 
     # then generate the code
@@ -838,11 +850,12 @@ def gen_aba_kernel(self, single_call_timing = False):
                     "d_q_qd_tau is the vector of joint positions, velocities, torques", \
                     "stride_q_qd is the stride between each q, qd", \
                     "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                    "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                     "gravity is the gravity constant", \
                     "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
     func_def_start = "void aba_kernel(T *d_qdd, unsigned char *d_workspace, const T *d_q_qd_tau, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def_end = "T *d_f_ext, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
@@ -900,7 +913,7 @@ def gen_aba_host(self, mode = 0):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"aba requires all-data or dynamics gridData\");")
 
     func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
-    func_call_end = "d_robotModel,gravity,num_timesteps);"
+    func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd = NUM_JOINTS + 2*NUM_VEL;")
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")

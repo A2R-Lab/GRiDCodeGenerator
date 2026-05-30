@@ -473,7 +473,7 @@ def gen_integrator_inner(self):
     # placement + global scratch through every FD inner call (stages reuse the
     # same F bytes sequentially).
     self.gen_forward_dynamics_inner_function_call(
-        updated_var_names=dict(d_workspace_name="d_workspace"), minv_f_in_smem_expr="MINV_F_IN_SMEM")
+        updated_var_names=dict(d_workspace_name="d_workspace", d_f_ext_name="nullptr"), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync()
 
     # Single-stage branch — Euler / Semi-Implicit Euler.
@@ -525,7 +525,7 @@ def gen_integrator_inner(self):
     self.gen_add_sync()
     # FD at p1.
     self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2", d_workspace_name="d_workspace",
+        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
     ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync()
 
@@ -556,7 +556,7 @@ def gen_integrator_inner(self):
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p2_q"))
         self.gen_add_sync()
         self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3", d_workspace_name="d_workspace",
+            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
         ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync()
         self.gen_add_end_control_flow()
@@ -583,7 +583,7 @@ def gen_integrator_inner(self):
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p3_q"))
         self.gen_add_sync()
         self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4", d_workspace_name="d_workspace",
+            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
         ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync()
         self.gen_add_end_control_flow()

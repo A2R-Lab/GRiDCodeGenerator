@@ -7,7 +7,8 @@ def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input =
 def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
                                                s_df_du_name = "s_df_du",
                                                d_temp_spill_name = "nullptr",
-                                               temp_spill_flag_name = "false"):
+                                               temp_spill_flag_name = "false",
+                                               d_f_ext_name = "d_f_ext"):
     n = self.robot.get_num_vel()
     if not use_qdd_Minv_input:
         #
@@ -21,14 +22,14 @@ def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
         # c+vaf/ID code reuses these bytes (the steps run sequentially).
         self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
         # updated_var_names = dict(s_c_name = "s_temp", s_vaf_name = "&s_temp[" + str(n) + "]", s_temp_name = "&s_temp[" + str(19*n) + "]")
-        updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]")
+        updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]", d_f_ext_name = d_f_ext_name)
         self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
         self.gen_forward_dynamics_finish_function_call(updated_var_names)
         self.gen_add_sync()
-        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True)
+        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True, updated_var_names = dict(d_f_ext_name = d_f_ext_name))
     # else just compute vaf
     else:
-        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True)
+        self.gen_inverse_dynamics_inner_function_call(compute_c = False, use_qdd_input = True, updated_var_names = dict(d_f_ext_name = d_f_ext_name))
     # then run the gradient code
     self.gen_inverse_dynamics_gradient_inner_function_call(
         dict(d_temp_spill_name = d_temp_spill_name, temp_spill_flag_name = temp_spill_flag_name)
@@ -72,7 +73,8 @@ def gen_forward_dynamics_gradient_device_function_call(self,
                                                            use_da_df_spill_expr = "false",
                                                            s_df_du_name = "s_df_du",
                                                            d_workspace_pool_name = "nullptr",
-                                                           d_temp_spill_name = "nullptr"):
+                                                           d_temp_spill_name = "nullptr",
+                                                           d_f_ext_name = "d_f_ext"):
     """Emit the call to `forward_dynamics_gradient_device`. Arg order MUST
     match the def in gen_forward_dynamics_gradient_device. The caller decides
     where the OUTPUT s_df_du lives (smem buffer or the global d_df_du band) and
@@ -89,7 +91,7 @@ def gen_forward_dynamics_gradient_device_function_call(self,
     start += "s_vaf, s_dc_du, s_qdd, s_Minv, "
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
-           + "d_robotModel, gravity);")
+           + "d_robotModel, " + d_f_ext_name + ", gravity);")
     self.gen_add_code_line(start + middle + end)
 
 def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
@@ -141,6 +143,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
         "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
         "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
         "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
         "d_robotModel holds XImats/topology; gravity is the gravity constant",
     ]
     fname = "forward_dynamics_gradient_device_qdd" if use_qdd_Minv_input else "forward_dynamics_gradient_device"
@@ -152,7 +155,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
         func_def_start += "const T *s_u, "
         func_def_start += "T *s_vaf, T *s_dc_du, T *s_qdd, T *s_Minv, "
     func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
-                    "const robotModel<T> *d_robotModel, const T gravity) {")
+                    "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity) {")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("fd_du orchestration as a single inner-owns-placement device function",
@@ -278,11 +281,12 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
     func_def_start = "void forward_dynamics_gradient_kernel(T *d_df_du, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def_end = "T *d_f_ext, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     if use_qdd_Minv_input:
         func_def_start += "const T *d_qdd, "
         func_params.insert(-2,"d_qdd is the vector of joint accelerations")
@@ -344,7 +348,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_gradient requires all-data or dynamics gridData\");")
     func_call_start = "forward_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
-    func_call_end = "d_robotModel,gravity,num_timesteps);"
+    func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     self.gen_add_code_line("int stride_q_qd= 3*NUM_JOINTS;")

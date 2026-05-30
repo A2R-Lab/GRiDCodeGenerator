@@ -1075,10 +1075,13 @@ class GRiDCodeGenerator:
                                  "    T *d_q_qd_u;", \
                                  "    T *d_q_qd;", \
                                  "    T *d_q;", \
+                                 # external forces: body-major 6*NUM_BODIES local-frame, per timestep (zeroed by default)
+                                 "    T *d_f_ext;", \
                                  "    // CPU INPUTS", \
                                  "    T *h_q_qd_u;", \
                                  "    T *h_q_qd;", \
                                  "    T *h_q;", \
+                                 "    T *h_f_ext;", \
                                  "    // GPU OUTPUTS", \
                                  "    T *d_c;", \
                                  "    T *d_Minv;", \
@@ -1126,6 +1129,12 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_q, NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_q_qd_u = (T *)malloc(3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_q = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    // external forces (body-major 6*NUM_BODIES local-frame); zeroed so the", \
+                      "    // default (no-fext) path subtracts nothing. Users overwrite h_f_ext and", \
+                      "    // copy to d_f_ext to apply external forces.", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_f_ext, 6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMemset(hd_data->d_f_ext, 0, 6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_f_ext = (T *)calloc(6*NUM_BODIES*NUM_TIMESTEPS, sizeof(T));", \
                       "}", \
                       "if (needs_dynamics) {", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_q_qd, 2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
@@ -1208,13 +1217,13 @@ class GRiDCodeGenerator:
         # (algo_label, algo_short, gate_attr, bytes_macro, [(kernel_name<T>, signature), ...])
         ("inverse_dynamics", "id", None, "ID_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_kernel<T>",
-             "void (*)(T *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         ("direct_minv", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("direct_minv_kernel<T>",
@@ -1224,15 +1233,15 @@ class GRiDCodeGenerator:
         ]),
         ("forward_dynamics", "fd", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("forward_dynamics_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         ("aba", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("aba_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("aba_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         ("crba", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("crba_kernel<T>",
@@ -1254,23 +1263,23 @@ class GRiDCodeGenerator:
         ]),
         ("inverse_dynamics_gradient", "id_du", "generate_id_du", "ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_gradient_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         ("forward_dynamics_gradient", "fd_du", "generate_fd_du", "FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("forward_dynamics_gradient_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel_single_timing<T>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_body_frame_kernel<T>",
@@ -1417,6 +1426,7 @@ class GRiDCodeGenerator:
         self.gen_add_code_line("void close_grid(cudaStream_t *streams, robotModel<T> *d_robotModel, gridData<T, KIND> *hd_data){", True)
         self.gen_add_code_lines(["gpuErrchk(cudaFree(d_robotModel));", \
                                  "gpuErrchk(cudaFree(hd_data->d_q_qd_u)); gpuErrchk(cudaFree(hd_data->d_q_qd)); gpuErrchk(cudaFree(hd_data->d_q));", \
+                                 "gpuErrchk(cudaFree(hd_data->d_f_ext)); free(hd_data->h_f_ext);", \
                                  "gpuErrchk(cudaFree(hd_data->d_c)); gpuErrchk(cudaFree(hd_data->d_Minv)); gpuErrchk(cudaFree(hd_data->d_qdd)); gpuErrchk(cudaFree(hd_data->d_M));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
                                  "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
