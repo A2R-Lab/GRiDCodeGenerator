@@ -1594,6 +1594,28 @@ class GRiDCodeGenerator:
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
+        # G0 footgun guard: mimic robots' GRADIENT algorithms are not yet folded
+        # (the reduced alpha-scaled gradient assembly is deferred to T3-finisher).
+        # Until then refuse to emit a gradient algo for a mimic robot rather than
+        # silently writing ZEROS. Non-gradient mimic codegen (id/fd/aba/crba/minv/
+        # ee_pose/integrator value) is unaffected and still emits normally.
+        if self.robot_has_mimic_joints():
+            _MIMIC_GRADIENT_ALGORITHMS = {
+                "id_du", "fd_du", "ee_pose_gradient", "ee_pose_hessian",
+                "idsva_so_body_frame", "fdsva_so",
+                "integrator_gradient", "integrator_with_gradient",
+            }
+            requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
+            if requested_gradients:
+                raise NotImplementedError(
+                    "mimic gradients not yet supported — deferred to T3-finisher. "
+                    "Robot has mimic joints but the requested codegen selection includes "
+                    "gradient algorithm(s) " + ", ".join(requested_gradients) + ". "
+                    "These would emit silently-zeroed output (no valid mimic-reduced "
+                    "gradient exists yet). Re-run with a non-gradient profile/algorithm "
+                    "list (e.g. 'dynamics-core', or id/fd/aba/crba/minv/ee_pose/integrator) "
+                    "to codegen this robot."
+                )
         self.generate_id_du = "id_du" in algorithms
         self.generate_fd_du = "fd_du" in algorithms
         self.generate_ee_pose_hessian = "ee_pose_hessian" in algorithms

@@ -123,16 +123,19 @@ def gen_inverse_dynamics_gradient_inner(self):
         # s_dc_du columns by raw body id and would write past the reduced
         # 2*NV*NV output (NB > NV) and read the mis-sized topology helpers.
         # The mimic-aware reduced gradient (alpha-scaled velocity reads +
-        # per-body v-slot fold) is a later phase (T3 P3). Until it lands,
-        # emit a SAFE zeroed output so the kernel runs without an OOB write
-        # (the value is gated out of equivalence comparison for mimic robots).
-        self.gen_add_code_line("// T3 P3 PENDING: mimic ID-gradient not yet folded; zero output (safe stub).")
-        self.gen_add_parallel_loop("ind", str(2*n*n))
-        self.gen_add_code_line("s_dc_du[ind] = static_cast<T>(0);")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
-        self.gen_add_end_function()
-        return
+        # per-body v-slot fold) is a later phase (T3-finisher). It used to emit
+        # a SILENTLY-ZEROED output, which is a footgun: callers would consume
+        # all-zero gradients as if valid. `gen_all_code` now refuses gradient
+        # codegen for mimic robots up front (clear NotImplementedError), so this
+        # inner generator should be unreachable for a mimic robot. Guard it as a
+        # hard error in case it is invoked directly, bypassing that check —
+        # never emit silent zeros.
+        raise NotImplementedError(
+            "mimic ID-gradient (inverse_dynamics_gradient_inner) not yet supported — "
+            "deferred to T3-finisher. The mimic-reduced gradient assembly is not "
+            "implemented; refusing to emit silently-zeroed output. Codegen this robot "
+            "with a non-gradient profile/algorithm selection."
+        )
 
     #
     # Optimize memory requirements due to sparsity induced by branching
