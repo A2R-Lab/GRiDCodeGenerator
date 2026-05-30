@@ -174,16 +174,6 @@ def _floating_gravity_lie_metadata(robot):
         "is_root_translation": lie_sign_flip,
     }
 
-def _gravity_shim_full_spill_count(robot):
-    """Floats of the gravity-Hessian helper's shared portion (when fully spilled).
-
-    Includes dX, a, da, f, df, and 4*6x6 scratch. Pure-shape function; no `self`.
-    """
-    NV = robot.get_num_vel()
-    NB = robot.get_num_bodies()
-    return int(36 * NV + 6 * NB + 6 * NV * NB + 6 * NB + 6 * NV * NB + 4 * 36)
-
-
 def _gravity_shim_use_full_spill(self):
     """Decide whether to spill the gravity-shim's shared portion to d_workspace.
 
@@ -2308,46 +2298,6 @@ def gen_idsva_so_body_frame_public_dvdq_layout_repair(self):
     self.gen_add_sync()
 
 
-def gen_idsva_so_body_frame_device_temp_mem_size(self):
-    return self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    
-
-def gen_idsva_so_body_frame_device(self, use_qdd_input = False, single_call_timing=False):
-    # Note: this body_frame-specific device wrapper is not emitted in
-    # gen_idsva_so_body_frame (see line 2451 TODO). Inline-CUDA users should
-    # call gen_idsva_so_device instead — a codegen-time dispatcher that picks
-    # body_frame_inner for fixed-base and world_frame_inner for floating-base
-    # (mirrors the host-level idsva_so dispatcher).
-    NV = self.robot.get_num_vel()
-    # construct the boilerplate and function definition
-    func_params = ["s_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*NV**3), \
-                   "s_q is the vector of joint positions", \
-                   "s_qd is the vector of joint velocities", \
-                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
-                   "gravity is the gravity constant"]
-    func_def_start = "void idsva_so_body_frame_device(T *s_idsva_so, const T *s_q, const T *s_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity) {"
-    func_notes = []
-    if use_qdd_input:
-        func_def_start += "const T *s_qdd, "
-        func_params.insert(-2,"s_qdd is the vector of joint accelerations")
-    else:
-        func_notes.append("optimized for qdd = 0")
-    func_def = func_def_start + func_def_end
-    self.gen_add_func_doc("Computes the second order derivates of idsva",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-    # add the shared memory variables
-    shared_mem_size = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size)
-    # The inner loads/updates XImats internally (inner-owns-placement), so no external
-    # XImats call here; this device wrapper keeps s_temp in smem (SCRATCH_IN_SMEM=true).
-    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-    self.gen_idsva_so_body_frame_inner_function_call()
-    self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
-    self.gen_add_end_function()
-
 def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
                                                     use_global_output, s_temp_in_global, bc_in_global):
     """Emit the idsva_so body-frame kernel body for one tier's spill flags.
@@ -2572,8 +2522,6 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
 def gen_idsva_so_body_frame(self):
     # gen the inner code
     self.gen_idsva_so_body_frame_inner()
-    # gen the wrapper code for device fn
-    # self.gen_idsva_so_body_frame_device(False) TODO
     # and the kernels
     self.gen_idsva_so_body_frame_kernel(False,True)
     self.gen_idsva_so_body_frame_kernel(False,False)

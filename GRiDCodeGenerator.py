@@ -47,8 +47,8 @@ class GRiDCodeGenerator:
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
                             gen_crba_device, gen_crba_kernel, gen_crba_host, \
                             gen_idsva_so_body_frame_inner_temp_mem_size, gen_idsva_so_body_frame_inner_function_call, idsva_so_needs_reference_order_output_repair, \
-                            gen_idsva_so_body_frame_reference_order_output_repair, gen_idsva_so_body_frame_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, gen_idsva_so_body_frame_device_temp_mem_size, \
-                            gen_idsva_so_body_frame_device, gen_idsva_so_body_frame_kernel, gen_idsva_so_body_frame_host, gen_idsva_so_body_frame, \
+                            gen_idsva_so_body_frame_reference_order_output_repair, gen_idsva_so_body_frame_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, \
+                            gen_idsva_so_body_frame_kernel, gen_idsva_so_body_frame_host, gen_idsva_so_body_frame, \
                             gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
                             gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \
                             gen_idsva_so_world_frame_host, gen_idsva_so_world_frame, \
@@ -244,13 +244,6 @@ class GRiDCodeGenerator:
                 offset = py_align_up(offset, 4)
                 offset += 4 * int(int_count)
             return py_align_up(offset, 16)
-
-        def select_shared_tier(full_t_count, selective_t_count):
-            if py_arena_bytes(full_t_count) <= self.cuda_target_shared_mem_bytes:
-                return 0
-            if py_arena_bytes(selective_t_count) <= self.cuda_target_shared_mem_bytes:
-                return 1
-            return 2
 
         def select_shared_tier_3way(*t_counts):
             """Pick the (perf, lite, minimal) spill-level indices for one algo.

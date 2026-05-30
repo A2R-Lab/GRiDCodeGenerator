@@ -87,13 +87,6 @@ def gen_static_array_ind_3d(self, ind, col, row, ind_stride = 36, col_stride = 6
 def gen_add_sync(self):
     self.gen_add_code_line("__syncthreads();")
 
-def gen_add_debug_print_code_line(self, print_code_string):
-    self.gen_add_sync()
-    self.gen_add_serial_ops()
-    self.gen_add_code_line(print_code_string)
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-
 def gen_add_debug_print_code_lines(self, print_code_string_arr):
     self.gen_add_sync()
     self.gen_add_serial_ops()
@@ -360,34 +353,6 @@ def gen_anti_licm_output_write(self, store_to_name, load_from_name = None):
         "reinterpret_cast<volatile T *>(d_" + store_to_name + ")[rep & 1023] = "
         "reinterpret_cast<const volatile T *>(" + load_from_name + ")[rep & 7]; }"
     )
-
-
-def _any_algo_uses_workspace_spill(self):
-    """Return True when any Phase 2/3 spill-aware algo's PERF pick is non-zero
-    (i.e. the kernel writes/reads d_workspace at PERF tier). Used to default
-    GRID_CUDA_ENABLE_L2_PERSISTING to 1 — spilled bytes are hot enough to
-    benefit from L2 residency. Conservative: also flips on whenever any algo's
-    LITE/MINIMAL pick spills (most h1_2 scenarios). False on small robots
-    where every algo collapses to no-spill at all tiers."""
-    spill_picks = []
-    for attr in ("minv_spill_tier_3way", "id_du_spill_tier_3way", "fd_du_spill_tier_3way",
-                 "d2ee_spill_tier_3way", "fdsva_so_spill_tier_3way", "fd_spill_tier_3way"):
-        picks = getattr(self, attr, None)
-        if picks is not None:
-            spill_picks.extend(picks)
-    # Existing single-pick spill flags (binary; carried from pre-Phase-2a):
-    for attr in ("idsva_so_body_frame_use_global_output",
-                 "idsva_so_body_frame_grav_full_spill",
-                 "idsva_so_world_frame_use_global_output",
-                 "fdsva_so_use_workspace_temp",
-                 "fdsva_so_fd_grad_use_spill",
-                 "d2ee_use_workspace_temp",
-                 "d2ee_use_workspace_d2xhom",
-                 "id_du_use_global_temp",
-                 "fd_du_use_global_temp"):
-        if getattr(self, attr, False):
-            return True
-    return any(p > 0 for p in spill_picks)
 
 
 def gen_add_shared_memory_helpers(self):

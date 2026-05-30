@@ -1063,12 +1063,6 @@ def _emit_carry_copy(self, name, src, dst, base):
     self.gen_add_code_line(base + "[16*" + name + "_dst[c] + rc] = " + base + "[16*" + name + "_src[c] + rc];")
     self.gen_add_end_control_flow()
 
-def gen_end_effector_pose_gradient_device_temp_mem_size(self, fixed_target_name = ""):
-    n = self.robot.get_num_pos()
-    XHom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
-    wrapper_size = self.gen_topology_helpers_size() + XHom_size + dXhom_size # for Xhom and dXhom
-    return self.gen_end_effector_pose_gradient_inner_temp_mem_size(fixed_target_name) + wrapper_size
-
 def gen_end_effector_pose_gradient_device(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -2176,14 +2170,6 @@ def _emit_d2M_same_joint_block(self, di, dj, ee_idx, ee_jid, vi, vj, nv, num_ees
     self.gen_add_code_line("s_d2eePos[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
     self.gen_add_code_line("s_d2eePos[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
     self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
-
-def gen_end_effector_pose_gradient_hessian_device_temp_mem_size(self):
-    XHom_size, _dXhom_unused, _d2Xhom_unused = self.gen_get_Xhom_size()
-    # The FD-on-Jacobian inner only needs s_Xhom (LOCAL transforms); dXhom and
-    # d2Xhom are no longer used (the geometric-Jacobian gradient inner reads
-    # only s_Xhom via s_Xworld).
-    wrapper_size = self.gen_topology_helpers_size() + XHom_size
-    return self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size() + wrapper_size
 
 def gen_end_effector_pose_gradient_hessian_device(self):
     n = self.robot.get_num_pos()
