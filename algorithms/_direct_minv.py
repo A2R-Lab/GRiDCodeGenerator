@@ -43,11 +43,48 @@ def gen_direct_minv_inner_function_call(self, updated_var_names = None,
     minv_code = minv_code_start + minv_code_middle + minv_code_end
     self.gen_add_code_line(minv_code)
 
+def _gen_direct_minv_inner_mimic(self, n, no_F_size):
+    """Emit the mimic Minv path: M = crba_inner(q); Minv = inv(M); symmetrize.
+
+    n = NV. s_F (6*NV*NV) is the scratch arena here (F is never built on this
+    path). Layout in s_F:
+      [0, NV*NV)            M_buf (reduced mass matrix from crba_inner)
+      [NV*NV, NV*NV+band)   crba_inner scratch band (its IC + locals)
+    invert_matrix writes the inverse into s_Minv using its own s_temp scratch
+    (we pass the no_F s_temp region, sized >= NV for glass's dense invert).
+    """
+    self.gen_add_code_line("// mimic Minv = inv(CRBA(q))")
+    # M lives in s_F[0..NV*NV); the rest of s_F (6*NV*NV total) is invert scratch.
+    # crba_inner's scratch band reuses s_temp (the no_F region, >= 36*NB) which is
+    # otherwise unused on this path. crba is config-only: s_qd + gravity unused.
+    self.gen_add_code_line("T *s_M_reduced = &s_F[0];")
+    self.gen_add_code_line("T *s_invert_temp = &s_F[" + str(n*n) + "];")
+    helpers = self.gen_insert_helpers_function_call()  # "s_XImats, s_topology_helpers, "
+    # Signature: crba_inner(s_M, s_q, s_qd, [s_XImats, s_topology_helpers], s_temp, d_workspace, gravity)
+    self.gen_add_code_line(
+        "crba_inner<T, true>(s_M_reduced, s_q, s_q, " + helpers
+        + "s_temp, nullptr, static_cast<T>(0));")
+    self.gen_add_sync()
+    # Invert the reduced NV x NV mass matrix into s_Minv (dense, block-cooperative).
+    self.gen_add_code_line("invert_matrix(" + str(n) + ", s_M_reduced, s_Minv, s_invert_temp);")
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
 def gen_direct_minv_inner(self):
     NJ = self.robot.get_num_joints()
     n = self.robot.get_num_vel()
     max_bfs_levels = self.robot.get_max_bfs_level()
     max_bfs_width = self.robot.get_max_bfs_width()
+    if self.robot_has_mimic_joints():
+        # The mimic Minv path calls crba_inner, which is emitted AFTER this
+        # function in the header. Forward-declare it (mimic robots only, so the
+        # non-mimic header stays byte-identical). Signature must match _crba.py.
+        self.gen_add_code_line("// forward decl: mimic Minv routes through crba_inner (emitted later)")
+        self.gen_add_code_line("// (no default arg here; the definition below carries TEMP_IN_SMEM = true)")
+        self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM>")
+        self.gen_add_code_line("__device__")
+        self.gen_add_code_line("void crba_inner(T *s_M, const T *s_q, const T *s_qd, T *s_XImats, int *s_topology_helpers, T *s_temp, T *d_workspace, const T gravity);")
     # construct the boilerplate and function definition
     no_F_size = self.gen_direct_minv_inner_no_F_size()
     F_size = self.gen_direct_minv_inner_F_size()
@@ -89,6 +126,16 @@ def gen_direct_minv_inner(self):
     self.gen_add_code_line("T *s_F;")
     self.gen_add_code_line("if constexpr (F_IN_SMEM) { s_F = &s_temp[" + str(no_F_size) + "]; (void)d_workspace; }")
     self.gen_add_code_line("else { s_F = d_workspace; }")
+
+    if self.robot_has_mimic_joints():
+        # Mimic-aware Minv = inv(M_reduced). The per-body U/Dinv ABA recursion
+        # does NOT superpose for mimic joints (M_reduced^{-1} != G^T M_full^{-1} G),
+        # so — exactly like RBDReference.minv's mimic fast path — we form the
+        # reduced mass matrix via crba_inner and invert it (NV x NV). s_F is large
+        # (6*NV*NV) and unused on this path, so we carve M + the CRBA scratch band
+        # out of it; the inverse is written straight into s_Minv.
+        _gen_direct_minv_inner_mimic(self, n, no_F_size)
+        return
     FOffset = 0   # within s_F
     IAOffset = 0  # within s_temp
     UOffset = IAOffset + 36*n

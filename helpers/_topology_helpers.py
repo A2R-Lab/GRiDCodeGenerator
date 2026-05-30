@@ -12,8 +12,15 @@ def gen_get_Xhom_size(self):
     NJ = self.robot.get_num_joints()
     nfj = self.robot.get_num_fixed_joints() if self.include_fixed_kinematic_targets else 0
     Xhom_size = 16*(NJ+nfj) # one homogeneous transform per joint plus optional fixed kinematic targets
-    dXhom_size = 16*n # kinematic targets are fixed so don't include (gradient is 0)
-    d2Xhom_size = 16*(n*n if self.robot.floating_base else n) # floating root has dense local quaternion second derivatives
+    # The fixed-base dXhom/d2Xhom are stored PER-BODY (one 4x4 per joint id):
+    # both gen_init_XImats (host) and gen_load_update_XImats_helpers (device)
+    # write len(get_d2Xmats_hom_ordered_by_id()) == NUM_BODIES matrices. Budget
+    # by NUM_BODIES so a mimic robot (NB > nq) doesn't overflow h_XImats. For
+    # non-mimic robots NB == nq, so this is byte-identical to the legacy 16*n.
+    NB = self.robot.get_num_bodies()
+    body_count = NB if not self.robot.floating_base else n
+    dXhom_size = 16*body_count # kinematic targets are fixed so don't include (gradient is 0)
+    d2Xhom_size = 16*(n*n if self.robot.floating_base else NB) # floating root has dense local quaternion second derivatives
     return Xhom_size, dXhom_size, d2Xhom_size
 
 def _qinds_to_list(self, inds):
@@ -184,6 +191,12 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     self.gen_add_end_function()
 
 def gen_load_update_XImats_helpers_temp_mem_size(self):
+    if self.robot_has_mimic_joints():
+        # Mimic path needs per-BODY scratch: s_q_eff[NB] (the folded angle
+        # alpha*q[target]+offset) plus per-body sin/cos (2*NB). Non-mimic
+        # robots keep the legacy 2*nq so their arena/header stays byte-identical.
+        NB = self.robot.get_num_joints()
+        return 3*NB
     n = self.robot.get_num_pos()
     return 2*n
 
@@ -238,6 +251,24 @@ def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_
                                   extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
                                   tier_workspace_expr = tier_workspace_expr)
 
+def _xi_fixed_sincos_subst(self, str_val, ind):
+    """Substitute sin/cos/theta for fixed-base body `ind` into a transform
+    cell. Mimic-aware: on a model with mimic joints, body `ind` reads its
+    folded angle and per-body sin/cos from the s_q_eff layout
+    (s_q_eff[NB] | sin[NB] | cos[NB]); otherwise it reads the legacy
+    s_temp[ind]/s_temp[ind+nq]/s_q[ind] (byte-identical to pre-mimic)."""
+    if self.robot_has_mimic_joints():
+        NB = self.robot.get_num_joints()
+        str_val = str_val.replace("sin(theta)", "s_temp[" + str(ind + NB) + "]")
+        str_val = str_val.replace("cos(theta)", "s_temp[" + str(ind + 2*NB) + "]")
+        str_val = str_val.replace("theta", "s_temp[" + str(ind) + "]")
+        return str_val
+    n = self.robot.get_num_joints()
+    str_val = str_val.replace("sin(theta)", "s_temp[" + str(ind) + "]")
+    str_val = str_val.replace("cos(theta)", "s_temp[" + str(ind + n) + "]")
+    str_val = str_val.replace("theta", "s_q[" + str(ind) + "]")
+    return str_val
+
 def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_homogenous_transforms = False):
     n = self.robot.get_num_joints()
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
@@ -285,12 +316,46 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
-        # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
-        self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
-        self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
+        if self.robot_has_mimic_joints():
+            # Mimic q-fold: build per-BODY effective angle s_q_eff[ind] =
+            # alpha_ind * s_q[q_slot(ind)] + offset_ind (mirrors RBDReference's
+            # q_for_joint), then compute per-body sin/cos against it. A mimic
+            # body and its target both evaluate their transform at the
+            # prescribed scaled+offset coordinate. Layout in s_temp:
+            #   [0, NB)      s_q_eff   [NB, 2NB) sin   [2NB, 3NB) cos
+            NB = self.robot.get_num_joints()
+            assert not self.robot.floating_base, \
+                "mimic q-fold path assumes fixed base (no URDF mimic on the floating root)"
+            self.gen_add_serial_ops()
+            for ind in range(NB):
+                qslot = self.robot.get_joint_index_q(ind)
+                if isinstance(qslot, (list, tuple)):
+                    assert len(qslot) == 1
+                    qslot = qslot[0]
+                j = self.robot.get_joint_by_id(ind)
+                if getattr(j, "is_mimic", False):
+                    mult = j.get_mimic_multiplier()
+                    off = j.get_mimic_offset()
+                    expr = "static_cast<T>(" + repr(mult) + ") * s_q[" + str(qslot) + "]"
+                    if off != 0.0:
+                        expr += " + static_cast<T>(" + repr(off) + ")"
+                    self.gen_add_code_line("s_temp[" + str(ind) + "] = " + expr + ";")
+                else:
+                    self.gen_add_code_line("s_temp[" + str(ind) + "] = s_q[" + str(qslot) + "];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_parallel_loop("k",str(NB))
+            self.gen_add_code_line("s_temp[k+" + str(NB) + "] = static_cast<T>(sin(s_temp[k]));")
+            self.gen_add_code_line("s_temp[k+" + str(2*NB) + "] = static_cast<T>(cos(s_temp[k]));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+        else:
+            self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
+            # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
+            self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
+            self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
     # else just load in XI from global to shared efficiently
     else:
         self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + ");")
@@ -343,6 +408,16 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                         str_val = str_val.replace("q3_fb", "s_q[5]")
                         str_val = str_val.replace("q4_fb", "s_q[6]")
                     
+                    elif self.robot_has_mimic_joints():
+                        # Mimic path: body `ind`'s transform reads the per-body
+                        # FOLDED angle and its sin/cos from the s_q_eff layout
+                        # (s_q_eff[NB] | sin[NB] | cos[NB]). For the prismatic
+                        # ("theta" bare) substitution we use the effective angle
+                        # s_temp[ind] (= alpha*q[target]+offset) directly.
+                        NB = self.robot.get_num_joints()
+                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + NB) + "]")
+                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
+                        str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
                     else:
                         # first check for sin/cos (revolute)
                         str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
@@ -365,11 +440,8 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
                         str_val = sp.ccode(val)
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        # sin/cos (revolute) + theta (prismatic), mimic-aware
+                        str_val = _xi_fixed_sincos_subst(self, str_val, ind)
                         # then output the code
                         cpp_ind = str(baseXI_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
@@ -381,11 +453,8 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
                         str_val = sp.ccode(val)
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        # sin/cos (revolute) + theta (prismatic), mimic-aware
+                        str_val = _xi_fixed_sincos_subst(self, str_val, ind)
                         # then output the code
                         cpp_ind = str(baseXI_size + Xhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
@@ -397,11 +466,8 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                     if not self.custom_is_constant(val):
                         # parse the symbolic value into the appropriate array access
                         str_val = sp.ccode(val)
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        # sin/cos (revolute) + theta (prismatic), mimic-aware
+                        str_val = _xi_fixed_sincos_subst(self, str_val, ind)
                         # then output the code
                         cpp_ind = str(baseXI_size + Xhom_size + dXhom_size + self.gen_static_array_ind_3d(ind,col,row,ind_stride=16,col_stride=4))
                         self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
@@ -527,12 +593,44 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
             self.gen_add_end_control_flow()
-        self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
-        # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
-        self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
-        self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
+        if self.robot_has_mimic_joints():
+            # Mimic q-fold (same scheme as gen_load_update_XImats_helpers):
+            # s_temp = [s_q_eff(NB) | sin(NB) | cos(NB)] so body `ind`'s Xhom
+            # reads its folded angle/sincos. Avoids the OOB s_q[ind>=nq] the
+            # legacy per-joint substitution would emit for NB > nq.
+            NB = self.robot.get_num_joints()
+            assert not self.robot.floating_base, \
+                "mimic XmatsHom q-fold path assumes fixed base"
+            self.gen_add_serial_ops()
+            for ind in range(NB):
+                qslot = self.robot.get_joint_index_q(ind)
+                if isinstance(qslot, (list, tuple)):
+                    assert len(qslot) == 1
+                    qslot = qslot[0]
+                j = self.robot.get_joint_by_id(ind)
+                if getattr(j, "is_mimic", False):
+                    mult = j.get_mimic_multiplier()
+                    off = j.get_mimic_offset()
+                    expr = "static_cast<T>(" + repr(mult) + ") * s_q[" + str(qslot) + "]"
+                    if off != 0.0:
+                        expr += " + static_cast<T>(" + repr(off) + ")"
+                    self.gen_add_code_line("s_temp[" + str(ind) + "] = " + expr + ";")
+                else:
+                    self.gen_add_code_line("s_temp[" + str(ind) + "] = s_q[" + str(qslot) + "];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_parallel_loop("k",str(NB))
+            self.gen_add_code_line("s_temp[k+" + str(NB) + "] = static_cast<T>(sin(s_temp[k]));")
+            self.gen_add_code_line("s_temp[k+" + str(2*NB) + "] = static_cast<T>(cos(s_temp[k]));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+        else:
+            self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
+            # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
+            self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
+            self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
     # else just load in XI from global to shared efficiently
     else:
         self.gen_add_parallel_loop("ind",str(Xhom_size))
@@ -571,6 +669,14 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
             str_val = str_val.replace("q2_fb", "s_q[4]")
             str_val = str_val.replace("q3_fb", "s_q[5]")
             str_val = str_val.replace("q4_fb", "s_q[6]")
+        elif self.robot_has_mimic_joints():
+            # body `ind` reads its folded angle / per-body sincos from the
+            # s_q_eff layout (s_q_eff[NB] | sin[NB] | cos[NB]); mirrors the
+            # XImats mimic q-fold above.
+            NB = self.robot.get_num_joints()
+            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + NB) + "]")
+            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
+            str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
         else:
             str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
             str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
