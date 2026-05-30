@@ -529,50 +529,80 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
         ee_anchor = anchors[ee_idx]
         for job in jobs:
             flat_jobs.append((ee_idx, ee_anchor, job))
+    # Collapse jobs that target the same destination column (same (ee_idx, vi)) —
+    # these occur when several joint ids in a chain map to one velocity coordinate
+    # (e.g. h1_2's finger joints sharing a v-index). The original serial emission
+    # wrote them in order and let the LAST writer win; keeping only the last
+    # occurrence per (ee_idx, vi) reproduces that last-writer-wins result exactly
+    # while making every remaining job's destination column disjoint (a hard
+    # requirement for the block-parallel fill — no two work-items touch one cell).
+    _dedup = {}
+    for entry in flat_jobs:
+        ee_idx, _anc, job = entry
+        _dedup[(ee_idx, job["vi"])] = entry  # later entries overwrite earlier
+    flat_jobs = list(_dedup.values())
     n_flat = len(flat_jobs)
     if n_flat > 0:
         self.gen_add_code_line("//")
-        self.gen_add_code_line("// Step 3: per-chain-joint columns of J_v, J_w (one block per (ee, S-column))")
+        self.gen_add_code_line("// Step 3: per-chain-joint columns of J_v, J_w (one block-parallel work-item per (ee, S-column))")
         self.gen_add_code_line("//")
-        self.gen_add_serial_ops()
-        # Use a serial single-thread emission per (ee, S-col) so each block can use
-        # compile-time constants for the joint id, axis, etc. Total work per block is
-        # ~10 FLOPs; total blocks ~chain_depth * num_ees * dofs_per_joint -- small.
-        for ee_idx, ee_anchor, job in flat_jobs:
-            j = job["j"]; vi = job["vi"]
-            ang = job["ang"]; lin = job["lin"]; rev = job["revolute"]
-            # column-major rotation: R_j[r,c] = s_Xworld[16*j + r + 4*c], r,c in 0..2
-            # local axis as compile-time floats
-            ax = ang if rev else lin
-            ax_str = ["static_cast<T>(" + ("{:.17g}".format(a)) + ")" for a in ax]
-            # axis_world[r] = sum_c R_j[r,c] * ax[c] = sum_c s_Xworld[16*j + r + 4*c] * ax[c]
-            self.gen_add_code_line("// ee=" + str(ee_idx) + " j=" + str(j) + " vi=" + str(vi) + (" rev" if rev else " prism"))
-            self.gen_add_code_line("{", True)
-            for r in range(3):
-                term = []
-                for c in range(3):
-                    if abs(ax[c]) < 1e-15:
-                        continue
-                    term.append("s_Xworld[" + str(16*j + r + 4*c) + "] * " + ax_str[c])
-                expr = " + ".join(term) if term else "static_cast<T>(0)"
-                self.gen_add_code_line("T axw_" + str(r) + " = " + expr + ";")
-            if rev:
-                # J_w[ee, vi, r] = axw_r
-                for r in range(3):
-                    self.gen_add_code_line("s_Jw[" + str(3*nv*ee_idx + 3*vi + r) + "] = axw_" + str(r) + ";")
-                # arm = p_ee - p_j -> dx, dy, dz
-                self.gen_add_code_line("T dx = s_Xworld[" + str(16*ee_anchor + 12) + "] - s_Xworld[" + str(16*j + 12) + "];")
-                self.gen_add_code_line("T dy = s_Xworld[" + str(16*ee_anchor + 13) + "] - s_Xworld[" + str(16*j + 13) + "];")
-                self.gen_add_code_line("T dz = s_Xworld[" + str(16*ee_anchor + 14) + "] - s_Xworld[" + str(16*j + 14) + "];")
-                # J_v = axw cross (p_ee - p_j)
-                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 0) + "] = axw_1*dz - axw_2*dy;")
-                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 1) + "] = axw_2*dx - axw_0*dz;")
-                self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + 2) + "] = axw_0*dy - axw_1*dx;")
-            else:
-                # J_v[ee, vi, r] = axw_r; J_w already zero from init
-                for r in range(3):
-                    self.gen_add_code_line("s_Jv[" + str(3*nv*ee_idx + 3*vi + r) + "] = axw_" + str(r) + ";")
-            self.gen_add_end_control_flow()
+        # Each job fills a DISJOINT column of J_v / J_w (the destination base
+        # offset 3*nv*ee_idx + 3*vi is unique per (ee_idx, vi)), so the jobs are
+        # fully independent and distribute across the block with no atomics. The
+        # per-job compile-time constants (joint id j, S-column vi, ee anchor, the
+        # 3-component local axis, the revolute flag) are baked into const arrays
+        # indexed by job_idx; the existing Step-2 zero-fill + sync above leaves
+        # out-of-chain columns at zero.
+        job_j    = [job["j"] for (_ee, _anc, job) in flat_jobs]
+        job_anc  = [ee_anchor for (_ee, ee_anchor, _job) in flat_jobs]
+        job_rev  = [1 if job["revolute"] else 0 for (_ee, _anc, job) in flat_jobs]
+        # Destination column base into s_Jv / s_Jw is unique per (ee_idx, vi);
+        # bake it (with nv folded in) at codegen time so the device code needs no
+        # runtime nv symbol and the disjointness is manifest.
+        job_base = [3*nv*ee_idx + 3*job["vi"] for (ee_idx, _anc, job) in flat_jobs]
+        job_ax   = []  # the local axis (angular for revolute, linear for prismatic)
+        for (_ee, _anc, job) in flat_jobs:
+            ax = job["ang"] if job["revolute"] else job["lin"]
+            # Snap sub-threshold components to exact 0 so axw = a*x + 0*0 + 0*0 is
+            # bit-identical to the original "drop near-zero terms" emission (adding
+            # exact 0.0 never perturbs a finite float).
+            job_ax.append([float(ax[c]) if abs(ax[c]) >= 1e-15 else 0.0 for c in range(3)])
+
+        def _int_arr(vals):
+            return "{ " + ", ".join(str(v) for v in vals) + " }"
+        def _ax_arr(vals):
+            return "{ " + ", ".join("static_cast<T>({:.17g})".format(v) for v in vals) + " }"
+
+        self.gen_add_code_line("static const int eeg_job_j[]    = " + _int_arr(job_j) + ";")
+        self.gen_add_code_line("static const int eeg_job_anc[]  = " + _int_arr(job_anc) + ";")
+        self.gen_add_code_line("static const int eeg_job_rev[]  = " + _int_arr(job_rev) + ";")
+        self.gen_add_code_line("static const int eeg_job_base[] = " + _int_arr(job_base) + ";")
+        self.gen_add_code_line("const T eeg_job_ax[] = " + _ax_arr([a for ax in job_ax for a in ax]) + ";")
+        self.gen_add_parallel_loop("job_idx", str(n_flat))
+        self.gen_add_code_line("int j   = eeg_job_j[job_idx];")
+        self.gen_add_code_line("int ee_anchor = eeg_job_anc[job_idx];")
+        self.gen_add_code_line("int col_base = eeg_job_base[job_idx];")
+        self.gen_add_code_line("T ax0 = eeg_job_ax[3*job_idx + 0]; T ax1 = eeg_job_ax[3*job_idx + 1]; T ax2 = eeg_job_ax[3*job_idx + 2];")
+        # column-major rotation: R_j[r,c] = s_Xworld[16*j + r + 4*c], r,c in 0..2
+        # axis_world[r] = sum_c R_j[r,c] * ax[c]
+        self.gen_add_code_line("T axw_0 = s_Xworld[16*j + 0]*ax0 + s_Xworld[16*j + 4]*ax1 + s_Xworld[16*j + 8]*ax2;")
+        self.gen_add_code_line("T axw_1 = s_Xworld[16*j + 1]*ax0 + s_Xworld[16*j + 5]*ax1 + s_Xworld[16*j + 9]*ax2;")
+        self.gen_add_code_line("T axw_2 = s_Xworld[16*j + 2]*ax0 + s_Xworld[16*j + 6]*ax1 + s_Xworld[16*j + 10]*ax2;")
+        self.gen_add_code_line("if (eeg_job_rev[job_idx]) {", True)
+        # J_w[ee, vi, r] = axw_r
+        self.gen_add_code_line("s_Jw[col_base + 0] = axw_0; s_Jw[col_base + 1] = axw_1; s_Jw[col_base + 2] = axw_2;")
+        # arm = p_ee - p_j -> dx, dy, dz ; J_v = axw cross (p_ee - p_j)
+        self.gen_add_code_line("T dx = s_Xworld[16*ee_anchor + 12] - s_Xworld[16*j + 12];")
+        self.gen_add_code_line("T dy = s_Xworld[16*ee_anchor + 13] - s_Xworld[16*j + 13];")
+        self.gen_add_code_line("T dz = s_Xworld[16*ee_anchor + 14] - s_Xworld[16*j + 14];")
+        self.gen_add_code_line("s_Jv[col_base + 0] = axw_1*dz - axw_2*dy;")
+        self.gen_add_code_line("s_Jv[col_base + 1] = axw_2*dx - axw_0*dz;")
+        self.gen_add_code_line("s_Jv[col_base + 2] = axw_0*dy - axw_1*dx;")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        # J_v[ee, vi, r] = axw_r; J_w already zero from init
+        self.gen_add_code_line("s_Jv[col_base + 0] = axw_0; s_Jv[col_base + 1] = axw_1; s_Jv[col_base + 2] = axw_2;")
+        self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
