@@ -101,6 +101,98 @@ def _idsva_so_floating_velocity_metadata(robot):
         "ancestor_body_index": ancestor_body_index,
     }
 
+def gen_idsva_so_xdown_plucker_inverse(self, mode):
+    """Emit the magic-number Plücker-block spatial-transform inverse Xdown = inv(Xup).
+
+    Single source of truth for the byte-identical Xdown inverse that appears in
+    both the fixed body-frame inner (GPU block-parallel) and the (kept,
+    non-production) floating-reference inner (single-thread serial). The two call
+    sites differ only in their loop scaffolding/index variable, so this helper
+    reproduces each site's exact current emission verbatim. The world-frame Step 2
+    Xdown uses the structurally-different explicit E^T/-E^T·B·E^T form and is NOT
+    routed through here.
+
+    mode="fixed_parallel": block-parallel over XIMAT_SIZE*NUM_BODIES (index `i`),
+        followed by a __syncthreads(). Used by gen_idsva_so_body_frame_inner.
+    mode="floating_serial": serial for-loops with an explicit zero-init pass
+        (index `flat`). Used by gen_idsva_so_body_frame_floating_reference_inner.
+    """
+    if mode == "fixed_parallel":
+        self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES')
+        self.gen_add_code_line('size_t idx = i % XIMAT_SIZE;')
+        self.gen_add_code_line('size_t sub_idx = idx % 18;')
+        # TODO fix magic numbers
+        self.gen_add_code_line('if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {', True)
+        self.gen_add_code_line(f'Xdown[i] = Xup[i+5];')
+        self.gen_add_code_line(f'Xdown[i+5] = Xup[i];')
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line('else if (idx % 18 == 2 || idx % 18 == 5) {', True)
+        self.gen_add_code_line(f'Xdown[i] = Xup[i+10];')
+        self.gen_add_code_line('Xdown[i+10] = Xup[i];')
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line('else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 &&')
+        self.gen_add_code_line('            sub_idx != 12 && sub_idx != 15)', True)
+        self.gen_add_code_line(f'Xdown[i] = Xup[i];')
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+    elif mode == "floating_serial":
+        self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) Xdown[flat] = static_cast<T>(0);")
+        self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) {", True)
+        self.gen_add_code_line("int idx = flat % 36;")
+        self.gen_add_code_line("int sub_idx = idx % 18;")
+        self.gen_add_code_line("if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {", True)
+        self.gen_add_code_line("Xdown[flat] = Xup[flat + 5];")
+        self.gen_add_code_line("Xdown[flat + 5] = Xup[flat];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else if (idx % 18 == 2 || idx % 18 == 5) {", True)
+        self.gen_add_code_line("Xdown[flat] = Xup[flat + 10];")
+        self.gen_add_code_line("Xdown[flat + 10] = Xup[flat];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 && sub_idx != 12 && sub_idx != 15) {", True)
+        self.gen_add_code_line("Xdown[flat] = Xup[flat];")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+    else:
+        raise ValueError(f"unknown gen_idsva_so_xdown_plucker_inverse mode: {mode}")
+
+def gen_idsva_so_reference_order_rt_rp_assembly(self, S, psid, psidd, psid_Sd, di, ai, inline_row_col):
+    """Emit the rt1..rt9 / rp1..rp6 outer-product + crm/dot assembly shared by the
+    reference-order output repair (block-parallel branched-fixed path) and the
+    floating-reference inner (single-thread). Both compute the identical algebra
+    over a (d, a) coordinate pair; they differ only in the subspace buffer names
+    (S vs S_vel, psid vs psid_vel, ...) and the loop index variables (jid/ancestor_j
+    vs dd/cc). The emitter reproduces each call site's exact current bytes.
+
+    S/psid/psidd/psid_Sd: subspace buffer base names for this path.
+    di/ai: the d-coordinate / ancestor-coordinate index expressions.
+    inline_row_col: True emits `int row = ...; int col = ...;` on one line (floating
+        path); False emits them on two lines (branched-fixed path).
+    """
+    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    if inline_row_col:
+        self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
+    else:
+        self.gen_add_code_line("int row = idx % 6;")
+        self.gen_add_code_line("int col = idx / 6;")
+    self.gen_add_code_line(f"rt1[idx] = {S}[{di}*6 + row] * {psid}[{ai}*6 + col];")
+    self.gen_add_code_line(f"rt2[idx] = {S}[{di}*6 + row] * {S}[{ai}*6 + col];")
+    self.gen_add_code_line(f"rt3[idx] = {psid}[{di}*6 + row] * {psid}[{ai}*6 + col];")
+    self.gen_add_code_line(f"rt4[idx] = {S}[{di}*6 + row] * {psidd}[{ai}*6 + col];")
+    self.gen_add_code_line(f"rt5[idx] = {S}[{di}*6 + row] * {psid_Sd}[{ai}*6 + col];")
+    self.gen_add_code_line(f"rt6[idx] = {S}[{ai}*6 + row] * {psid}[{di}*6 + col];")
+    self.gen_add_code_line(f"rt7[idx] = {S}[{ai}*6 + row] * {psidd}[{di}*6 + col];")
+    self.gen_add_code_line(f"rt8[idx] = {S}[{ai}*6 + row] * {S}[{di}*6 + col];")
+    self.gen_add_code_line(f"rt9[idx] = {S}[{ai}*6 + row] * {psid_Sd}[{di}*6 + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    self.gen_add_code_line(f"rp1[row] = crm_mul<T>(row, &{psid}[{ai}*6], &{S}[{di}*6]);")
+    self.gen_add_code_line(f"rp2[row] = crm_mul<T>(row, &{psidd}[{ai}*6], &{S}[{di}*6]);")
+    self.gen_add_code_line(f"rp3[row] = crm_mul<T>(row, &{S}[{ai}*6], &{S}[{di}*6]);")
+    self.gen_add_code_line(f"rp4[row] = crm_mul<T>(row, &{psid_Sd}[{ai}*6], &{S}[{di}*6]) - static_cast<T>(2) * crm_mul<T>(row, &{psid}[{di}*6], &{S}[{ai}*6]);")
+    self.gen_add_code_line(f"rp5[row] = crm_mul<T>(row, &{S}[{di}*6], &{S}[{ai}*6]);")
+    self.gen_add_code_line(f"rp6[row] = dot_prod<T, 6, 1, 1>(&IC_S[{di}*6], &crm_S[{ai}*36 + row*6]) + dot_prod<T, 6, 1, 1>(&{S}[{ai}*6], &crf_S_IC[{di}*36 + row*6]);")
+    self.gen_add_end_control_flow()
+
 def gen_idsva_so_body_frame_inner_temp_mem_size(self):
     """
     Returns the total size of the temporary memory required for the
@@ -889,27 +981,8 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
     self.gen_add_code_line("int st_end = idsva_ref_st_start[jid + 1];")
     self.gen_add_code_line("int succ_begin = idsva_ref_succ_start[jid];")
     self.gen_add_code_line("int succ_end = idsva_ref_succ_start[jid + 1];")
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
-    self.gen_add_code_line("int row = idx % 6;")
-    self.gen_add_code_line("int col = idx / 6;")
-    self.gen_add_code_line("rt1[idx] = S[jid*6 + row] * psid[ancestor_j*6 + col];")
-    self.gen_add_code_line("rt2[idx] = S[jid*6 + row] * S[ancestor_j*6 + col];")
-    self.gen_add_code_line("rt3[idx] = psid[jid*6 + row] * psid[ancestor_j*6 + col];")
-    self.gen_add_code_line("rt4[idx] = S[jid*6 + row] * psidd[ancestor_j*6 + col];")
-    self.gen_add_code_line("rt5[idx] = S[jid*6 + row] * psid_Sd[ancestor_j*6 + col];")
-    self.gen_add_code_line("rt6[idx] = S[ancestor_j*6 + row] * psid[jid*6 + col];")
-    self.gen_add_code_line("rt7[idx] = S[ancestor_j*6 + row] * psidd[jid*6 + col];")
-    self.gen_add_code_line("rt8[idx] = S[ancestor_j*6 + row] * S[jid*6 + col];")
-    self.gen_add_code_line("rt9[idx] = S[ancestor_j*6 + row] * psid_Sd[jid*6 + col];")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
-    self.gen_add_code_line("rp1[row] = crm_mul<T>(row, &psid[ancestor_j*6], &S[jid*6]);")
-    self.gen_add_code_line("rp2[row] = crm_mul<T>(row, &psidd[ancestor_j*6], &S[jid*6]);")
-    self.gen_add_code_line("rp3[row] = crm_mul<T>(row, &S[ancestor_j*6], &S[jid*6]);")
-    self.gen_add_code_line("rp4[row] = crm_mul<T>(row, &psid_Sd[ancestor_j*6], &S[jid*6]) - static_cast<T>(2) * crm_mul<T>(row, &psid[jid*6], &S[ancestor_j*6]);")
-    self.gen_add_code_line("rp5[row] = crm_mul<T>(row, &S[jid*6], &S[ancestor_j*6]);")
-    self.gen_add_code_line("rp6[row] = dot_prod<T, 6, 1, 1>(&IC_S[jid*6], &crm_S[ancestor_j*36 + row*6]) + dot_prod<T, 6, 1, 1>(&S[ancestor_j*6], &crf_S_IC[jid*36 + row*6]);")
-    self.gen_add_end_control_flow()
+    self.gen_idsva_so_reference_order_rt_rp_assembly(
+        "S", "psid", "psidd", "psid_Sd", "jid", "ancestor_j", inline_row_col=False)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_j = idsva_ref_st_values[st_pos];")
     self.gen_add_code_line("d2tau_dq2[st_j*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + jid*SECOND_ORDER_COORDS + ancestor_j] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_j*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_j*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_j*6]);")
@@ -1114,22 +1187,7 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_end_control_flow()
 
     self.gen_add_code_line("// Compute Xdown using the same spatial-transform inverse pattern as the fixed path.")
-    self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) Xdown[flat] = static_cast<T>(0);")
-    self.gen_add_code_line("for (int flat = 0; flat < 36*NUM_BODIES; ++flat) {", True)
-    self.gen_add_code_line("int idx = flat % 36;")
-    self.gen_add_code_line("int sub_idx = idx % 18;")
-    self.gen_add_code_line("if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {", True)
-    self.gen_add_code_line("Xdown[flat] = Xup[flat + 5];")
-    self.gen_add_code_line("Xdown[flat + 5] = Xup[flat];")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (idx % 18 == 2 || idx % 18 == 5) {", True)
-    self.gen_add_code_line("Xdown[flat] = Xup[flat + 10];")
-    self.gen_add_code_line("Xdown[flat + 10] = Xup[flat];")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 && sub_idx != 12 && sub_idx != 15) {", True)
-    self.gen_add_code_line("Xdown[flat] = Xup[flat];")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
+    self.gen_idsva_so_xdown_plucker_inverse("floating_serial")
 
     self.gen_add_code_line("// Transform each velocity-coordinate S column.")
     self.gen_add_code_line("for (int vel = 0; vel < NUM_VEL; ++vel) {", True)
@@ -1254,26 +1312,8 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_code_line("int ancestor_body = ancestor_body_index[anc_pos];")
     self.gen_add_code_line("for (int cpos = body_v_start[ancestor_body]; cpos < body_v_start[ancestor_body + 1]; ++cpos) {", True)
     self.gen_add_code_line("int cc = body_v_index[cpos];")
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
-    self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
-    self.gen_add_code_line("rt1[idx] = S_vel[dd*6 + row] * psid_vel[cc*6 + col];")
-    self.gen_add_code_line("rt2[idx] = S_vel[dd*6 + row] * S_vel[cc*6 + col];")
-    self.gen_add_code_line("rt3[idx] = psid_vel[dd*6 + row] * psid_vel[cc*6 + col];")
-    self.gen_add_code_line("rt4[idx] = S_vel[dd*6 + row] * psidd_vel[cc*6 + col];")
-    self.gen_add_code_line("rt5[idx] = S_vel[dd*6 + row] * psid_Sd_vel[cc*6 + col];")
-    self.gen_add_code_line("rt6[idx] = S_vel[cc*6 + row] * psid_vel[dd*6 + col];")
-    self.gen_add_code_line("rt7[idx] = S_vel[cc*6 + row] * psidd_vel[dd*6 + col];")
-    self.gen_add_code_line("rt8[idx] = S_vel[cc*6 + row] * S_vel[dd*6 + col];")
-    self.gen_add_code_line("rt9[idx] = S_vel[cc*6 + row] * psid_Sd_vel[dd*6 + col];")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
-    self.gen_add_code_line("rp1[row] = crm_mul<T>(row, &psid_vel[cc*6], &S_vel[dd*6]);")
-    self.gen_add_code_line("rp2[row] = crm_mul<T>(row, &psidd_vel[cc*6], &S_vel[dd*6]);")
-    self.gen_add_code_line("rp3[row] = crm_mul<T>(row, &S_vel[cc*6], &S_vel[dd*6]);")
-    self.gen_add_code_line("rp4[row] = crm_mul<T>(row, &psid_Sd_vel[cc*6], &S_vel[dd*6]) - static_cast<T>(2) * crm_mul<T>(row, &psid_vel[dd*6], &S_vel[cc*6]);")
-    self.gen_add_code_line("rp5[row] = crm_mul<T>(row, &S_vel[dd*6], &S_vel[cc*6]);")
-    self.gen_add_code_line("rp6[row] = dot_prod<T, 6, 1, 1>(&IC_S[dd*6], &crm_S[cc*36 + row*6]) + dot_prod<T, 6, 1, 1>(&S_vel[cc*6], &crf_S_IC[dd*36 + row*6]);")
-    self.gen_add_end_control_flow()
+    self.gen_idsva_so_reference_order_rt_rp_assembly(
+        "S_vel", "psid_vel", "psidd_vel", "psid_Sd_vel", "dd", "cc", inline_row_col=True)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
     self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_vel*6]);")
@@ -1637,23 +1677,7 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     # Just the transpose of internal 3x3 submatrices
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line("// Compute Xdown - child to parent transformation matrices")
-    self.gen_add_parallel_loop('i','XIMAT_SIZE*NUM_BODIES')
-    self.gen_add_code_line('size_t idx = i % XIMAT_SIZE;')
-    self.gen_add_code_line('size_t sub_idx = idx % 18;')
-    # TODO fix magic numbers
-    self.gen_add_code_line('if (idx % 18 == 1 || idx % 18 == 4 || idx % 18 == 8 || idx % 18 == 11) {', True)
-    self.gen_add_code_line(f'Xdown[i] = Xup[i+5];')
-    self.gen_add_code_line(f'Xdown[i+5] = Xup[i];')
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line('else if (idx % 18 == 2 || idx % 18 == 5) {', True)
-    self.gen_add_code_line(f'Xdown[i] = Xup[i+10];')
-    self.gen_add_code_line('Xdown[i+10] = Xup[i];')
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line('else if (sub_idx != 6 && sub_idx != 9 && sub_idx != 13 && sub_idx != 16 &&')
-    self.gen_add_code_line('            sub_idx != 12 && sub_idx != 15)', True)
-    self.gen_add_code_line(f'Xdown[i] = Xup[i];')
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
+    self.gen_idsva_so_xdown_plucker_inverse("fixed_parallel")
 
     # Transform S
     self.gen_add_code_line("\n\n")
@@ -2796,10 +2820,16 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     # BFS parent-dependent — keep sequential under thread-0 guard.
     self.gen_add_code_line("// Build cumulative Xup. Floating-base root: Xup[0] = inv(X_local[0]).")
     floating_base = self.robot.floating_base
-    self.gen_add_serial_ops()
+    # The body walk is a REQUIRED recursion (Xup[jid] reads Xup[parent]), so the jid
+    # loop stays serial; but within each body the work distributes across the block:
+    # the root-init builds (rare, one-time) run on thread 0, while the dominant
+    # Xup[jid] = X_local[jid] @ Xup[parent] 36-element matmul is element-independent and
+    # runs as a block-parallel idx-over-36 loop. A per-body __syncthreads publishes
+    # Xup[jid] before any child reads it. All threads execute the loop body.
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
     self.gen_add_code_line("int parent = wf_parent[jid];")
     self.gen_add_code_line("if (parent < 0) {", True)
+    self.gen_add_serial_ops()
     if floating_base:
         # Spatial Plücker `X = [E 0; B E]` with B = -E*r̂. Inverse:
         # `X^{-1} = [E^T 0; -E^T*B*E^T E^T]`. Both blocks of E transpose; the bottom-left
@@ -2839,19 +2869,19 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
             "// Fixed-base root: Xup[0] = X_local[0] (no inversion).",
             "for (int idx = 0; idx < 36; ++idx) Xup[jid*36 + idx] = s_XImats[jid*36 + idx];",
         ])
-    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # close thread-0 guard for the root-init build
+    self.gen_add_end_control_flow()  # close if (parent < 0)
     self.gen_add_code_line("else {", True)
-    self.gen_add_code_line("// Xup[jid] = X_local[jid] @ Xup[parent] (column-major matmul).")
-    self.gen_add_code_line("for (int idx = 0; idx < 36; ++idx) {", True)
+    self.gen_add_code_line("// Xup[jid] = X_local[jid] @ Xup[parent] (column-major matmul, block-parallel over the 36 elements).")
+    self.gen_add_parallel_loop("idx", "36")
     self.gen_add_code_line("int row = idx % 6; int col = idx / 6;")
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) acc += s_XImats[jid*36 + row + 6*kk] * Xup[parent*36 + kk + 6*col];")
     self.gen_add_code_line("Xup[jid*36 + idx] = acc;")
     self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()  # close thread-0 guard for Xup
-    self.gen_add_sync()
+    self.gen_add_end_control_flow()  # close else
+    self.gen_add_sync()             # publish Xup[jid] before any child body reads it
+    self.gen_add_end_control_flow()  # end Xup forward jid loop
 
     # ---- Step 2: Xdown[i] = inv(Xup[i]) — parallel over jid.
     self.gen_add_code_line("// Build Xdown[i] = inv(Xup[i]) using Plücker block inverse:")
@@ -2915,7 +2945,9 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     ])
     self.gen_add_code_line("for (int jid = 0; jid < NUM_BODIES; ++jid) {", True)
     self.gen_add_code_line("int parent = wf_parent[jid];")
-    # --- Sequential 6-vector chain on thread 0 (v/a init, vJ/aJ, psid/psidd, v/a update, Sd).
+    self.gen_add_code_line("int vc_begin = wf_body_v_start[jid]; int vc_count = wf_body_v_start[jid + 1] - vc_begin;")
+    # --- Thread-0 reduction chain: v/a init + vJ/aJ build (a genuine length-vc serial
+    # reduction). v_w[jid]/a_w[jid] hold the PRE-update values needed by psid/psidd.
     self.gen_add_serial_ops()
     # Initialize v[jid], a[jid]
     self.gen_add_code_line("if (parent < 0) {", True)
@@ -2925,33 +2957,40 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) { v_w[jid*6 + row] = v_w[parent*6 + row]; a_w[jid*6 + row] = a_w[parent*6 + row]; }")
     self.gen_add_end_control_flow()
 
-    # vJ, aJ, psid, psidd (referring to v[jid], a[jid] which haven't been updated yet).
+    # vJ, aJ (reduction over the body's velocity columns — kept serial on thread 0).
     self.gen_add_code_line("// vJ = sum_p S_vel[p] * qd[p]; aJ = sum_p S_vel[p] * qdd[p].")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) { fs_vJ[row] = static_cast<T>(0); fs_aJ[row] = static_cast<T>(0); }")
-    self.gen_add_code_line("for (int pos = wf_body_v_start[jid]; pos < wf_body_v_start[jid + 1]; ++pos) {", True)
+    self.gen_add_code_line("for (int pos = vc_begin; pos < vc_begin + vc_count; ++pos) {", True)
     self.gen_add_code_line("int vel = wf_body_v_index[pos];")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) { fs_vJ[row] += S_vel[vel*6 + row] * s_qd[vel]; fs_aJ[row] += S_vel[vel*6 + row] * s_qdd[vel]; }")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("// aJ += crm(v[jid]) @ vJ.")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) fs_aJ[row] += crm_mul<T>(row, &v_w[jid*6], fs_vJ);")
+    self.gen_add_end_control_flow()  # close thread-0 guard (v/a init + vJ/aJ reduction)
+    self.gen_add_sync()             # publish pre-update v_w/a_w + fs_vJ/fs_aJ to all threads
 
-    # psid[vel] = crm(v[jid]) @ S_vel[vel], psidd[vel] = crm(a[jid]) @ S + crm(v) @ psid
-    self.gen_add_code_line("// psid[vel] = crm(v[jid]) @ S; psidd[vel] = crm(a[jid]) @ S + crm(v[jid]) @ psid.")
-    self.gen_add_code_line("for (int pos = wf_body_v_start[jid]; pos < wf_body_v_start[jid + 1]; ++pos) {", True)
-    self.gen_add_code_line("int vel = wf_body_v_index[pos];")
+    # psid/psidd are independent across the body's velocity columns: parallelize one
+    # column per thread. Reads the PRE-update v_w[jid]/a_w[jid] (broadcast).
+    self.gen_add_code_line("// psid[vel] = crm(v[jid]) @ S; psidd[vel] = crm(a[jid]) @ S + crm(v[jid]) @ psid (parallel over body velocity columns).")
+    self.gen_add_parallel_loop("lane", "vc_count")
+    self.gen_add_code_line("int vel = wf_body_v_index[vc_begin + lane];")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) psid_v[vel*6 + row] = crm_mul<T>(row, &v_w[jid*6], &S_vel[vel*6]);")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) psidd_v[vel*6 + row] = crm_mul<T>(row, &a_w[jid*6], &S_vel[vel*6]) + crm_mul<T>(row, &v_w[jid*6], &psid_v[vel*6]);")
     self.gen_add_end_control_flow()
+    self.gen_add_sync()             # all psid/psidd reads of pre-update v_w done before the update below
 
-    # Update v[jid] += vJ, a[jid] += aJ
+    # Update v[jid] += vJ, a[jid] += aJ (thread 0; fs_vJ/fs_aJ already in shared).
+    self.gen_add_serial_ops()
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) { v_w[jid*6 + row] += fs_vJ[row]; a_w[jid*6 + row] += fs_aJ[row]; }")
+    self.gen_add_end_control_flow()  # close thread-0 guard (v/a update)
+    self.gen_add_sync()             # publish post-update v_w[jid] to all threads
 
-    # Sd[vel] = crm(v[jid]_new) @ S
-    self.gen_add_code_line("for (int pos = wf_body_v_start[jid]; pos < wf_body_v_start[jid + 1]; ++pos) {", True)
-    self.gen_add_code_line("int vel = wf_body_v_index[pos];")
+    # Sd[vel] = crm(v[jid]_new) @ S — independent across the body's velocity columns.
+    self.gen_add_code_line("// Sd[vel] = crm(v[jid]_new) @ S (parallel over body velocity columns).")
+    self.gen_add_parallel_loop("lane", "vc_count")
+    self.gen_add_code_line("int vel = wf_body_v_index[vc_begin + lane];")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) Sd_vel[vel*6 + row] = crm_mul<T>(row, &v_w[jid*6], &S_vel[vel*6]);")
     self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()  # close thread-0 guard (sequential 6-vector chain)
     self.gen_add_sync()
 
     # --- IC[jid] = Xup[jid]^T @ I_body @ Xup[jid]: two block-parallel idx-over-36 builds.
@@ -2972,8 +3011,9 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_sync()
 
     # --- IC_v (6-vec), then BC[jid] (36, block-parallel), then f[jid] (6-vec).
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) fs_IC_v[row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &v_w[jid*6]);")
+    # IC_v rows are independent: parallelize one row per thread.
+    self.gen_add_parallel_loop("row", "6")
+    self.gen_add_code_line("fs_IC_v[row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &v_w[jid*6]);")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     # BC[jid] = crf(v) @ IC + icrf(IC @ v) - IC @ crm(v).
@@ -2988,15 +3028,13 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_code_line("BC[jid*36 + idx] = t_crfv_IC + icrf<T>(idx, fs_IC_v) - t_IC_crmv;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    # f[jid] = IC @ a + crf(v) @ IC @ v.
-    self.gen_add_code_line("// f[jid] = IC[jid] @ a[jid] + crf(v[jid]) @ (IC[jid] @ v[jid]).")
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
+    # f[jid] = IC @ a + crf(v) @ IC @ v. Rows are independent: parallelize one row per thread.
+    self.gen_add_code_line("// f[jid] = IC[jid] @ a[jid] + crf(v[jid]) @ (IC[jid] @ v[jid]) (parallel over the 6 rows).")
+    self.gen_add_parallel_loop("row", "6")
     self.gen_add_code_line("T crf_v_row2[6];")
     self.gen_add_code_line("for (int kk = 0; kk < 6; ++kk) crf_v_row2[kk] = -crm<T>(kk + 6*row, &v_w[jid*6]);")
     self.gen_add_code_line("f_w[jid*6 + row] = dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], &a_w[jid*6]) + dot_prod<T, 6, 1, 1>(crf_v_row2, fs_IC_v);")
     self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()  # close thread-0 guard (f build)
     self.gen_add_sync()
     self.gen_add_end_control_flow()  # end forward jid loop
     self.gen_add_sync()
