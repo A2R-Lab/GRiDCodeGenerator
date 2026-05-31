@@ -85,7 +85,8 @@ class GRiDCodeGenerator:
                             gen_plant_step_kernel, gen_quadratic_cost_kernel, gen_ee_pos_cost_kernel, gen_plant_kernels, \
                             gen_id_bias_device, gen_id_bias_kernel, gen_id_bias_host, gen_id_bias, \
                             gen_centroidal_inner, gen_com_device, gen_ccrba_device, gen_energy_device, \
-                            _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy
+                            _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy, \
+                            gen_frame_jacobian_inner, gen_frame_jacobian_device, gen_frame_jacobian
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -116,8 +117,14 @@ class GRiDCodeGenerator:
             "integrator", "integrator_gradient", "integrator_with_gradient",
             "f_ext_grad", "regressor", "fd_parameter_gradient",
         }
+        # E2 (additive, opt-in only): frame_jacobian is NOT part of the default
+        # `all` profile so the default-profile header stays byte-identical. It is
+        # a recognized key for explicit algorithm_list requests and has its own
+        # `frame-jacobian` profile. Requires `ee_pose` (world-transform machinery).
+        opt_in_algorithms = {"frame_jacobian"}
         profile_algorithms = {
             "all": all_algorithms,
+            "frame-jacobian": {"ee_pose", "minv", "frame_jacobian"},
             "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"id", "minv", "fd"},
@@ -181,11 +188,15 @@ class GRiDCodeGenerator:
                 key = canonicalize(item)
                 if key in profile_algorithms:
                     algorithms.update(profile_algorithms[key])
-                elif key in all_algorithms:
+                elif key in all_algorithms or key in opt_in_algorithms:
                     algorithms.add(key)
                 else:
                     raise ValueError("Unknown GRiD algorithm selection: " + str(item))
 
+        # E2: frame_jacobian needs the world-transform machinery (ee_pose) and,
+        # for OSC composition, minv. Pull them in when requested.
+        if "frame_jacobian" in algorithms:
+            algorithms.update({"ee_pose", "minv"})
         if "fd_du" in algorithms:
             algorithms.update({"id", "minv", "fd", "id_du"})
         if "id_du" in algorithms:
@@ -2143,6 +2154,20 @@ class GRiDCodeGenerator:
         # (need `ee_pose`). All are NEW emitters appended after the existing
         # algorithms, so existing emission is byte-identical.
         self.gen_centroidal_quickwins(algorithms)
+        # E2 (additive, opt-in): general-frame geometric Jacobian. Only emitted
+        # when the `frame_jacobian` key is explicitly selected, so every existing
+        # profile's header is byte-identical. Needs ee_pose's world-transform
+        # machinery (pulled in by _normalize_codegen_algorithms).
+        if "frame_jacobian" in algorithms and "ee_pose" in algorithms and not self.robot_has_mimic_joints():
+            NJ_fj = self.robot.get_num_joints()
+            Xhom_size_fj, _, _ = self.gen_get_Xhom_size()
+            # arena = s_XmatsHom(Xhom_size) + inner_temp(16*NJ); s_J is a caller param.
+            fj_t_count = Xhom_size_fj + (16 * NJ_fj)
+            self.gen_add_code_line(
+                "template <typename T> __host__ __device__ inline size_t FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES() "
+                "{ return grid_shared_arena_bytes<T>(" + str(fj_t_count) +
+                ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+            self.gen_frame_jacobian()
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
