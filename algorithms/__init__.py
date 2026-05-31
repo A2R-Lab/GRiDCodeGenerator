@@ -3,6 +3,9 @@ from ._regressor import *
 from ._direct_minv import *
 from ._forward_dynamics import *
 from ._inverse_dynamics_gradient import *
+# `import *` skips underscore-prefixed names; export the shared BFS-level index
+# decode helper explicitly so GRiDCodeGenerator can bind it as a method.
+from ._inverse_dynamics_gradient import _emit_fb_bfs_level_indexing
 from ._forward_dynamics_gradient import *
 from ._f_ext_gradient import *
 from ._eepose_gradient_hessian import *
