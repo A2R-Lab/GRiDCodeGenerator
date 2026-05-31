@@ -609,23 +609,34 @@ class GRiDCodeGenerator:
         idsva_so_body_frame_inner_temp_count = self.gen_idsva_so_body_frame_inner_temp_mem_size()
 
         # ----- idsva_so BODY-frame per-tier spill ladder -----
-        # Rungs least->most spill. Flags = (use_global_output, s_temp_in_global, bc_in_global).
+        # Rungs least->most spill. Flags = (use_global_output, s_temp_in_global, bc_in_global, tp_in_global).
         #   rung0 full:          output + s_temp + BC all in smem
         #   rung1 global_output: 4*NV^3 output tensor -> d_workspace (cheap; coalesced one-shot)
-        #   rung2 output_bc:     + BC (36*NB cold buffer, dead before hot loops) -> d_workspace
-        #   rung3 output_temp:   + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
+        #   rung2 output_bc:     + BC (36*NB cold buffer, dead before hot loops) -> d_workspace (surgical)
+        #   rung3 output_tp:     + ancestor-pair scratch t/p1..p6 (36*len(jids_a), 30-45% of the
+        #                          body arena; DEAD through the whole recursion-hot forward sweep,
+        #                          live only in the final block-parallel output assembly) ->
+        #                          d_workspace. BC stays in smem (slides down to fill the vacated
+        #                          t/p span). This surgical rung keeps the entire recursion-hot
+        #                          chain in smem and is the highest-payoff cold sub-band on
+        #                          humanoid-scale robots.
+        #   rung4 output_temp:   + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
+        # rungs 2 (BC) and 3 (t/p) are mutually exclusive surgical levers (inner enforces it).
         # Fixed-base is the production overflow case. Floating-base BODY is diagnostic
         # (the dispatcher routes floating to the WORLD frame) so it keeps the legacy
         # single-body emit with the gravity shim; its picks are (0,0,0) and unused.
         _idsva_bf_BC = 36 * self.robot.get_num_bodies()
+        _idsva_bf_jids_a = len(self.robot.get_jid_ancestor_ids(include_joint=True)[0])
+        _idsva_bf_TP = 36 * _idsva_bf_jids_a
         _idsva_bf_base_smem = (2*nv + n) + XI_size                                  # whole s_temp -> global
         _idsva_bf_full     = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3
         _idsva_bf_out      = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
         _idsva_so_body_tiers = [
-            ("full",          _idsva_bf_full,                False, False, False),
-            ("global_output", _idsva_bf_out,                 True,  False, False),
-            ("output_bc",     _idsva_bf_out - _idsva_bf_BC,  True,  False, True),
-            ("output_temp",   _idsva_bf_base_smem,           True,  True,  False),
+            ("full",          _idsva_bf_full,                False, False, False, False),
+            ("global_output", _idsva_bf_out,                 True,  False, False, False),
+            ("output_bc",     _idsva_bf_out - _idsva_bf_BC,  True,  False, True,  False),
+            ("output_tp",     _idsva_bf_out - _idsva_bf_TP,  True,  False, False, True),
+            ("output_temp",   _idsva_bf_base_smem,           True,  True,  False, False),
         ]
         self._idsva_so_body_tier_table = _idsva_so_body_tiers
         if self.robot.floating_base:
@@ -671,8 +682,16 @@ class GRiDCodeGenerator:
         self.idsva_so_world_frame_use_global_output = _idsva_so_world_tiers[self.idsva_so_world_frame_spill_tier_3way[0]][2]
         idsva_so_world_frame_t_count = self.idsva_so_world_frame_t_count_per_tier[0]
         # d_workspace floats needed per timestep by the idsva_so spill rungs (for so_workspace sizing).
+        # Body rungs: 4=output_temp (whole inner arena), 3=output_tp (36*len(jids_a) ancestor-pair
+        # scratch), 2=output_bc (36*NB cold slab); 0/1 spill nothing into d_workspace.
         def _idsva_body_ws_floats(pick):
-            return idsva_so_body_frame_inner_temp_count if pick == 3 else (_idsva_bf_BC if pick == 2 else 0)
+            if pick == 4:
+                return idsva_so_body_frame_inner_temp_count
+            if pick == 3:
+                return _idsva_bf_TP
+            if pick == 2:
+                return _idsva_bf_BC
+            return 0
         def _idsva_world_ws_floats(pick):
             # pick 3 (output_temp) spills the whole inner arena; pick 2 (output_cold)
             # spills just the surgical cold trio (Xdown 36*NB + v_w/a_w 12*NB).

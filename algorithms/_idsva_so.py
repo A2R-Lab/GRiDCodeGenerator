@@ -746,7 +746,7 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self):
     self.gen_add_end_control_flow()  # close thread-zero wrap
     self.gen_add_sync()
 
-def gen_idsva_so_body_frame_inner_function_call(self, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None):
+def gen_idsva_so_body_frame_inner_function_call(self, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None, tp_in_smem_expr = None):
     var_names = dict( \
         s_idsva_so_name = "s_idsva_so", \
         s_q_name = "s_q", \
@@ -760,16 +760,21 @@ def gen_idsva_so_body_frame_inner_function_call(self, use_qdd_input = False, upd
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    # Template args: <T> | <T, SCRATCH_IN_SMEM> | <T, SCRATCH_IN_SMEM, BC_IN_SMEM>.
-    # SCRATCH_IN_SMEM defaults true; if a caller only passes bc_in_smem_expr it must
-    # also pass scratch_in_smem_expr ("true") so the positional order stays correct.
-    if scratch_in_smem_expr is None and bc_in_smem_expr is None:
+    # Template args: <T> | <T, SCRATCH_IN_SMEM> | <T, SCRATCH_IN_SMEM, BC_IN_SMEM>
+    #   | <T, SCRATCH_IN_SMEM, BC_IN_SMEM, TP_IN_SMEM>.
+    # SCRATCH_IN_SMEM defaults true; if a caller only passes bc_in_smem_expr / tp_in_smem_expr
+    # it must also pass the lower-order exprs (default "true") so positional order stays correct.
+    if scratch_in_smem_expr is None and bc_in_smem_expr is None and tp_in_smem_expr is None:
         template_args = "<T>"
-    elif bc_in_smem_expr is None:
+    elif bc_in_smem_expr is None and tp_in_smem_expr is None:
         template_args = "<T, " + scratch_in_smem_expr + ">"
-    else:
+    elif tp_in_smem_expr is None:
         scratch_expr = scratch_in_smem_expr if scratch_in_smem_expr is not None else "true"
         template_args = "<T, " + scratch_expr + ", " + bc_in_smem_expr + ">"
+    else:
+        scratch_expr = scratch_in_smem_expr if scratch_in_smem_expr is not None else "true"
+        bc_expr = bc_in_smem_expr if bc_in_smem_expr is not None else "true"
+        template_args = "<T, " + scratch_expr + ", " + bc_expr + ", " + tp_in_smem_expr + ">"
     id_so_code_start = "idsva_so_body_frame_inner" + template_args + "(" + var_names["s_idsva_so_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_qdd_name"] + ", "
     id_so_code_middle = self.gen_insert_helpers_function_call()
     # Unified signature: both fixed and floating inners take
@@ -1345,6 +1350,13 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
         hot buffer S (NOT on BC), so spilling BC truncates only the arena tail and leaves
         every hot buffer (incl. D3, read by the reference-order repair) in place. This is
         the de-alias that fixes the surgical-rung g1/h1_2 regression.
+      - TP_IN_SMEM (surgical): only the ancestor-pair scratch t/p1..p6 (36*len(jids_a)
+        floats; 30-45% of the body arena) routes to d_workspace. t/p is anchored on
+        tp_anchor (the fixed in-smem hot-chain end) and is dead through the whole forward
+        recursion + D-matrix build (live only in the final block-parallel output assembly),
+        so spilling it keeps every recursion-hot buffer in smem. BC re-bases off tp_anchor
+        too, so it slides down to fill the vacated smem and the arena shrinks by exactly
+        36*len(jids_a). Mutually exclusive with BC_IN_SMEM/SCRATCH_IN_SMEM per the tier table.
     The inner loads/updates s_XImats from s_q internally, so it takes d_robotModel.
     """
     if self.robot.floating_base:
@@ -1381,7 +1393,12 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     self.gen_add_func_doc("Computes the second order derivatives of inverse dynamics",func_notes,func_params,None)
     # SCRATCH_IN_SMEM: whole-arena lever (s_temp pool in smem vs routed to d_workspace).
     # BC_IN_SMEM: surgical lever (only the cold BC slab routes to d_workspace).
-    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool BC_IN_SMEM = true>")
+    # TP_IN_SMEM: surgical lever (only the ancestor-pair scratch t/p1..p6, 36*len(jids_a)
+    #   floats, routes to d_workspace). t/p is DEAD through the whole recursion-hot forward
+    #   sweep + D-matrix build; it is written/read ONLY in the final block-parallel output
+    #   assembly (t1-t9 / p-phase). Spilling it keeps every recursion-hot buffer in smem and
+    #   is the single highest-payoff cold sub-band (30-45% of the body arena).
+    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool BC_IN_SMEM = true, bool TP_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Inner owns the pool placement; the repoint goes FIRST, before the offset-derived
@@ -1476,7 +1493,21 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
         'T *D2 = D1 + 36*NUM_BODIES;', # Temporary D2 tensor (6x6 for each joint)',
         'T *D3 = B_IC_S;', # Temporary D3 tensor - same as B(IC, S) (6x6 for each joint)',
         'T *D4 = crf_psid;', # Temporary D4 tensor (6x6 for each joint)',
-        f'T *t = D2 + 36*NUM_BODIES;', # Temporary outer product tensor for t1-t9 (6x6 for each joint and its ancestors)',
+        # tp_anchor is the FIXED in-smem end of the recursion-hot chain (just past D2). The
+        # ancestor-pair scratch t/p1..p6 (36*var_offset floats) anchors here when in smem.
+        # Holding this anchor stable (independent of where t/p actually lives) lets the
+        # TP_IN_SMEM=false rung relocate t/p to d_workspace while BC re-bases off this same
+        # in-smem anchor — so the hot chain below is byte-identical regardless of the t/p
+        # placement, and the smem arena shrinks by exactly 36*var_offset when t/p spills.
+        f'T *tp_anchor = D2 + 36*NUM_BODIES;',
+        f'T *t = tp_anchor;', # Temporary outer product tensor for t1-t9 (6x6 for each joint and its ancestors)',
+        # Surgical t/p spill: route the ancestor-pair scratch to d_workspace. t/p is DEAD
+        # through the whole forward sweep + D-matrix build (written/read ONLY in the final
+        # block-parallel t1-t9 / p-phase output assembly), and the t-loop distributes
+        # ancestor-pairs across the block on disjoint t_index_map[jid][anc]*36 slices, so a
+        # spilled (L2-pinned) access coalesces. Mutually exclusive with BC/whole-arena
+        # spills per the body tier table (rung "output_tp": TP=F, BC=T, SCRATCH=T).
+        'if constexpr (!TP_IN_SMEM) { t = d_workspace; }',
         'T *p1 = t;', # Temporary cross product vector for p1 (6x1 for each joint and its ancestors)',
         f'T *p2 = p1 + 6*{var_offset};', # Temporary cross product vector for p2 (6x1 for each joint and its ancestors)',
         f'T *p3 = p2 + 6*{var_offset};', # Temporary cross product vector for p3 (6x1 for each joint and its ancestors)',
@@ -1484,18 +1515,20 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
         f'T *p5 = p4 + 6*{var_offset};', # Temporary cross product vector for p5 (6x1 for each joint and its ancestors)',
         f'T *p6 = p5 + 6*{var_offset};', # Temporary cross product vector used in computation of d2tau_dqd2[ancestor, joint, joint] (6x1 for each joint and its ancestors)',
         'T *crf_S_IC = crm_psid;', # Cross product of S and IC (6x6 for each joint)',
-        # Composite body-Coriolis Bias tensor (6x6 for each joint). Relocated to the TOP
-        # of the arena (just past the t/p backward region) so it is the LAST 36*NB slab.
+        # Composite body-Coriolis Bias tensor (6x6 for each joint). It is the LAST 36*NB
+        # slab of the SMEM arena, anchored on tp_anchor (the in-smem hot-chain end) plus the
+        # in-smem t/p span. When TP_IN_SMEM (default) that span is 36*var_offset, so BC sits
+        # exactly where the legacy `p6 + 6*var_offset` put it (byte-identical). When t/p
+        # spills (TP_IN_SMEM=false) the in-smem span is 0, so BC slides DOWN to tp_anchor,
+        # reclaiming the vacated 36*var_offset smem and shrinking the arena.
         # BC is cold: written in the forward IC/BC propagation and last read by the
         # T2/T3/T4/D2 tensors, then dead before the t/p backward loops. The high arena
         # region it occupies is shared with Xup (forward-dead by the time BC is written)
-        # and the t/p region (backward-only, after BC is dead), so no live-range overlap.
-        # Because BC is the literal top slab, the surgical BC_IN_SMEM=false rung shrinks
-        # the smem arena by exactly 36*NB and truncates only BC's tail; every hot buffer
-        # below keeps its address. Total arena size is unchanged vs. the legacy layout
-        # (BC merely moved from its old mid-arena slot to the top; the hot chain shifted
-        # down by 36*NB to fill the vacated slot).
-        f'T *BC = p6 + 6*{var_offset};',
+        # and the in-smem t/p region (backward-only, after BC is dead), so no live-range
+        # overlap. Because BC is the literal top smem slab, the surgical BC_IN_SMEM=false
+        # rung shrinks the arena by exactly 36*NB and truncates only BC's tail; every hot
+        # buffer below keeps its address.
+        f'T *BC = tp_anchor + (TP_IN_SMEM ? 36*{var_offset} : 0);',
 
 
         '\n\n',
@@ -2327,14 +2360,18 @@ def gen_idsva_so_body_frame_public_dvdq_layout_repair(self):
 
 
 def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                    use_global_output, s_temp_in_global, bc_in_global):
+                                                    use_global_output, s_temp_in_global, bc_in_global, tp_in_global=False):
     """Emit the idsva_so body-frame kernel body for one tier's spill flags.
 
     Flags (see the per-tier ladder in GRiDCodeGenerator.py):
       - use_global_output: 4*NV^3 output tensor lives in d_idsva_so (global) vs s_idsva_so (smem).
       - s_temp_in_global:  the whole inner s_temp arena routes to d_workspace (guaranteed-fit fallback).
       - bc_in_global:      surgical — only the cold BC buffer routes to d_workspace (inner BC_IN_SMEM=false).
-    Floating-base (diagnostic) uses the gravity-shim spill at the SO offset regardless of flags.
+      - tp_in_global:      surgical — only the ancestor-pair scratch t/p1..p6 (36*len(jids_a))
+                           routes to d_workspace (inner TP_IN_SMEM=false); BC slides down to fill
+                           the vacated smem so the arena shrinks by exactly that span.
+    bc_in_global and tp_in_global are mutually exclusive (separate rungs). Floating-base
+    (diagnostic) uses the gravity-shim spill at the SO offset regardless of flags.
     """
     extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
     if not use_global_output:
@@ -2343,6 +2380,8 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         extra_t_buffers.append(("s_qdd", n))
     inner_temp = self.gen_idsva_so_body_frame_inner_temp_mem_size()
     bc_slab = 36 * self.robot.get_num_bodies()
+    jids_a, _ = self.robot.get_jid_ancestor_ids(include_joint=True)
+    tp_slab = 36 * len(jids_a)
     # smem s_temp allocation per rung:
     #   - s_temp_in_global (whole-arena rung): 0 (inner repoints s_temp -> d_workspace).
     #   - bc_in_global (surgical BC rung): inner_temp - BC. BC is the LAST (top) 36*NB
@@ -2350,20 +2389,25 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     #     every hot buffer below in place. This MUST match the per-tier launch smem bytes
     #     (GRiDCodeGenerator.py: _idsva_bf_out - _idsva_bf_BC) or the kernel arena and the
     #     launch disagree and the top slab reads OOB.
+    #   - tp_in_global (surgical t/p rung): inner_temp - 36*len(jids_a). t/p sits just below
+    #     BC; when it spills, BC slides down to fill it so the smem arena shrinks by exactly
+    #     the t/p span. MUST match GRiDCodeGenerator.py: _idsva_bf_out - _idsva_bf_TP.
     #   - otherwise (PERF / global_output rungs): full inner_temp.
     if s_temp_in_global:
         smem_temp = 0
     elif bc_in_global:
         smem_temp = inner_temp - bc_slab
+    elif tp_in_global:
+        smem_temp = inner_temp - tp_slab
     else:
         smem_temp = inner_temp
     self.gen_XImats_helpers_temp_shared_memory_code(smem_temp, extra_t_buffers = extra_t_buffers)
     # `d_temp_spill` is the typed view into d_workspace handed to the inner as its
     # `d_workspace` arg. The inner does the s_temp/BC repoint itself (inner-owns
-    # placement): whole-arena rung -> inner sets s_temp = d_temp_spill; surgical rung ->
-    # inner sets BC = d_temp_spill; floating shim -> gravity-Hessian uses it directly.
+    # placement): whole-arena rung -> inner sets s_temp = d_temp_spill; surgical BC/t-p rung
+    # -> inner sets BC / t = d_temp_spill; floating shim -> gravity-Hessian uses it directly.
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-    needs_workspace = self.robot.floating_base or s_temp_in_global or bc_in_global
+    needs_workspace = self.robot.floating_base or s_temp_in_global or bc_in_global or tp_in_global
     if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
     if use_qdd_input:
@@ -2372,12 +2416,15 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
     bc_in_smem_expr = "false" if bc_in_global else "true"
     scratch_in_smem_expr = "false" if s_temp_in_global else "true"
+    # Only thread the 4th template arg when t/p actually spills, so every non-tp rung emits
+    # the same <T, SCRATCH, BC> instantiation it did before (Gate A: byte-identical default).
+    tp_in_smem_expr = "false" if tp_in_global else None
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
 
     def _emit_spill_ptrs():
         # Whichever spill is active routes through d_temp_spill; the inner consumes it.
-        if self.robot.floating_base or bc_in_global or s_temp_in_global:
+        if self.robot.floating_base or bc_in_global or s_temp_in_global or tp_in_global:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
 
     if not single_call_timing:
@@ -2391,7 +2438,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
+        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr, tp_in_smem_expr = tp_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
         if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3),stride=str(4*n**3))
         self.gen_add_end_control_flow()
@@ -2411,7 +2458,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr)
+        self.gen_idsva_so_body_frame_inner_function_call(bc_in_smem_expr = bc_in_smem_expr, scratch_in_smem_expr = scratch_in_smem_expr, tp_in_smem_expr = tp_in_smem_expr)
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
         self.gen_add_end_control_flow()
         if not use_global_output: self.gen_kernel_save_result("idsva_so",str(4*n**3))
@@ -2446,18 +2493,18 @@ def gen_idsva_so_body_frame_kernel(self, use_qdd_input = False, single_call_timi
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
 
-    table = self._idsva_so_body_tier_table  # [(name, t_count, use_global_output, s_temp_in_global, bc_in_global), ...]
+    table = self._idsva_so_body_tier_table  # [(name, t_count, use_global_output, s_temp_in_global, bc_in_global, tp_in_global), ...]
     if not getattr(self, "idsva_so_body_frame_use_ladder", False):
         # Floating-base diagnostic path: single body, legacy gravity-shim spill.
         ugo = getattr(self, "idsva_so_body_frame_use_global_output", False)
         _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                             ugo, False, False)
+                                                             ugo, False, False, False)
     else:
         picks = self.idsva_so_body_frame_spill_tier_3way
         def _emit_idsva_so_body_body(pick):
-            _, _, ugo, stg, bcg = table[pick]
+            _, _, ugo, stg, bcg, tpg = table[pick]
             _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                                 ugo, stg, bcg)
+                                                                 ugo, stg, bcg, tpg)
         self.gen_tier_dispatch(picks, _emit_idsva_so_body_body)
     self.gen_add_end_function()
 
