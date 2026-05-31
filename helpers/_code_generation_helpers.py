@@ -688,9 +688,10 @@ def gen_device_wrapper(self, func_desc, func_def, shared_mem_size, inner_call_fn
     self.gen_add_end_function()
 
 def gen_tier_dispatch(self, picks, emit_body_fn):
-    """Emit the per-tier spill-pick dispatch scaffolding shared by ~10 kernel
+    """Emit the per-tier spill-pick dispatch scaffolding shared by 12 kernel
     emitters (crba / fd / fd_du / aba / fdsva_so / integrator / minv / id_du /
-    ee_grad / d2ee). Every site repeated the identical scaffolding (B+C §1.2):
+    ee_grad / d2ee / idsva_so body+world). Every site repeated the identical
+    scaffolding (B+C §1.2):
 
         picks = getattr(self, "<algo>_spill_tier_3way", (...))
         if picks[0] == picks[1] == picks[2]:

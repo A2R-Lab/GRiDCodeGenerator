@@ -305,18 +305,10 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     picks = getattr(self, "fd_du_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        uss, ugt = _FD_DU_PICK_FLAGS[picks[0]]
+    def _emit_fd_du_body(pick):
+        uss, ugt = _FD_DU_PICK_FLAGS[pick]
         _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            uss, ugt = _FD_DU_PICK_FLAGS[pick]
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, _emit_fd_du_body)
     self.gen_add_end_function()
 
 def gen_forward_dynamics_gradient_host(self, mode = 0):

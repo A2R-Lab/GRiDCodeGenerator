@@ -2445,19 +2445,11 @@ def gen_idsva_so_body_frame_kernel(self, use_qdd_input = False, single_call_timi
                                                              ugo, False, False)
     else:
         picks = self.idsva_so_body_frame_spill_tier_3way
-        if picks[0] == picks[1] == picks[2]:
-            _, _, ugo, stg, bcg = table[picks[0]]
+        def _emit_idsva_so_body_body(pick):
+            _, _, ugo, stg, bcg = table[pick]
             _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
                                                                  ugo, stg, bcg)
-        else:
-            for tier_idx, tier_name in enumerate(("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")):
-                _, _, ugo, stg, bcg = table[picks[tier_idx]]
-                head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
-                       ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
-                self.gen_add_code_line(head, True)
-                _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_input, single_call_timing,
-                                                                     ugo, stg, bcg)
-                self.gen_add_end_control_flow()
+        self.gen_tier_dispatch(picks, _emit_idsva_so_body_body)
     self.gen_add_end_function()
 
 def gen_idsva_so_body_frame_host(self, mode = 0):
@@ -3323,17 +3315,10 @@ def gen_idsva_so_world_frame_kernel(self, single_call_timing = False):
 
     table = self._idsva_so_world_tier_table  # [(name, t_count, use_global_output, s_temp_in_global, cold_in_global), ...]
     picks = self.idsva_so_world_frame_spill_tier_3way
-    if picks[0] == picks[1] == picks[2]:
-        _, _, ugo, stg, cig = table[picks[0]]
+    def _emit_idsva_so_world_body(pick):
+        _, _, ugo, stg, cig = table[pick]
         _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, ugo, stg, cig)
-    else:
-        for tier_idx, tier_name in enumerate(("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")):
-            _, _, ugo, stg, cig = table[picks[tier_idx]]
-            head = ("if constexpr (RESOURCE_TIER == " + tier_name + ") {") if tier_idx == 0 else \
-                   ("else if constexpr (RESOURCE_TIER == " + tier_name + ") {")
-            self.gen_add_code_line(head, True)
-            _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing, ugo, stg, cig)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, _emit_idsva_so_world_body)
     self.gen_add_end_function()
 
 

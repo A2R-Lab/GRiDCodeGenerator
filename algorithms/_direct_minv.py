@@ -656,16 +656,8 @@ def gen_direct_minv_kernel(self, single_call_timing = False):
     # or 1 (surgical F-to-workspace). When picks collapse, emit a single body
     # (current behavior); when they diverge, emit if-constexpr branches.
     picks = getattr(self, "minv_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(picks[0]), single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 def gen_direct_minv_host(self, mode = 0):

@@ -248,16 +248,8 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
     # Phase 3b: 3-way pick dispatch. Level 0 = Minv-F embedded in s_temp (extra
     # smem block); Level 1 = Minv-F in L2-pinned workspace.
     picks = getattr(self, "fd_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        _emit_fd_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_fd_kernel_body_for_flags(self, n, bool(pick), single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_fd_kernel_body_for_flags(self, n, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 

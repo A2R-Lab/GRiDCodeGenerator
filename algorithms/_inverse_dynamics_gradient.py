@@ -1157,18 +1157,10 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
     # Tier dispatch: collapsed picks → single body (current behavior);
     # divergent picks → 3 if-constexpr branches.
     picks = getattr(self, "id_du_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        uss, ugt = _ID_DU_PICK_FLAGS[picks[0]]
+    def _emit_id_du_body(pick):
+        uss, ugt = _ID_DU_PICK_FLAGS[pick]
         _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            uss, ugt = _ID_DU_PICK_FLAGS[pick]
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, _emit_id_du_body)
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_host(self, mode = 0):

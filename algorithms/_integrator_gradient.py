@@ -855,6 +855,12 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     # Per-tier surgical placement (perf, lite, minimal). When all three rungs
     # agree (small robots that fit at PERF), emit a single body; otherwise gate
     # per tier on RESOURCE_TIER.
+    # NOTE: this is the one tier-dispatch site that does NOT route through the
+    # shared gen_tier_dispatch helper (B+C §1.2): the collapse predicate keys on
+    # `picks` alone, but the body indexes THREE parallel per-tier tuples
+    # (dqdd_smem / dab_smem / inner_lvl) by tier position — not by the pick value
+    # — so the helper's value-based emit_body_fn(pick) contract doesn't fit.
+    # Kept bespoke (the plan explicitly allows this for the irregular sites).
     picks = getattr(self, "integrator_du_spill_tier_3way", (0, 0, 0))
     dqdd_smem = getattr(self, "integrator_du_dqdd_in_smem_per_tier", (True, True, True))
     dab_smem = getattr(self, "integrator_du_dab_in_smem_per_tier", (True, True, True))

@@ -1233,18 +1233,10 @@ def gen_end_effector_pose_gradient_kernel(self, single_call_timing = False, fixe
     # tier's spill flags. DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T, TIER>() is
     # tier-aware.
     picks = getattr(self, "ee_grad_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        uwt, uwd = _EE_GRAD_PICK_FLAGS[picks[0]]
+    def _emit_ee_grad_body(pick):
+        uwt, uwd = _EE_GRAD_PICK_FLAGS[pick]
         _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            uwt, uwd = _EE_GRAD_PICK_FLAGS[pick]
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, _emit_ee_grad_body)
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
@@ -2346,18 +2338,10 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = Fal
     # tier's spill flag. Smem-bytes constexpr D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T,TIER>()
     # is already tier-aware.
     picks = getattr(self, "d2ee_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        uwo = _D2EE_PICK_FLAGS[picks[0]]
+    def _emit_d2ee_body(pick):
+        uwo = _D2EE_PICK_FLAGS[pick]
         _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            uwo = _D2EE_PICK_FLAGS[pick]
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, _emit_d2ee_body)
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):

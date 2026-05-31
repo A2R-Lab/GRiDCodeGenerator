@@ -632,16 +632,8 @@ def gen_crba_kernel(self, single_call_timing = False):
     # band to L2-pinned workspace at LITE/MINIMAL. Level 0 = arena in smem
     # (current); Level 1 = redirected to workspace.
     picks = getattr(self, "crba_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(picks[0]), single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 def gen_crba_host(self, mode = 0):

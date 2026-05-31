@@ -747,16 +747,8 @@ def gen_integrator_kernel(self, single_call_timing=False):
     # spilled to d_workspace. When all three agree (robots that fit at PERF),
     # emit a single body; else gate per tier on RESOURCE_TIER (mirrors fd).
     picks = getattr(self, "integrator_spill_tier_3way", (0, 0, 0))
-    if picks[0] == picks[1] == picks[2]:
-        _emit_integrator_kernel_body_for_flags(self, n, bool(picks[0]), single_call_timing)
-    else:
-        tier_names = ("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")
-        for tier_idx, (tier_name, pick) in enumerate(zip(tier_names, picks)):
-            head = "if constexpr (RESOURCE_TIER == " + tier_name + ") {" if tier_idx == 0 else \
-                   "else if constexpr (RESOURCE_TIER == " + tier_name + ") {"
-            self.gen_add_code_line(head, True)
-            _emit_integrator_kernel_body_for_flags(self, n, bool(pick), single_call_timing)
-            self.gen_add_end_control_flow()
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_integrator_kernel_body_for_flags(self, n, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 
