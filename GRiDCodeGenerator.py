@@ -283,7 +283,11 @@ class GRiDCodeGenerator:
             lite = max(perf, lite)
             return (perf, lite, last)
 
-        id_t_count = 2*n + n + 18*n + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
+        # The ID kernel's s_vaf band is body-indexed (18*NJ); for mimic robots
+        # (NJ > n) size it 18*NJ so the inner's body f-writes don't overflow into
+        # the XImats region. Non-mimic keeps the legacy 18*n byte-identical.
+        _id_vaf = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+        id_t_count = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
         # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
         # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
         _n_pos = self.robot.get_num_pos()
@@ -426,13 +430,17 @@ class GRiDCodeGenerator:
         )
         fd_du_temp_count = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
         fd_du_selective_temp_count = max(self.gen_direct_minv_inner_temp_mem_size(), id_du_selective_temp_count)
-        id_device_t_count = 18*n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
+        # s_vaf is body-indexed (NB bodies). For a MIMIC robot NB > nv so size
+        # 18*NB; non-mimic keeps 18*nv/18*n (byte-identical; floating non-mimic has
+        # nv > NB so 18*nv already covers the body writes). The id_device path uses
+        # the get_num_pos() (==n) flavour for non-mimic to stay byte-identical with
+        # the legacy 18*n; mimic robots route through 18*NB so the inner's
+        # body-indexed f writes never overflow s_vaf into the XImats region.
+        _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
+        _vaf_cnt_id = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+        id_device_t_count = _vaf_cnt_id + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
         minv_device_t_count = self.gen_direct_minv_inner_temp_mem_size() + XI_size
         fd_device_t_count = self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
-        # s_vaf is body-indexed (NB bodies). For a MIMIC robot NB > nv so size
-        # 18*NB; non-mimic keeps 18*nv (byte-identical; floating non-mimic has
-        # nv > NB so 18*nv already covers the body writes).
-        _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
         id_du_device_t_count = _vaf_cnt + id_du_temp_count + XI_size
         fd_du_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + fd_du_temp_count + XI_size
         id_du_t_count_full = (nv + n) + (2*nv*nv) + (_vaf_cnt) + nv + id_du_temp_count + XI_size

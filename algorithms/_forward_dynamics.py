@@ -14,9 +14,17 @@ def gen_forward_dynamics_inner_temp_mem_size(self, minv_f_in_smem = True):
         and excluded. Caller sizes s_temp from FD_INNER_SMEM_BYTES<MINV_F_IN_SMEM>."""
         n = self.robot.get_num_pos()
         nv = self.robot.get_num_vel()
+        # The post-Minv ID band is laid out s_c[n] | s_vaf[18*NJ] | ID-inner-temp
+        # (see gen_forward_dynamics_inner: s_vaf at n*n+n, ID temp at n*n+n+18*NJ).
+        # s_vaf is body-indexed (NJ bodies), so for mimic robots (NJ > n) reserve
+        # 18*NJ here too; otherwise the ID inner's body-indexed f writes overflow
+        # the band and corrupt the ID temp. Non-mimic keeps the legacy 19*n
+        # (n s_c + 18*n s_vaf) byte-identical since NJ == n.
+        NJ = self.robot.get_num_joints()
+        id_band = (n + 18 * (NJ if self.robot_has_mimic_joints() else n)
+                   + self.gen_inverse_dynamics_inner_temp_mem_size())
         minv_footprint = self.gen_direct_minv_inner_no_F_size() + (6*nv*nv if minv_f_in_smem else 0)
-        return n*n + max(minv_footprint,
-                         19*n + self.gen_inverse_dynamics_inner_temp_mem_size())
+        return n*n + max(minv_footprint, id_band)
 
 def gen_forward_dynamics_finish_function_call(self, updated_var_names = None):
     var_names = dict( \

@@ -1,4 +1,15 @@
 def gen_inverse_dynamics_inner_temp_mem_size(self):
+        # The forward f-pass stashes each BODY's I*v product in s_temp indexed by
+        # raw body id (6*jid+row, jid in [0, get_num_joints())), so the scratch
+        # must hold 6*get_num_joints() floats. For non-mimic robots this matches
+        # the legacy 6*get_num_pos() exactly (fixed-base: both == NJ; floating-base:
+        # the legacy value was if anything LARGER, never smaller) so we keep the
+        # legacy expression there to stay byte-identical. For mimic robots
+        # get_num_joints() > get_num_pos() (mimic joints carry 0 DoF), so
+        # 6*get_num_pos() under-sizes s_temp by 6*num_mimic and the I*v writes
+        # overflow into the next shared-arena region, corrupting per-body forces.
+        if self.robot_has_mimic_joints():
+            return 6 * self.robot.get_num_joints()
         n = self.robot.get_num_pos()
         return 6*n
 
@@ -440,7 +451,15 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
 
 def gen_inverse_dynamics_device_temp_mem_size(self, compute_c = False):
     n = self.robot.get_num_pos()
-    wrapper_size = (18*n if compute_c else 0) + self.gen_topology_helpers_size() + 72*n # for XImats
+    # s_vaf and the XImats scratch are indexed by RAW body id (jid in
+    # [0, get_num_joints())) inside the inner, so for mimic robots (where
+    # get_num_joints() > get_num_pos()) they must be sized by the body count or
+    # the f-block writes for the extra mimic bodies overflow into the next arena
+    # region (s_XImats), corrupting the low-jid X matrices. Non-mimic robots have
+    # get_num_joints() == get_num_pos() (fixed) or the legacy value was already
+    # >= the body count (floating), so gate on mimic to stay byte-identical.
+    nb = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+    wrapper_size = (18*nb if compute_c else 0) + self.gen_topology_helpers_size() + 72*nb # for XImats
     return self.gen_inverse_dynamics_inner_temp_mem_size() + wrapper_size
 
 def gen_inverse_dynamics_device(self, compute_c = False, use_qdd_input = False):
@@ -470,7 +489,13 @@ def gen_inverse_dynamics_device(self, compute_c = False, use_qdd_input = False):
     func_def = func_def_start + func_def_middle + func_def_end
     # then generate the code (shared device-wrapper skeleton; B+C §1.1)
     shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
-    extra_t_buffers = [("s_vaf", 18*n)] if compute_c else []
+    # s_vaf is indexed by RAW body id inside the inner (v/a/f blocks each span
+    # get_num_joints() bodies), so for mimic robots it must be 18*get_num_joints()
+    # or the high-body f writes overflow into the next arena region (s_XImats) and
+    # silently corrupt the low-jid X matrices. Non-mimic robots keep the legacy
+    # 18*get_num_pos() (== body count for fixed; >= it for floating) byte-identical.
+    nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+    extra_t_buffers = [("s_vaf", 18*nb_vaf)] if compute_c else []
     self.gen_device_wrapper(
         "Compute the RNEA (Recursive Newton-Euler Algorithm)", func_def,
         shared_mem_size,
@@ -507,8 +532,11 @@ def gen_inverse_dynamics_kernel(self, use_qdd_input = False, single_call_timing 
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # add shared memory variables
-    extra_t_buffers = [("s_q_qd", 2*n), ("s_c", n), ("s_vaf", 18*n)]
+    # add shared memory variables. s_vaf is body-indexed (18*NJ); for mimic
+    # robots (NJ > n) size it 18*NJ so the inner's body f-writes never overflow
+    # into the XImats region. Non-mimic keeps the legacy 18*n byte-identical.
+    _kvaf = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+    extra_t_buffers = [("s_q_qd", 2*n), ("s_c", n), ("s_vaf", _kvaf)]
     if use_qdd_input:
         extra_t_buffers.append(("s_qdd", n))
     shared_mem_size = self.gen_inverse_dynamics_inner_temp_mem_size()
