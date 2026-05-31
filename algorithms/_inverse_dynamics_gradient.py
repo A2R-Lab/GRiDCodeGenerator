@@ -913,44 +913,73 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_sync()
 
     else:
-        self.gen_add_parallel_loop("jid_dq_qd",str(2*NJ))
-        self.gen_add_code_line("int jid = jid_dq_qd % " + str(NJ) + "; int dq_flag = jid == jid_dq_qd;")
-        # now we need to get a local pointer and loop over all n filling in 0 or col data based on the local pointer
-        # and the specific topology of the robot
-        self.gen_add_code_line("// Note that this gets a tad complicated due to memory compression and variable column length")
-        self.gen_add_code_line("//    so we need to fully unroll the loop -- this will not be the most efficient for a serial")
-        self.gen_add_code_line("//    chain manipulator but will generalize to branched robots")
-        self.gen_add_code_lines(["int Offset_src = dq_flag * " + str(Offset_df_dq) + " + !dq_flag * " + str(Offset_df_dqd) + \
-                                                 " + 6*" + df_col_offset_for_jid_cpp + " + " + S_ind_cpp + ";",
-                                 "int Offset_dst = !dq_flag * " + str(n*n) + " + jid; bool flag = 0;"])
+        # WIN A: branched fixed-base dc/du extraction, fanned to one thread per
+        # OUTPUT element (2*n*n) instead of 2*NJ lanes that each serially marched
+        # all NJ du-columns. Each output element s_dc_du[half, body=jid, du=djid]
+        # is INDEPENDENT and DISJOINT, so the fan needs no extra sync and is
+        # bit-exact with the old serial march.
+        #
+        # The old code advanced Offset_src by flag*6 over djid=0..NJ-1, so the
+        # df-source column for a (jid, djid) pair that couples is
+        #   running_sum_df_cols_per_jid[jid] + (#coupling djid' < djid),
+        # i.e. running_sum_df_cols_per_jid[jid] (= df_col_offset_for_jid_cpp at
+        # runtime) plus the within-block RANK of djid among jid's coupling set.
+        # We resolve that (jid, djid) -> rank map at codegen time and select the
+        # per-element src column / write-flag from it (no running pointer). The
+        # base offset df_col_offset_for_jid_cpp + S_ind stay as the existing
+        # runtime topology-helper expressions keyed on jid (the output body row),
+        # so the emitted arithmetic is the same modulo the rank decode.
+        # Build the per-(jid, djid) within-block rank + coupling table. For body
+        # jid, march djid=0..NJ-1 (mirrors the OLD Offset_src += flag*6 order) and
+        # assign increasing ranks to coupling columns.
+        rank_table = [[None]*NJ for _ in range(NJ)]
+        for jid in range(NJ):
+            rank = 0
+            for djid in range(NJ):
+                couples = self.robot.get_is_in_subtree_of(djid, jid) or self.robot.get_is_ancestor_of(djid, jid)
+                if couples:
+                    rank_table[jid][djid] = rank
+                    rank += 1
+        self.gen_add_parallel_loop("ind", str(2*n*n))
+        self.gen_add_code_line("// one thread per output element: decode (half, body jid, du-col djid)")
+        self.gen_add_code_line(f"int dq_flag = ind < {n*n}; int jid_du_ind = ind % {n*n};")
+        self.gen_add_code_line(f"int jid = jid_du_ind % {n}; int djid = jid_du_ind / {n};")
+        # Select this element's within-block source-column RANK and write-flag from
+        # the codegen table, keyed on the composite (jid*NJ + djid). Emit a per-djid
+        # block so each emits a compact in/not-in test over jid (mirrors the old
+        # per-column flag) plus a per-jid rank select only where it couples.
+        self.gen_add_code_line("int src_rank = 0; bool flag = false;")
         for djid in range(NJ):
-            self.gen_add_code_line("// dc[jid]/du[" + str(djid) + "]")
-            # extract all the inds we care about for this du
-            is_in_subtree_or_ancestor = [self.robot.get_is_in_subtree_of(djid,ind) or self.robot.get_is_ancestor_of(djid,ind) for ind in range(NJ)]
-            non_zero_inds = [i for (i, x) in enumerate(is_in_subtree_or_ancestor) if x == True]
-            # then set the if statement (if applicable)
-            if len(non_zero_inds) != n:
-                zero_inds = list(set(list(range(n))).difference(set(non_zero_inds)))
-                if len(non_zero_inds) == 0:
-                    # No body in [0,n) has djid in its subtree/ancestor set: this
-                    # du-column contributes nothing. gen_var_in_list([]) would emit
-                    # an empty "()" expression, so hardcode flag=false.
-                    jid_du_check_for_jid = "false"
-                elif len(zero_inds) == 0:
-                    # Every body in [0,n) couples to djid (non_zero_inds covers the
-                    # whole reduced range, e.g. when a mimic body extends the raw
-                    # body set past NV): gen_var_not_in_list([]) would emit "()";
-                    # the flag is unconditionally true.
-                    jid_du_check_for_jid = "true"
-                elif len(non_zero_inds) > n/2:
-                    jid_du_check_for_jid = self.gen_var_not_in_list("jid",[str(i) for i in zero_inds])
-                else:
-                    jid_du_check_for_jid = self.gen_var_in_list("jid",[str(i) for i in non_zero_inds])
-                self.gen_add_code_line("flag = " + jid_du_check_for_jid + ";")
-                # compute the val and pointer updates accordingly
-                self.gen_add_code_line("s_dc_du[Offset_dst] = flag * (" + S_sign_cpp + ") * s_temp[Offset_src]; Offset_src += flag*6; Offset_dst += " + str(n) + ";")
-            else: # else everyone updates and updates their pointer
-                self.gen_add_code_line("s_dc_du[Offset_dst] = (" + S_sign_cpp + ") * s_temp[Offset_src]; Offset_src += 6; Offset_dst += " + str(n) + ";")
+            non_zero_inds = [jid for jid in range(NJ) if rank_table[jid][djid] is not None]
+            self.gen_add_code_line("// du-col " + str(djid) + " couples to bodies: " + (",".join(str(i) for i in non_zero_inds) if non_zero_inds else "(none)"))
+            if not non_zero_inds:
+                continue
+            self.gen_add_code_line("if (djid == " + str(djid) + ") {", True)
+            # write-flag over jid
+            zero_inds = [jid for jid in range(NJ) if rank_table[jid][djid] is None]
+            if not zero_inds:
+                flag_expr = "true"
+            elif len(non_zero_inds) > NJ/2:
+                flag_expr = self.gen_var_not_in_list("jid", [str(i) for i in zero_inds])
+            else:
+                flag_expr = self.gen_var_in_list("jid", [str(i) for i in non_zero_inds])
+            self.gen_add_code_line("flag = " + flag_expr + ";")
+            # per-jid rank: only distinct ranks need a select; group jids by rank
+            ranks = sorted(set(rank_table[jid][djid] for jid in non_zero_inds))
+            if len(ranks) == 1:
+                self.gen_add_code_line("src_rank = " + str(ranks[0]) + ";")
+            else:
+                # non-branching sum of (jid==j)*rank_j over coupling jids
+                terms = " + ".join("(jid == " + str(jid) + ") * " + str(rank_table[jid][djid]) for jid in non_zero_inds)
+                self.gen_add_code_line("src_rank = " + terms + ";")
+            self.gen_add_end_control_flow()
+        # Source offset: same base (df block start + S_ind) as the old march, plus
+        # 6*rank for the within-block column. Output index matches the old
+        # Offset_dst progression (!dq_flag*n*n + n*djid + jid).
+        self.gen_add_code_line("int Offset_src = dq_flag * " + str(Offset_df_dq) + " + !dq_flag * " + str(Offset_df_dqd) + \
+                               " + 6*" + df_col_offset_for_jid_cpp + " + 6*src_rank + " + S_ind_cpp + ";")
+        self.gen_add_code_line("int Offset_dst = !dq_flag * " + str(n*n) + " + " + str(n) + "*djid + jid;")
+        self.gen_add_code_line("s_dc_du[Offset_dst] = flag * (" + S_sign_cpp + ") * s_temp[Offset_src];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -1351,11 +1380,17 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     self.gen_add_sync()
 
     # ---- forward pass (serial over bodies, root first) ----
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("T s_iv6[6];")
-    self.gen_add_code_line("T s_mtmp[6];")
-    self.gen_add_code_line("T s_ftmp[6];")
-    self.gen_add_code_line("T s_Svec[6];")
+    # WIN B: the body-walk MUST stay serial-ordered (each body reads its parent's
+    # dv/da gradient buffers written in a prior iteration), so EVERY lane runs the
+    # same `for ind` loop. But the independent work WITHIN a body — the per-column
+    # `for c` matvecs (one lane per gradient column) — is fanned via
+    # gen_add_parallel_loop("c", nv). The cross-body v-slot folds (`+=` into a
+    # single reduced column at slot idx) stay on ONE lane (gen_add_serial_ops) so
+    # a single reduced-column accumulation is never split across lanes — keeping
+    # the fold bit-exact. __syncthreads() at each subsection boundary makes the
+    # parallel writes visible to the next (per-c or single-column) reader.
+    # Per-lane scratch (s_iv6/s_mtmp/s_ftmp/s_Svec) becomes per-section stack
+    # locals (declared inside each loop/serial block below).
     for ind in range(NB):
         parent = self.robot.get_parent_id(ind)
         # The floating-base root (jid 0) is the only multi-DoF body: 6 v-slots
@@ -1381,16 +1416,14 @@ def _gen_id_du_mimic_inner(self, nv, NB):
                                    ", alpha=" + repr(alpha) + ", S_ind=" + str(s_ind) +
                                    ", S_sign=" + repr(s_sign) + ") ---")
         self.gen_add_code_line("{", True)  # per-body scope (avoid local redeclare)
-        # Build the S 6-vector (s_sign at row s_ind) for fxS-style products.
-        # (single-DoF bodies only; the float root's 6-DoF S is handled inline.)
-        if not is_float_root:
-            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
-            self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
 
-        # Iv = I[ind] * v[ind]
-        self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_iv6[r] = static_cast<T>(0);")
-        self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_iv6[r] += s_XImats[" + str(Ioff) + " + r + 6*p] * s_vaf[" + str(v_ind) + " + p]; }")
-        self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(off_iv + 6*ind) + " + r] = s_iv6[r];")
+        # Iv = I[ind] * v[ind] (one lane writes the per-body 6-vector; read by df below)
+        self.gen_add_serial_ops()
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) { T iv = static_cast<T>(0);")
+        self.gen_add_code_line("  for (int p = 0; p < 6; p++) iv += s_XImats[" + str(Ioff) + " + r + 6*p] * s_vaf[" + str(v_ind) + " + p];")
+        self.gen_add_code_line("  s_temp[" + str(off_iv + 6*ind) + " + r] = iv; }")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
 
         if parent != -1:
             p_dv_dq  = cell(off_dv_dq,  parent, 0)
@@ -1402,7 +1435,9 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             c_dv_dqd = cell(off_dv_dqd, ind, 0)
             c_da_dqd = cell(off_da_dqd, ind, 0)
             # dv_du[ind] = X[ind] * dv_du[parent] ; da_du[ind] = X[ind]*da_du[parent]
-            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            # WIN B: one lane per gradient column c (independent outputs; the per-
+            # element 6-wide reduction over p is intact, so bit-exact).
+            self.gen_add_parallel_loop("c", str(nv))
             self.gen_add_code_line("for (int r = 0; r < 6; r++) {", True)
             self.gen_add_code_line("T acc_vq=static_cast<T>(0), acc_aq=static_cast<T>(0), acc_vqd=static_cast<T>(0), acc_aqd=static_cast<T>(0);")
             self.gen_add_code_line("for (int p = 0; p < 6; p++) {", True)
@@ -1418,16 +1453,22 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("s_temp[" + str(c_da_dqd) + " + 6*c + r] = acc_aqd;")
             self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
+            self.gen_add_sync()  # the X*parent cols feed the single-column += folds below
 
             # dv_dq[:,idx,ind]  += alpha * mxS(S, X*v_parent)  = alpha*s_sign*mx_Sind(X v_parent)
-            # X*v_parent: dv contribution uses v[parent]
+            # X*v_parent: dv contribution uses v[parent]. Single reduced-column (idx)
+            # fold -> ONE lane (cross-body v-slot accumulate stays unsplit, bit-exact).
+            self.gen_add_serial_ops()
             self.gen_add_code_line("// dv_dq[:,idx] += alpha*mxS(S, X*v_parent); dv_dqd[:,idx] += alpha*S")
+            self.gen_add_code_line("T s_mtmp[6];")
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
             self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*parent) + " + p]; }")
             # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]. mxS(S,.) carries the
             # joint sign (S = s_sign*e_{s_ind}); mx<ind>_peq_scaled only applies
             # the UNIT-axis column, so fold s_sign into the scale (alpha*s_sign).
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # dv_dq[:,idx] now visible to the da += mxS(dv) reader below
 
         if is_float_root:
             # ===== FLOATING ROOT own-DoF terms (6-DoF motion subspace S) =====
@@ -1438,24 +1479,31 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             # sets entry [k, ii]. The root is never mimic (alpha == 1). dv_dq
             # stays 0 (no parent + own term parent-gated), so the da += mxS(dv_dq)
             # *qd term is identically 0 for dq.
-            # dv_dqd[:,ii,root] += S[:,ii]  (entry [k, ii] = sign)
+            # dv_dqd[:,ii,root] += S[:,ii]  (entry [k, ii] = sign). Single-column
+            # (per-DoF) folds -> ONE lane (root v-slots, bit-exact accumulate).
+            self.gen_add_serial_ops()
             self.gen_add_code_line("// FLOATING ROOT: dv_dqd[:,ii,root] += S[:,ii]")
             for ii in range(6):
                 k, sgn = root_dof_axes[ii]
                 self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, ii)) + " + " + str(k) + "] += static_cast<T>(" + repr(sgn) + ");")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # dv_dqd[:,ii] visible to the da_dqd += mxS(dv_dqd) reader
             # da_dqd[:,c,root] += sum_ii sgn_ii * mx<k_ii>(dv_dqd[:,c,root]) * qd[ii]
-            #   (da_dq term is 0 because dv_dq[:,c,root] == 0)
+            #   (da_dq term is 0 because dv_dq[:,c,root] == 0). WIN B: one lane per c.
             self.gen_add_code_line("// FLOATING ROOT: da_dqd[:,c] += sum_ii sgn*mx_k(dv_dqd[:,c]) * qd[ii]")
-            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            self.gen_add_parallel_loop("c", str(nv))
             for ii in range(6):
                 k, sgn = root_dof_axes[ii]
                 self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(sgn) + ") * s_qd[" + str(ii) + "]);")
             self.gen_add_end_control_flow()
+            self.gen_add_sync()  # da_dqd[:,c] for all c before the per-DoF (col ii) folds below
             # da_dq[:,ii,root] += mxS(S[:,ii], root_gravity) = sgn*mx<k>(root_grav)
             #   root_gravity = inv(X)*gravity_vec. inv(X) motion-transform block
             #   form [[R^T,0],[C,R^T]] => col 5 is [0,0,0, R^T[:,2]] = [0,0,0,
             #   X[2,0], X[2,1], X[2,2]] (col-major X[2,k]=s_XImats[Xoff+6*k+2]);
-            #   gravity_vec = [0,0,0,0,0,gravity].
+            #   gravity_vec = [0,0,0,0,0,gravity]. Single-column (col ii) -> ONE lane.
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("T s_mtmp[6];")
             self.gen_add_code_line("// FLOATING ROOT: da_dq[:,ii] += sgn*mx_k(inv(X)*gravity_vec)")
             self.gen_add_code_line("s_mtmp[0] = static_cast<T>(0); s_mtmp[1] = static_cast<T>(0); s_mtmp[2] = static_cast<T>(0);")
             self.gen_add_code_line("s_mtmp[3] = s_XImats[" + str(Xoff + 2) + "] * gravity;")
@@ -1469,24 +1517,36 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             for ii in range(6):
                 k, sgn = root_dof_axes[ii]
                 self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, ii)) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(sgn) + "));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # all da cols (incl per-DoF ii) before df reads them
         else:
             # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
             # adds this for EVERY body including the root (it sits OUTSIDE the
             # parent!=-1 guard in rnea_grad_fpass_dqd) — the joint's own velocity
             # subspace contributes to dv/dqd regardless of having a parent.
+            # Single reduced-column (idx) fold -> ONE lane (bit-exact accumulate).
+            self.gen_add_serial_ops()
             self.gen_add_code_line("// dv_dqd[:,idx] += alpha*S (all bodies incl. root)")
             self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # dv_dqd[:,idx] visible to the da += mxS(dv_dqd) reader below
 
             # da_du[:,c,ind] += mxS(S, dv_du[:,c,ind], alpha*qd[idx])   for every column c
+            # WIN B: one lane per gradient column c (reads dv_du[:,c] incl col idx
+            # written above; each lane owns a distinct column -> no cross-lane race).
             self.gen_add_code_line("// da_du[:,c] += mxS(S, dv_du[:,c], alpha*qd[idx])")
+            self.gen_add_parallel_loop("c", str(nv))
             self.gen_add_code_line("T qd_a = static_cast<T>(" + repr(alpha) + ") * s_qd[" + str(idx) + "];")
-            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
             self.gen_add_end_control_flow()
+            self.gen_add_sync()  # all da cols before the single-column (idx) da folds below
 
             # da_dq[:,idx,ind] += alpha*mxS(S, X*a_parent or root_gravity)
-            # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
+            # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind]). Single reduced-column (idx)
+            # folds -> ONE lane (bit-exact accumulate into one column).
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("T s_mtmp[6];")
             self.gen_add_code_line("// da_dq[:,idx] += alpha*mxS(S, X*a_parent); da_dqd[:,idx] += alpha*mxS(S, v[ind])")
             if parent != -1:
                 self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
@@ -1501,10 +1561,16 @@ def _gen_id_du_mimic_inner(self, nv, NB):
                 self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
             # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # all da cols (incl col idx) before df reads them
 
         # df_du[:,:,ind] = I*da_du + fxv(dv_du, Iv) + fxv(v, I*dv_du)
+        # WIN B: one lane per gradient column c (df[:,c] reads da[:,c], dv[:,c], Iv
+        # — all finalized + synced above; outputs are disjoint per c, bit-exact).
+        # Per-lane scratch s_ftmp/s_mtmp are stack locals inside the loop.
         self.gen_add_code_line("// df_du[:,c] = I*da_du[:,c] + fx(dv_du[:,c])*Iv + fx(v)*I*dv_du[:,c]")
-        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+        self.gen_add_parallel_loop("c", str(nv))
+        self.gen_add_code_line("T s_ftmp[6]; T s_mtmp[6];")
         for (dabuf, dfbuf, dvbuf) in [(off_da_dq, off_df_dq, off_dv_dq), (off_da_dqd, off_df_dqd, off_dv_dqd)]:
             # I*da_du
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { T acc=static_cast<T>(0);")
@@ -1521,18 +1587,22 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("fx_times_v<T>(s_ftmp, &s_vaf[" + str(v_ind) + "], s_mtmp);")
             self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(dfbuf, ind, 0)) + " + 6*c + r] += s_ftmp[r];")
         self.gen_add_end_control_flow()  # end for c (df_du)
+        self.gen_add_sync()  # df[:,:,ind] complete before next body (child) reads it
         self.gen_add_end_control_flow()  # end per-body scope
-    self.gen_add_end_control_flow()  # end serial fwd
     self.gen_add_sync()
 
     # ---- backward pass (serial, deepest first) ----
     # dc_du[idx,:] += alpha * S^T * df_du[:,:,ind]
     # df_du[:,idx,parent] += alpha * (X^T * fxS(S, f[ind]))   [dq only]
     # df_du[:,:,parent]  += X^T * df_du[:,:,ind]
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("T s_fxs[6];")
-    self.gen_add_code_line("T s_xtfxs[6];")
-    self.gen_add_code_line("T s_Svec[6];")
+    # WIN B: the body-walk stays serial-ordered (deepest first; a parent reads
+    # df_du buffers its children wrote), so EVERY lane runs the same `for ind`.
+    # The per-column `for c` work (the dc_du fold + the X^T df propagation) fans
+    # one lane per column c; the single-column df_dq[:,idx,parent] fold stays on
+    # ONE lane. The dc_du v-slot reduction is a cross-BODY accumulate at a fixed
+    # ROW idx, column c — each (c) hit is on one lane and the cross-body sum is
+    # serialized by the body-walk + inter-body __syncthreads, so it stays
+    # bit-exact (a single reduced entry is never split across lanes).
     for ind in range(NB - 1, -1, -1):
         parent = self.robot.get_parent_id(ind)
         is_float_root = fb and ind == 0
@@ -1550,25 +1620,34 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             # ii, a single signed axis k=root_dof_axes[ii], so this reduces to
             #   dc_du[ii, c] += sgn * df_du[k, c, root]   for ii in 0..5 (alpha=1)
             self.gen_add_code_line("// --- bpass body 0 (FLOATING ROOT, v-slots 0..5, S^T df_du) ---")
-            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            # WIN B: one lane per gradient column c (each c writes distinct dc_du
+            # entries; the cross-body dc_du accumulate is serialized by the walk).
+            self.gen_add_parallel_loop("c", str(nv))
             for ii in range(6):
                 k, sgn = root_dof_axes[ii]
                 self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(ii) + "] += static_cast<T>(" + repr(sgn) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(k) + "];")
                 self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(ii) + "] += static_cast<T>(" + repr(sgn) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(k) + "];")
             self.gen_add_end_control_flow()
+            self.gen_add_sync()  # finish this body's dc_du fold before the (earlier) walk ends
             # root has no parent -> no df propagation; backward pass done for root.
             continue
         self.gen_add_code_line("// --- bpass body " + str(ind) + " (v-slot " + str(idx) + ") ---")
         # dc_dq[idx, c]  += alpha * s_sign * df_dq[s_ind, c, ind]
         # dc_dqd[idx, c] += alpha * s_sign * df_dqd[s_ind, c, ind]
+        # WIN B: one lane per gradient column c. Each c writes a distinct dc_du
+        # entry; the cross-body accumulate at row idx is serialized by the walk.
         coeff = alpha * s_sign
-        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+        self.gen_add_parallel_loop("c", str(nv))
         self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
         self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
         self.gen_add_end_control_flow()
         if parent != -1:
-            # df_dq[:,idx,parent] += alpha * X^T * fxS(S, f[ind])
+            self.gen_add_sync()  # dc_du fold reads df[ind]; df[parent] += below must wait
+            # df_dq[:,idx,parent] += alpha * X^T * fxS(S, f[ind]). Single reduced-
+            # column (idx) fold on the PARENT -> ONE lane (bit-exact accumulate).
             # fxS(S, f) = Fx(S)*f = fx_times_v(S, f); S = s_sign*e_{s_ind}
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("T s_fxs[6]; T s_xtfxs[6]; T s_Svec[6];")
             self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
             self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
             self.gen_add_code_line("fx_times_v<T>(s_fxs, s_Svec, &s_vaf[" + str(f_ind) + "]);")
@@ -1576,8 +1655,15 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_xtfxs[r] = static_cast<T>(0);")
             self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_xtfxs[r] += s_XImats[" + str(Xoff) + " + p + 6*r] * s_fxs[p]; }")
             self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(off_df_dq, parent, 0)) + " + 6*" + str(idx) + " + r] += static_cast<T>(" + repr(alpha) + ") * s_xtfxs[r];")
-            # df_du[:,:,parent] += X^T * df_du[:,:,ind]   (both dq and dqd)
-            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            self.gen_add_end_control_flow()
+            # The single-column df_dq[:,idx,parent] += (above) must land BEFORE the
+            # X^T propagation below touches that same parent column (preserves the
+            # original H-then-I float accumulation order -> bit-exact).
+            self.gen_add_sync()
+            # df_du[:,:,parent] += X^T * df_du[:,:,ind]   (both dq and dqd).
+            # WIN B: one lane per gradient column c (distinct parent columns; the
+            # 6-wide reduction over p stays intact per (c,r) -> bit-exact).
+            self.gen_add_parallel_loop("c", str(nv))
             self.gen_add_code_line("for (int r = 0; r < 6; r++) {", True)
             self.gen_add_code_line("T acc_q=static_cast<T>(0), acc_qd=static_cast<T>(0);")
             self.gen_add_code_line("for (int p = 0; p < 6; p++) {", True)
@@ -1589,7 +1675,9 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("s_temp[" + str(cell(off_df_dqd, parent, 0)) + " + 6*c + r] += acc_qd;")
             self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()  # end serial bpass
+        # Inter-body barrier: this body's dc_du fold (and any df[parent] writes)
+        # must be visible before the next (shallower) body reads/accumulates.
+        self.gen_add_sync()
     self.gen_add_sync()
 
 
