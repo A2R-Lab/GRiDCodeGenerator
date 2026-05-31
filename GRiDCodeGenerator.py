@@ -520,6 +520,12 @@ class GRiDCodeGenerator:
         # CRBA: the inner scratch band is spilled as one band to L2-pinned
         # workspace at LITE/MINIMAL. Level 0 = scratch in smem (current);
         # Level 1 = scratch redirected to workspace.
+        # An intermediate surgical-spill rung (keep hot band in smem, spill only a
+        # cold sub-band) was investigated for K-crbarung and DEFERRED: post-I-crba
+        # the whole inner band (42*NJ / 36*NJ+slab) is hot with no cold sub-band,
+        # and the full arena (<=~19 KB) already fits smem at every default tier.
+        # See _crba.py header (gen_crba_inner_temp_mem_size) for the full rationale.
+        # Rungs stay at 2 (full | inner-band-to-workspace).
         _crba_base_count = nv*nv + crba_input_t_count + XI_size
         _crba_t_count_full      = _crba_base_count + self.gen_crba_inner_temp_mem_size()
         _crba_t_count_workspace = _crba_base_count
