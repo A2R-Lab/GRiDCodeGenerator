@@ -2855,11 +2855,14 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
         self.gen_end_effector_pose_gradient_hessian_host(2)
 
     if include_pose or include_gradient or include_hessian:
-        self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
-        self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
-        # batched large-batch FK convenience path (one block/warp per sample).
-        # Skip for floating-base / mimic robots: the standalone inner does not
-        # support those (it routes through end_effector_pose instead).
+        # standalone warp/thread FK inners + batched convenience path.
+        # Skip ENTIRELY for floating-base / mimic robots: the standalone inner
+        # does not support those (it raises) — they route through
+        # end_effector_pose instead. (The inner emission was previously outside
+        # this guard, which made codegen raise for every floating/mimic robot
+        # that includes ee_pose.)
         if not self.robot.floating_base and not self.robot_has_mimic_joints():
+            self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
+            self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_fk_batched_kernel()
             self.gen_ee_pose_fk_batched_host()
