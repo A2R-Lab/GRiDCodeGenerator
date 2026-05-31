@@ -73,7 +73,10 @@ class GRiDCodeGenerator:
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient, \
                             gen_plant_step, gen_plant_step_gradient, gen_quadratic_state_cost, gen_quadratic_input_cost, \
                             gen_ee_pos_cost, gen_plant_barriers, gen_grid_plant, \
-                            gen_plant_step_kernel, gen_quadratic_cost_kernel, gen_ee_pos_cost_kernel, gen_plant_kernels
+                            gen_plant_step_kernel, gen_quadratic_cost_kernel, gen_ee_pos_cost_kernel, gen_plant_kernels, \
+                            gen_id_bias_device, gen_id_bias_kernel, gen_id_bias_host, gen_id_bias, \
+                            gen_centroidal_inner, gen_com_device, gen_ccrba_device, gen_energy_device, \
+                            _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -526,6 +529,20 @@ class GRiDCodeGenerator:
         self.d2ee_use_workspace_d2xhom = False
         d2ee_t_count = _d2ee_arenas[self.d2ee_spill_tier]
         self.d2ee_t_count_per_tier = tuple(_d2ee_arenas[i] for i in self.d2ee_spill_tier_3way)
+        # G2 centroidal quick-wins smem t-counts (no tier spill — new, low perf
+        # priority families use the full smem arena).
+        NB = self.robot.get_num_bodies()
+        # generalized_gravity (the larger of the two ID-bias kernels: + s_qd0):
+        #   s_q_qd(2n) + s_out(nv) + s_vaf(18n) + s_qd0(nv) + inner_temp(6n) + XI
+        self.id_bias_t_count = 2*n + nv + 18*n + nv + 6*n + XI_size
+        # com/ccrba/energy share one arena sizing (use the largest input/output):
+        #   s_in(<=2n) + s_out(<=6nv+6) + s_A(6nv) + s_com(3) + s_extra(4)
+        #   + centroidal_inner_temp + XHom_size
+        _centroidal_inner_temp = 16*self.robot.get_num_joints() + 6*nv*NB + 36*NB + 6*nv + 36
+        _centroidal_base = 6*nv + 3 + 4 + _centroidal_inner_temp + XHom_size
+        self.com_t_count    = n + (3 + 3*nv) + _centroidal_base
+        self.ccrba_t_count  = 2*n + (6*nv + 6) + _centroidal_base
+        self.energy_t_count = 2*n + 3 + _centroidal_base
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
         # would exceed the target, set self.idsva_so_body_frame_grav_full_spill and
         # let gen_idsva_so_body_frame_inner_temp_mem_size() return the smaller value
@@ -938,6 +955,11 @@ class GRiDCodeGenerator:
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.d2ee_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "}",
+                                 # G2 centroidal quick-wins shared-mem macros (no tier spill).
+                                 "template <typename T> __host__ __device__ inline size_t ID_BIAS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.id_bias_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t COM_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.com_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t CCRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t ENERGY_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.energy_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
@@ -1137,6 +1159,10 @@ class GRiDCodeGenerator:
                                  # integrator outputs
                                  "    T *d_x_kp1;", \
                                  "    T *d_dAB;", \
+                                 # G2 centroidal quick-wins outputs
+                                 "    T *d_com;", \
+                                 "    T *d_ccrba;", \
+                                 "    T *d_energy;", \
                                  "    // CPU OUTPUTS", \
                                  "    T *h_c;", \
                                  "    T *h_Minv;", \
@@ -1156,6 +1182,10 @@ class GRiDCodeGenerator:
                                  # integrator outputs
                                  "    T *h_x_kp1;", \
                                  "    T *h_dAB;", \
+                                 # G2 centroidal quick-wins outputs
+                                 "    T *h_com;", \
+                                 "    T *h_ccrba;", \
+                                 "    T *h_energy;", \
                                  "};"])
 
     def gen_init_gridData(self):
@@ -1221,6 +1251,15 @@ class GRiDCodeGenerator:
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "}", \
+                      "// G2 centroidal quick-wins outputs (com: 3+3*NV ; ccrba: 6*NV+6 ; energy: 3)", \
+                      "if (needs_dynamics || needs_kinematics) {", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_com, (3+3*NUM_VEL)*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_ccrba, (6*NUM_VEL+6)*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_energy, 3*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_com = (T *)malloc((3+3*NUM_VEL)*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_ccrba = (T *)malloc((6*NUM_VEL+6)*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_energy = (T *)malloc(3*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "return hd_data;"]
         # generate as templated or not function
@@ -1387,6 +1426,40 @@ class GRiDCodeGenerator:
             ("end_effector_pose_gradient_hessian_kernel_single_timing<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
+        # G2 centroidal quick-wins. gravity/nonlinear_effects gate on `id`
+        # (RNEA bias wrappers); com/ccrba/energy gate on `ee_pose` (homogeneous-
+        # transform world-frame machinery). algo_short keys an entry that is in
+        # generated_algorithms exactly when the dep is present.
+        ("generalized_gravity", "id", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("generalized_gravity_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("generalized_gravity_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("nonlinear_effects", "id", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("nonlinear_effects_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("nonlinear_effects_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("com", "ee_pose", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("com_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("com_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("ccrba", "ee_pose", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("ccrba_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("ccrba_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("energy", "ee_pose", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("energy_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("energy_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
     ]
 
     def gen_init_close_grid(self):
@@ -1428,6 +1501,11 @@ class GRiDCodeGenerator:
             if gate_attr is not None and not getattr(self, gate_attr, True):
                 continue
             if gate_attr is None and generated_set is not None and algo_short not in generated_set:
+                continue
+            # G2 centroidal kinematics-domain families are not emitted for mimic
+            # robots (their per-body Jacobian fold isn't mimic-reduced yet), so
+            # skip registering their (nonexistent) kernels there.
+            if algo_label in ("com", "ccrba", "energy") and self.robot_has_mimic_joints():
                 continue
             # Wrap EVERY kernel's attribute registration in a compile-time-
             # resolvable size guard so init_grid never hard-aborts when a kernel
@@ -1612,6 +1690,32 @@ class GRiDCodeGenerator:
             self.gen_add_code_line("printf(\"\\n\");")
             self.gen_add_end_control_flow()
             self.gen_add_end_function()
+
+    def gen_centroidal_quickwins(self, algorithms):
+        """Emit the G2 centroidal quick-win families (R1-R3). Each is gated on
+        the grid:: deps it composes being present; a missing dep emits a comment
+        instead of an undefined call (mirrors gen_grid_plant's gating). Mimic
+        robots are skipped for the kinematics-domain centroidal families (the
+        per-body Jacobian fold isn't mimic-reduced yet) — gravity/bias still
+        emit since they reuse the mimic-aware RNEA inner."""
+        # R1 generalized_gravity / nonlinear_effects: RNEA bias wrappers.
+        if "id" in algorithms:
+            self.gen_id_bias(gravity_only=True)
+            self.gen_id_bias(gravity_only=False)
+        else:
+            self.gen_add_code_line("// [centroidal] generalized_gravity/nonlinear_effects skipped: require 'id' (grid::inverse_dynamics_inner).")
+        # R3/R2/energy: kinematics-domain centroidal families. Need homogeneous
+        # transforms (always present when ee_pose is generated).
+        kin_ok = ("ee_pose" in algorithms) and not self.robot_has_mimic_joints()
+        if kin_ok:
+            self.gen_centroidal_inner()
+            self.gen_com()
+            self.gen_ccrba()
+            self.gen_energy()
+        elif "ee_pose" not in algorithms:
+            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: require 'ee_pose' (homogeneous-transform world-frame machinery).")
+        else:
+            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
 
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
@@ -1879,6 +1983,13 @@ class GRiDCodeGenerator:
                     self.gen_idsva_so_dispatcher()
             if "fdsva_so" in algorithms:
                 self.gen_fdsva_so()
+        # G2 centroidal quick-wins (R1-R3): additive families gated on their
+        # grid:: deps. generalized_gravity / nonlinear_effects are RNEA bias
+        # wrappers (need `id`); com / ccrba / energy live in the kinematics
+        # (homogeneous-transform) domain and reuse the world-transform machinery
+        # (need `ee_pose`). All are NEW emitters appended after the existing
+        # algorithms, so existing emission is byte-identical.
+        self.gen_centroidal_quickwins(algorithms)
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()

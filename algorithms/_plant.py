@@ -377,6 +377,176 @@ def gen_ee_pos_cost(self):
 
 
 # ---------------------------------------------------------------------------
+# CoM-tracking cost (R3 plant hook). Direct clone of ee_pos_cost with the EE
+# position/Jacobian replaced by the CoM position / CoM Jacobian from
+# grid::com_device (which writes [p_com(3); J_com(3 x NUM_VEL, column-major)]).
+#   r       = p_com(q) - p_des                          (3-vector)
+#   value   = 1/2 sum_r W[r] r[r]^2
+#   grad_x  = [J_com^T W r ; 0]
+#   GN hess = J_com^T W J_com  (q-block of the NX x NX hessian; qd rows/cols 0)
+# ---------------------------------------------------------------------------
+
+def gen_com_cost(self):
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nx = nq + nv
+    com_out = 3 + 3 * nv  # com (3) + Jcom (3 x nv) layout from grid::com_device
+    # ---- value ----
+    self.gen_add_func_doc(
+        "com_cost: value = 1/2 sum_r W[r] (p_com_r(q) - p_des_r)^2 over the 3 CoM axes",
+        ["Calls grid::com_device for [p_com; J_com] (auto-allocating; owns its scratch).",
+         "s_com scratch must hold 3 + 3*NUM_VEL (the com device output)."],
+        ["s_out scalar cost", "s_q joint positions", "s_p_des desired CoM (3)",
+         "s_W per-axis weight (3)", "s_com scratch (3 + 3*NUM_VEL)", "d_robotModel GPU model helpers"],
+        None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void com_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
+                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_com[r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+    # ---- gradient wrt x = [q; qd] (qd block zero) ----
+    self.gen_add_func_doc(
+        "com_cost_gradient: grad_x = [J_com^T W (p_com - p_des) ; 0]",
+        ["J_com = rows of s_com starting at offset 3, layout s_com[3 + 3*vi + r] (3 x NUM_VEL column-major)."],
+        ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_p_des / s_W / d_robotModel as above",
+         "s_com scratch (3 + 3*NUM_VEL)"], None)
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
+                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("i", str(nv))
+    self.gen_add_code_line("T g = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*i + r]; T e = s_com[r] - s_p_des[r]; g += Jri * s_W[r] * e; }")
+    self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (!ACCUMULATE) {", True)
+    self.gen_add_parallel_loop("i", str(nv))
+    self.gen_add_code_line("s_grad[" + str(nq) + " + i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+    # ---- GN hessian J_com^T W J_com over the q-block of x ----
+    self.gen_add_func_doc(
+        "com_cost_hessian: Gauss-Newton hessian = J_com^T diag(W) J_com in the q-block of the x-hessian",
+        ["Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
+        ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_W / d_robotModel as above",
+         "s_com scratch (3 + 3*NUM_VEL)"], None)
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
+                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", str(nx * nx))
+    self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
+    self.gen_add_code_line("T h = static_cast<T>(0);")
+    self.gen_add_code_line("if (row < " + str(nv) + " && col < " + str(nv) + ") {")
+    self.gen_add_code_line("    #pragma unroll")
+    self.gen_add_code_line("    for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*row + r]; T Jrj = s_com[3 + 3*col + r]; h += Jri * s_W[r] * Jrj; }")
+    self.gen_add_code_line("}")
+    self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+# ---------------------------------------------------------------------------
+# Centroidal-momentum-tracking cost (R2 plant hook). The momentum h = A(q) qd
+# has velocity-Jacobian J_h = A (the CMM), so this is the same value/grad/GN-hess
+# pattern with p->h, J->A but the variable is x=[q;qd] and h depends on qd
+# linearly: grad_qd = A^T W r, GN-hess qd-block = A^T W A (the q-dependence of A
+# is dropped, Gauss-Newton style, matching the ee_pos_cost ratified choice).
+# grid::ccrba_device writes [A (6 x NUM_VEL, column-major); h (6)].
+# ---------------------------------------------------------------------------
+
+def gen_momentum_cost(self):
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nx = nq + nv
+    self.gen_add_func_doc(
+        "momentum_cost: value = 1/2 sum_r W[r] (h_r(q,qd) - h_des_r)^2 over the 6 centroidal components",
+        ["Calls grid::ccrba_device for [A; h] (auto-allocating; owns its scratch).",
+         "s_ccrba scratch must hold 6*NUM_VEL + 6 (the ccrba device output)."],
+        ["s_out scalar cost", "s_q / s_qd joint position/velocity", "s_h_des desired momentum (6)",
+         "s_W per-component weight (6)", "s_ccrba scratch (6*NUM_VEL + 6)", "d_robotModel GPU model helpers"],
+        None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void momentum_cost(T *s_out, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
+                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+    # gradient wrt x = [q; qd]; the q-block is dropped (GN on A), qd-block = A^T W r
+    self.gen_add_func_doc(
+        "momentum_cost_gradient: grad_x = [0 ; A^T W (h - h_des)] (q-block dropped, GN on A)",
+        ["A = s_ccrba[r + 6*vi] (6 x NUM_VEL column-major); h = s_ccrba[6*NUM_VEL + r]."],
+        ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_qd / s_h_des / s_W / d_robotModel as above",
+         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
+                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("if (!ACCUMULATE) {", True)
+    self.gen_add_parallel_loop("i", str(nq))
+    self.gen_add_code_line("s_grad[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_parallel_loop("i", str(nv))
+    self.gen_add_code_line("T g = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*i]; T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; g += Ari * s_W[r] * e; }")
+    self.gen_add_code_line("if (ACCUMULATE) { s_grad[" + str(nq) + " + i] += g; } else { s_grad[" + str(nq) + " + i] = g; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+    # GN hessian A^T W A in the qd-block of the NX x NX hessian
+    self.gen_add_func_doc(
+        "momentum_cost_hessian: Gauss-Newton hessian = A^T diag(W) A in the qd-block of the x-hessian",
+        ["Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
+        ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_qd / s_W / d_robotModel as above",
+         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
+                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", str(nx * nx))
+    self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
+    self.gen_add_code_line("T h = static_cast<T>(0);")
+    self.gen_add_code_line("if (row >= " + str(nq) + " && col >= " + str(nq) + ") {")
+    self.gen_add_code_line("    int vi = row - " + str(nq) + "; int vj = col - " + str(nq) + ";")
+    self.gen_add_code_line("    #pragma unroll")
+    self.gen_add_code_line("    for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*vi]; T Arj = s_ccrba[r + 6*vj]; h += Ari * s_W[r] * Arj; }")
+    self.gen_add_code_line("}")
+    self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+# ---------------------------------------------------------------------------
 # Log-barriers (joint position / velocity / torque). Explicit bound pointers.
 # ---------------------------------------------------------------------------
 
@@ -725,6 +895,16 @@ def gen_grid_plant(self, algorithms):
         self.gen_ee_pos_cost()
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'ee_pose' and 'ee_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
+
+    # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
+    # kinematics-domain device fns (grid::com_device / grid::ccrba_device),
+    # which are emitted when `ee_pose` is present and the robot is non-mimic.
+    centroidal_ok = ("ee_pose" in algorithms) and not self.robot_has_mimic_joints()
+    if centroidal_ok:
+        gen_com_cost(self)
+        gen_momentum_cost(self)
+    else:
+        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'ee_pose', non-mimic).")
 
     # Binding layer (G1): emit the per-timestep kernels that wrap the device
     # functions above, so the grid_rbd Python/C-ABI surface can launch them.
