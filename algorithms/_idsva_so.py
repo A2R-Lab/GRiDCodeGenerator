@@ -956,6 +956,18 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
     self.gen_add_end_control_flow()  # close parallel loop over (jid, ancestor) pairs
     self.gen_add_sync()
 
+# ============================================================================
+# SO-AUDIT FLAG (2026-05-31): KEPT NON-PRODUCTION FALLBACK — do NOT delete without
+# the dedicated SO audit (docs/open-tasks/so_audit_plan.md, HANDOFF G4).
+# `gen_idsva_so_body_frame_floating_reference_inner` (+ its gravity-shim family) is
+# the body-frame floating-base second-order path. It is NOT emitted in production:
+# the dispatcher routes ALL floating-base SO to world_frame (see `frame_suffix` /
+# `gen_idsva_so_device`), so the floating branch of the body-frame inner (~L1363) is
+# unreachable. It is also NOT a live test oracle. It is ~entirely single-threaded
+# (one big `if(threadIdx==0)` block) — the largest serial surface in this file, but
+# zero production impact. Deliberately retained as a fallback/reference ("world-frame
+# co-exists with" it, see module note below). The SO audit decides keep-vs-retire.
+# ============================================================================
 def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False):
     """
     Emits a floating-base diagnostic IDSVA-SO path with explicit body/velocity
