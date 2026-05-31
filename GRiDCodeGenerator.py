@@ -1771,18 +1771,26 @@ class GRiDCodeGenerator:
         if self.robot_has_mimic_joints():
             # T3-finisher: id_du + fd_du mimic gradients have landed (dense
             # serial reduced-space fold, fixed-base). They are removed from the
-            # refusal set. Floating-base mimic gradients are NOT yet supported,
-            # so refuse them regardless of algorithm (the dense inner asserts
-            # fixed-base). ee_pose_gradient/hessian + idsva_so/fdsva_so + the
-            # integrator gradients remain refused (P4 pending).
+            # refusal set. B2-ee: ee_pose_gradient + ee_pose_hessian mimic folds
+            # have landed for FIXED-BASE (alpha-weighted geometric-Jacobian column
+            # / world-frame generator accumulate; see _eepose_gradient_hessian.py
+            # Step 3b / Step 2). They are removed from the fixed-base refusal set.
+            # Floating-base mimic gradients are NOT yet supported, so refuse them
+            # regardless of algorithm (the dense id/fd inner asserts fixed-base;
+            # the floating-root 6-DoF subspace fold for ee is a separate follow-on).
+            # idsva_so/fdsva_so + the integrator gradients remain refused (P4 pending).
             _MIMIC_GRADIENT_ALGORITHMS = {
-                "ee_pose_gradient", "ee_pose_hessian",
                 "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
             if self.robot.floating_base:
-                _MIMIC_GRADIENT_ALGORITHMS |= {"id_du", "fd_du"}
+                # Floating-base mimic gradients (including ee pose grad/hessian,
+                # whose floating root needs a 6-DoF subspace fold rather than the
+                # scalar alpha fold) are still refused.
+                _MIMIC_GRADIENT_ALGORITHMS |= {
+                    "id_du", "fd_du", "ee_pose_gradient", "ee_pose_hessian",
+                }
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(
