@@ -1281,16 +1281,18 @@ def gen_inverse_dynamics_gradient(self):
 
 
 def _gen_id_du_mimic_inner(self, nv, NB):
-    """Dense serial mimic ID-gradient (T3-finisher P3, fixed-base).
+    """Dense serial mimic ID-gradient (T3-finisher P3 fixed-base; B1 floating).
 
     Mirrors RBDReference.rnea_grad exactly, in REDUCED v-space:
       forward pass dq/dqd -> per-body dv_du, da_du, df_du (6 x nv x NB),
       backward pass       -> dc_dq, dc_dqd (nv x nv).
     Every joint-velocity read scales by the body's mimic multiplier alpha and
     every dc_du / df_du write accumulates (+=) into the body's reduced v-slot,
-    so a mimic body and its target fold together. Single-DoF bodies only
-    (fixed base); the multi-DoF floating root mimic-gradient is a separate
-    follow-on and is refused upstream.
+    so a mimic body and its target fold together. Non-root bodies are single
+    -DoF (the floating root is the only multi-DoF joint and is never mimic);
+    the floating-base root (jid 0) carries a 6-DoF motion subspace S = I_6
+    over v-slots 0..5, so its own-DoF contributions LOOP over the 6 root DoFs
+    (mirrors RBDReference.rnea_grad_fpass_dq's `for ii in range(len(idx))`).
 
     Output s_dc_du is 2*nv*nv, column-major nv x nv per half:
       dc_dq  at [0, nv*nv)       element [v_i, c] -> s_dc_du[c*nv + v_i]
@@ -1299,9 +1301,27 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     f @ s_vaf[12*NB+6*ind]. The big dense buffers live in s_temp (routed to
     workspace at the global-temp tier for humanoid-scale NB)."""
     import numpy as _np
-    assert not self.robot.floating_base, \
-        "_gen_id_du_mimic_inner is fixed-base only (floating mimic gradient refused upstream)"
     GRAV_NEG = "gravity"  # s_a base row 5 holds X*gravity already via s_vaf
+    fb = self.robot.floating_base
+
+    # Floating-base root (jid 0) per-DoF motion-subspace metadata. The root's S
+    # is a 6x6 motion subspace (pinocchio free-flyer: the [[0,I3],[I3,0]] block
+    # swap), NOT the identity, so each root DoF ii maps to spatial axis k = the
+    # nonzero of S column ii (with that entry's sign). mxS(S[:,ii], v) reduces to
+    # sign * mx<k>(v) and dv_dqd[:,ii] += S[:,ii] sets entry [k, ii]. Extracted
+    # from the actual S matrix (robust to convention), used by the float-root
+    # forward/backward emit below.
+    root_dof_axes = None
+    if fb:
+        _S0 = _np.asarray(self.robot.get_S_by_id(0), dtype=float).reshape(6, 6)
+        root_dof_axes = []
+        for _ii in range(6):
+            _col = _S0[:, _ii]
+            _nz = _np.nonzero(_np.abs(_col) > 1e-12)[0]
+            assert len(_nz) == 1, \
+                "floating root S column %d is not a single signed axis: %r" % (_ii, _col)
+            _k = int(_nz[0]); _sgn = float(_col[_k])
+            root_dof_axes.append((_k, _sgn))
 
     bw = 6 * nv * NB  # one dense buffer (6 rows x nv cols x NB bodies)
     off_dv_dq  = 0
@@ -1335,21 +1355,34 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     self.gen_add_code_line("T s_Svec[6];")
     for ind in range(NB):
         parent = self.robot.get_parent_id(ind)
-        idx = self._v_slot_cpp(ind)
+        # The floating-base root (jid 0) is the only multi-DoF body: 6 v-slots
+        # (0..5) and S = I_6, so its own-DoF gradient terms LOOP over the 6 root
+        # DoFs instead of using a scalar (idx, s_ind, s_sign). It is never mimic
+        # (alpha == 1). Non-root bodies stay on the proven scalar path.
+        is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
-        s_ind = self.robot.get_S_index_by_id(ind)
-        s_sign = float(self.robot.get_S_sign_by_id(ind))
+        if is_float_root:
+            idx = None; s_ind = None; s_sign = None
+        else:
+            idx = self._v_slot_cpp(ind)
+            s_ind = self.robot.get_S_index_by_id(ind)
+            s_sign = float(self.robot.get_S_sign_by_id(ind))
         v_ind = 6 * ind                 # s_vaf v
         a_ind = 6 * NB + 6 * ind        # s_vaf a
         Xoff = 36 * ind                 # X[ind] col-major in s_XImats
         Ioff = 36 * NB + 36 * ind       # I[ind]
-        self.gen_add_code_line("// --- body " + str(ind) + " (v-slot " + str(idx) +
-                               ", alpha=" + repr(alpha) + ", S_ind=" + str(s_ind) +
-                               ", S_sign=" + repr(s_sign) + ") ---")
+        if is_float_root:
+            self.gen_add_code_line("// --- body 0 (FLOATING ROOT, v-slots 0..5, S=I6) ---")
+        else:
+            self.gen_add_code_line("// --- body " + str(ind) + " (v-slot " + str(idx) +
+                                   ", alpha=" + repr(alpha) + ", S_ind=" + str(s_ind) +
+                                   ", S_sign=" + repr(s_sign) + ") ---")
         self.gen_add_code_line("{", True)  # per-body scope (avoid local redeclare)
         # Build the S 6-vector (s_sign at row s_ind) for fxS-style products.
-        self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
-        self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
+        # (single-DoF bodies only; the float root's 6-DoF S is handled inline.)
+        if not is_float_root:
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
+            self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
 
         # Iv = I[ind] * v[ind]
         self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_iv6[r] = static_cast<T>(0);")
@@ -1393,37 +1426,78 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             # the UNIT-axis column, so fold s_sign into the scale (alpha*s_sign).
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
 
-        # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
-        # adds this for EVERY body including the root (it sits OUTSIDE the
-        # parent!=-1 guard in rnea_grad_fpass_dqd) — the joint's own velocity
-        # subspace contributes to dv/dqd regardless of having a parent.
-        self.gen_add_code_line("// dv_dqd[:,idx] += alpha*S (all bodies incl. root)")
-        self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
-
-        # da_du[:,c,ind] += mxS(S, dv_du[:,c,ind], alpha*qd[idx])   for every column c
-        self.gen_add_code_line("// da_du[:,c] += mxS(S, dv_du[:,c], alpha*qd[idx])")
-        self.gen_add_code_line("T qd_a = static_cast<T>(" + repr(alpha) + ") * s_qd[" + str(idx) + "];")
-        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
-        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
-        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
-        self.gen_add_end_control_flow()
-
-        # da_dq[:,idx,ind] += alpha*mxS(S, X*a_parent or root_gravity)
-        # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
-        self.gen_add_code_line("// da_dq[:,idx] += alpha*mxS(S, X*a_parent); da_dqd[:,idx] += alpha*mxS(S, v[ind])")
-        if parent != -1:
-            self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
-            self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+        if is_float_root:
+            # ===== FLOATING ROOT own-DoF terms (6-DoF motion subspace S) =====
+            # Mirrors rnea_grad_fpass_dq/dqd's `for ii in range(len(idx))` over
+            # the 6 root DoFs. S is the free-flyer 6x6 subspace (NOT identity):
+            # root DoF ii maps to spatial axis k=root_dof_axes[ii][0] with sign
+            # sgn, so mxS(S[:,ii], v) == sgn * mx<k>(v) and dv_dqd[:,ii] += S[:,ii]
+            # sets entry [k, ii]. The root is never mimic (alpha == 1). dv_dq
+            # stays 0 (no parent + own term parent-gated), so the da += mxS(dv_dq)
+            # *qd term is identically 0 for dq.
+            # dv_dqd[:,ii,root] += S[:,ii]  (entry [k, ii] = sign)
+            self.gen_add_code_line("// FLOATING ROOT: dv_dqd[:,ii,root] += S[:,ii]")
+            for ii in range(6):
+                k, sgn = root_dof_axes[ii]
+                self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, ii)) + " + " + str(k) + "] += static_cast<T>(" + repr(sgn) + ");")
+            # da_dqd[:,c,root] += sum_ii sgn_ii * mx<k_ii>(dv_dqd[:,c,root]) * qd[ii]
+            #   (da_dq term is 0 because dv_dq[:,c,root] == 0)
+            self.gen_add_code_line("// FLOATING ROOT: da_dqd[:,c] += sum_ii sgn*mx_k(dv_dqd[:,c]) * qd[ii]")
+            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            for ii in range(6):
+                k, sgn = root_dof_axes[ii]
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(sgn) + ") * s_qd[" + str(ii) + "]);")
+            self.gen_add_end_control_flow()
+            # da_dq[:,ii,root] += mxS(S[:,ii], root_gravity) = sgn*mx<k>(root_grav)
+            #   root_gravity = inv(X)*gravity_vec. inv(X) motion-transform block
+            #   form [[R^T,0],[C,R^T]] => col 5 is [0,0,0, R^T[:,2]] = [0,0,0,
+            #   X[2,0], X[2,1], X[2,2]] (col-major X[2,k]=s_XImats[Xoff+6*k+2]);
+            #   gravity_vec = [0,0,0,0,0,gravity].
+            self.gen_add_code_line("// FLOATING ROOT: da_dq[:,ii] += sgn*mx_k(inv(X)*gravity_vec)")
+            self.gen_add_code_line("s_mtmp[0] = static_cast<T>(0); s_mtmp[1] = static_cast<T>(0); s_mtmp[2] = static_cast<T>(0);")
+            self.gen_add_code_line("s_mtmp[3] = s_XImats[" + str(Xoff + 2) + "] * gravity;")
+            self.gen_add_code_line("s_mtmp[4] = s_XImats[" + str(Xoff + 8) + "] * gravity;")
+            self.gen_add_code_line("s_mtmp[5] = s_XImats[" + str(Xoff + 14) + "] * gravity;")
+            for ii in range(6):
+                k, sgn = root_dof_axes[ii]
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, ii)) + "], s_mtmp, static_cast<T>(" + repr(sgn) + "));")
+            # da_dqd[:,ii,root] += mxS(S[:,ii], v[root]) = sgn*mx<k>(v[root])
+            self.gen_add_code_line("// FLOATING ROOT: da_dqd[:,ii] += sgn*mx_k(v[root])")
+            for ii in range(6):
+                k, sgn = root_dof_axes[ii]
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, ii)) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(sgn) + "));")
         else:
-            # root: the base's accel is PURE gravity (NOT the body's own a, which
-            # also carries S*qdd when use_qdd_input — that would corrupt fd_du).
-            # X*gravity is column 5 of X scaled by `gravity`:
-            #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity   (col 5 = +30).
-            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
-        # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
-        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
+            # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
+            # adds this for EVERY body including the root (it sits OUTSIDE the
+            # parent!=-1 guard in rnea_grad_fpass_dqd) — the joint's own velocity
+            # subspace contributes to dv/dqd regardless of having a parent.
+            self.gen_add_code_line("// dv_dqd[:,idx] += alpha*S (all bodies incl. root)")
+            self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
+
+            # da_du[:,c,ind] += mxS(S, dv_du[:,c,ind], alpha*qd[idx])   for every column c
+            self.gen_add_code_line("// da_du[:,c] += mxS(S, dv_du[:,c], alpha*qd[idx])")
+            self.gen_add_code_line("T qd_a = static_cast<T>(" + repr(alpha) + ") * s_qd[" + str(idx) + "];")
+            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+            self.gen_add_end_control_flow()
+
+            # da_dq[:,idx,ind] += alpha*mxS(S, X*a_parent or root_gravity)
+            # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
+            self.gen_add_code_line("// da_dq[:,idx] += alpha*mxS(S, X*a_parent); da_dqd[:,idx] += alpha*mxS(S, v[ind])")
+            if parent != -1:
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
+                self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+            else:
+                # fixed-base root: the base's accel is PURE gravity (NOT the body's
+                # own a, which also carries S*qdd when use_qdd_input — that would
+                # corrupt fd_du). X*gravity is column 5 of X scaled by `gravity`:
+                #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity (col5=+30).
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+            # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
 
         # df_du[:,:,ind] = I*da_du + fxv(dv_du, Iv) + fxv(v, I*dv_du)
         self.gen_add_code_line("// df_du[:,c] = I*da_du[:,c] + fx(dv_du[:,c])*Iv + fx(v)*I*dv_du[:,c]")
@@ -1458,12 +1532,29 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     self.gen_add_code_line("T s_Svec[6];")
     for ind in range(NB - 1, -1, -1):
         parent = self.robot.get_parent_id(ind)
-        idx = self._v_slot_cpp(ind)
+        is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
-        s_ind = self.robot.get_S_index_by_id(ind)
-        s_sign = float(self.robot.get_S_sign_by_id(ind))
+        if is_float_root:
+            idx = None; s_ind = None; s_sign = None
+        else:
+            idx = self._v_slot_cpp(ind)
+            s_ind = self.robot.get_S_index_by_id(ind)
+            s_sign = float(self.robot.get_S_sign_by_id(ind))
         Xoff = 36 * ind
         f_ind = 12 * NB + 6 * ind
+        if is_float_root:
+            # FLOATING ROOT: dc_du[ii,:] += (S^T df_du)[ii,:]; S^T row ii = S col
+            # ii, a single signed axis k=root_dof_axes[ii], so this reduces to
+            #   dc_du[ii, c] += sgn * df_du[k, c, root]   for ii in 0..5 (alpha=1)
+            self.gen_add_code_line("// --- bpass body 0 (FLOATING ROOT, v-slots 0..5, S^T df_du) ---")
+            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            for ii in range(6):
+                k, sgn = root_dof_axes[ii]
+                self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(ii) + "] += static_cast<T>(" + repr(sgn) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(k) + "];")
+                self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(ii) + "] += static_cast<T>(" + repr(sgn) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(k) + "];")
+            self.gen_add_end_control_flow()
+            # root has no parent -> no df propagation; backward pass done for root.
+            continue
         self.gen_add_code_line("// --- bpass body " + str(ind) + " (v-slot " + str(idx) + ") ---")
         # dc_dq[idx, c]  += alpha * s_sign * df_dq[s_ind, c, ind]
         # dc_dqd[idx, c] += alpha * s_sign * df_dqd[s_ind, c, ind]
