@@ -57,15 +57,8 @@ def gen_forward_dynamics_finish(self):
 
     # compute the final answer qdd = Minv * (u - c)
     # remember that Minv is an SYMMETRIC_UPPER triangular matrix
-    self.gen_add_parallel_loop("row",str(n))
-    self.gen_add_code_line("T val = static_cast<T>(0);")
-    self.gen_add_code_line("for(int col = 0; col < " + str(n) + "; col++) {", True)
-    self.gen_add_code_line("// account for the fact that Minv is an SYMMETRIC_UPPER triangular matrix")
-    self.gen_add_code_line("int index = (row <= col) * (col * " + str(n) + " + row) + (row > col) * (row * " + str(n) + " + col);")
-    self.gen_add_code_line("val += s_Minv[index] * (s_u[col] - s_c[col]);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("s_qdd[row] = val;")
-    self.gen_add_end_control_flow()
+    self.gen_minv_apply(n, "s_qdd[row]", "(s_u[col] - s_c[col])",
+                        loop_var = "row", comment_in_loop = True, negate = False)
     self.gen_add_end_function()
 
 def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,

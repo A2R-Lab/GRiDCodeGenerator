@@ -130,6 +130,54 @@ def gen_add_parallel_loop(self, var_name, max_val, block_level = False):
                     var_name + " < " + max_val + "; " + var_name + " += blockDim.x*blockDim.y){"
     self.gen_add_code_line(code, True)
 
+def gen_minv_apply(self, n, out_name, rhs_expr, loop_var = "row", loop_max = None,
+                   pre_lines = None, comment_in_loop = True, negate = False):
+    """Emit `out = (+/-) Minv @ rhs` over a parallel loop, exploiting that Minv
+    is stored SYMMETRIC_UPPER (only the upper triangle is materialized; the
+    lower triangle is read transposed via the `(row<=col)`/`(row>col)` index).
+
+    Shared core of forward_dynamics_finish (`qdd = Minv*(u-c)`, n*1, not negated)
+    and forward_dynamics_gradient's df/du finish (`df_du = -Minv*dc_du`, n*2n,
+    negated). The reduction over `col`, the symmetric-upper `int index = ...`
+    line, and the `val +=` accumulation are identical; the call differs only in
+    the loop bound, the per-iteration index decode (`pre_lines`), the rhs slice
+    expression, the output target, and the sign — all parameters here.
+
+    Parameters
+    ----------
+    n            : reduced velocity dim (matrix is n x n).
+    out_name     : C++ lvalue (indexed by `loop_var`) receiving the result.
+    rhs_expr     : C++ expression for the rhs column `col` (a function of `col`).
+    loop_var     : parallel-loop induction var (default "row").
+    loop_max     : parallel-loop bound expr (default str(n) => one column).
+    pre_lines    : extra C++ lines emitted at the top of the loop body, before
+                   `T val` (e.g. row/offset decode for the n x 2n case).
+    comment_in_loop : True  -> the SYMMETRIC_UPPER comment sits inside the `col`
+                              loop, just above `int index` (forward_dynamics).
+                      False -> the comment sits in the loop body before `T val`
+                              (forward_dynamics_gradient).
+    negate       : negate the accumulated result on the output write.
+    """
+    if loop_max is None:
+        loop_max = str(n)
+    comment = "// account for the fact that Minv is an SYMMETRIC_UPPER triangular matrix"
+    index_line = "int index = (row <= col) * (col * " + str(n) + " + row) + (row > col) * (row * " + str(n) + " + col);"
+    self.gen_add_parallel_loop(loop_var, loop_max)
+    if pre_lines is not None:
+        for line in pre_lines:
+            self.gen_add_code_line(line)
+    if not comment_in_loop:
+        self.gen_add_code_line(comment)
+    self.gen_add_code_line("T val = static_cast<T>(0);")
+    self.gen_add_code_line("for(int col = 0; col < " + str(n) + "; col++) {", True)
+    if comment_in_loop:
+        self.gen_add_code_line(comment)
+    self.gen_add_code_line(index_line)
+    self.gen_add_code_line("val += s_Minv[index] * " + rhs_expr + ";")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line(out_name + " = " + ("-val;" if negate else "val;"))
+    self.gen_add_end_control_flow()
+
 def gen_static_array_ind_2d(self, col, row, col_stride = 6):
     return col_stride*col + row
 

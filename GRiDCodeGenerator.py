@@ -4,7 +4,7 @@ import numpy as np
 class GRiDCodeGenerator:
     # first import helpers to write code generation, spatial algebra, and opology helpers (parent, child, Sind, XImats) and the robotModel object wrapepr
     from .helpers import gen_add_code_line, gen_add_code_lines, gen_add_end_control_flow, gen_add_end_function, \
-                         gen_add_func_doc, gen_add_serial_ops, gen_add_parallel_loop, gen_add_sync, gen_var_in_list, \
+                         gen_add_func_doc, gen_add_serial_ops, gen_add_parallel_loop, gen_minv_apply, gen_add_sync, gen_var_in_list, \
                          gen_var_not_in_list, gen_add_multi_threaded_select, gen_kernel_load_inputs, gen_kernel_save_result, \
                          gen_anti_licm_input_reload, gen_anti_licm_output_write, \
                          gen_static_array_ind_2d, gen_static_array_ind_3d, gen_add_debug_print_code_lines, \

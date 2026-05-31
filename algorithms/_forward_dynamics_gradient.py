@@ -56,16 +56,11 @@ def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
         self.gen_add_sync()
 
     # and finally finish with df/du = -Minv*dc/du
-    self.gen_add_parallel_loop("ind",str(n*2*n))
-    self.gen_add_code_line("int row = ind % " + str(n) + "; int dc_col_offset = ind - row;")
-    self.gen_add_code_line("// account for the fact that Minv is an SYMMETRIC_UPPER triangular matrix")
-    self.gen_add_code_line("T val = static_cast<T>(0);")
-    self.gen_add_code_line("for(int col = 0; col < " + str(n) + "; col++) {", True)
-    self.gen_add_code_line("int index = (row <= col) * (col * " + str(n) + " + row) + (row > col) * (row * " + str(n) + " + col);")
-    self.gen_add_code_line("val += s_Minv[index] * s_dc_du[dc_col_offset + col];")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line(s_df_du_name + "[ind] = -val;")
-    self.gen_add_end_control_flow()
+    self.gen_minv_apply(
+        n, s_df_du_name + "[ind]", "s_dc_du[dc_col_offset + col]",
+        loop_var = "ind", loop_max = str(n*2*n),
+        pre_lines = ["int row = ind % " + str(n) + "; int dc_col_offset = ind - row;"],
+        comment_in_loop = False, negate = True)
 
 def gen_forward_dynamics_gradient_device_function_call(self,
                                                            use_qdd_Minv_input = False,
