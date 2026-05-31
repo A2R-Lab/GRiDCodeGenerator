@@ -2263,8 +2263,19 @@ class GRiDCodeGenerator:
                     self._lie_helpers_emitted = True
                 self.gen_frame_jacobian_dot()
             if "osc_inertia" in algorithms:
-                # Lambda arena = s_XmatsHom + extras(s_Jfj[6nv] + s_MJt[nv*6] + s_task[36] + s_taskinv[36]) + inner_temp(16*NJ).
-                osc_t_count = Xhom_size_fj + (6 * nv_fj) + (nv_fj * 6) + 36 + 36 + (16 * NJ_fj)
+                # Lambda is SELF-CONTAINED: it composes Minv on device via
+                # direct_minv_inner, so the arena carries BOTH transform families
+                # (spatial s_XImats for minv + homogeneous s_XmatsHom for J) plus
+                # the minv buffers (s_Minv + the spilled F-region passed as
+                # d_workspace) and the J*Minv*J^T compose scratch.
+                # arena = s_XImats(XI) + extras + s_temp(max(no_F, 16*NJ)) where
+                # extras = s_XmatsHom + s_Minv + s_F + s_Jfj + s_MJt + s_task + s_taskinv.
+                osc_XI_size = self.gen_get_XI_size(False, False)
+                osc_noF = self.gen_direct_minv_inner_no_F_size()
+                osc_F = self.gen_direct_minv_inner_F_size()
+                osc_temp = max(osc_noF, 16 * NJ_fj)
+                osc_t_count = (osc_XI_size + Xhom_size_fj + (nv_fj * nv_fj) + osc_F
+                               + (6 * nv_fj) + (nv_fj * 6) + 36 + 36 + osc_temp)
                 self.gen_add_code_line(
                     "template <typename T> __host__ __device__ inline size_t OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES() "
                     "{ return grid_shared_arena_bytes<T>(" + str(osc_t_count) +

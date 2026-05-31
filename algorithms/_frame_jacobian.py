@@ -331,52 +331,90 @@ def gen_osc_inertia_device(self):
     Lambda = (J Minv J^T)^{-1}.
 
     Direct CUDA transcription of the RBDReference numpy oracle
-    (`RBDReference.osc_inertia`): compose the (already-emitted) frame Jacobian J
-    with the joint-space inverse mass matrix Minv, then invert the 6x6 task
-    matrix via the block-cooperative GLASS Gauss-Jordan (`invert_matrix`).
+    (`RBDReference.osc_inertia`): compose the frame Jacobian J with the
+    joint-space inverse mass matrix Minv, then invert the 6x6 task matrix via
+    the block-cooperative GLASS Gauss-Jordan (`invert_matrix`).
 
-    Minv is a *caller-provided input* (SYMMETRIC_UPPER, NUM_VEL x NUM_VEL,
-    column-major) so this kernel stays decoupled from direct_minv's smem/
-    workspace tiering: the caller computes it once via grid::direct_minv_device
-    and feeds it in. (Device-side Minv composition is a follow-up; see the
-    docstring note in test_cuda_frame_jacobian.)"""
+    SELF-CONTAINED: Minv is composed ON DEVICE here via `direct_minv_inner`
+    (the kernel takes only q, no caller-provided Minv). The arena carries BOTH
+    transform families — the spatial `s_XImats` (6x6) that direct_minv consumes
+    AND the homogeneous `s_XmatsHom` (4x4) that the Jacobian consumes — loaded
+    by their respective `load_update_*` helpers (both already emitted whenever
+    the frame_jacobian key is selected, since it pulls in {ee_pose, minv}).
+
+    Plumbing:
+      * direct_minv_inner is templated <T, F_IN_SMEM>; we pass F_IN_SMEM=false
+        and hand it a dedicated SHARED `s_F` buffer (6*NV*NV) as its
+        `d_workspace` arg, so the heavy F-region lives in smem WITHOUT having to
+        thread it through the tail of s_temp (avoids the no_F+F contiguity the
+        F_IN_SMEM=true path assumes). s_temp is sized to direct_minv's no_F
+        region (>= the Jacobian inner's 16*NJ world-transform scratch).
+      * direct_minv emits SYMMETRIC_UPPER; we densify to a full symmetric
+        s_Minv before the J*Minv*J^T contraction (floating-base output is
+        already full-symmetric, but the densify read is symmetric-safe either
+        way: read the upper-triangle source for every (r,c))."""
     nv = self.robot.get_num_vel()
+    Xhom_size, _, _ = self.gen_get_Xhom_size()             # local homogeneous 4x4 transforms
+    no_F_size = self.gen_direct_minv_inner_no_F_size()
+    F_size = self.gen_direct_minv_inner_F_size()
+    # s_temp serves BOTH the minv inner (no_F region) and the Jacobian inner
+    # (16*NJ world-transform scratch); they run sequentially so size by the max.
+    temp_size = max(no_F_size, _frame_jacobian_inner_temp_mem_size(self))
+
     func_def = ("void osc_inertia_device(T *s_Lambda, const int target_jid, "
-                "const int reference_frame, const T *s_q, const T *s_Minv, "
+                "const int reference_frame, const T *s_q, "
                 "const robotModel<T> *d_robotModel) {")
     func_params = ["s_Lambda holds the 6 x 6 operational-space inertia (column-major)",
                    "target_jid is the joint id of the frame",
                    "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
                    "s_q is the joint position vector",
-                   "s_Minv is the NUM_VEL x NUM_VEL inverse mass matrix (fully populated symmetric, column-major) from direct_minv_device (densify the SYMMETRIC_UPPER output first)",
                    "d_robotModel is the GPU model helpers"]
-    func_notes = ["Lambda = (J Minv J^T)^{-1}; Minv is supplied by the caller (e.g. grid::direct_minv_device)."]
+    func_notes = ["Lambda = (J Minv J^T)^{-1}; self-contained — Minv is composed on device via direct_minv_inner (no caller Minv)."]
     self.gen_add_func_doc("Compute the operational-space (task) inertia",
                           func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    # Arena: world-transform machinery + J (6 x nv) + MJt (nv x 6) + task (6x6)
-    # + taskinv (6x6, the invert_matrix Ainv workspace). s_Lambda is a param.
-    extra = [("s_Jfj", 6 * nv), ("s_MJt", nv * 6), ("s_task", 36), ("s_taskinv", 36)]
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(
-        _frame_jacobian_inner_temp_mem_size(self), extra_t_buffers=extra,
+    # Arena: BOTH transform families + Minv + the direct_minv F-region (passed
+    # as d_workspace) + the Jacobian J + the J*Minv*J^T compose scratch.
+    # s_Lambda is a param. s_XImats / s_temp / topology / linalg are emitted by
+    # gen_XImats_helpers_temp_shared_memory_code; the rest are extra_t_buffers.
+    extra = [("s_XmatsHom", Xhom_size), ("s_Minv", nv * nv), ("s_F", F_size),
+             ("s_Jfj", 6 * nv), ("s_MJt", nv * 6), ("s_task", 36), ("s_taskinv", 36)]
+    self.gen_XImats_helpers_temp_shared_memory_code(
+        temp_size, extra_t_buffers=extra,
         include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
 
+    # ---- Step 1: spatial transforms -> direct_minv_inner -> SYMMETRIC_UPPER Minv ----
+    self.gen_load_update_XImats_helpers_function_call()
+    self.gen_add_sync()
+    # F_IN_SMEM=false + s_F (shared) as d_workspace: keeps F in smem without the
+    # no_F+F s_temp contiguity the smem-tail path requires.
+    self.gen_direct_minv_inner_function_call(
+        updated_var_names=dict(d_workspace_name="s_F"), f_in_smem_expr="false")
+    self.gen_add_sync()
+
+    # ---- Step 2: homogeneous transforms -> frame_jacobian_inner -> J ----
+    # (The SYMMETRIC_UPPER -> full densify is folded into the J*Minv*J^T
+    # contraction below: the MJt loop reads the upper-triangle Minv entry.)
     self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_add_sync()
     self.gen_add_code_line("frame_jacobian_inner<T>(s_Jfj, target_jid, reference_frame, s_q, s_XmatsHom, d_robotModel, s_temp);")
     self.gen_add_sync()
 
     # MJt = Minv @ J^T  (nv x 6, column-major: MJt[k + nv*c]). J is 6 x nv
     # column-major so J^T(m,c) == J[c + 6*m], giving
     #   (Minv J^T)[k,c] = sum_m Minv(k,m) * J[c + 6*m].
-    # s_Minv is a fully-populated symmetric matrix (caller densified the
-    # SYMMETRIC_UPPER direct_minv output), so read Minv[k + nv*m] directly.
+    # direct_minv emits SYMMETRIC_UPPER, so read the upper-triangle entry
+    # Minv[min(k,m), max(k,m)] to get the full symmetric Minv(k,m).
     self.gen_add_parallel_loop("ind", str(nv * 6))
     self.gen_add_code_line("int k = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
     self.gen_add_code_line("T acc = static_cast<T>(0);")
-    self.gen_add_code_line("for (int m = 0; m < " + str(nv) + "; ++m) acc += s_Minv[k + " + str(nv) + "*m] * s_Jfj[c + 6*m];")
+    self.gen_add_code_line("for (int m = 0; m < " + str(nv) + "; ++m) {", True)
+    self.gen_add_code_line("int r0 = (k < m) ? k : m; int c0 = (k < m) ? m : k;")
+    self.gen_add_code_line("acc += s_Minv[r0 + " + str(nv) + "*c0] * s_Jfj[c + 6*m];")
+    self.gen_add_end_control_flow()
     self.gen_add_code_line("s_MJt[ind] = acc;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
