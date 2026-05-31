@@ -22,6 +22,10 @@ class GRiDCodeGenerator:
     from .algorithms import gen_inverse_dynamics_inner_temp_mem_size, gen_inverse_dynamics_inner_function_call, \
                             gen_inverse_dynamics_device_temp_mem_size, gen_inverse_dynamics_inner, gen_inverse_dynamics_device, \
                             gen_inverse_dynamics_kernel, gen_inverse_dynamics_host, gen_inverse_dynamics, \
+                            gen_inverse_dynamics_regressor_inner_temp_mem_size, gen_inverse_dynamics_regressor_inner_function_call, \
+                            gen_inverse_dynamics_regressor_inner, gen_inverse_dynamics_regressor_device_temp_mem_size, \
+                            gen_inverse_dynamics_regressor_device, gen_inverse_dynamics_regressor_kernel, \
+                            gen_inverse_dynamics_regressor_host, gen_inverse_dynamics_regressor, \
                             gen_direct_minv_inner_temp_mem_size, gen_direct_minv_inner_F_size, gen_direct_minv_inner_no_F_size, gen_direct_minv_inner_function_call, gen_direct_minv_inner, \
                             gen_direct_minv_device, gen_direct_minv_kernel, gen_direct_minv_host, gen_direct_minv, \
                             gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_inner_F_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
@@ -105,7 +109,7 @@ class GRiDCodeGenerator:
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
-            "f_ext_grad",
+            "f_ext_grad", "regressor",
         }
         profile_algorithms = {
             "all": all_algorithms,
@@ -113,6 +117,7 @@ class GRiDCodeGenerator:
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"id", "minv", "fd"},
             "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du", "f_ext_grad"},
+            "regressor": {"id", "regressor"},
             "f-ext-gradient": {"id", "minv", "f_ext_grad"},
             "kinematics": {"ee_pose"},
             "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
@@ -135,6 +140,8 @@ class GRiDCodeGenerator:
             "f-ext-grad": "f_ext_grad",
             "fext-grad": "f_ext_grad",
             "f-ext-gradient-only": "f_ext_grad",
+            "joint-torque-regressor": "regressor",
+            "inverse-dynamics-regressor": "regressor",
             "idsva-so": "idsva_so_body_frame",
             "fdsva-so": "fdsva_so",
             "ee-pose": "ee_pose",
@@ -284,6 +291,12 @@ class GRiDCodeGenerator:
             return (perf, lite, last)
 
         id_t_count = 2*n + n + 18*n + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
+        # joint-torque regressor (E1): kernel smem = XI + s_q_qd_qdd(NUM_POS+2nv)
+        # + s_Y (nv x 10*NUM_BODIES) + s_vaf(18*NUM_POS) + RNEA forward scratch.
+        # n == get_num_pos() here. Additive.
+        regressor_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() + 18*n \
+            + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size
+        self.regressor_t_count = regressor_t_count
         # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
         # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
         _n_pos = self.robot.get_num_pos()
@@ -872,6 +885,7 @@ class GRiDCodeGenerator:
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1382,6 +1396,14 @@ class GRiDCodeGenerator:
              "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
              "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        # E1 joint-torque regressor: Y is nv x 10*NUM_BODIES, can exceed the 48 KB
+        # default dynamic-smem cap on big robots (g1: ~55 KB), so it MUST opt in.
+        ("regressor", "regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("inverse_dynamics_regressor_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("inverse_dynamics_regressor_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_body_frame_kernel<T>",
@@ -1971,6 +1993,10 @@ class GRiDCodeGenerator:
         # then generate the dynamics algorithms
         if "id" in algorithms:
             self.gen_inverse_dynamics()
+        # E1: joint-torque regressor Y (tau = Y . pi). Additive; reuses the RNEA
+        # forward sweep emitted by gen_inverse_dynamics (requires "id").
+        if "regressor" in algorithms:
+            self.gen_inverse_dynamics_regressor()
         if "minv" in algorithms:
             self.gen_direct_minv()
         if "fd" in algorithms:

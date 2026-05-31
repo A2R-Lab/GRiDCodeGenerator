@@ -56,6 +56,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("fd_du",                "FD_DU (∂FD/∂q,v)",                  "Gradients"),
     AlgoEntry("f_ext_gradient",       "F_EXT_GRAD (∂tau/∂fext=-Jᵀ, ∂q̈/∂fext=M⁻¹Jᵀ)",
               "Gradients"),
+    AlgoEntry("regressor",            "REGRESSOR (Joint-torque Y; tau=Y·π, ∂tau/∂π)",
+              "Gradients", legacy_labels=("inverse_dynamics_regressor", "joint torque regressor")),
 
     # Integrators
     AlgoEntry("integrator",           "Integrator (x_{k+1})",              "Integrators"),
