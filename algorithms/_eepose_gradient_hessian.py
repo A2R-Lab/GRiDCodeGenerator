@@ -2649,6 +2649,114 @@ def gen_ee_pose_inner_warp(self, fixed_target_name = ""):
 
     self.gen_add_end_function()
 
+def gen_ee_pose_fk_batched_kernel(self):
+    # Large-batch FK kernel: ONE BLOCK PER SAMPLE (b = blockIdx.x), mirroring
+    # the HJCD-IK launch <<<B, threads>>>. Each block walks its sample's whole
+    # chain via the ee_pose_inner_{thread,warp} device inner and writes a
+    # 7-element pose (position + quaternion). USE_WARP selects the warp- vs
+    # thread-cooperative inner; both produce identical poses.
+    #   d_q layout:    q[b*stride_q + j]      (batch-major, stride_q == NUM_POS)
+    #   d_pose7 layout: pose7[b*7 + 0..2] = translation, [3..6] = quaternion (w,x,y,z)
+    n = self.robot.get_num_pos()
+    NJ = self.robot.get_num_joints()
+    Xhom_size, _, _ = self.gen_get_Xhom_size()
+    temp_size = self.gen_load_update_XImats_helpers_temp_mem_size()
+    default_ee = self.robot.get_leaf_nodes()[0]
+    self.gen_add_func_doc(
+        "Batched forward kinematics: one block per sample, pos+quat output.",
+        ["USE_WARP picks the warp-cooperative inner (warp 0) vs the thread inner (thread 0).",
+         "target_idx selects the output frame (defaults to the leaf EE joint id)."],
+        ["d_pose7 is the (B x 7) output: [tx,ty,tz, qw,qx,qy,qz] per sample",
+         "d_q is the (B x NUM_POS) joint-position input (batch-major, stride stride_q)",
+         "stride_q is the stride between samples in d_q (== NUM_POS)",
+         "d_robotModel holds the per-robot constants (XImats, topology helpers)",
+         "B is the batch size (== gridDim.x)",
+         "target_idx is the joint frame whose world pose is written"],
+        None)
+    self.gen_add_code_line("template <typename T, bool USE_WARP = false>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void ee_pose_fk_batched_kernel(T *d_pose7, const T *d_q, const int stride_q, "
+                           "const robotModel<T> *d_robotModel, const int B, const int target_idx = " + str(default_ee) + ") {", True)
+    # static shared per-block scratch (sizes are compile-time constants)
+    self.gen_add_code_line("__shared__ T s_q[" + str(n) + "];")
+    self.gen_add_code_line("__shared__ T s_XmatsHom[" + str(Xhom_size) + "];")
+    self.gen_add_code_line("__shared__ T s_jointXforms[" + str(16*NJ) + "];")
+    self.gen_add_code_line("__shared__ T s_temp[" + str(max(temp_size,1)) + "];")
+    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
+        self.gen_add_code_line("__shared__ int s_topology_helpers[" + str(self.gen_topology_helpers_size()) + "];")
+    self.gen_add_code_line("for (int b = blockIdx.x; b < B; b += gridDim.x) {", True)
+    # cooperative load of this sample's q
+    self.gen_add_code_line("for (int j = threadIdx.x; j < " + str(n) + "; j += blockDim.x) { s_q[j] = d_q[b*stride_q + j]; }")
+    self.gen_add_sync()
+    # fill s_XmatsHom (constant + q-dependent cells) via the canonical path
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_add_sync()
+    # walk the chain with the requested cooperative inner
+    self.gen_add_code_line("if (USE_WARP) {", True)
+    self.gen_add_code_line("if ((threadIdx.x >> 5) == 0) { ee_pose_inner_warp<T>(s_jointXforms, s_XmatsHom, s_q, target_idx); }")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("if (threadIdx.x == 0) { ee_pose_inner_thread<T>(s_jointXforms, s_XmatsHom, s_q, target_idx); }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # extract pos + quaternion from the target's 4x4 (column-major homogeneous)
+    self.gen_add_code_line("if (threadIdx.x == 0) {", True)
+    self.gen_add_code_line("const T* X = &s_jointXforms[16*target_idx];")
+    self.gen_add_code_line("// rotation block (column-major): R[r][c] = X[4*c + r]")
+    self.gen_add_code_line("const T r00=X[0], r10=X[1], r20=X[2];")
+    self.gen_add_code_line("const T r01=X[4], r11=X[5], r21=X[6];")
+    self.gen_add_code_line("const T r02=X[8], r12=X[9], r22=X[10];")
+    self.gen_add_code_line("T* o = &d_pose7[b*7];")
+    self.gen_add_code_line("o[0]=X[12]; o[1]=X[13]; o[2]=X[14];")
+    self.gen_add_code_line("// quaternion (w,x,y,z) from rotation (Shepperd's method)")
+    self.gen_add_code_line("const T tr = r00 + r11 + r22;")
+    self.gen_add_code_line("T qw,qx,qy,qz;")
+    self.gen_add_code_line("if (tr > (T)0) {", True)
+    self.gen_add_code_line("T S = sqrt(tr + (T)1) * (T)2; qw = (T)0.25*S; qx=(r21-r12)/S; qy=(r02-r20)/S; qz=(r10-r01)/S;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else if (r00 > r11 && r00 > r22) {", True)
+    self.gen_add_code_line("T S = sqrt((T)1 + r00 - r11 - r22) * (T)2; qw=(r21-r12)/S; qx=(T)0.25*S; qy=(r01+r10)/S; qz=(r02+r20)/S;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else if (r11 > r22) {", True)
+    self.gen_add_code_line("T S = sqrt((T)1 + r11 - r00 - r22) * (T)2; qw=(r02-r20)/S; qx=(r01+r10)/S; qy=(T)0.25*S; qz=(r12+r21)/S;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("T S = sqrt((T)1 + r22 - r00 - r11) * (T)2; qw=(r10-r01)/S; qx=(r02+r20)/S; qy=(r12+r21)/S; qz=(T)0.25*S;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("o[3]=qw; o[4]=qx; o[5]=qy; o[6]=qz;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+def gen_ee_pose_fk_batched_host(self):
+    # Host launcher for the batched FK kernel. Mirrors the existing batched
+    # end_effector_pose host convention (device buffers + streams) but takes
+    # the (B x NUM_POS) input -> (B x 7) pos+quat output directly.
+    n = self.robot.get_num_pos()
+    default_ee = self.robot.get_leaf_nodes()[0]
+    self.gen_add_func_doc(
+        "Host launcher for batched FK (<<<B, threads>>>, one block per sample).",
+        ["USE_WARP selects the warp- vs thread-cooperative per-sample inner."],
+        ["d_pose7 is the device (B x 7) output buffer",
+         "d_q is the device (B x NUM_POS) input buffer (batch-major)",
+         "B is the batch size",
+         "d_robotModel holds the per-robot constants",
+         "threads is the per-block thread count (>=32 for the warp variant)",
+         "target_idx selects the output frame (defaults to the leaf EE)",
+         "stream is the CUDA stream"],
+        None)
+    self.gen_add_code_line("template <typename T, bool USE_WARP = false>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void ee_pose_fk_batched(T *d_pose7, const T *d_q, const int B, "
+                           "const robotModel<T> *d_robotModel, const int threads = 32, "
+                           "const int target_idx = " + str(default_ee) + ", cudaStream_t stream = (cudaStream_t)0) {", True)
+    self.gen_add_code_line("const int stride_q = " + str(n) + ";")
+    self.gen_add_code_line("ee_pose_fk_batched_kernel<T, USE_WARP><<<B, threads, 0, stream>>>("
+                           "d_pose7, d_q, stride_q, d_robotModel, B, target_idx);")
+    self.gen_add_end_function()
+    self.gen_add_code_line("#define GRID_HAS_FK_BATCHED 1")
+
 def gen_eepose_and_derivatives(self, fixed_target_name = "",
                                include_pose = True, include_gradient = True, include_hessian = True):
     ee_target_names = [""]
@@ -2699,3 +2807,9 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
     if include_pose or include_gradient or include_hessian:
         self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
         self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
+        # batched large-batch FK convenience path (one block/warp per sample).
+        # Skip for floating-base / mimic robots: the standalone inner does not
+        # support those (it routes through end_effector_pose instead).
+        if not self.robot.floating_base and not self.robot_has_mimic_joints():
+            self.gen_ee_pose_fk_batched_kernel()
+            self.gen_ee_pose_fk_batched_host()

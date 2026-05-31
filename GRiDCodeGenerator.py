@@ -43,6 +43,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_output_count, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
                             gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, gen_ee_pose_inner_thread, gen_ee_pose_inner_warp, \
                             gen_ee_pose_inner_xform_from_q_lines, gen_ee_pose_inner_parent_lookup, \
+                            gen_ee_pose_fk_batched_kernel, gen_ee_pose_fk_batched_host, \
                             gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, gen_aba_inner_cold_mem_size, \
