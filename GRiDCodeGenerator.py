@@ -66,7 +66,8 @@ class GRiDCodeGenerator:
                             gen_integrator_gradient_device, gen_integrator_gradient_device_function_call, \
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient, \
                             gen_plant_step, gen_plant_step_gradient, gen_quadratic_state_cost, gen_quadratic_input_cost, \
-                            gen_ee_pos_cost, gen_plant_barriers, gen_grid_plant
+                            gen_ee_pos_cost, gen_plant_barriers, gen_grid_plant, \
+                            gen_plant_step_kernel, gen_quadratic_cost_kernel, gen_ee_pos_cost_kernel, gen_plant_kernels
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
