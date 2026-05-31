@@ -309,15 +309,15 @@ class GRiDCodeGenerator:
         _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                 self.gen_direct_minv_inner_temp_mem_size())
         f_ext_grad_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
-        # A.3 (-dJ^T/dq) FD kernel (fixed base only): arena = XI + s_q + the FD
-        # scratch (s_qpert | 2x J^T buffers | J^T-inner temp | XImats reload).
-        if not self.robot.floating_base:
-            _feg_dq_extra = (_n_pos + 2*nv*6*_NB
-                             + self.gen_f_ext_gradient_inner_temp_mem_size()
-                             + self.gen_load_update_XImats_helpers_temp_mem_size())
-            f_ext_grad_dq_t_count = _n_pos + _feg_dq_extra + XI_size
-        else:
-            f_ext_grad_dq_t_count = 0
+        # A.3 (-dJ^T/dq) FD kernel (both base modes): arena = XI + s_q + the FD
+        # scratch (s_qpert | [floating: s_dv(nv)] | 2x J^T buffers | J^T-inner temp
+        # | XImats reload). Floating base adds an nv-sized velocity-perturbation
+        # buffer for the SE(3) Lie-group root retract (grid_integrate_floating_q).
+        _feg_dq_dv = nv if self.robot.floating_base else 0
+        _feg_dq_extra = (_n_pos + _feg_dq_dv + 2*nv*6*_NB
+                         + self.gen_f_ext_gradient_inner_temp_mem_size()
+                         + self.gen_load_update_XImats_helpers_temp_mem_size())
+        f_ext_grad_dq_t_count = _n_pos + _feg_dq_extra + XI_size
         # Minv Phase 3a: per-tier spill picks. Level 0 = F in smem (6*NV*NV
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_direct_minv_inner_F_size()
@@ -922,8 +922,8 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",] + ([
-                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] if not self.robot.floating_base else []) + [
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] + [
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1211,8 +1211,8 @@ class GRiDCodeGenerator:
                                  # f_ext gradient column (section A): dtau/dfext = -J^T,
                                  # dqdd/dfext = M^-1 J^T; each nv x (6*NB), body-major.
                                  "    T *d_dtau_dfext;",
-                                 "    T *d_dqdd_dfext;"]
-                                 + ([ "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (fixed base)" ] if not self.robot.floating_base else [])
+                                 "    T *d_dqdd_dfext;",
+                                 "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)"]
                                  + [
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
@@ -1237,8 +1237,8 @@ class GRiDCodeGenerator:
                                  "    T *h_dc_du;", \
                                  "    T *h_df_du;", \
                                  "    T *h_dtau_dfext;",
-                                 "    T *h_dqdd_dfext;"]
-                                 + ([ "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (fixed base)" ] if not self.robot.floating_base else [])
+                                 "    T *h_dqdd_dfext;",
+                                 "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (both base modes)"]
                                  + [
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
@@ -1289,10 +1289,10 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dtau_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
-                      "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));"]
-                      + ([ "    // f_ext A.3: -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (fixed base only)",
-                           "    gpuErrchk(cudaMalloc((void**)&hd_data->d_did_du_dfext, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
-                           "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));" ] if not self.robot.floating_base else [])
+                      "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
+                      "    // f_ext A.3: -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_did_du_dfext, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
+                      "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));"]
                       + [
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
@@ -1369,7 +1369,9 @@ class GRiDCodeGenerator:
     # need 52-57 KB shared mem. The call is a no-op when BYTES is already
     # under the device default.
     # Default False so the f_ext A.3 (-dJ^T/dq) kernel is registered ONLY when
-    # gen_f_ext_gradient actually emitted it (fixed base). Unset -> not emitted.
+    # gen_f_ext_gradient actually emitted it. gen_f_ext_gradient now emits it for
+    # BOTH base modes (fixed: scalar FD; floating: SE(3) Lie-group root retract),
+    # so the instance attr is set True whenever f_ext_grad is generated.
     _f_ext_grad_dq_emitted = False
 
     KERNEL_ATTR_MANIFEST = [
@@ -1652,8 +1654,8 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_c)); gpuErrchk(cudaFree(hd_data->d_Minv)); gpuErrchk(cudaFree(hd_data->d_qdd)); gpuErrchk(cudaFree(hd_data->d_M));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));",
-                                 "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);"]
-                                 + ([ "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);" ] if not self.robot.floating_base else [])
+                                 "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);",
+                                 "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);"]
                                  + [
                                  "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
