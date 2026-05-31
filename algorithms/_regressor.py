@@ -598,7 +598,13 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
         "gravity is the gravity constant",
         "num_timesteps is the length of the trajectory points",
     ]
-    func_def_start = "void fd_parameter_gradient_kernel(T *d_dqdd_dpi, const T *d_q_qd_u, const int stride_q_qd_u, "
+    # g1-spill: the kernel takes d_workspace as its 2nd argument. At a spilled tier
+    # (FD_PARAMETER_GRADIENT_Y_IN_SMEM<TIER>()==false) the s_Y regressor scratch
+    # lives in the L2-pinned d_workspace SO section instead of smem; at TIER_SHARED
+    # (default) it stays in smem and d_workspace is unused. Default TIER keeps the
+    # arena byte-identical, but the extra arg changes the signature -- the host
+    # wrapper passes hd_data->d_workspace.
+    func_def_start = "void fd_parameter_gradient_kernel(T *d_dqdd_dpi, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -608,18 +614,39 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
+    # g1-spill: s_Y is the LAST t_buffer; its arena slot is sized out_size at
+    # TIER_SHARED and 0 at spilled tiers (the real s_Y is then routed to
+    # d_workspace below). Sizing the slot via a per-tier constexpr keeps a single
+    # arena declaration (all pointers stay in this scope) while shrinking the
+    # smem footprint exactly to match FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
+    self.gen_add_code_line("constexpr bool FPG_Y_IN_SMEM = FD_PARAMETER_GRADIENT_Y_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int FPG_Y_SLOT = FPG_Y_IN_SMEM ? " + str(out_size) + " : 0;")
     extra_t_buffers = [
         ("s_q_qd_u", in_size), ("s_dqdd_dpi", out_size), ("s_Minv", nv * nv),
-        ("s_Y", out_size), ("s_qdd", nv), ("s_vaf", 18 * NUM_POS), ("s_c", nv),
+        ("s_qdd", nv), ("s_vaf", 18 * NUM_POS), ("s_c", nv), ("s_Y", "FPG_Y_SLOT"),
     ]
     shared_mem_size = self.gen_fd_parameter_gradient_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_code_line("if constexpr (FPG_Y_IN_SMEM) { (void)d_workspace; }")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) +
                            "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + nv) + "];")
+
+    def _repoint_spilled_Y(in_timestep_loop):
+        # When spilled, repoint s_Y at the L2-pinned d_workspace SO section
+        # (per-timestep slot; reused safely -- fd_param never runs concurrently with
+        # the SO kernels). Emitted where `k` is in scope for the batched path.
+        self.gen_add_code_line("if constexpr (!FPG_Y_IN_SMEM) {", True)
+        if in_timestep_loop:
+            self.gen_add_code_line("s_Y = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("s_Y = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_end_control_flow()
+
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_u", str(in_size), stride="stride_q_qd_u")
+        _repoint_spilled_Y(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_fd_parameter_gradient_inner_function_call()
@@ -628,6 +655,7 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q_qd_u", str(in_size))
+        _repoint_spilled_Y(in_timestep_loop=False)
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call()
@@ -666,7 +694,9 @@ def gen_fd_parameter_gradient_host(self, mode=0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fd_parameter_gradient requires all-data or dynamics gridData\");")
-    func_call_start = "fd_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_dqdd_dpi,hd_data->d_q_qd_u,stride_q_qd_u,"
+    # g1-spill: pass hd_data->d_workspace as the kernel's 2nd arg. At the spilled
+    # default tier (s_Y in d_workspace) it is read; at TIER_SHARED it is unused.
+    func_call_start = "fd_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -679,6 +709,10 @@ def gen_fd_parameter_gradient_host(self, mode=0):
             "gpuErrchkKernel();",
         ])
     self.gen_add_code_line("// then call the kernel")
+    # g1-spill: L2-pin d_workspace when the default tier spills s_Y into it.
+    ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!FD_PARAMETER_GRADIENT_Y_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
     func_call_code = [func_call_start + func_call_end]
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")

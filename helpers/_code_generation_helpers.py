@@ -602,11 +602,27 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
     if extra_byte_regions is None:
         extra_byte_regions = []
     topology_count = self.gen_topology_helpers_size() if include_topology_helpers else 0
-    fixed_t_region_count = sum(int(count) for _, count in t_buffers)
+    # A t_buffer count may be a C++ constexpr expression string (e.g. a per-tier
+    # slot size like "FPG_Y_SLOT") rather than a Python int; such slots are
+    # tier-routed and excluded from the (debug-only) Python fixed-size accounting.
+    def _int_or_zero(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+    fixed_t_region_count = sum(_int_or_zero(count) for _, count in t_buffers)
     if ximat_size:
         fixed_t_region_count += int(ximat_size)
     temp_size_int = int(temp_mem_size) if temp_mem_size is not None else 0
     t_region_count = fixed_t_region_count + temp_size_int
+    # If any t_buffer count is a C++ constexpr-string (tier-routed slot like a
+    # per-tier spilled buffer), the Python int sum above undercounts it. Build a
+    # C++ sum expression so the (debug-only) layout assert stays exact at every
+    # tier. has_expr_count => the t_region_count int is incomplete; use the expr.
+    has_expr_count = any(not isinstance(count, int) for _, count in t_buffers)
+    t_region_count_expr = " + ".join(["0"] + [str(count) for _, count in t_buffers]
+                                     + ([str(int(ximat_size))] if ximat_size else [])
+                                     + ([str(temp_size_int)] if temp_size_int else []))
     extra_byte_expr = " + ".join(str(count) for _, count in extra_byte_regions) if extra_byte_regions else "0"
     self.gen_add_code_line("// GRID shared arena layout")
     for name, count in t_buffers:
@@ -674,6 +690,9 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("else {", True)
         self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(fixed_t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
         self.gen_add_end_control_flow()
+    elif has_expr_count:
+        # Tier-routed slot present: the C++ slot-size expression is exact per tier.
+        self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(static_cast<size_t>(" + t_region_count_expr + "), " + str(topology_count) + ", " + extra_byte_expr + "));")
     else:
         self.gen_add_code_line("assert(s_arena_offset == grid_shared_arena_bytes<T>(" + str(t_region_count) + ", " + str(topology_count) + ", " + extra_byte_expr + "));")
     self.gen_add_code_line("#endif")
