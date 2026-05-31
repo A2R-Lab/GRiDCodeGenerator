@@ -36,6 +36,10 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_gradient_inner_python, gen_forward_dynamics_gradient_kernel, \
                             gen_forward_dynamics_gradient_device, gen_forward_dynamics_gradient_device_function_call, \
                             gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, \
+                            gen_f_ext_gradient_inner_temp_mem_size, gen_f_ext_gradient_inner_function_call, \
+                            gen_f_ext_gradient_jacobianT_inner, gen_f_ext_gradient_output_size, gen_f_ext_gradient_device, \
+                            gen_f_ext_gradient_dq_device, \
+                            gen_f_ext_gradient_kernel, gen_f_ext_gradient_host, gen_f_ext_gradient, \
                             gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
@@ -96,13 +100,15 @@ class GRiDCodeGenerator:
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
+            "f_ext_grad",
         }
         profile_algorithms = {
             "all": all_algorithms,
             "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"id", "minv", "fd"},
-            "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du"},
+            "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du", "f_ext_grad"},
+            "f-ext-gradient": {"id", "minv", "f_ext_grad"},
             "kinematics": {"ee_pose"},
             "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
             "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame", "fdsva_so"},
@@ -121,6 +127,9 @@ class GRiDCodeGenerator:
             "id-gradient": "id_du",
             "forward-dynamics-gradient": "fd_du",
             "fd-gradient": "fd_du",
+            "f-ext-grad": "f_ext_grad",
+            "fext-grad": "f_ext_grad",
+            "f-ext-gradient-only": "f_ext_grad",
             "idsva-so": "idsva_so_body_frame",
             "fdsva-so": "fdsva_so",
             "ee-pose": "ee_pose",
@@ -163,6 +172,10 @@ class GRiDCodeGenerator:
             algorithms.update({"id", "minv", "fd", "id_du"})
         if "id_du" in algorithms:
             algorithms.add("id")
+        # f_ext gradient: dtau/dfext reuses the RNEA spatial-transform load (id),
+        # dqdd/dfext reuses direct_minv's inner (minv).
+        if "f_ext_grad" in algorithms:
+            algorithms.update({"id", "minv"})
         if "aba" in algorithms and self.robot.floating_base:
             algorithms.update({"id", "minv", "fd"})
         if "fdsva_so" in algorithms:
@@ -266,6 +279,14 @@ class GRiDCodeGenerator:
             return (perf, lite, last)
 
         id_t_count = 2*n + n + 18*n + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
+        # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
+        # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
+        _n_pos = self.robot.get_num_pos()
+        _NB = self.robot.get_num_bodies()
+        _feg_out = nv * 6 * _NB
+        _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
+                                self.gen_direct_minv_inner_temp_mem_size())
+        f_ext_grad_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
         # Minv Phase 3a: per-tier spill picks. Level 0 = F in smem (6*NV*NV
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_direct_minv_inner_F_size()
@@ -819,6 +840,7 @@ class GRiDCodeGenerator:
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1098,6 +1120,10 @@ class GRiDCodeGenerator:
                                  "    T *d_M;", \
                                  "    T *d_dc_du;", \
                                  "    T *d_df_du;", \
+                                 # f_ext gradient column (section A): dtau/dfext = -J^T,
+                                 # dqdd/dfext = M^-1 J^T; each nv x (6*NB), body-major.
+                                 "    T *d_dtau_dfext;", \
+                                 "    T *d_dqdd_dfext;", \
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
                                  "    T *d_d2eePos;", \
@@ -1116,6 +1142,8 @@ class GRiDCodeGenerator:
                                  "    T *h_M;", \
                                  "    T *h_dc_du;", \
                                  "    T *h_df_du;", \
+                                 "    T *h_dtau_dfext;", \
+                                 "    T *h_dqdd_dfext;", \
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
                                  "    T *h_d2eePos;", \
@@ -1157,6 +1185,11 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_M, NUM_JOINTS*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dc_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, NUM_JOINTS*2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    // f_ext gradient column (section A): dtau/dfext, dqdd/dfext are each nv x (6*NB)", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dtau_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));", \
@@ -1289,6 +1322,12 @@ class GRiDCodeGenerator:
              "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("f_ext_gradient", "f_ext_grad", None, "F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("f_ext_gradient_kernel<T>",
+             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("f_ext_gradient_kernel_single_timing<T>",
+             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_body_frame_kernel<T>",
@@ -1438,6 +1477,8 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_f_ext)); free(hd_data->h_f_ext);", \
                                  "gpuErrchk(cudaFree(hd_data->d_c)); gpuErrchk(cudaFree(hd_data->d_Minv)); gpuErrchk(cudaFree(hd_data->d_qdd)); gpuErrchk(cudaFree(hd_data->d_M));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
+                                 "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));", \
+                                 "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);", \
                                  "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
                                  "gpuErrchk(grid_end_l2_persisting(0));", \
@@ -1605,6 +1646,7 @@ class GRiDCodeGenerator:
                 "id_du", "fd_du", "ee_pose_gradient", "ee_pose_hessian",
                 "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
+                "f_ext_grad",
             }
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
@@ -1810,6 +1852,8 @@ class GRiDCodeGenerator:
             self.gen_inverse_dynamics_gradient()
         if "fd_du" in algorithms:
             self.gen_forward_dynamics_gradient()
+        if "f_ext_grad" in algorithms:
+            self.gen_f_ext_gradient()
         if "aba" in algorithms:
             self.gen_aba()
         if "crba" in algorithms:
