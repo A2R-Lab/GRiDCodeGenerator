@@ -1,3 +1,37 @@
+def _emit_fb_bfs_level_indexing(self, inds, n, dq_flag_line = None):
+    """Emit the shared floating-base per-BFS-level index decode used by the
+    dv/du, da/du and df/du sweeps, and return the (jid_cpp, parent_jid_cpp)
+    C++ handles the caller substitutes downstream.
+
+    Every floating-base sweep opens its level loop the same way: a
+    `parallel_loop` over `6*2*n*len(inds)` threads, the `row`/`col` decode
+    `int row = ind % 6; int col = (ind / 6) % n;`, and — when a level holds more
+    than one joint — an `ind_du` fold plus two `multi_threaded_select`s picking
+    this thread's `jid` and `parent_jid` from the level's joint list. Pulling
+    this into one helper keeps the three sweeps byte-identical (the emitted CUDA
+    is unchanged) while removing the copy-paste.
+
+    The `dq_flag` line's position varies between sweeps: the dv/du and da/du
+    sweeps emit it right after the loop opens (pass `dq_flag_line`), while the
+    df/du sweep defers it past extra setup (pass None and emit it at the call
+    site). Per-sweep extras (e.g. dv/du's `dof_id`) likewise stay at the caller.
+    """
+    self.gen_add_parallel_loop("ind", str(6*2*n*len(inds)))
+    if dq_flag_line is not None:
+        self.gen_add_code_line(dq_flag_line)
+    self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
+    if len(inds) > 1:
+        self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
+        breakpoints = [str((idx+1)*n*6) for idx, jid in enumerate(inds)]
+        self.gen_add_multi_threaded_select(
+            "(ind_du)", "<", breakpoints,
+            [("int", "jid", [str(jid) for jid in inds])])
+        self.gen_add_multi_threaded_select(
+            "(ind_du)", "<", breakpoints,
+            [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])])
+        return "jid", "parent_jid"
+    return inds[0], self.robot.get_parent_id(inds[0])
+
 def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
         if self.robot_has_mimic_joints():
             # The mimic path emits a DENSE serial fold (6 dense per-body buffers
@@ -368,20 +402,8 @@ def gen_inverse_dynamics_gradient_inner(self):
             self.gen_add_code_line("// dv/du = Xmat*dv_parent/du + {Mx(Xv) or S for col ind}")
             self.gen_add_code_line("// first compute dv/du = Xmat*dv_parent/du")
             if self.robot.floating_base:
-                self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
-                self.gen_add_code_line(f"bool dq_flag = ind < {6*n*len(inds)};")
-                self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
-                if len(inds) > 1: 
-                    self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
-                    select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                    jid = "jid"
-                    self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-                    select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
-                    parent_ind_cpp = "parent_jid"
-                    self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-                else:
-                    jid = inds[0]
-                    parent_ind_cpp = self.robot.get_parent_id(jid)
+                jid, parent_ind_cpp = self._emit_fb_bfs_level_indexing(
+                    inds, n, dq_flag_line = f"bool dq_flag = ind < {6*n*len(inds)};")
                 self.gen_add_code_line(f"int dof_id = {jid}+5; (void)dof_id;")
                 self.gen_add_code_line(f"int du_offset = dq_flag ? {Offset_dv_dq} + {6*n}*{jid} : {Offset_dv_dqd} + {6*n}*{jid};")
                 self.gen_add_code_line(f"int parent_du_offset = dq_flag ? {Offset_dv_dq} + {6*n}*{parent_ind_cpp} : {Offset_dv_dqd} + {6*n}*{parent_ind_cpp};")
@@ -557,20 +579,8 @@ def gen_inverse_dynamics_gradient_inner(self):
         # there are 2*(bfs_level + 1) columns per du with 2*bfs mults with X and then the addition in the last col
         self.gen_add_code_line("// da/du += Xmat*da_parent/du")    
         if self.robot.floating_base: 
-            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
-            self.gen_add_code_line(f"bool dq_flag = ind < {6*n*len(inds)};")
-            self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
-            if len(inds) > 1: 
-                self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
-                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                jid = "jid"
-                self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-                select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
-                parent_ind_cpp = "parent_jid"
-                self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-            else:
-                jid = inds[0]
-                parent_ind_cpp = self.robot.get_parent_id(jid)
+            jid, parent_ind_cpp = self._emit_fb_bfs_level_indexing(
+                inds, n, dq_flag_line = f"bool dq_flag = ind < {6*n*len(inds)};")
             self.gen_add_code_line(f"int du_offset = dq_flag ? {Offset_da_dq} + {6*n}*{jid} : {Offset_da_dqd} + {6*n}*{jid};")
             self.gen_add_code_line(f"int parent_du_offset = dq_flag ? {Offset_da_dq} + {6*n}*{parent_ind_cpp} : {Offset_da_dqd} + {6*n}*{parent_ind_cpp};")
             self.gen_add_code_line("s_temp[du_offset + 6*col + row] += dot_prod<T,6,6,1>(&s_XImats[36 * " + str(jid) + " + row]," + \
@@ -782,17 +792,10 @@ def gen_inverse_dynamics_gradient_inner(self):
         if not sparsity_branch_corrector_needed:
             sparsity_branch_corrector = str(0)
         self.gen_add_code_line("// df_lambda/du += X^T * df/du + {Xmx(f), 0}")
-        if self.robot.floating_base: 
-            self.gen_add_parallel_loop("ind",str(6*2*n*len(inds)))
-            self.gen_add_code_line(f"int row = ind % 6; int col = (ind / 6) % {n};")
+        if self.robot.floating_base:
+            # dq_flag is deferred (emitted below after extra setup), so pass None.
+            jid, _ = self._emit_fb_bfs_level_indexing(inds, n)
             if len(inds) > 1:
-                self.gen_add_code_line(f'int ind_du = ind % {6*n*len(inds)};')
-                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                jid = "jid"
-                self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
-                select_var_vals = [("int", "parent_jid", [str(self.robot.get_parent_id(jid)) for jid in inds])]
-                
-                self.gen_add_multi_threaded_select("(ind_du)", "<", [str((idx+1)*n*6) for idx, jid in enumerate(inds)], select_var_vals)
                 parent_jid = f'parent_jid*{6*n}'
         else:
             self.gen_add_parallel_loop("ind",str(6*2*curr_cols_per_du))

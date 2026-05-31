@@ -31,7 +31,7 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_inner_F_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
                             gen_forward_dynamics_inner_function_call, gen_forward_dynamics_inner, gen_forward_dynamics_device, \
                             gen_forward_dynamics_kernel, gen_forward_dynamics_host, gen_forward_dynamics, \
-                            gen_inverse_dynamics_gradient_inner_temp_mem_size, gen_inverse_dynamics_gradient_temp_layout, \
+                            gen_inverse_dynamics_gradient_inner_temp_mem_size, gen_inverse_dynamics_gradient_temp_layout, _emit_fb_bfs_level_indexing, \
                             gen_inverse_dynamics_gradient_kernel_max_temp_mem_size, \
                             gen_inverse_dynamics_gradient_inner_function_call, gen_inverse_dynamics_gradient_inner, \
                             gen_inverse_dynamics_gradient_device, gen_inverse_dynamics_gradient_device_function_call, \
