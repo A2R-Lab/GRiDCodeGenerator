@@ -1388,8 +1388,10 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("// dv_dq[:,idx] += alpha*mxS(S, X*v_parent); dv_dqd[:,idx] += alpha*S")
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
             self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*parent) + " + p]; }")
-            # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+            # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]. mxS(S,.) carries the
+            # joint sign (S = s_sign*e_{s_ind}); mx<ind>_peq_scaled only applies
+            # the UNIT-axis column, so fold s_sign into the scale (alpha*s_sign).
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
 
         # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
         # adds this for EVERY body including the root (it sits OUTSIDE the
@@ -1412,16 +1414,16 @@ def _gen_id_du_mimic_inner(self, nv, NB):
         if parent != -1:
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
             self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
         else:
             # root: the base's accel is PURE gravity (NOT the body's own a, which
             # also carries S*qdd when use_qdd_input — that would corrupt fd_du).
             # X*gravity is column 5 of X scaled by `gravity`:
             #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity   (col 5 = +30).
             self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
         # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
-        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha) + "));")
+        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
 
         # df_du[:,:,ind] = I*da_du + fxv(dv_du, Iv) + fxv(v, I*dv_du)
         self.gen_add_code_line("// df_du[:,c] = I*da_du[:,c] + fx(dv_du[:,c])*Iv + fx(v)*I*dv_du[:,c]")
