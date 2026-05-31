@@ -1894,21 +1894,20 @@ class GRiDCodeGenerator:
             # ee_pose_hessian mimic folds have landed for FIXED-BASE (alpha-
             # weighted geometric-Jacobian column / world-frame generator
             # accumulate; see _eepose_gradient_hessian.py Step 3b / Step 2),
-            # removed from the fixed-base refusal set. Floating-base mimic ee
-            # gradients still need a 6-DoF subspace fold and remain refused.
+            # removed from the fixed-base refusal set. B2-ee FLOATING: the
+            # floating root contributes 6 INDEPENDENT velocity slots (vi 0..5),
+            # so it decomposes into 6 singleton single-column geometric-Jacobian /
+            # world-generator fills — never a shared-v-slot mimic group. The mimic
+            # alpha fold (Step 3b grad / Step 2 hess) operates orthogonally on the
+            # 1-DoF mimic joints' shared slots, so floating + mimic compose with no
+            # separate 6-DoF root fold. ee_pose_gradient/ee_pose_hessian are now
+            # supported for FLOATING-base mimic robots too (removed below).
             # idsva_so/fdsva_so + the integrator gradients remain refused (P4 pending).
             _MIMIC_GRADIENT_ALGORITHMS = {
                 "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
-            if self.robot.floating_base:
-                # Floating-base mimic ee pose grad/hessian (whose floating root
-                # needs a 6-DoF subspace fold rather than the scalar alpha fold)
-                # are still refused. id_du/fd_du floating mimic have landed (B1).
-                _MIMIC_GRADIENT_ALGORITHMS |= {
-                    "ee_pose_gradient", "ee_pose_hessian",
-                }
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(
