@@ -1897,11 +1897,18 @@ class GRiDCodeGenerator:
             # removed from the fixed-base refusal set. Floating-base mimic ee
             # gradients still need a 6-DoF subspace fold and remain refused.
             # idsva_so/fdsva_so + the integrator gradients remain refused (P4 pending).
+            # B2-SO (FLAG for main reconcile): fixed-base mimic idsva_so/fdsva_so
+            # un-refused — the body-frame inner now runs the per-body INTERNAL
+            # NUM_BODIES-coordinate sweep into a 4*NB^3 slab and alpha-folds to the
+            # reduced 4*NV^3 public output (see _idsva_so.py gen_idsva_so_body_frame_inner
+            # is_mimic path). Floating-base mimic SO stays refused (its 6-DoF root
+            # subspace needs a per-root-DoF fold, not the scalar v-slot/alpha fold).
             _MIMIC_GRADIENT_ALGORITHMS = {
-                "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
+            if self.robot.floating_base:
+                _MIMIC_GRADIENT_ALGORITHMS |= {"idsva_so_body_frame", "fdsva_so"}
             if self.robot.floating_base:
                 # Floating-base mimic ee pose grad/hessian (whose floating root
                 # needs a 6-DoF subspace fold rather than the scalar alpha fold)

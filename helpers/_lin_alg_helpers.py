@@ -254,7 +254,16 @@ def gen_matmul(self):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void matmul(int index, T *A, T *B, T *dest, int num, bool t) {", True)
-    self.gen_add_code_line("int cur = 36*((index/num)%NUM_JOINTS);")
+    # B2-SO FIX (FLAG for main reconcile): the per-block modulus must wrap by the
+    # number of BODY blocks, not NUM_JOINTS. For mimic robots NUM_BODIES > NUM_JOINTS
+    # (extra mimic-sibling bodies), and this helper is called over 36*NUM_BODIES
+    # elements by the idsva_so IC build (I @ Xup). With the old NUM_JOINTS modulus the
+    # last mimic body wrapped to block 0 and read body 0's inertia -> corrupted IC for
+    # that body -> propagated up the whole composite-inertia chain -> wrong SO output.
+    # NUM_BODIES == NUM_JOINTS for every non-mimic fixed robot, so this is byte-identical
+    # there. matmul is used ONLY by _idsva_so.py (3 call sites; the two Xup sites pass
+    # index/num == 0 so the modulus is a no-op for them), so this change is self-contained.
+    self.gen_add_code_line("int cur = 36*((index/num)%NUM_BODIES);")
     self.gen_add_code_line("T *vec1 = &B[cur + (t*5+1)*(index%6)];")
     self.gen_add_code_line("T *vec2 = &A[6*(index/6)];")
     self.gen_add_code_line("dest[index] = dot_prod<T,6, 6, 1>(vec1, vec2);")
