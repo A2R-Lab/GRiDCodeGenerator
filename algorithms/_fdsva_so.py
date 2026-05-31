@@ -399,26 +399,45 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     # which silently dropped/duplicated args when the helper signature changed).
     fd_start = "forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call()
     fd_end = "s_temp, nullptr, nullptr, gravity);"  # trailing nullptr = no external forces
-    if not single_call_timing:
-        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
-        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n),stride="stride_q_qd_u")
+
+    # B3 dedup (so_audit_plan): the timed (single_call_timing) and untimed kernel
+    # bodies differed ONLY by the per-timestep `k*...PER_TIMESTEP +` offset prefix
+    # on the global/workspace pointers (the untimed body indexes per-timestep k;
+    # the timed body reuses slot 0 across NUM_TIMESTEPS reps). The output-tensor
+    # pointers, the four workspace spill pointers, and the device call were
+    # otherwise verbatim. Factored into _emit_fdsva_so_compute_pointers_and_call,
+    # parameterized by `timing` (drops the k-offset + the d_df2/d_idsva_so k-slice
+    # and uses the bare-`d_workspace` fd_grad_spill form the timed path used).
+    def _emit_fdsva_so_compute_pointers_and_call(timing):
+        # per-timestep slot offset prefix into d_workspace (empty for timing reps)
+        ws_k = "" if timing else "k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + "
         if use_global_tensors:
-            self.gen_add_code_line(f'T *s_df2 = &d_df2[k*{4*n**3}];')
-            self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[k*{4*n**3}];')
+            if timing:
+                self.gen_add_code_line('T *s_df2 = d_df2;')
+                self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')
+            else:
+                self.gen_add_code_line(f'T *s_df2 = &d_df2[k*{4*n**3}];')
+                self.gen_add_code_line(f'T *s_idsva_so = &d_idsva_so[k*{4*n**3}];')
         if use_workspace_temp:
-            self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
+            self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[' + ws_k + 'GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if fd_grad_use_spill:
-            self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
+            # spill band sits at offset 0 of this timestep's slot; timed reps reuse
+            # slot 0 so the index collapses to the bare base pointer.
+            if timing:
+                self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
+            else:
+                self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);')
         if use_workspace_df_du:
             # Phase 3e: s_df_du in L2-pinned workspace, in its own dedicated section
             # past grad + SO (avoids conflict with fd_grad_spill which is at offset 0).
-            self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
+            self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[' + ws_k + 'GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
         if use_workspace_Minv:
             # Phase 3e: s_Minv lives just past s_df_du in the FDSVA_SO spill section.
-            self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
-        self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
-        # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
-        # contraction uses the same region in its later phase. See full inner.
+            self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[' + ws_k + 'GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
+        if not timing:
+            self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
+            # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
+            # contraction uses the same region in its later phase. See full inner.
         self.gen_fdsva_so_device_function_call(
             scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
             fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
@@ -426,6 +445,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
             d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
             s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr")
+
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
+        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n),stride="stride_q_qd_u")
+        _emit_fdsva_so_compute_pointers_and_call(timing=False)
         self.gen_add_sync()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n),stride=f"{4*n**3}")
         self.gen_add_end_control_flow()
@@ -434,24 +458,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n))
-        if use_global_tensors:
-            self.gen_add_code_line('T *s_df2 = d_df2;')
-            self.gen_add_code_line('T *s_idsva_so = d_idsva_so;')
-        if use_workspace_temp:
-            self.gen_add_code_line('T *s_fdsva_temp = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
-        if fd_grad_use_spill:
-            self.gen_add_code_line('T *d_fd_grad_spill = reinterpret_cast<T *>(d_workspace);')
-        if use_workspace_df_du:
-            self.gen_add_code_line('T *s_df_du = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>()]);')
-        if use_workspace_Minv:
-            self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
-        self.gen_fdsva_so_device_function_call(
-            scratch_in_smem_expr = "false" if use_workspace_idsva_temp else "true",
-            fd_grad_use_spill_expr = "true" if fd_grad_use_spill else "false",
-            contract_in_smem_expr = "false" if use_workspace_temp else "true",
-            d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
-            d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
-            s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr")
+        _emit_fdsva_so_compute_pointers_and_call(timing=True)
         self.gen_add_end_control_flow()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n))
 
