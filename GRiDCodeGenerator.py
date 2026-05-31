@@ -38,7 +38,7 @@ class GRiDCodeGenerator:
                             gen_forward_dynamics_gradient_host, gen_forward_dynamics_gradient, \
                             gen_f_ext_gradient_inner_temp_mem_size, gen_f_ext_gradient_inner_function_call, \
                             gen_f_ext_gradient_jacobianT_inner, gen_f_ext_gradient_output_size, gen_f_ext_gradient_device, \
-                            gen_f_ext_gradient_dq_device, \
+                            gen_f_ext_gradient_dq_kernel, gen_f_ext_gradient_dq_host, \
                             gen_f_ext_gradient_kernel, gen_f_ext_gradient_host, gen_f_ext_gradient, \
                             gen_end_effector_pose_inner_temp_mem_size, gen_end_effector_pose_inner_function_call, gen_end_effector_pose_inner, \
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
@@ -296,6 +296,15 @@ class GRiDCodeGenerator:
         _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                 self.gen_direct_minv_inner_temp_mem_size())
         f_ext_grad_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
+        # A.3 (-dJ^T/dq) FD kernel (fixed base only): arena = XI + s_q + the FD
+        # scratch (s_qpert | 2x J^T buffers | J^T-inner temp | XImats reload).
+        if not self.robot.floating_base:
+            _feg_dq_extra = (_n_pos + 2*nv*6*_NB
+                             + self.gen_f_ext_gradient_inner_temp_mem_size()
+                             + self.gen_load_update_XImats_helpers_temp_mem_size())
+            f_ext_grad_dq_t_count = _n_pos + _feg_dq_extra + XI_size
+        else:
+            f_ext_grad_dq_t_count = 0
         # Minv Phase 3a: per-tier spill picks. Level 0 = F in smem (6*NV*NV
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_direct_minv_inner_F_size()
@@ -880,7 +889,8 @@ class GRiDCodeGenerator:
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",] + ([
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] if not self.robot.floating_base else []) + [
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1167,8 +1177,10 @@ class GRiDCodeGenerator:
                                  "    T *d_df_du;", \
                                  # f_ext gradient column (section A): dtau/dfext = -J^T,
                                  # dqdd/dfext = M^-1 J^T; each nv x (6*NB), body-major.
-                                 "    T *d_dtau_dfext;", \
-                                 "    T *d_dqdd_dfext;", \
+                                 "    T *d_dtau_dfext;",
+                                 "    T *d_dqdd_dfext;"]
+                                 + ([ "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (fixed base)" ] if not self.robot.floating_base else [])
+                                 + [
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
                                  "    T *d_d2eePos;", \
@@ -1191,8 +1203,10 @@ class GRiDCodeGenerator:
                                  "    T *h_M;", \
                                  "    T *h_dc_du;", \
                                  "    T *h_df_du;", \
-                                 "    T *h_dtau_dfext;", \
-                                 "    T *h_dqdd_dfext;", \
+                                 "    T *h_dtau_dfext;",
+                                 "    T *h_dqdd_dfext;"]
+                                 + ([ "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (fixed base)" ] if not self.robot.floating_base else [])
+                                 + [
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
                                  "    T *h_d2eePos;", \
@@ -1210,7 +1224,7 @@ class GRiDCodeGenerator:
                                  "};"])
 
     def gen_init_gridData(self):
-        code_lines = ["gridData<T, KIND> *hd_data = (gridData<T, KIND> *)calloc(1, sizeof(gridData<T, KIND>));",
+        code_lines = (["gridData<T, KIND> *hd_data = (gridData<T, KIND> *)calloc(1, sizeof(gridData<T, KIND>));",
                       "const bool needs_dynamics = KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS;",
                       "const bool needs_kinematics = KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS;",
                       "// input variables used by dynamics and/or kinematics",
@@ -1241,8 +1255,12 @@ class GRiDCodeGenerator:
                       "    // f_ext gradient column (section A): dtau/dfext, dqdd/dfext are each nv x (6*NB)", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dtau_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
+                      "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));"]
+                      + ([ "    // f_ext A.3: -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (fixed base only)",
+                           "    gpuErrchk(cudaMalloc((void**)&hd_data->d_did_du_dfext, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
+                           "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));" ] if not self.robot.floating_base else [])
+                      + [
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));", \
@@ -1282,7 +1300,7 @@ class GRiDCodeGenerator:
                       "    hd_data->h_ccrba = (T *)malloc((6*NUM_VEL+6)*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_energy = (T *)malloc(3*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
-                      "return hd_data;"]
+                      "return hd_data;"])
         # generate as templated or not function
         self.gen_add_func_doc("Allocated device and host memory for all computations",
                               [], [], "A pointer to the gridData struct of pointers")
@@ -1317,6 +1335,10 @@ class GRiDCodeGenerator:
     # as bogus ~0 us values. We hit this on g1 floating where ABA / FD / MINV
     # need 52-57 KB shared mem. The call is a no-op when BYTES is already
     # under the device default.
+    # Default False so the f_ext A.3 (-dJ^T/dq) kernel is registered ONLY when
+    # gen_f_ext_gradient actually emitted it (fixed base). Unset -> not emitted.
+    _f_ext_grad_dq_emitted = False
+
     KERNEL_ATTR_MANIFEST = [
         # (algo_label, algo_short, gate_attr, bytes_macro, [(kernel_name<T>, signature), ...])
         ("inverse_dynamics", "id", None, "ID_DYNAMIC_SHARED_MEM_BYTES<T>()", [
@@ -1390,6 +1412,16 @@ class GRiDCodeGenerator:
              "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
              "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        # A.3 (-dJ^T/dq): own kernel + smem macro, fixed-base only. Gated on the
+        # instance attr _f_ext_grad_dq_emitted (set True only when the kernel is
+        # actually emitted) so the floating-base header — which has neither the
+        # kernel nor the F_EXT_GRAD_DQ_* macro — never references them.
+        ("f_ext_gradient_dq", "f_ext_grad_dq", "_f_ext_grad_dq_emitted", "F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("f_ext_gradient_dq_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("f_ext_gradient_dq_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_body_frame_kernel<T>",
@@ -1578,8 +1610,10 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_f_ext)); free(hd_data->h_f_ext);", \
                                  "gpuErrchk(cudaFree(hd_data->d_c)); gpuErrchk(cudaFree(hd_data->d_Minv)); gpuErrchk(cudaFree(hd_data->d_qdd)); gpuErrchk(cudaFree(hd_data->d_M));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
-                                 "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));", \
-                                 "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);", \
+                                 "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));",
+                                 "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);"]
+                                 + ([ "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);" ] if not self.robot.floating_base else [])
+                                 + [
                                  "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
                                  "gpuErrchk(grid_end_l2_persisting(0));", \

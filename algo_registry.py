@@ -56,6 +56,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("fd_du",                "FD_DU (∂FD/∂q,v)",                  "Gradients"),
     AlgoEntry("f_ext_gradient",       "F_EXT_GRAD (∂tau/∂fext=-Jᵀ, ∂q̈/∂fext=M⁻¹Jᵀ)",
               "Gradients"),
+    AlgoEntry("f_ext_gradient_dq",    "F_EXT_GRAD_DQ (∂(id_du)/∂fext=-∂Jᵀ/∂q, fixed base)",
+              "Gradients"),
 
     # Integrators
     AlgoEntry("integrator",           "Integrator (x_{k+1})",              "Integrators"),
