@@ -709,440 +709,6 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     self.gen_add_sync()
     self.gen_add_end_function()
 
-def _emit_eepose_grad_extraction(self, n, num_ees, ee_off, dee_off, ee_compact = False):
-    # Shared eePos extraction: reads the chained ee transform (s_eeTemp at ee_off)
-    # and the gradient transform (s_deeTemp at dee_off) and writes s_deePos. When
-    # ee_compact is True the ee transform is stored once per ee (slot = deeInd/n)
-    # instead of redundantly per (ee, djid) pair (the serial/dense path used the
-    # redundant layout and passes ee_off == dee_off, ee_compact == False).
-    self.gen_add_parallel_loop("ind",str(6*n*num_ees))
-    self.gen_add_code_line("int outputInd = ind % 6; int deeInd = ind / 6;")
-    if ee_compact:
-        # ee transform stored once per ee (slot = deeInd / n); deeTemp still full
-        # (ee*n + djid) layout (out-of-chain slots pre-zeroed -> 0 gradient out).
-        self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[" + str(ee_off) + " + 16*(deeInd / " + str(n) + ")]; T *s_dXmat_hom = &s_deeTemp[" + str(dee_off) + " + 16*deeInd];")
-    else:
-        self.gen_add_code_line("T *s_Xmat_hom = &s_eeTemp[" + str(ee_off) + " + 16*deeInd]; T *s_dXmat_hom = &s_deeTemp[" + str(dee_off) + " + 16*deeInd];")
-    # xyz position is easy (eePos_xyz1 = Xmat_hom * offset) where offset = [x,y,z,1]
-    self.gen_add_code_line("// xyz is easy")
-    self.gen_add_code_line("if (outputInd < 3){s_deePos[6*deeInd + outputInd] = s_dXmat_hom[12 + outputInd];}")
-    # roll pitch yaw is a bit more difficult
-    self.gen_add_code_line("// roll pitch yaw is a bit more difficult")
-    self.gen_add_code_line("// note: d/dz of arctan2(y(z),x(z)) = [-x'(z)y(z)+x(z)y'(z)]/[(x(z)^2 + y(z)^2)]")
-    self.gen_add_code_line("// Also note that d/dz of sqrt(f(z)) = f'(z)/2sqrt(f(z))")
-    self.gen_add_code_line("else {", add_indent_after=True)
-    self.gen_add_code_line("// simpler to recompute")
-    self.gen_add_code_line("T sqrtTerm = sqrt(s_Xmat_hom[10]*s_Xmat_hom[10] + s_Xmat_hom[6]*s_Xmat_hom[6]);")
-    self.gen_add_code_line("T dsqrtTerm = (s_Xmat_hom[10]*s_dXmat_hom[10] + s_Xmat_hom[6]*s_dXmat_hom[6])/sqrtTerm;")
-    select_var_vals = [("T", "y",       ["s_Xmat_hom[6]",  "-s_Xmat_hom[2]",  "s_Xmat_hom[1]"]), \
-                       ("T", "x",       ["s_Xmat_hom[10]",  "sqrtTerm",        "s_Xmat_hom[0]"]), \
-                       ("T", "y_prime", ["s_dXmat_hom[6]", "-s_dXmat_hom[2]", "s_dXmat_hom[1]"]), \
-                       ("T", "x_prime", ["s_dXmat_hom[10]", "dsqrtTerm",       "s_dXmat_hom[0]"])]
-    self.gen_add_multi_threaded_select("outputInd", "==", [str(i) for i in range(3,6)], select_var_vals)
-    self.gen_add_code_line("s_deePos[6*deeInd + outputInd] = (-x_prime*y + x*y_prime)/(x*x + y*y);")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-
-def _emit_eepose_grad_compacted_nonserial(self, n, all_ees, num_ees):
-    # ---- Compacted (in-chain only) gradient chain-up for the non-serial /
-    # floating-base case. Replaces the dense n*num_ees-per-level sweep that
-    # masked out-of-chain pairs. Numerically identical: out-of-chain gradients
-    # are exactly 0, and we keep the deeTemp pairs at the SAME (ee*n + djid)
-    # slot layout (pre-zeroed) so the shared extraction reads them unchanged.
-    #
-    # Layout:
-    #   s_eeTemp  : per-ee FK transform, double-buffered. ee `ei` -> slot
-    #               parity*num_ees + ei  (16 floats / matrix).
-    #   s_deeTemp : per in-chain (ei, djid) gradient transform, double-buffered
-    #               at the full (ei*n + djid) layout. parity offset 16*n*num_ees.
-    #
-    # The chain for ee `ei` is J_e = [ee, parent(ee), ... , root]. At BFS level l
-    # the incoming factor is joint J_e[l]; for the gradient pair (ei, djid) that
-    # factor is dXhom[djid] iff djid affects J_e[l] (exactly one level per pair),
-    # else Xhom[J_e[l]]. Each level is two grid_linalg_indexed_batched_gemm calls
-    # (one A_base = s_dXhom for the dX-substituted pairs, one A_base = s_Xhom for
-    # the rest) plus the per-ee FK multiply.
-    import_q = self.robot.get_joint_index_q
-    # `affects(q, j)` mirrors grid_q_index_affects_joint for BOTH base modes:
-    # q affects joint j iff q is one of j's q-indices (floating root joint 0 owns
-    # the 0..5/6 base coords; a revolute joint owns exactly its single q-index).
-    def _affects_set(joint_id):
-        q = import_q(joint_id)
-        return set(q) if isinstance(q, list) else {q}
-    affects = lambda q_index, joint_id: q_index in _affects_set(joint_id)
-    # Build per-ee chains and the flat in-chain pair list.
-    ee_chains = []          # ee_chains[ei] = [ee, p1, ..., root]
-    max_len = 0
-    for ee in all_ees:
-        chain = [ee]
-        cur = ee
-        while True:
-            par = self.robot.get_parent_id(cur)
-            if par == -1:
-                break
-            chain.append(par)
-            cur = par
-        ee_chains.append(chain)
-        max_len = max(max_len, len(chain))
-    # in-chain q-indices per ee (sorted, matches dense djid ascending order)
-    ee_qinds = []
-    for ei, ee in enumerate(all_ees):
-        qset = set()
-        for j in ee_chains[ei]:
-            q = import_q(j)
-            for qi in (q if isinstance(q, list) else [q]):
-                qset.add(qi)
-        ee_qinds.append(sorted(qset))
-
-    self.gen_add_code_line("// NON-SERIAL: compacted in-chain chain-up (GLASS indexed batched 4x4 GEMM)")
-    # zero s_deeTemp (both buffers) so out-of-chain (ee,djid) slots read as 0 in
-    # extraction -> exactly the dense `inChain * ...` masked result.
-    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees))
-    self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-
-    # ---- Level 0: seed eeTemp (per ee) and deeTemp (per in-chain pair).
-    # eeTemp[ei] = Xhom[ee]; deeTemp[ei,djid] = (djid affects ee ? dXhom[djid] : Xhom[ee]).
-    self.gen_add_code_line("// level 0: seed per-ee FK transform")
-    self.gen_add_parallel_loop("ind", str(16*num_ees))
-    self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
-    select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
-    self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
-    self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-
-    # level-0 deeTemp seed: for each in-chain pair, the leaf factor.
-    seed_pairs = []   # (dst_slot, src_matrix_slot_in_base, base) base in {"X","dX"}
-    for ei, ee in enumerate(all_ees):
-        for djid in ee_qinds[ei]:
-            dst = ei*n + djid
-            if affects(djid, ee):
-                seed_pairs.append((dst, djid, "dX"))
-            else:
-                seed_pairs.append((dst, ee, "X"))
-    self.gen_add_code_line("// level 0: seed per-(ee,djid) gradient transform (in-chain only)")
-    self.gen_add_code_line("static const int grad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
-    self.gen_add_code_line("static const int grad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
-    self.gen_add_code_line("static const int grad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)))
-    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
-    self.gen_add_code_line("const T *s_src = grad_seed_isdx[p] ? &s_dXhom[16*grad_seed_src[p]] : &s_Xhom[16*grad_seed_src[p]];")
-    self.gen_add_code_line("s_deeTemp[16*grad_seed_dst[p] + rc] = s_src[rc];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-
-    # ---- Levels 1..max_len-1: chain up by the parent factor at that level.
-    for level in range(1, max_len):
-        even = level % 2
-        ee_dst_off = 16*num_ees*even
-        ee_src_off = 16*num_ees*(not even)
-        dee_dst_off = 16*n*num_ees*even
-        dee_src_off = 16*n*num_ees*(not even)
-        # eeTemp: for each ee whose chain has a joint at this level: dst = parent * src.
-        ee_a, ee_b, ee_c = [], [], []   # matrix slots
-        for ei in range(num_ees):
-            if level < len(ee_chains[ei]):
-                par = ee_chains[ei][level]
-                ee_a.append(par)                                  # s_Xhom slot
-                ee_b.append((ee_src_off // 16) + ei)              # s_eeTemp src slot
-                ee_c.append((ee_dst_off // 16) + ei)              # s_eeTemp dst slot
-        # deeTemp: split into dX-substituted and X-only pair lists at this level.
-        dee_dx_a, dee_dx_b, dee_dx_c = [], [], []
-        dee_x_a,  dee_x_b,  dee_x_c  = [], [], []
-        # carry-forward copies: ees whose chain already reached the root must keep
-        # ping-ponging so EVERY ee lands in the same final-parity buffer (the dense
-        # path assumed uniform final parity; copying makes us robust regardless).
-        ee_carry_src, ee_carry_dst = [], []   # eeTemp matrix slots
-        dee_carry_src, dee_carry_dst = [], []  # deeTemp matrix slots
-        for ei in range(num_ees):
-            if level >= len(ee_chains[ei]):
-                ee_carry_src.append((ee_src_off // 16) + ei)
-                ee_carry_dst.append((ee_dst_off // 16) + ei)
-                for djid in ee_qinds[ei]:
-                    dee_carry_src.append((dee_src_off // 16) + ei*n + djid)
-                    dee_carry_dst.append((dee_dst_off // 16) + ei*n + djid)
-        for ei in range(num_ees):
-            if level >= len(ee_chains[ei]):
-                continue
-            par = ee_chains[ei][level]
-            for djid in ee_qinds[ei]:
-                src_slot = (dee_src_off // 16) + ei*n + djid
-                dst_slot = (dee_dst_off // 16) + ei*n + djid
-                if affects(djid, par):
-                    dee_dx_a.append(djid)            # s_dXhom slot
-                    dee_dx_b.append(src_slot)
-                    dee_dx_c.append(dst_slot)
-                else:
-                    dee_x_a.append(par)              # s_Xhom slot
-                    dee_x_b.append(src_slot)
-                    dee_x_c.append(dst_slot)
-        self.gen_add_code_line("// level " + str(level) + "/" + str(max_len-1) + ": chain up by parent factor")
-        sfx = "_l" + str(level)
-        # eeTemp FK multiply
-        if ee_a:
-            self.gen_add_code_line("static const int ee_a" + sfx + "[] = {" + ", ".join(map(str, ee_a)) + "};")
-            self.gen_add_code_line("static const int ee_b" + sfx + "[] = {" + ", ".join(map(str, ee_b)) + "};")
-            self.gen_add_code_line("static const int ee_c" + sfx + "[] = {" + ", ".join(map(str, ee_c)) + "};")
-            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(ee_a)) + ", ee_a" + sfx + ", ee_b" + sfx + ", ee_c" + sfx + ", s_Xhom, s_eeTemp, s_eeTemp);")
-        # deeTemp X-only multiply
-        if dee_x_a:
-            self.gen_add_code_line("static const int dee_xa" + sfx + "[] = {" + ", ".join(map(str, dee_x_a)) + "};")
-            self.gen_add_code_line("static const int dee_xb" + sfx + "[] = {" + ", ".join(map(str, dee_x_b)) + "};")
-            self.gen_add_code_line("static const int dee_xc" + sfx + "[] = {" + ", ".join(map(str, dee_x_c)) + "};")
-            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(dee_x_a)) + ", dee_xa" + sfx + ", dee_xb" + sfx + ", dee_xc" + sfx + ", s_Xhom, s_deeTemp, s_deeTemp);")
-        # deeTemp dX-substituted multiply
-        if dee_dx_a:
-            self.gen_add_code_line("static const int dee_da" + sfx + "[] = {" + ", ".join(map(str, dee_dx_a)) + "};")
-            self.gen_add_code_line("static const int dee_db" + sfx + "[] = {" + ", ".join(map(str, dee_dx_b)) + "};")
-            self.gen_add_code_line("static const int dee_dc" + sfx + "[] = {" + ", ".join(map(str, dee_dx_c)) + "};")
-            self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(dee_dx_a)) + ", dee_da" + sfx + ", dee_db" + sfx + ", dee_dc" + sfx + ", s_dXhom, s_deeTemp, s_deeTemp);")
-        # carry forward already-finished ees (copy src->dst parity, unchanged value)
-        if ee_carry_src:
-            self.gen_add_code_line("static const int ee_csrc" + sfx + "[] = {" + ", ".join(map(str, ee_carry_src)) + "};")
-            self.gen_add_code_line("static const int ee_cdst" + sfx + "[] = {" + ", ".join(map(str, ee_carry_dst)) + "};")
-            self.gen_add_parallel_loop("ind", str(16*len(ee_carry_src)))
-            self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
-            self.gen_add_code_line("s_eeTemp[16*ee_cdst" + sfx + "[c] + rc] = s_eeTemp[16*ee_csrc" + sfx + "[c] + rc];")
-            self.gen_add_end_control_flow()
-        if dee_carry_src:
-            self.gen_add_code_line("static const int dee_csrc" + sfx + "[] = {" + ", ".join(map(str, dee_carry_src)) + "};")
-            self.gen_add_code_line("static const int dee_cdst" + sfx + "[] = {" + ", ".join(map(str, dee_carry_dst)) + "};")
-            self.gen_add_parallel_loop("ind", str(16*len(dee_carry_src)))
-            self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
-            self.gen_add_code_line("s_deeTemp[16*dee_cdst" + sfx + "[c] + rc] = s_deeTemp[16*dee_csrc" + sfx + "[c] + rc];")
-            self.gen_add_end_control_flow()
-        if ee_carry_src or dee_carry_src:
-            self.gen_add_sync()
-        # NOTE: grid_linalg_indexed_batched_gemm already issues a trailing
-        # __syncthreads(); the three calls in this level read distinct buffers /
-        # disjoint c_idx slots so they are independent. The carry-forward copies
-        # write the OTHER parity half (distinct slots) so they are independent too.
-    # final parity after the last level
-    final_level = max_len - 1
-    final_even = final_level % 2
-    ee_final_off = 16*num_ees*final_even
-    dee_final_off = 16*n*num_ees*final_even
-    self.gen_add_code_line("//")
-    self.gen_add_code_line("// extract eePos from the compacted transforms (ee transform per-ee)")
-    self.gen_add_code_line("//")
-    # extraction reads eeTemp per-ee (slot deeInd/n) at ee_final_off and deeTemp
-    # at the full (ee*n+djid) layout at dee_final_off.
-    _emit_eepose_grad_extraction(self, n, num_ees, ee_final_off, dee_final_off, ee_compact = True)
-
-def _eepose_chain_metadata(self, all_ees):
-    # Shared topology pre-compute for the compacted non-serial ee chains.
-    # Returns (ee_chains, ee_qinds, max_len, affects) where ee_chains[ei] is the
-    # leaf->root joint list and ee_qinds[ei] the sorted in-chain q-indices.
-    # `affects(q, j)` mirrors grid_q_index_affects_joint for BOTH base modes.
-    def _affects_set(joint_id):
-        q = self.robot.get_joint_index_q(joint_id)
-        return set(q) if isinstance(q, list) else {q}
-    affects = lambda q_index, joint_id: q_index in _affects_set(joint_id)
-    ee_chains, max_len = [], 0
-    for ee in all_ees:
-        chain, cur = [ee], ee
-        while True:
-            par = self.robot.get_parent_id(cur)
-            if par == -1:
-                break
-            chain.append(par); cur = par
-        ee_chains.append(chain); max_len = max(max_len, len(chain))
-    ee_qinds = []
-    for ei, ee in enumerate(all_ees):
-        qset = set()
-        for j in ee_chains[ei]:
-            q = self.robot.get_joint_index_q(j)
-            for qi in (q if isinstance(q, list) else [q]):
-                qset.add(qi)
-        ee_qinds.append(sorted(qset))
-    return ee_chains, ee_qinds, max_len, affects
-
-def _emit_eepose_hess_compacted_nonserial(self, n, all_ees, num_ees):
-    # ---- Compacted (in-chain only) gradient + hessian chain-up for the
-    # non-serial / floating-base case. Replaces the dense n*n*num_ees-per-level
-    # quadratic sweep that masked out-of-chain (i,j,ee) triples. Numerically
-    # identical: out-of-chain entries are exactly 0, and we keep the SAME slot
-    # layouts (pre-zeroed) so the shared extraction reads them unchanged.
-    #
-    # Layouts (matching the dense hessian extraction):
-    #   s_eeTemp   : per-ee FK transform, slot ei                 (dbl-buf 16*num_ees)
-    #   s_deeTemp  : per-(ei,djid) gradient, slot ei*n + djid      (dbl-buf 16*n*num_ees)
-    #   s_d2eeTemp : per-(ei,i,j) hessian, slot ei*n*n + i*n + j   (dbl-buf 16*n*n*num_ees)
-    ee_chains, ee_qinds, max_len, affects = _eepose_chain_metadata(self, all_ees)
-
-    # ============ Phase 1: gradient chain (eeTemp + deeTemp) ============
-    self.gen_add_code_line("// NON-SERIAL: compacted gradient chain (GLASS indexed batched 4x4 GEMM)")
-    self.gen_add_parallel_loop("ind", str(2*16*n*num_ees))
-    self.gen_add_code_line("s_deeTemp[ind] = static_cast<T>(0);")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    # level 0 eeTemp seed
-    self.gen_add_code_line("// level 0: seed per-ee FK transform")
-    self.gen_add_parallel_loop("ind", str(16*num_ees))
-    self.gen_add_code_line("int rc = ind % 16; int ei = ind / 16;")
-    select_var_vals = [("int", "eeInd", [str(jid) for jid in all_ees])]
-    self.gen_add_multi_threaded_select("ind", "<", [str(16*(i+1)) for i in range(num_ees)], select_var_vals)
-    self.gen_add_code_line("s_eeTemp[ind] = s_Xhom[16*eeInd + rc];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    # level 0 deeTemp seed
-    seed_pairs = []
-    for ei, ee in enumerate(all_ees):
-        for djid in ee_qinds[ei]:
-            dst = ei*n + djid
-            seed_pairs.append((dst, djid, "dX") if affects(djid, ee) else (dst, ee, "X"))
-    self.gen_add_code_line("// level 0: seed per-(ee,djid) gradient transform (in-chain only)")
-    self.gen_add_code_line("static const int hgrad_seed_dst[] = {" + ", ".join(str(p[0]) for p in seed_pairs) + "};")
-    self.gen_add_code_line("static const int hgrad_seed_src[] = {" + ", ".join(str(p[1]) for p in seed_pairs) + "};")
-    self.gen_add_code_line("static const int hgrad_seed_isdx[] = {" + ", ".join(("1" if p[2] == "dX" else "0") for p in seed_pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(seed_pairs)))
-    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
-    self.gen_add_code_line("const T *s_src = hgrad_seed_isdx[p] ? &s_dXhom[16*hgrad_seed_src[p]] : &s_Xhom[16*hgrad_seed_src[p]];")
-    self.gen_add_code_line("s_deeTemp[16*hgrad_seed_dst[p] + rc] = s_src[rc];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    # gradient chain-up levels
-    for level in range(1, max_len):
-        even = level % 2
-        ee_dst, ee_src = 16*num_ees*even // 16, 16*num_ees*(not even) // 16
-        dee_dst, dee_src = 16*n*num_ees*even // 16, 16*n*num_ees*(not even) // 16
-        ee_a, ee_b, ee_c = [], [], []
-        dee_dx_a, dee_dx_b, dee_dx_c = [], [], []
-        dee_x_a, dee_x_b, dee_x_c = [], [], []
-        ee_csrc, ee_cdst, dee_csrc, dee_cdst = [], [], [], []
-        for ei in range(num_ees):
-            if level >= len(ee_chains[ei]):
-                ee_csrc.append(ee_src + ei); ee_cdst.append(ee_dst + ei)
-                for djid in ee_qinds[ei]:
-                    dee_csrc.append(dee_src + ei*n + djid); dee_cdst.append(dee_dst + ei*n + djid)
-                continue
-            par = ee_chains[ei][level]
-            ee_a.append(par); ee_b.append(ee_src + ei); ee_c.append(ee_dst + ei)
-            for djid in ee_qinds[ei]:
-                s = dee_src + ei*n + djid; d = dee_dst + ei*n + djid
-                if affects(djid, par):
-                    dee_dx_a.append(djid); dee_dx_b.append(s); dee_dx_c.append(d)
-                else:
-                    dee_x_a.append(par); dee_x_b.append(s); dee_x_c.append(d)
-        self.gen_add_code_line("// gradient level " + str(level) + "/" + str(max_len-1))
-        sfx = "_hg" + str(level)
-        _emit_idx_gemm(self, "ee" + sfx, ee_a, ee_b, ee_c, "s_Xhom", "s_eeTemp", "s_eeTemp")
-        _emit_idx_gemm(self, "dx" + sfx, dee_x_a, dee_x_b, dee_x_c, "s_Xhom", "s_deeTemp", "s_deeTemp")
-        _emit_idx_gemm(self, "dd" + sfx, dee_dx_a, dee_dx_b, dee_dx_c, "s_dXhom", "s_deeTemp", "s_deeTemp")
-        _emit_carry_copy(self, "eec" + sfx, ee_csrc, ee_cdst, "s_eeTemp")
-        _emit_carry_copy(self, "dec" + sfx, dee_csrc, dee_cdst, "s_deeTemp")
-        if ee_csrc or dee_csrc:
-            self.gen_add_sync()
-    final_even = (max_len - 1) % 2
-    ee_final = 16*num_ees*final_even
-    dee_final = 16*n*num_ees*final_even
-
-    # ============ Phase 2: hessian chain (d2eeTemp) ============
-    self.gen_add_code_line("// NON-SERIAL: compacted hessian chain (GLASS indexed batched 4x4 GEMM)")
-    self.gen_add_parallel_loop("ind", str(2*16*n*n*num_ees))
-    self.gen_add_code_line("s_d2eeTemp[ind] = static_cast<T>(0);")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    # in-chain (ei, i, j) triples. The d2Xhom matrix slot must match
-    # grid_d2xhom_offset: floating base stores a dense (q_i,q_j) block (slot
-    # i*n+j); fixed base stores only the diagonal (slot i, and i==j there since a
-    # fixed-base joint is owned by a single q-index so "both affect" => i==j).
-    floating = self.robot.floating_base
-    def d2_factor(i, j, joint):
-        ai, aj = affects(i, joint), affects(j, joint)
-        if ai and aj:
-            return ("d2", (i*n + j) if floating else i)   # s_d2Xhom slot grid_d2xhom_offset
-        if ai:
-            return ("dxi", i)               # s_dXhom slot i
-        if aj:
-            return ("dxj", j)               # s_dXhom slot j
-        return ("x", joint)                 # s_Xhom slot
-    # level 0 seed
-    seed_d2, seed_dxi, seed_dxj, seed_x = [], [], [], []  # (dst, src)
-    for ei, ee in enumerate(all_ees):
-        for i in ee_qinds[ei]:
-            for j in ee_qinds[ei]:
-                dst = ei*n*n + i*n + j
-                kind, src = d2_factor(i, j, ee)
-                if kind == "d2": seed_d2.append((dst, src))
-                elif kind == "dxi": seed_dxi.append((dst, src))
-                elif kind == "dxj": seed_dxj.append((dst, src))
-                else: seed_x.append((dst, src))
-    self.gen_add_code_line("// hessian level 0: seed per-(ee,i,j) transform (in-chain only)")
-    _emit_seed_copy(self, "hs_d2", seed_d2, "s_d2Xhom", "s_d2eeTemp")
-    _emit_seed_copy(self, "hs_di", seed_dxi, "s_dXhom", "s_d2eeTemp")
-    _emit_seed_copy(self, "hs_dj", seed_dxj, "s_dXhom", "s_d2eeTemp")
-    _emit_seed_copy(self, "hs_x", seed_x, "s_Xhom", "s_d2eeTemp")
-    self.gen_add_sync()
-    # hessian chain-up levels
-    for level in range(1, max_len):
-        even = level % 2
-        d2_dst, d2_src = 16*n*n*num_ees*even // 16, 16*n*n*num_ees*(not even) // 16
-        g = {"d2": ([], [], []), "dxi": ([], [], []), "dxj": ([], [], []), "x": ([], [], [])}
-        carry_src, carry_dst = [], []
-        for ei in range(num_ees):
-            if level >= len(ee_chains[ei]):
-                for i in ee_qinds[ei]:
-                    for j in ee_qinds[ei]:
-                        carry_src.append(d2_src + ei*n*n + i*n + j); carry_dst.append(d2_dst + ei*n*n + i*n + j)
-                continue
-            par = ee_chains[ei][level]
-            for i in ee_qinds[ei]:
-                for j in ee_qinds[ei]:
-                    s = d2_src + ei*n*n + i*n + j; d = d2_dst + ei*n*n + i*n + j
-                    kind, src = d2_factor(i, j, par)
-                    g[kind][0].append(src); g[kind][1].append(s); g[kind][2].append(d)
-        self.gen_add_code_line("// hessian level " + str(level) + "/" + str(max_len-1))
-        sfx = "_hh" + str(level)
-        _emit_idx_gemm(self, "d2" + sfx, g["d2"][0], g["d2"][1], g["d2"][2], "s_d2Xhom", "s_d2eeTemp", "s_d2eeTemp")
-        _emit_idx_gemm(self, "di" + sfx, g["dxi"][0], g["dxi"][1], g["dxi"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
-        _emit_idx_gemm(self, "dj" + sfx, g["dxj"][0], g["dxj"][1], g["dxj"][2], "s_dXhom", "s_d2eeTemp", "s_d2eeTemp")
-        _emit_idx_gemm(self, "xx" + sfx, g["x"][0], g["x"][1], g["x"][2], "s_Xhom", "s_d2eeTemp", "s_d2eeTemp")
-        _emit_carry_copy(self, "d2c" + sfx, carry_src, carry_dst, "s_d2eeTemp")
-        if carry_src:
-            self.gen_add_sync()
-    d2_final = 16*n*n*num_ees*final_even
-
-    # ============ Phase 3: extraction (rebase pointers to final parity) ============
-    self.gen_add_code_line("// rebase to the final-parity buffers, then extract")
-    self.gen_add_code_line("s_eeTemp = &s_eeTemp[" + str(ee_final) + "];")
-    self.gen_add_code_line("s_deeTemp = &s_deeTemp[" + str(dee_final) + "];")
-    self.gen_add_code_line("s_d2eeTemp = &s_d2eeTemp[" + str(d2_final) + "];")
-    _emit_eepose_hess_extraction(self, n, num_ees)
-
-def _emit_idx_gemm(self, name, a, b, c, A_base, B_base, C_base):
-    if not a:
-        return
-    self.gen_add_code_line("static const int " + name + "_a[] = {" + ", ".join(map(str, a)) + "};")
-    self.gen_add_code_line("static const int " + name + "_b[] = {" + ", ".join(map(str, b)) + "};")
-    self.gen_add_code_line("static const int " + name + "_c[] = {" + ", ".join(map(str, c)) + "};")
-    self.gen_add_code_line("grid_linalg_indexed_batched_gemm<T, 4>(" + str(len(a)) + ", " + name + "_a, " + name + "_b, " + name + "_c, " + A_base + ", " + B_base + ", " + C_base + ");")
-
-def _emit_seed_copy(self, name, pairs, src_base, dst_base):
-    # pairs: list of (dst_slot, src_slot). Copies 4x4 from src_base[src] to dst_base[dst].
-    if not pairs:
-        return
-    self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(str(p[0]) for p in pairs) + "};")
-    self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(str(p[1]) for p in pairs) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(pairs)))
-    self.gen_add_code_line("int rc = ind % 16; int p = ind / 16;")
-    self.gen_add_code_line(dst_base + "[16*" + name + "_dst[p] + rc] = " + src_base + "[16*" + name + "_src[p] + rc];")
-    self.gen_add_end_control_flow()
-
-def _emit_carry_copy(self, name, src, dst, base):
-    # carry-forward: copy already-finished slots into the other parity half.
-    if not src:
-        return
-    self.gen_add_code_line("static const int " + name + "_src[] = {" + ", ".join(map(str, src)) + "};")
-    self.gen_add_code_line("static const int " + name + "_dst[] = {" + ", ".join(map(str, dst)) + "};")
-    self.gen_add_parallel_loop("ind", str(16*len(src)))
-    self.gen_add_code_line("int rc = ind % 16; int c = ind / 16;")
-    self.gen_add_code_line(base + "[16*" + name + "_dst[c] + rc] = " + base + "[16*" + name + "_src[c] + rc];")
-    self.gen_add_end_control_flow()
-
 def gen_end_effector_pose_gradient_device(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -1639,11 +1205,32 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
     # (ee, vi) slot is written exactly once with alpha == 1.0, so the emitted code
     # below is byte-identical to the legacy "=" assignment (no spurious accumulate
     # or 1.0* factor) — gated by HAS_MIMIC / first-writer tracking.
+    #
+    # PARALLELIZATION: each (ee, vi) s_Sworld slot is a DISJOINT 16-float region
+    # (base = 16*(ee*nv+vi)), zero-filled above with a sync, so the slots are
+    # independent. We group the chain DOFs by (ee_idx, vi) — a MIMIC slot collects
+    # several chain joints (target + mimics) that fold into ONE slot via the
+    # alpha-weighted "=" then "+=" accumulate — and dispatch one-thread-per-slot
+    # via a single block-parallel loop over a flat slot index (`sworld_slot`).
+    # Every writer to a slot lives in the SAME guard (one thread owns the slot and
+    # accumulates its writers serially) so the mimic reduction is never split.
+    # The per-writer emitted arithmetic is byte-identical to the old thread-0
+    # serial path (first writer "=", later mimic writers "+=").
     HAS_MIMIC = self.robot_has_mimic_joints()
-    self.gen_add_serial_ops()
-    seen_slots = set()
+    slot_groups = []     # list of (ee_idx, vi, [dof, ...]) in stable first-seen order
+    slot_index = {}      # (ee_idx, vi) -> position in slot_groups
     for ee_idx in range(num_ees):
         for dof in per_ee_dof_info[ee_idx]:
+            key = (ee_idx, dof["vi"])
+            if key not in slot_index:
+                slot_index[key] = len(slot_groups)
+                slot_groups.append((ee_idx, dof["vi"], []))
+            slot_groups[slot_index[key]][2].append(dof)
+
+    def _emit_sworld_slot(ee_idx, slot_vi, dofs):
+        # Emit every chain-DOF writer that folds into this (ee_idx, slot_vi) slot,
+        # in chain order, with first-writer "=" and later (mimic) writers "+=".
+        for w, dof in enumerate(dofs):
             vi = dof["vi"]
             j = dof["joint_jid"]
             ang = dof["ang"]
@@ -1652,8 +1239,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
             base = 16 * (ee_idx * nv + vi)
             ax = ang if rev else lin
             alpha = self._alpha_for_jid(j) if HAS_MIMIC else 1.0
-            first_writer = (ee_idx, vi) not in seen_slots
-            seen_slots.add((ee_idx, vi))
+            first_writer = (w == 0)
             # First writer to a fresh slot assigns ("="); a later writer (only the
             # mimic case) accumulates ("+="). With alpha == 1.0 and first_writer the
             # emitted text matches the legacy path exactly.
@@ -1740,6 +1326,14 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
                     _set(base + 13, "axw_1")
                     _set(base + 14, "axw_2")
             self.gen_add_end_control_flow()
+
+    # Dispatch all (ee, vi) slots one-thread-per-slot via a single block-parallel loop.
+    n_slots = len(slot_groups)
+    self.gen_add_parallel_loop("sworld_slot", str(n_slots))
+    for k, (ee_idx, slot_vi, dofs) in enumerate(slot_groups):
+        self.gen_add_code_line("if (sworld_slot == " + str(k) + ") {", True)
+        _emit_sworld_slot(ee_idx, slot_vi, dofs)
+        self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
@@ -1856,8 +1450,19 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
     self.gen_add_code_line("//")
     # Emit per-ee per-pair code. For each ee, we have len(chain_dofs)^2 pairs.
     # Each pair fires once with explicit constants (chain_pos, S_col, joint_jid).
+    #
+    # PARALLELIZATION: each output cell (ee, vi, vj) writes a DISJOINT 6-element
+    # region s_d2eePos[ee*6nv2 + c*nv2 + vi*nv + vj] (pre-zeroed in Step 5a, with
+    # a sync, and no read-after-write between cells), so the cells are fully
+    # independent. We collect one deferred-emit closure per cell, then dispatch
+    # them one-thread-per-cell via a single block-parallel loop over a flat cell
+    # index (`d2m_cell`). Each closure emits the SAME per-cell scalar arithmetic
+    # as the old thread-0 serial path -> bit-identical output. For a MIMIC v-slot
+    # pair the whole block-pair SUM (the reduction into that one cell) lives in a
+    # SINGLE closure (one thread owns the cell and sums its block-pairs serially),
+    # so the reduction is never split across threads.
     HAS_MIMIC = self.robot_has_mimic_joints()
-    self.gen_add_serial_ops()
+    cell_emitters = []   # list of (comment_str, emit_callable) — one per output cell
     for ee_idx in range(num_ees):
         ee_jid = anchors[ee_idx]
         chain_dofs = per_ee_dof_info[ee_idx]
@@ -1902,14 +1507,15 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
                         continue  # already emitted for this (vi, vj) slot pair
                     si_base = 16 * (ee_idx * nv + vi)
                     sj_base = 16 * (ee_idx * nv + vj)
-                    self.gen_add_code_line(
+                    cell_emitters.append((
                         "// ee=" + str(ee_idx) + " MIMIC pair (vi=" + str(vi) +
-                        ", vj=" + str(vj) + ")")
-                    self.gen_add_code_line("{", True)
-                    _emit_d2M_mimic_vslot_pair_block(
-                        self, ee_idx, ee_jid, vi, vj, nv, num_ees,
-                        vi_to_blocks[vi], vi_to_blocks[vj], si_base, sj_base)
-                    self.gen_add_end_control_flow()
+                        ", vj=" + str(vj) + ")",
+                        (lambda ee_idx=ee_idx, ee_jid=ee_jid, vi=vi, vj=vj,
+                                bi=vi_to_blocks[vi], bj=vi_to_blocks[vj],
+                                sib=si_base, sjb=sj_base:
+                            _emit_d2M_mimic_vslot_pair_block(
+                                self, ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                bi, bj, sib, sjb))))
                     continue
                 # Determine ordering: a = di['chain_pos'], b = dj['chain_pos']
                 a = di["chain_pos"]; b = dj["chain_pos"]
@@ -1921,17 +1527,10 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
                 # (which writes h_idx = ... + j*nv + i_fd) so the public layout
                 # is identical: index = e*6*nv*nv + c*nv*nv + vi*nv + vj.
                 # Per-pair scoped block — local names don't collide across pairs.
-                self.gen_add_code_line(
-                    "// ee=" + str(ee_idx) + " pair (vi=" + str(vi) + ", vj=" + str(vj) +
-                    ", a=" + str(a) + ", b=" + str(b) + ")")
-                self.gen_add_code_line("{", True)
-                # Read X_ee column 3 (p_ee) and X_ee R block (used in skew/inv)
-                self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
-                self.gen_add_code_line("T pey = s_Xworld[" + str(16*ee_jid + 13) + "];")
-                self.gen_add_code_line("T pez = s_Xworld[" + str(16*ee_jid + 14) + "];")
-                # Read S_i_world and S_j_world skew axis components and column 3
                 si_base = 16 * (ee_idx * nv + vi)
                 sj_base = 16 * (ee_idx * nv + vj)
+                comment = ("// ee=" + str(ee_idx) + " pair (vi=" + str(vi) + ", vj=" + str(vj) +
+                           ", a=" + str(a) + ", b=" + str(b) + ")")
                 # We need the top-left 3x3 product (S_prox @ S_dist)[:3,:3] and
                 # the column-3 expansion (S_prox @ S_dist @ X_ee)[:3, 3].
                 # Compute it for the proximal/distal ordering.
@@ -1940,51 +1539,45 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
                     # prismatic intra-pair doesn't exist except for the diagonal where
                     # B = A_x^2 for revolute, 0 for prismatic). For multi-DOF (floating
                     # base) joints, use the closed form B_world below.
-                    # Diagonal vi == vj case (always present): B_local at v=0 = A_x^2.
-                    # For revolute, A = [[ω_×, 0]; 0] so A^2 = [[ω_×^2, 0]; 0]: this is
-                    # the "centripetal" term.
-                    # We handle this via the intra-pair lookup (which includes c_a == c_b).
+                    # Diagonal vi == vj case (always present); off-diagonal same-joint
+                    # pairs only exist for multi-DOF (floating base) joints.
                     if vi == vj:
-                        # Diagonal: B_local for column c_a alone.
-                        dof = di  # same as dj
-                        c_a = dof["S_col"]
-                        c_b = dof["S_col"]
-                        is_intra_multi = (vi, vj) in intra_pair_lookup
-                        # Even for single-DOF joints we hit this code path on the
-                        # diagonal. Handle revolute / prismatic / floating-base
-                        # uniformly via the on-the-fly B formula.
-                        _emit_d2M_same_joint_block(self, dof, dof,
-                                                   ee_idx, ee_jid, vi, vj, nv, num_ees,
-                                                   chain_jids[a],
-                                                   si_base, sj_base)
+                        sj_block = di  # same as dj on the diagonal
+                    elif (vi, vj) in intra_pair_lookup:
+                        sj_block = dj
                     else:
-                        # Off-diagonal same-joint pair: only exists for multi-DOF
-                        # (floating base) joints.
-                        if (vi, vj) in intra_pair_lookup:
-                            # Look up which is c_a, c_b by S_col
-                            _emit_d2M_same_joint_block(self, di, dj,
-                                                       ee_idx, ee_jid, vi, vj, nv, num_ees,
-                                                       chain_jids[a],
-                                                       si_base, sj_base)
-                        else:
-                            # Shouldn't happen (a == b but DOFs not in same joint)
-                            # Emit a zero-write defensively (rows 0..5 already zero
-                            # from the bulk zero in Step 5a).
-                            pass
+                        # Shouldn't happen (a == b but DOFs not in same joint).
+                        # Out-of-chain cell stays at its Step-5a zero -> emit nothing.
+                        continue
+                    emit = (lambda di=di, dj=sj_block, ee_idx=ee_idx, ee_jid=ee_jid, vi=vi, vj=vj,
+                                   jid=chain_jids[a], sib=si_base, sjb=sj_base:
+                                _emit_d2M_same_joint_block(self, di, dj,
+                                                           ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                                           jid, sib, sjb))
                 else:
-                    # Different chain joints: pick the proximal/distal.
-                    # Proximal = the one with smaller chain_pos.
-                    if a < b:
-                        prox_base = si_base
-                        dist_base = sj_base
-                    else:
-                        prox_base = sj_base
-                        dist_base = si_base
-                    # Read all 4x4 entries of S_prox and S_dist (column-major)
-                    # (Skip the bottom row — known zero)
-                    _emit_d2M_cross_joint_block(self, prox_base, dist_base,
-                                                ee_idx, vi, vj, nv, num_ees, si_base, sj_base)
-                self.gen_add_end_control_flow()
+                    # Different chain joints: proximal = smaller chain_pos.
+                    prox_base = si_base if a < b else sj_base
+                    dist_base = sj_base if a < b else si_base
+                    emit = (lambda pb=prox_base, db=dist_base, ee_idx=ee_idx, vi=vi, vj=vj,
+                                   sib=si_base, sjb=sj_base:
+                                _emit_d2M_cross_joint_block(self, pb, db,
+                                                            ee_idx, vi, vj, nv, num_ees, sib, sjb))
+                def _emit_nonmimic_cell(ee_jid=ee_jid, _emit=emit):
+                    # Read X_ee column 3 (p_ee); helpers consume pex/pey/pez.
+                    self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
+                    self.gen_add_code_line("T pey = s_Xworld[" + str(16*ee_jid + 13) + "];")
+                    self.gen_add_code_line("T pez = s_Xworld[" + str(16*ee_jid + 14) + "];")
+                    _emit()
+                cell_emitters.append((comment, _emit_nonmimic_cell))
+
+    # Dispatch all cells one-thread-per-cell via a single block-parallel loop.
+    n_cells = len(cell_emitters)
+    self.gen_add_parallel_loop("d2m_cell", str(n_cells))
+    for k, (comment, emit) in enumerate(cell_emitters):
+        self.gen_add_code_line(comment)
+        self.gen_add_code_line("if (d2m_cell == " + str(k) + ") {", True)
+        emit()
+        self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
