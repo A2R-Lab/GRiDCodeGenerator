@@ -31,6 +31,10 @@ __all__ = [
     "gen_frame_jacobian_inner",
     "gen_frame_jacobian_device",
     "gen_frame_jacobian",
+    "gen_frame_jacobian_dot_device",
+    "gen_frame_jacobian_dot",
+    "gen_osc_inertia_device",
+    "gen_osc_inertia",
 ]
 
 
@@ -233,3 +237,168 @@ def gen_frame_jacobian_device(self):
 def gen_frame_jacobian(self):
     self.gen_frame_jacobian_inner()
     self.gen_frame_jacobian_device()
+
+
+# Finite-difference step for J-dot (mirrors RBDReference.frame_jacobian_dot,
+# which central-differences the analytic Jacobian along the integrator flow).
+_FRAME_JAC_DOT_FD_STEP = 1e-4
+
+
+def gen_frame_jacobian_dot_device(self):
+    """Emit frame_jacobian_dot_device: the time derivative Jdot of the
+    general-frame geometric Jacobian along v = qd.
+
+    Direct CUDA transcription of the RBDReference numpy oracle
+    (`RBDReference.frame_jacobian_dot`), which central-differences the analytic
+    `frame_jacobian` along the Lie-group integrator flow:
+
+        Jdot = (J(integrate(q,+h*qd)) - J(integrate(q,-h*qd))) / (2h).
+
+    We integrate q on device (vector add for fixed base; SE(3) retract
+    `grid_integrate_floating_q` for floating base), rebuild the world-transform
+    machinery at each perturbed q, reuse `frame_jacobian_inner` to assemble J,
+    then difference. Correctness-first single-block (mirrors frame_jacobian)."""
+    n_pos = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    floating = self.robot.floating_base
+    step = _FRAME_JAC_DOT_FD_STEP
+
+    func_def = ("void frame_jacobian_dot_device(T *s_Jdot, const int target_jid, "
+                "const int reference_frame, const T *s_q, const T *s_qd, "
+                "const robotModel<T> *d_robotModel) {")
+    func_params = ["s_Jdot holds the 6 x NUM_VEL Jacobian time derivative (column-major, [linear; angular])",
+                   "target_jid is the joint id of the frame",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
+                   "s_q is the joint position vector",
+                   "s_qd is the joint velocity vector v (Pinocchio order [v_lin; omega; joints] for floating base)",
+                   "d_robotModel is the GPU model helpers"]
+    func_notes = ["Central finite difference of frame_jacobian along the integrator flow (matches the numpy oracle)."]
+    self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian",
+                          func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+
+    # Arena: world-transform machinery + 3 scratch buffers (perturbed q and the
+    # two perturbed Jacobians). s_Jdot is a caller-provided function param.
+    extra = [("s_qpert", n_pos), ("s_Jp", 6 * nv), ("s_Jm", 6 * nv)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _frame_jacobian_inner_temp_mem_size(self), extra_t_buffers=extra,
+        include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+
+    step_lit = "static_cast<T>({:.17g})".format(step)
+    self.gen_add_code_line("const T fj_h = " + step_lit + ";")
+
+    # Two passes: +h then -h. Build q_pert = integrate(q, sgn*h*qd), rebuild
+    # world transforms, assemble J into s_Jp / s_Jm.
+    for sgn, dest in (("static_cast<T>(1)", "s_Jp"), ("static_cast<T>(-1)", "s_Jm")):
+        self.gen_add_code_line("// perturb (" + ("+h" if dest == "s_Jp" else "-h") + "), rebuild transforms, assemble J -> " + dest)
+        if floating:
+            # Build v_dt = sgn*h*qd into a small per-thread scratch, then SE(3) retract.
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("{")
+            self.gen_add_code_line("T v_dt[" + str(nv) + "];")
+            self.gen_add_code_line("for (int i = 0; i < " + str(nv) + "; ++i) v_dt[i] = (" + sgn + ") * fj_h * s_qd[i];")
+            self.gen_add_code_line("grid_integrate_floating_q<T, " + str(n_pos) + ">(s_q, v_dt, s_qpert);")
+            self.gen_add_code_line("}")
+            self.gen_add_end_control_flow()  # serial
+            self.gen_add_sync()
+        else:
+            self.gen_add_parallel_loop("i", str(n_pos))
+            self.gen_add_code_line("s_qpert[i] = s_q[i] + (" + sgn + ") * fj_h * s_qd[i];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+        self.gen_load_update_XmatsHom_helpers_function_call(
+            updated_var_names=dict(s_q_name="s_qpert"))
+        self.gen_add_code_line("frame_jacobian_inner<T>(" + dest + ", target_jid, reference_frame, "
+                               "s_qpert, s_XmatsHom, d_robotModel, s_temp);")
+        self.gen_add_sync()
+
+    # Jdot = (s_Jp - s_Jm) / (2h).
+    self.gen_add_parallel_loop("ind", str(6 * nv))
+    self.gen_add_code_line("s_Jdot[ind] = (s_Jp[ind] - s_Jm[ind]) / (static_cast<T>(2) * fj_h);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
+def gen_frame_jacobian_dot(self):
+    self.gen_frame_jacobian_dot_device()
+
+
+def gen_osc_inertia_device(self):
+    """Emit osc_inertia_device: the 6x6 operational-space (task) inertia
+    Lambda = (J Minv J^T)^{-1}.
+
+    Direct CUDA transcription of the RBDReference numpy oracle
+    (`RBDReference.osc_inertia`): compose the (already-emitted) frame Jacobian J
+    with the joint-space inverse mass matrix Minv, then invert the 6x6 task
+    matrix via the block-cooperative GLASS Gauss-Jordan (`invert_matrix`).
+
+    Minv is a *caller-provided input* (SYMMETRIC_UPPER, NUM_VEL x NUM_VEL,
+    column-major) so this kernel stays decoupled from direct_minv's smem/
+    workspace tiering: the caller computes it once via grid::direct_minv_device
+    and feeds it in. (Device-side Minv composition is a follow-up; see the
+    docstring note in test_cuda_frame_jacobian.)"""
+    nv = self.robot.get_num_vel()
+    func_def = ("void osc_inertia_device(T *s_Lambda, const int target_jid, "
+                "const int reference_frame, const T *s_q, const T *s_Minv, "
+                "const robotModel<T> *d_robotModel) {")
+    func_params = ["s_Lambda holds the 6 x 6 operational-space inertia (column-major)",
+                   "target_jid is the joint id of the frame",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
+                   "s_q is the joint position vector",
+                   "s_Minv is the NUM_VEL x NUM_VEL inverse mass matrix (fully populated symmetric, column-major) from direct_minv_device (densify the SYMMETRIC_UPPER output first)",
+                   "d_robotModel is the GPU model helpers"]
+    func_notes = ["Lambda = (J Minv J^T)^{-1}; Minv is supplied by the caller (e.g. grid::direct_minv_device)."]
+    self.gen_add_func_doc("Compute the operational-space (task) inertia",
+                          func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+
+    # Arena: world-transform machinery + J (6 x nv) + MJt (nv x 6) + task (6x6)
+    # + taskinv (6x6, the invert_matrix Ainv workspace). s_Lambda is a param.
+    extra = [("s_Jfj", 6 * nv), ("s_MJt", nv * 6), ("s_task", 36), ("s_taskinv", 36)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _frame_jacobian_inner_temp_mem_size(self), extra_t_buffers=extra,
+        include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_add_code_line("frame_jacobian_inner<T>(s_Jfj, target_jid, reference_frame, s_q, s_XmatsHom, d_robotModel, s_temp);")
+    self.gen_add_sync()
+
+    # MJt = Minv @ J^T  (nv x 6, column-major: MJt[k + nv*c]). J is 6 x nv
+    # column-major so J^T(m,c) == J[c + 6*m], giving
+    #   (Minv J^T)[k,c] = sum_m Minv(k,m) * J[c + 6*m].
+    # s_Minv is a fully-populated symmetric matrix (caller densified the
+    # SYMMETRIC_UPPER direct_minv output), so read Minv[k + nv*m] directly.
+    self.gen_add_parallel_loop("ind", str(nv * 6))
+    self.gen_add_code_line("int k = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int m = 0; m < " + str(nv) + "; ++m) acc += s_Minv[k + " + str(nv) + "*m] * s_Jfj[c + 6*m];")
+    self.gen_add_code_line("s_MJt[ind] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # task = J @ MJt  (6 x 6, column-major: task[i + 6*c] = sum_k J[i + 6*k] * MJt[k + nv*c]).
+    self.gen_add_parallel_loop("ind", "36")
+    self.gen_add_code_line("int i = ind % 6; int c = ind / 6;")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int k = 0; k < " + str(nv) + "; ++k) acc += s_Jfj[i + 6*k] * s_MJt[k + " + str(nv) + "*c];")
+    self.gen_add_code_line("s_task[ind] = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # Lambda = task^{-1} (6x6) via block-cooperative GLASS Gauss-Jordan.
+    self.gen_add_code_line("invert_matrix<T>(6, s_task, s_taskinv, s_temp);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", "36")
+    self.gen_add_code_line("s_Lambda[ind] = s_taskinv[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
+def gen_osc_inertia(self):
+    self.gen_osc_inertia_device()

@@ -78,6 +78,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               legacy_labels=("deepos",)),
     AlgoEntry("ee_pose_hessian",      "EE_POSE_HESSIAN (2nd-order EE Jacobian)", "Kinematics"),
     AlgoEntry("frame_jacobian",       "FRAME_JACOBIAN (general-frame J: LOCAL/WORLD/LWA)", "Kinematics"),
+    AlgoEntry("frame_jacobian_dot",   "FRAME_JACOBIAN_DOT (time derivative Jdot of the general-frame J)", "Kinematics"),
+    AlgoEntry("osc_inertia",          "OSC_INERTIA (operational-space inertia Lambda = (J Minv J^T)^-1)", "Kinematics"),
 
     # Second-Order
     AlgoEntry("idsva_so",             "IDSVA_SO (dispatched: body for fixed, world for floating)",
