@@ -1856,6 +1856,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
     self.gen_add_code_line("//")
     # Emit per-ee per-pair code. For each ee, we have len(chain_dofs)^2 pairs.
     # Each pair fires once with explicit constants (chain_pos, S_col, joint_jid).
+    HAS_MIMIC = self.robot_has_mimic_joints()
     self.gen_add_serial_ops()
     for ee_idx in range(num_ees):
         ee_jid = anchors[ee_idx]
@@ -1866,11 +1867,50 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
         intra_pair_lookup = {(p[0], p[1]): p for p in intra_pairs}
         intra_pair_lookup.update({(p[1], p[0]): p for p in intra_pairs})
 
+        # Group chain DOFs by v-slot. A MIMIC joint folds into its target's slot,
+        # so a v-slot can collect MULTIPLE chain blocks (the target + each mimic,
+        # e.g. the h1_2 thumb: proximal + 2 mimics -> 3 blocks on one slot). The
+        # Hessian cell for any (vi, vj) where either slot is multi-block must SUM
+        # over every block-pair (RBDReference convention); a single-writer emit
+        # would last-writer-win and drop all but one term (the exact-zero bug).
+        vi_to_blocks = {}
+        for d in chain_dofs:
+            vi_to_blocks.setdefault(d["vi"], []).append({
+                "chain_pos": d["chain_pos"], "jid": d["joint_jid"],
+                "alpha": (self._alpha_for_jid(d["joint_jid"]) if HAS_MIMIC else 1.0),
+                "ang": d["ang"], "lin": d["lin"], "revolute": d["revolute"],
+            })
+        for vlist in vi_to_blocks.values():
+            vlist.sort(key=lambda b: b["chain_pos"])
+        multi_slots = {vi for vi, blks in vi_to_blocks.items() if len(blks) > 1}
+
         # Pair iteration: per (vi_i, vi_j), with i,j enumerated over chain DOFs.
         for di in chain_dofs:
             vi = di["vi"]
             for dj in chain_dofs:
                 vj = dj["vi"]
+                # MIMIC multi-block routing: if either slot has >1 chain block,
+                # emit the alpha-weighted block-pair SUM exactly ONCE per ordered
+                # (vi, vj) pair (skip the duplicate chain-DOF iterations that map
+                # to the same slot pair). Non-mimic slots are always singletons
+                # so this branch is never taken -> output byte-identical.
+                if vi in multi_slots or vj in multi_slots:
+                    # Emit the slot pair ONCE: only when this (di, dj) is the
+                    # first chain block of slot vi AND the first of slot vj.
+                    if (di["chain_pos"] != vi_to_blocks[vi][0]["chain_pos"]
+                            or dj["chain_pos"] != vi_to_blocks[vj][0]["chain_pos"]):
+                        continue  # already emitted for this (vi, vj) slot pair
+                    si_base = 16 * (ee_idx * nv + vi)
+                    sj_base = 16 * (ee_idx * nv + vj)
+                    self.gen_add_code_line(
+                        "// ee=" + str(ee_idx) + " MIMIC pair (vi=" + str(vi) +
+                        ", vj=" + str(vj) + ")")
+                    self.gen_add_code_line("{", True)
+                    _emit_d2M_mimic_vslot_pair_block(
+                        self, ee_idx, ee_jid, vi, vj, nv, num_ees,
+                        vi_to_blocks[vi], vi_to_blocks[vj], si_base, sj_base)
+                    self.gen_add_end_control_flow()
+                    continue
                 # Determine ordering: a = di['chain_pos'], b = dj['chain_pos']
                 a = di["chain_pos"]; b = dj["chain_pos"]
                 # H index: c*nv*nv + i*nv + j  with i = "outer" (Hessian row j_v),
@@ -2305,6 +2345,170 @@ def _emit_d2M_same_joint_block(self, di, dj, ee_idx, ee_jid, vi, vj, nv, num_ees
     self.gen_add_code_line("s_d2eePos[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
     self.gen_add_code_line("s_d2eePos[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
     self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
+
+def _emit_d2M_mimic_vslot_pair_block(self, ee_idx, ee_jid, vi, vj, nv, num_ees,
+                                     blocks_i, blocks_j, si_base, sj_base):
+    """Emit the d2(pose)/dv2 cell for a MIMIC-shared v-slot pair (vi, vj).
+
+    When several chain joints fold into one velocity coordinate (a mimic joint
+    and its target, or a multi-mimic finger like the h1_2 thumb: target + two
+    mimics), the Hessian column for that v-slot is the SUM over EVERY block-pair
+    (a in v-slot vi) x (b in v-slot vj), each scaled by alpha_a * alpha_b, with
+    per-block-pair chain ordering -- exactly mirroring the RBDReference analytic
+    double-block accumulate (the `vi_to_blocks` nested loop). The legacy
+    per-chain-DOF emission overwrote the cell once per block-pair
+    (last-writer-wins), which dropped every contribution but one (e.g. the h1_2
+    thumb diagonal collapsed to a single mimic's term and the proximal/cross
+    terms vanished -> exact-zero output columns 58798/101906/104948).
+
+    blocks_i / blocks_j are lists of dicts:
+        {chain_pos, jid, alpha, ang (3), lin (3), revolute (bool)}
+    sorted by chain_pos. si_base / sj_base are the FOLDED s_Sworld bases used for
+    the H_w (Jw_i x Jw_j) correction, which is built from the full folded angular
+    columns (s_Sworld already holds the alpha-folded generator from Step 2).
+    """
+    self.gen_add_code_line("// MIMIC v-slot pair (vi=" + str(vi) + ", vj=" + str(vj) +
+                           "): sum over " + str(len(blocks_i)) + "x" + str(len(blocks_j)) +
+                           " block-pairs (alpha-weighted)")
+    self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
+    self.gen_add_code_line("T pey = s_Xworld[" + str(16*ee_jid + 13) + "];")
+    self.gen_add_code_line("T pez = s_Xworld[" + str(16*ee_jid + 14) + "];")
+    # d2M accumulators: top 3 rows x 4 cols (column-major Mrc), zeroed.
+    for r in range(3):
+        for c in range(4):
+            self.gen_add_code_line("T M" + str(r) + str(c) + " = static_cast<T>(0);")
+
+    def _world_axis_lines(prefix, jid, ax_local):
+        # axw_r = R_jid_world @ ax_local; R column-major in s_Xworld[16*jid].
+        for r in range(3):
+            terms = []
+            for c in range(3):
+                if abs(ax_local[c]) < 1e-15:
+                    continue
+                coef = "static_cast<T>(" + "{:.17g}".format(ax_local[c]) + ")"
+                terms.append("s_Xworld[" + str(16*jid + r + 4*c) + "] * " + coef)
+            expr = " + ".join(terms) if terms else "static_cast<T>(0)"
+            self.gen_add_code_line("T " + prefix + "_" + str(r) + " = " + expr + ";")
+
+    def _emit_block_generator(name, blk):
+        # Per-block world generator G (top 3 rows, 4 cols) as scalars name_rc.
+        # Revolute: G[:3,:3]=[axw]_x, G[:3,3]=pj x axw. Prismatic: G[:3,3]=axw.
+        jid = blk["jid"]
+        ax = blk["ang"] if blk["revolute"] else blk["lin"]
+        ax = [float(ax[c]) if abs(ax[c]) >= 1e-15 else 0.0 for c in range(3)]
+        _world_axis_lines(name + "w", jid, ax)
+        self.gen_add_code_line("T " + name + "pjx = s_Xworld[" + str(16*jid + 12) + "];")
+        self.gen_add_code_line("T " + name + "pjy = s_Xworld[" + str(16*jid + 13) + "];")
+        self.gen_add_code_line("T " + name + "pjz = s_Xworld[" + str(16*jid + 14) + "];")
+        if blk["revolute"]:
+            self.gen_add_code_line("T " + name + "00 = static_cast<T>(0); T " + name + "11 = static_cast<T>(0); T " + name + "22 = static_cast<T>(0);")
+            self.gen_add_code_line("T " + name + "10 =  " + name + "w_2; T " + name + "20 = -" + name + "w_1;")
+            self.gen_add_code_line("T " + name + "01 = -" + name + "w_2; T " + name + "21 =  " + name + "w_0;")
+            self.gen_add_code_line("T " + name + "02 =  " + name + "w_1; T " + name + "12 = -" + name + "w_0;")
+            self.gen_add_code_line("T " + name + "03 = " + name + "pjy*" + name + "w_2 - " + name + "pjz*" + name + "w_1;")
+            self.gen_add_code_line("T " + name + "13 = " + name + "pjz*" + name + "w_0 - " + name + "pjx*" + name + "w_2;")
+            self.gen_add_code_line("T " + name + "23 = " + name + "pjx*" + name + "w_1 - " + name + "pjy*" + name + "w_0;")
+        else:
+            for r in range(3):
+                for c in range(3):
+                    self.gen_add_code_line("T " + name + str(r) + str(c) + " = static_cast<T>(0);")
+            self.gen_add_code_line("T " + name + "03 = " + name + "w_0;")
+            self.gen_add_code_line("T " + name + "13 = " + name + "w_1;")
+            self.gen_add_code_line("T " + name + "23 = " + name + "w_2;")
+
+    for blk_a in blocks_i:
+        for blk_b in blocks_j:
+            a = blk_a["chain_pos"]; b = blk_b["chain_pos"]
+            scale = float(blk_a["alpha"]) * float(blk_b["alpha"])
+            s_lit = "static_cast<T>(" + repr(scale) + ")"
+            self.gen_add_code_line("{  // block-pair a_cp=" + str(a) + " b_cp=" + str(b) +
+                                   " alpha_i*alpha_j=" + repr(scale))
+            if a == b:
+                # Same chain joint: scale * (L_a @ B_local @ Linv_a @ X_ee).
+                jid = blk_a["jid"]
+                ang_a = blk_a["ang"]; lin_a = blk_a["lin"]; rev_a = blk_a["revolute"]
+                ang_b = blk_b["ang"]; lin_b = blk_b["lin"]; rev_b = blk_b["revolute"]
+                _world_axis_lines("baw", jid, ang_a)
+                _world_axis_lines("bbw", jid, ang_b)
+                _world_axis_lines("balw", jid, lin_a)
+                _world_axis_lines("bblw", jid, lin_b)
+                if rev_a and rev_b:
+                    self.gen_add_code_line("T badotb = baw_0*bbw_0 + baw_1*bbw_1 + baw_2*bbw_2;")
+                    for r in range(3):
+                        for c in range(3):
+                            diag = " - badotb" if r == c else ""
+                            self.gen_add_code_line("T Br" + str(r) + str(c) +
+                                                   " = static_cast<T>(0.5)*(baw_" + str(r) + "*bbw_" + str(c) +
+                                                   " + bbw_" + str(r) + "*baw_" + str(c) + ")" + diag + ";")
+                    self.gen_add_code_line("T bpax = s_Xworld[" + str(16*jid + 12) + "]; T bpay = s_Xworld[" + str(16*jid + 13) + "]; T bpaz = s_Xworld[" + str(16*jid + 14) + "];")
+                    for r in range(3):
+                        self.gen_add_code_line("T Bt" + str(r) + " = -(Br" + str(r) + "0*bpax + Br" + str(r) + "1*bpay + Br" + str(r) + "2*bpaz);")
+                elif (rev_a and not rev_b) or ((not rev_a) and rev_b):
+                    if rev_a:
+                        avx, avy, avz = "baw_0", "baw_1", "baw_2"
+                        lvx, lvy, lvz = "bblw_0", "bblw_1", "bblw_2"
+                    else:
+                        avx, avy, avz = "bbw_0", "bbw_1", "bbw_2"
+                        lvx, lvy, lvz = "balw_0", "balw_1", "balw_2"
+                    for r in range(3):
+                        for c in range(3):
+                            self.gen_add_code_line("T Br" + str(r) + str(c) + " = static_cast<T>(0);")
+                    self.gen_add_code_line("T Bt0 = static_cast<T>(0.5)*(" + avy + "*" + lvz + " - " + avz + "*" + lvy + ");")
+                    self.gen_add_code_line("T Bt1 = static_cast<T>(0.5)*(" + avz + "*" + lvx + " - " + avx + "*" + lvz + ");")
+                    self.gen_add_code_line("T Bt2 = static_cast<T>(0.5)*(" + avx + "*" + lvy + " - " + avy + "*" + lvx + ");")
+                else:
+                    for r in range(3):
+                        for c in range(3):
+                            self.gen_add_code_line("T Br" + str(r) + str(c) + " = static_cast<T>(0);")
+                    for r in range(3):
+                        self.gen_add_code_line("T Bt" + str(r) + " = static_cast<T>(0);")
+                for r in range(3):
+                    for c in range(3):
+                        self.gen_add_code_line("M" + str(r) + str(c) + " += " + s_lit + " * Br" + str(r) + str(c) + ";")
+                self.gen_add_code_line("M03 += " + s_lit + " * (Br00*pex + Br01*pey + Br02*pez + Bt0);")
+                self.gen_add_code_line("M13 += " + s_lit + " * (Br10*pex + Br11*pey + Br12*pez + Bt1);")
+                self.gen_add_code_line("M23 += " + s_lit + " * (Br20*pex + Br21*pey + Br22*pez + Bt2);")
+            else:
+                if a < b:
+                    prox, dist = blk_a, blk_b
+                else:
+                    prox, dist = blk_b, blk_a
+                _emit_block_generator("P", prox)
+                _emit_block_generator("D", dist)
+                for r in range(3):
+                    for c in range(4):
+                        self.gen_add_code_line("T Mb" + str(r) + str(c) + " = P" + str(r) + "0*D0" + str(c) +
+                                               " + P" + str(r) + "1*D1" + str(c) + " + P" + str(r) + "2*D2" + str(c) + ";")
+                for r in range(3):
+                    for c in range(3):
+                        self.gen_add_code_line("M" + str(r) + str(c) + " += " + s_lit + " * Mb" + str(r) + str(c) + ";")
+                self.gen_add_code_line("M03 += " + s_lit + " * (Mb00*pex + Mb01*pey + Mb02*pez + Mb03);")
+                self.gen_add_code_line("M13 += " + s_lit + " * (Mb10*pex + Mb11*pey + Mb12*pez + Mb13);")
+                self.gen_add_code_line("M23 += " + s_lit + " * (Mb20*pex + Mb21*pey + Mb22*pez + Mb23);")
+            self.gen_add_code_line("}")
+
+    self.gen_add_code_line("T Hxyz_x = M03; T Hxyz_y = M13; T Hxyz_z = M23;")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[" + str(si_base + r + 4*c) + "];")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[" + str(sj_base + r + 4*c) + "];")
+    for r in range(3):
+        for c in range(3):
+            self.gen_add_code_line("T SiSj" + str(r) + str(c) + " = Si" + str(r) + "0*Sj0" + str(c) +
+                                   " + Si" + str(r) + "1*Sj1" + str(c) + " + Si" + str(r) + "2*Sj2" + str(c) + ";")
+    self.gen_add_code_line("T HW_x = static_cast<T>(0.5) * ((M21 - SiSj21) - (M12 - SiSj12));")
+    self.gen_add_code_line("T HW_y = static_cast<T>(0.5) * ((M02 - SiSj02) - (M20 - SiSj20));")
+    self.gen_add_code_line("T HW_z = static_cast<T>(0.5) * ((M10 - SiSj10) - (M01 - SiSj01));")
+    base = "(" + str(ee_idx * 6 * nv * nv) + " + " + str(vi * nv + vj) + ")"
+    self.gen_add_code_line("s_d2eePos[" + base + " + 0 * " + str(nv*nv) + "] = Hxyz_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 1 * " + str(nv*nv) + "] = Hxyz_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 2 * " + str(nv*nv) + "] = Hxyz_z;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
+    self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
+
 
 def gen_end_effector_pose_gradient_hessian_device(self):
     n = self.robot.get_num_pos()
