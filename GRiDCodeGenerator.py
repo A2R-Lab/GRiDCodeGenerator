@@ -86,7 +86,9 @@ class GRiDCodeGenerator:
                             gen_id_bias_device, gen_id_bias_kernel, gen_id_bias_host, gen_id_bias, \
                             gen_centroidal_inner, gen_com_device, gen_ccrba_device, gen_energy_device, \
                             _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy, \
-                            gen_frame_jacobian_inner, gen_frame_jacobian_device, gen_frame_jacobian
+                            gen_frame_jacobian_inner, gen_frame_jacobian_device, gen_frame_jacobian, \
+                            gen_frame_jacobian_dot_device, gen_frame_jacobian_dot, \
+                            gen_osc_inertia_device, gen_osc_inertia
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -121,10 +123,14 @@ class GRiDCodeGenerator:
         # `all` profile so the default-profile header stays byte-identical. It is
         # a recognized key for explicit algorithm_list requests and has its own
         # `frame-jacobian` profile. Requires `ee_pose` (world-transform machinery).
-        opt_in_algorithms = {"frame_jacobian"}
+        # E2 CUDA parity (additive, opt-in only): frame_jacobian_dot (Jdot) and
+        # osc_inertia (Lambda) join frame_jacobian as recognized-but-not-default
+        # keys so the default `all` header stays byte-identical.
+        opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia"}
         profile_algorithms = {
             "all": all_algorithms,
-            "frame-jacobian": {"ee_pose", "minv", "frame_jacobian"},
+            "frame-jacobian": {"ee_pose", "minv", "frame_jacobian",
+                               "frame_jacobian_dot", "osc_inertia"},
             "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"id", "minv", "fd"},
@@ -193,8 +199,11 @@ class GRiDCodeGenerator:
                 else:
                     raise ValueError("Unknown GRiD algorithm selection: " + str(item))
 
-        # E2: frame_jacobian needs the world-transform machinery (ee_pose) and,
-        # for OSC composition, minv. Pull them in when requested.
+        # E2: frame_jacobian (+ its Jdot/Lambda siblings) need the world-transform
+        # machinery (ee_pose) and, for OSC composition, minv. Pull them in plus the
+        # base frame_jacobian emit (the siblings reuse frame_jacobian_inner).
+        if "frame_jacobian_dot" in algorithms or "osc_inertia" in algorithms:
+            algorithms.add("frame_jacobian")
         if "frame_jacobian" in algorithms:
             algorithms.update({"ee_pose", "minv"})
         if "fd_du" in algorithms:
@@ -2229,6 +2238,8 @@ class GRiDCodeGenerator:
         # machinery (pulled in by _normalize_codegen_algorithms).
         if "frame_jacobian" in algorithms and "ee_pose" in algorithms and not self.robot_has_mimic_joints():
             NJ_fj = self.robot.get_num_joints()
+            nv_fj = self.robot.get_num_vel()
+            n_pos_fj = self.robot.get_num_pos()
             Xhom_size_fj, _, _ = self.gen_get_Xhom_size()
             # arena = s_XmatsHom(Xhom_size) + inner_temp(16*NJ); s_J is a caller param.
             fj_t_count = Xhom_size_fj + (16 * NJ_fj)
@@ -2237,6 +2248,28 @@ class GRiDCodeGenerator:
                 "{ return grid_shared_arena_bytes<T>(" + str(fj_t_count) +
                 ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
             self.gen_frame_jacobian()
+            # E2 CUDA parity (opt-in siblings). Jdot/Lambda reuse frame_jacobian_inner.
+            if "frame_jacobian_dot" in algorithms:
+                # Jdot arena = s_XmatsHom + extras(s_qpert[n_pos] + s_Jp[6nv] + s_Jm[6nv]) + inner_temp(16*NJ).
+                fjd_t_count = Xhom_size_fj + n_pos_fj + (2 * 6 * nv_fj) + (16 * NJ_fj)
+                self.gen_add_code_line(
+                    "template <typename T> __host__ __device__ inline size_t FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES() "
+                    "{ return grid_shared_arena_bytes<T>(" + str(fjd_t_count) +
+                    ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                # Floating-base Jdot integrates q on the SE(3) group; emit the Lie
+                # helpers if no other kinematics path already did.
+                if self.robot.floating_base and not getattr(self, "_lie_helpers_emitted", False):
+                    self.gen_lie_group_helpers()
+                    self._lie_helpers_emitted = True
+                self.gen_frame_jacobian_dot()
+            if "osc_inertia" in algorithms:
+                # Lambda arena = s_XmatsHom + extras(s_Jfj[6nv] + s_MJt[nv*6] + s_task[36] + s_taskinv[36]) + inner_temp(16*NJ).
+                osc_t_count = Xhom_size_fj + (6 * nv_fj) + (nv_fj * 6) + 36 + 36 + (16 * NJ_fj)
+                self.gen_add_code_line(
+                    "template <typename T> __host__ __device__ inline size_t OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES() "
+                    "{ return grid_shared_arena_bytes<T>(" + str(osc_t_count) +
+                    ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_osc_inertia()
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
