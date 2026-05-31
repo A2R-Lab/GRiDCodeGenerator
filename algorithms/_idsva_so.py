@@ -216,6 +216,19 @@ def gen_idsva_so_body_frame_inner_temp_mem_size(self):
         # (see `gen_floating_gravity_d2tau_dq_spill_count`).
         return int(base_count + gen_floating_gravity_d2tau_dq_shared_count(self))
     jids_a, ancestors = self.robot.get_jid_ancestor_ids(include_joint=True)
+    # Fixed-base mimic: the inner runs the whole per-body sweep in unique-per-body
+    # INTERNAL coordinates (n_int = NUM_BODIES; internal slot == body id) so that
+    # mimic siblings sharing a project v-slot get distinct internal slots (mirrors
+    # RBDReference.idsva_so_body_frame's has_mimic path). The vel-indexed scratch
+    # bands (the 30*NV vectors) are sized by NB instead of NV, and a 4*NB^3 internal
+    # output slab is appended on top; the inner assembles into that slab then folds
+    # to the reduced 4*NV^3 public output. Non-mimic robots keep the NV sizing
+    # byte-identical (NB == NV for fixed non-mimic single-DoF chains).
+    if self.robot_has_mimic_joints():
+        NB = num_bodies
+        base = 36 * NB * 10 + 30 * NB + 6 + len(jids_a) * 36
+        internal_slab = 4 * NB ** 3
+        return int(base + internal_slab)
     return int(36 * NV * 10 + 30 * NV + 6 + len(jids_a)*36)
 
 def _floating_gravity_lie_metadata(robot):
@@ -1593,6 +1606,36 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     
     self.gen_add_code_lines(vars)
 
+    # ---- Fixed-base mimic: internal NUM_BODIES-coordinate sweep + alpha fold ----
+    # When the robot has mimic joints, NB > NV and multiple bodies share a project
+    # v-slot. The whole assembly below is body(jid)-indexed and writes the output
+    # with an OUTPUT STRIDE of SECOND_ORDER_COORDS. For mimic we run it in unique-
+    # per-body INTERNAL coordinates (internal slot == body id, n_int = NB) into a
+    # 4*NB^3 internal slab, then fold each axis to the reduced 4*NV^3 public output
+    # with the alpha reduction R[i, v_slot(i)] += alpha_i (mirrors
+    # RBDReference.idsva_so_body_frame's has_mimic path). To reuse the entire
+    # assembly unchanged we (a) shadow SECOND_ORDER_COORDS = NB inside the inner so
+    # every output-stride site uses the NB stride, and (b) repoint s_idsva_so (hence
+    # d2tau_dq2/.../dM_dq) at the internal slab. The public NV^3 output pointer is
+    # saved first; the fold writes it at the very end.
+    is_mimic = self.robot_has_mimic_joints()
+    if is_mimic:
+        # Public (reduced 4*NV^3) output destination handed in by the caller.
+        self.gen_add_code_line("T *s_idsva_so_public = s_idsva_so;")
+        # Internal 4*NB^3 slab anchored at the top of the (NB-grown) arena, just
+        # past BC (the legacy top slab). BC = tp_anchor + 36*var_offset when in smem.
+        self.gen_add_code_line(f"T *s_idsva_so_internal = BC + 36*NUM_BODIES;")
+        self.gen_add_code_line("s_idsva_so = s_idsva_so_internal;")
+        # Shadow the output stride to NB for the whole assembly. This function-local
+        # const shadows the global SECOND_ORDER_COORDS (= NV) inside the inner only.
+        self.gen_add_code_line("const int SECOND_ORDER_COORDS = NUM_BODIES;")
+        # Re-derive the output tensor pointers off the (now internal) s_idsva_so with
+        # the NB stride (the earlier `vars` definitions used the NV-stride global).
+        self.gen_add_code_line("d2tau_dq2 = s_idsva_so;")
+        self.gen_add_code_line("d2tau_dqd2 = d2tau_dq2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;")
+        self.gen_add_code_line("d2tau_dvdq = d2tau_dqd2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;")
+        self.gen_add_code_line("dM_dq = d2tau_dvdq + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;")
+
     # Surgical spill: BC (36*NB) is a cold buffer (write-once, dead before the t1-t9/
     # p1-p6 hot loops, and not read by reference_order_output_repair), so at a spill
     # tier it can move to global d_workspace while the hot buffers stay in smem. BC is
@@ -1691,10 +1734,29 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     # Compute vJ = S @ qd & aJ = S @ qdd in parallel
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Compute vJ = S @ qd & aJ = S @ qdd')
+    if is_mimic:
+        # Mimic-aware velocity read: body `joint`'s spatial joint velocity is
+        # alpha_joint * qd[v_slot(joint)]. body_vslot maps each body to its
+        # (possibly shared) reduced v-slot; body_alpha is the mimic multiplier
+        # (1.0 for non-mimic bodies). This both fixes the OOB s_qd[joint] read
+        # (joint == body id can exceed NV-1 for a mimic body) and applies the
+        # multiplier exactly as RBDReference does. Mirrors the oracle's
+        # `_qd = alpha_i * qd[inds_v_true]`.
+        body_vslot = [self._v_slot_cpp(b) for b in range(num_bodies)]
+        body_alpha = [self._alpha_for_jid(b) for b in range(num_bodies)]
+        self.gen_add_code_line(
+            "static const int body_vslot[] = { " + ", ".join(map(str, body_vslot)) + " };")
+        self.gen_add_code_line(
+            "static const T body_alpha[] = { " + ", ".join(
+                "static_cast<T>(" + repr(a) + ")" for a in body_alpha) + " };")
     self.gen_add_parallel_loop('i','2*6*NUM_BODIES')
     self.gen_add_code_line('int joint = i / 6;')
-    self.gen_add_code_line('if (joint < NUM_BODIES) vJ[i] = S[i] * s_qd[joint];')
-    self.gen_add_code_line('else aJ[i - 6*NUM_BODIES] = S[i - 6*NUM_BODIES] * s_qdd[joint - NUM_BODIES];')
+    if is_mimic:
+        self.gen_add_code_line('if (joint < NUM_BODIES) vJ[i] = S[i] * (body_alpha[joint] * s_qd[body_vslot[joint]]);')
+        self.gen_add_code_line('else { int jj = joint - NUM_BODIES; aJ[i - 6*NUM_BODIES] = S[i - 6*NUM_BODIES] * (body_alpha[jj] * s_qdd[body_vslot[jj]]); }')
+    else:
+        self.gen_add_code_line('if (joint < NUM_BODIES) vJ[i] = S[i] * s_qd[joint];')
+        self.gen_add_code_line('else aJ[i - 6*NUM_BODIES] = S[i - 6*NUM_BODIES] * s_qdd[joint - NUM_BODIES];')
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
@@ -2361,6 +2423,48 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
 
     if self.idsva_so_needs_reference_order_output_repair():
         self.gen_idsva_so_body_frame_reference_order_output_repair()
+
+    if is_mimic:
+        # ---- Fold the internal 4*NB^3 sweep to the reduced 4*NV^3 public output ----
+        # public[v(i), v(j), v(k)] += alpha_i*alpha_j*alpha_k * internal[i, j, k],
+        # summed over internal slots (i,j,k) that share reduced v-slots (mimic
+        # siblings). This is the einsum('ia,ijk,jb,kc->abc', R, T, R, R) reduction
+        # the oracle applies, with R[i, v(i)] = alpha_i. Each of the 4 tensor blocks
+        # folds independently. We zero the public output first (NV^3 per block) then
+        # scatter-accumulate every internal cell into its reduced destination.
+        NB = num_bodies
+        fold_vslot = [self._v_slot_cpp(b) for b in range(NB)]
+        fold_alpha = [self._alpha_for_jid(b) for b in range(NB)]
+        self.gen_add_sync()
+        self.gen_add_code_line("// Mimic fold: reduce internal NB^3 sweep to public NV^3 output")
+        self.gen_add_code_line(
+            "static const int so_fold_vslot[] = { " + ", ".join(map(str, fold_vslot)) + " };")
+        self.gen_add_code_line(
+            "static const T so_fold_alpha[] = { " + ", ".join(
+                "static_cast<T>(" + repr(a) + ")" for a in fold_alpha) + " };")
+        # Zero the public NV^3 output (4 blocks).
+        self.gen_add_parallel_loop('i', f'4*{NV**3}')
+        self.gen_add_code_line("s_idsva_so_public[i] = static_cast<T>(0);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        # Scatter-accumulate. One thread per internal cell per block; the destination
+        # public cell is uniquely determined by (v(i),v(j),v(k)). Multiple internal
+        # cells can map to the SAME public cell (mimic siblings), so we must use an
+        # atomic accumulate to avoid lost updates across the block's threads.
+        self.gen_add_parallel_loop('idx', f'4*{NB**3}')
+        self.gen_add_code_line(f'int blk = idx / {NB**3};')
+        self.gen_add_code_line(f'int rem = idx % {NB**3};')
+        self.gen_add_code_line(f'int ii = rem / {NB*NB};')
+        self.gen_add_code_line(f'int jj = (rem / {NB}) % {NB};')
+        self.gen_add_code_line(f'int kk = rem % {NB};')
+        self.gen_add_code_line("T val = s_idsva_so_internal[idx];")
+        self.gen_add_code_line("if (val != static_cast<T>(0)) {", True)
+        self.gen_add_code_line("T w = so_fold_alpha[ii] * so_fold_alpha[jj] * so_fold_alpha[kk];")
+        self.gen_add_code_line(f"int dst = blk*{NV**3} + so_fold_vslot[ii]*{NV*NV} + so_fold_vslot[jj]*{NV} + so_fold_vslot[kk];")
+        self.gen_add_code_line("atomicAdd(&s_idsva_so_public[dst], w * val);")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
 
     self.gen_add_end_function()
 

@@ -1902,12 +1902,26 @@ class GRiDCodeGenerator:
             # 1-DoF mimic joints' shared slots, so floating + mimic compose with no
             # separate 6-DoF root fold. ee_pose_gradient/ee_pose_hessian are now
             # supported for FLOATING-base mimic robots too (removed below).
-            # idsva_so/fdsva_so + the integrator gradients remain refused (P4 pending).
+            # B2-SO: FIXED-base mimic idsva_so/fdsva_so un-refused — the body-frame
+            # inner runs the per-body INTERNAL NUM_BODIES-coordinate sweep into a
+            # 4*NB^3 slab and alpha-folds to the reduced 4*NV^3 public output (see
+            # _idsva_so.py gen_idsva_so_body_frame_inner is_mimic path; also fixed a
+            # shared matmul %NUM_JOINTS->%NUM_BODIES block-wrap bug). Floating-base
+            # mimic SO stays refused (added below). The integrator gradients +
+            # f_ext_grad remain refused for both bases (P4 pending).
             _MIMIC_GRADIENT_ALGORITHMS = {
-                "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
+            if self.robot.floating_base:
+                # Floating-base mimic SECOND-ORDER (idsva_so/fdsva_so) stays
+                # refused: the floating root's 6-DoF subspace needs a per-root-DoF
+                # fold, not the scalar v-slot/alpha fold that the fixed-base
+                # internal-NB sweep uses (B2-SO landed FIXED-base only). Floating
+                # mimic ee_pose grad/hessian ARE supported (B2-ee FLOATING; the 6
+                # independent root v-slots decompose into singleton columns), so
+                # they are NOT added here.
+                _MIMIC_GRADIENT_ALGORITHMS |= {"idsva_so_body_frame", "fdsva_so"}
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(
