@@ -1623,7 +1623,25 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
     self.gen_add_sync()
     # Then emit per (ee, chain-joint, S-col) the explicit 4x4 fill. Serial-ops
     # per slot — total work is small (chain_depth * dofs_per_joint * num_ees blocks).
+    #
+    # MIMIC fold: a mimic joint and its target share one velocity slot vi
+    # (get_joint_index_v(mimic) == get_joint_index_v(target)), so several chain
+    # joints map to the SAME s_Sworld[16*(ee*nv+vi)] generator. The world-frame
+    # twist generator S_world is LINEAR in the joint rate, so the shared column is
+    # the alpha-weighted SUM of each contributing joint's generator (the mimic
+    # body moves alpha * the target's rate). Every downstream step (the d2M
+    # bilinear products, the J_w/J_v readout, the rpy chain rule) is expressed
+    # purely in terms of s_Sworld[vi] / s_deePos[vi], so folding the generator
+    # here is sufficient — no other step needs a mimic branch. The signed motion
+    # subspace S is baked directly into `ax` (= the full S column, sign included),
+    # so unlike the unit-axis id_du path no separate s_sign factor is needed; the
+    # only scalar fold is the mimic multiplier alpha. For a non-mimic robot every
+    # (ee, vi) slot is written exactly once with alpha == 1.0, so the emitted code
+    # below is byte-identical to the legacy "=" assignment (no spurious accumulate
+    # or 1.0* factor) — gated by HAS_MIMIC / first-writer tracking.
+    HAS_MIMIC = self.robot_has_mimic_joints()
     self.gen_add_serial_ops()
+    seen_slots = set()
     for ee_idx in range(num_ees):
         for dof in per_ee_dof_info[ee_idx]:
             vi = dof["vi"]
@@ -1633,9 +1651,30 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
             rev = dof["revolute"]
             base = 16 * (ee_idx * nv + vi)
             ax = ang if rev else lin
+            alpha = self._alpha_for_jid(j) if HAS_MIMIC else 1.0
+            first_writer = (ee_idx, vi) not in seen_slots
+            seen_slots.add((ee_idx, vi))
+            # First writer to a fresh slot assigns ("="); a later writer (only the
+            # mimic case) accumulates ("+="). With alpha == 1.0 and first_writer the
+            # emitted text matches the legacy path exactly.
+            assign = "=" if first_writer else "+="
+            def _val(rhs):
+                # Wrap rhs by the mimic scale when alpha != 1.0; otherwise leave it
+                # untouched so non-mimic output is byte-identical.
+                if alpha == 1.0:
+                    return rhs
+                return "static_cast<T>(" + repr(float(alpha)) + ") * (" + rhs + ")"
+            def _set(slot, rhs):
+                # When first_writer the zero-fill above already cleared the slot, so
+                # "=" and "+=" are numerically identical; we keep "=" so the legacy
+                # (non-mimic) text is preserved exactly. A scaled accumulate from a
+                # later mimic joint folds in additively.
+                self.gen_add_code_line("s_Sworld[" + str(slot) + "] " + assign + " " + _val(rhs) + ";")
             self.gen_add_code_line(
                 "// ee=" + str(ee_idx) + " vi=" + str(vi) + " jid=" + str(j) +
-                (" rev" if rev else " prism") + " ax_local=" + str(ax))
+                (" rev" if rev else " prism") + " ax_local=" + str(ax) +
+                ("" if alpha == 1.0 else " alpha=" + repr(float(alpha)) +
+                 (" (fold)" if not first_writer else " (mimic-target)")))
             self.gen_add_code_line("{", True)
             # axis_world = R_j_world @ ax_local
             # R_j_world is column-major in s_Xworld[16*j]: R[r,c] = s_Xworld[16*j + r + 4*c]
@@ -1658,24 +1697,48 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
                 # [axw]_x  =  [[0, -wz,  wy],
                 #              [wz, 0,  -wx],
                 #              [-wy, wx, 0]]
-                self.gen_add_code_line("s_Sworld[" + str(base +  0) + "] = static_cast<T>(0);")  # S[0,0]
-                self.gen_add_code_line("s_Sworld[" + str(base +  1) + "] =  axw_2;")             # S[1,0] =  wz
-                self.gen_add_code_line("s_Sworld[" + str(base +  2) + "] = -axw_1;")             # S[2,0] = -wy
-                self.gen_add_code_line("s_Sworld[" + str(base +  4) + "] = -axw_2;")             # S[0,1] = -wz
-                self.gen_add_code_line("s_Sworld[" + str(base +  5) + "] = static_cast<T>(0);")  # S[1,1]
-                self.gen_add_code_line("s_Sworld[" + str(base +  6) + "] =  axw_0;")             # S[2,1] =  wx
-                self.gen_add_code_line("s_Sworld[" + str(base +  8) + "] =  axw_1;")             # S[0,2] =  wy
-                self.gen_add_code_line("s_Sworld[" + str(base +  9) + "] = -axw_0;")             # S[1,2] = -wx
-                self.gen_add_code_line("s_Sworld[" + str(base + 10) + "] = static_cast<T>(0);")  # S[2,2]
-                # Column 3: p_j x axw  (= -[axw]_x p_j)
-                self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = pjy*axw_2 - pjz*axw_1;")
-                self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = pjz*axw_0 - pjx*axw_2;")
-                self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = pjx*axw_1 - pjy*axw_0;")
+                if first_writer and alpha == 1.0:
+                    # Legacy fast path: reproduce the original emission CHARACTER
+                    # FOR CHARACTER (incl. the aligned double-space before bare
+                    # axw_* terms) so non-mimic grid.cuh stays byte-identical.
+                    self.gen_add_code_line("s_Sworld[" + str(base +  0) + "] = static_cast<T>(0);")  # S[0,0]
+                    self.gen_add_code_line("s_Sworld[" + str(base +  1) + "] =  axw_2;")             # S[1,0] =  wz
+                    self.gen_add_code_line("s_Sworld[" + str(base +  2) + "] = -axw_1;")             # S[2,0] = -wy
+                    self.gen_add_code_line("s_Sworld[" + str(base +  4) + "] = -axw_2;")             # S[0,1] = -wz
+                    self.gen_add_code_line("s_Sworld[" + str(base +  5) + "] = static_cast<T>(0);")  # S[1,1]
+                    self.gen_add_code_line("s_Sworld[" + str(base +  6) + "] =  axw_0;")             # S[2,1] =  wx
+                    self.gen_add_code_line("s_Sworld[" + str(base +  8) + "] =  axw_1;")             # S[0,2] =  wy
+                    self.gen_add_code_line("s_Sworld[" + str(base +  9) + "] = -axw_0;")             # S[1,2] = -wx
+                    self.gen_add_code_line("s_Sworld[" + str(base + 10) + "] = static_cast<T>(0);")  # S[2,2]
+                    # Column 3: p_j x axw  (= -[axw]_x p_j)
+                    self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = pjy*axw_2 - pjz*axw_1;")
+                    self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = pjz*axw_0 - pjx*axw_2;")
+                    self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = pjx*axw_1 - pjy*axw_0;")
+                else:
+                    # Mimic fold (later writer or scaled): accumulate the skew axis
+                    # entries; the diagonal zeros need no accumulate (the slot was
+                    # zero-filled and no contributing generator touches the diagonal).
+                    _set(base +  1, "axw_2")
+                    _set(base +  2, "-axw_1")
+                    _set(base +  4, "-axw_2")
+                    _set(base +  6, "axw_0")
+                    _set(base +  8, "axw_1")
+                    _set(base +  9, "-axw_0")
+                    # Column 3: p_j x axw  (= -[axw]_x p_j)
+                    _set(base + 12, "pjy*axw_2 - pjz*axw_1")
+                    _set(base + 13, "pjz*axw_0 - pjx*axw_2")
+                    _set(base + 14, "pjx*axw_1 - pjy*axw_0")
             else:
-                # Prismatic: S[:3, 3] = axis_world, rest zero
-                self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = axw_0;")
-                self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = axw_1;")
-                self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = axw_2;")
+                if first_writer and alpha == 1.0:
+                    # Prismatic legacy fast path (byte-identical).
+                    self.gen_add_code_line("s_Sworld[" + str(base + 12) + "] = axw_0;")
+                    self.gen_add_code_line("s_Sworld[" + str(base + 13) + "] = axw_1;")
+                    self.gen_add_code_line("s_Sworld[" + str(base + 14) + "] = axw_2;")
+                else:
+                    # Prismatic mimic fold: S[:3, 3] = alpha * axis_world.
+                    _set(base + 12, "axw_0")
+                    _set(base + 13, "axw_1")
+                    _set(base + 14, "axw_2")
             self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_sync()
