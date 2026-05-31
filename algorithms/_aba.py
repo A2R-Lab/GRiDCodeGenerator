@@ -87,27 +87,72 @@ def gen_aba_inner_floating(self):
             self.gen_add_sync()
             continue
 
-        for jid in inds:
-            parent = self.robot.get_parent_id(jid)
-            S_ind = self.robot.get_S_index_by_id(jid)
-            S_sign = self.robot.get_S_sign_by_id(jid)
-            dof = jid + 5
-            jid6 = 6 * jid
-            parent6 = 6 * parent
-            self.gen_add_code_line("// v[" + str(jid) + "] = X[" + str(jid) + "]*v[" + str(parent) + "] + S*qdot")
-            self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid}], &s_va[{parent6}], &s_va[{jid6}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
-            self.gen_add_serial_ops()
-            self.gen_add_code_line(f"s_va[{jid6 + S_ind}] += static_cast<T>({S_sign}) * s_qd[{dof}];")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
-            self.gen_add_serial_ops()
-            self.gen_mx_func_call_for_cpp([jid], updated_var_names = dict(S_ind_name = str(S_ind),
-                                                                          s_dst_name = "&s_temp[" + str(cOffset + jid6) + "]",
-                                                                          s_src_name = "&s_va[" + str(jid6) + "]",
-                                                                          s_scale_name = "static_cast<T>(" + str(S_sign) + ") * s_qd[" + str(dof) + "]"),
-                                              PEQ_FLAG = False, SCALE_FLAG = True)
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
+        # Sibling joints at the SAME bfs level are independent (disjoint,
+        # already-computed parents), so fuse all of this level's per-joint 6x6
+        # row-strided GEMVs into ONE block-cooperative
+        # grid_linalg_segmented_row_strided_gemv (mirrors the ID forward-pass
+        # fusion in _inverse_dynamics.py). The += S*qd correction folds into the
+        # same store via FUSE_SCALED_ADD: a compile-time per-segment selector
+        # S_sel holds the joint sign at its S index (0 elsewhere), and
+        # scalar[seg] = s_qd[dof]. Then the c[k] = mxS(v[k])*(sign*qd) bias is a
+        # single parallel loop over siblings with a multi_threaded_select. This
+        # is a pure independent-work reorder -> numerically identical (per-joint
+        # GEMV column reduction order unchanged), with ONE sync per level instead
+        # of per joint.
+        seg = len(inds)
+        parents = [self.robot.get_parent_id(jid_val) for jid_val in inds]
+        s_inds = [self.robot.get_S_index_by_id(jid_val) for jid_val in inds]
+        s_signs = [self.robot.get_S_sign_by_id(jid_val) for jid_val in inds]
+        dofs = [jid_val + 5 for jid_val in inds]
+        tag = "lvl" + str(bfs_level)
+        self.gen_add_code_line("// v[k] = X[k]*v[parent_k] + S[k]*qd[k] for all bfs-level joints at once")
+        a_off = ", ".join(str(36 * jid_val) for jid_val in inds)
+        v_x_off = ", ".join(str(6 * p) for p in parents)
+        v_y_off = ", ".join(str(6 * jid_val) for jid_val in inds)
+        self.gen_add_code_line(f"static const int seg_a_off_{tag}[{seg}] = {{{a_off}}};")
+        self.gen_add_code_line(f"static const int seg_v_x_off_{tag}[{seg}] = {{{v_x_off}}};")
+        self.gen_add_code_line(f"static const int seg_v_y_off_{tag}[{seg}] = {{{v_y_off}}};")
+        # per-segment 6-vector selector: sign at the joint S index, 0 elsewhere
+        sel_vals = []
+        for i in range(seg):
+            row_vals = ["static_cast<T>(0)"] * 6
+            row_vals[s_inds[i]] = f"static_cast<T>({s_signs[i]})"
+            sel_vals.extend(row_vals)
+        self.gen_add_code_line(f"static const int seg_s_off_{tag}[{seg}] = {{{', '.join(str(6 * i) for i in range(seg))}}};")
+        self.gen_add_code_line(f"static const T S_sel_{tag}[{6 * seg}] = {{{', '.join(sel_vals)}}};")
+        # scalar[seg] = s_qd[dof] in tempMat scratch (free during the forward pass)
+        self.gen_add_serial_ops()
+        for i in range(seg):
+            self.gen_add_code_line(f"s_temp[{tempMatOffset + i}] = s_qd[{dofs[i]}];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_code_line(f"grid_linalg_segmented_row_strided_gemv<T,6,6,6,true>({seg}, seg_a_off_{tag}, seg_v_x_off_{tag}, seg_v_y_off_{tag}, s_XImats, s_va, s_va, static_cast<T>(1), static_cast<T>(0), seg_s_off_{tag}, S_sel_{tag}, &s_temp[{tempMatOffset}], s_linalg_smem);")
+        # c[k] = mxS(v[k]) * (sign*qd[dof]) for all siblings (parallel over level)
+        self.gen_add_code_line("// c[k] = mxS(v[k]) * (S_sign*qd[k])")
+        self.gen_add_parallel_loop("ind", str(seg))
+        if seg > 1:
+            _, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+            S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
+            select_var_vals = [("int", "jid", [str(jid_val) for jid_val in inds]),
+                               ("int", "dof", [str(d) for d in dofs])]
+            self.gen_add_multi_threaded_select("ind", "==", [str(i) for i in range(seg)], select_var_vals)
+            dst_name = "&s_temp[" + str(cOffset) + " + 6*jid]"
+            src_name = "&s_va[6*jid]"
+            scale_name = "(" + S_sign_cpp + ") * s_qd[dof]"
+        else:
+            jid_val = inds[0]
+            S_ind_cpp = str(s_inds[0])
+            S_sign_cpp = str(s_signs[0])
+            dst_name = "&s_temp[" + str(cOffset + 6 * jid_val) + "]"
+            src_name = "&s_va[" + str(6 * jid_val) + "]"
+            scale_name = "static_cast<T>(" + str(s_signs[0]) + ") * s_qd[" + str(dofs[0]) + "]"
+        self.gen_mx_func_call_for_cpp(inds, updated_var_names = dict(S_ind_name = S_ind_cpp,
+                                                                     s_dst_name = dst_name,
+                                                                     s_src_name = src_name,
+                                                                     s_scale_name = scale_name),
+                                          PEQ_FLAG = False, SCALE_FLAG = True)
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
 
     self.gen_add_code_line("// Initialize vcross[k]")
     self.gen_add_parallel_loop("jid", str(NJ))
