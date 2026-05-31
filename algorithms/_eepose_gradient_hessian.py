@@ -2420,244 +2420,210 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("ee_pose_hessian"))
     self.gen_add_end_function()
 
-def gen_X_single_thread(self, fixed_target_name = ""):
-    n = self.robot.get_num_pos()
-    has_fixed_target = fixed_target_name != ""
+def gen_ee_pose_inner_xform_from_q_lines(self, lane_guarded = False):
+    # Robot-general per-joint homogeneous-transform refresh from s_q.
+    #
+    # Emits the q-DEPENDENT cells of every joint's 4x4 s_XmatsHom block,
+    # computing sin/cos of the joint angle inline. The constant cells (fixed
+    # rotation pattern + translation offsets) are assumed to already be present
+    # in s_XmatsHom -- the caller pre-loads them once (e.g. from
+    # d_robotModel->d_XImats) and only the trig cells change with q. This
+    # mirrors the serial section of gen_load_update_XmatsHom_helpers but as a
+    # standalone, d_robotModel-free device snippet.
+    #
+    # Generality: driven by the symbolic per-joint Xmats (any DoF / axis /
+    # joint type the parser emits), NOT a hardcoded iiwa14 7R pattern. Returns
+    # the list of "joint j touches its block" booleans so warp lane-partitioning
+    # can mirror it.
+    import sympy as sp
+    NJ = self.robot.get_num_joints()
+    Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id(include_fixed_joints = False)
+    fb = self.robot.floating_base
+    has_mimic = self.robot_has_mimic_joints()
+    if fb or has_mimic:
+        # The standalone (d_robotModel-free) inner only supports the plain
+        # fixed-base, non-mimic angle->sincos substitution. Floating-base roots
+        # and mimic q-folding need the s_temp/s_q_eff scratch that the general
+        # load_update path provides; route those through end_effector_pose_inner
+        # instead. Flag loudly so a bad emit fails at codegen, not silently.
+        raise NotImplementedError(
+            "ee_pose_inner_{thread,warp}: floating-base / mimic robots are not "
+            "supported by the standalone FK inner; use end_effector_pose for those.")
+    # which joints actually have q-dependent cells (so warp can skip the rest)
+    joint_has_q = []
+    for jid in range(NJ):
+        M = Xmats_hom[jid]
+        joint_has_q.append(any(not self.custom_is_constant(M[r, c])
+                               for r in range(4) for c in range(4)))
+    return Xmats_hom, joint_has_q
 
-    if has_fixed_target:
-        fixed_joint = self.robot.get_fixed_joint_by_name(fixed_target_name)
-        fixed_joints = self.robot.get_fixed_joints_ordered_by_id()
-        fixed_offset = fixed_joints.index(fixed_joint)
-        flange_idx = n + fixed_offset
+def gen_ee_pose_inner_thread(self, fixed_target_name = ""):
+    import sympy as sp
+    NJ = self.robot.get_num_joints()
+    parents = [self.robot.get_parent_id(jid) for jid in range(NJ)]
+    Xmats_hom, joint_has_q = self.gen_ee_pose_inner_xform_from_q_lines()
 
     self.gen_add_func_doc(
-        "Single thread joint transformation matrix accumulation up to joint (tid)",
-        [],
+        "Thread-per-sample forward kinematics: serial chain walk that fills the "
+        "full cumulative (world-frame) joint transforms s_jointXforms from s_q. "
+        "Robot-general (any DoF / joint types). Reads s_jointXforms[16*target_idx] "
+        "for the world pose of frame target_idx.",
+        ["Assumes the constant (q-independent) cells of s_XmatsHom are pre-loaded; "
+         "only the q-dependent cells are refreshed here."],
         [
-            "s_jointXforms is the pointer to the cumulative joint transfomration matrices",
-            "s_XmatsHom is the pointer to the homogenous transformation matrices",
+            "s_jointXforms is the pointer to the cumulative (world) joint transforms (16 per joint)",
+            "s_XmatsHom is the pointer to the per-joint homogeneous transforms (16 per joint)",
             "s_q is the vector of joint positions",
-            "tid is the joint index up to compute",
+            "target_idx is the joint index whose world transform is desired (full array is filled)",
         ],
         None
     )
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
-    self.gen_add_code_line("void X_single_thread(T *s_jointXforms, T *s_XmatsHom, T *s_q, int tid) {", True)
+    self.gen_add_code_line("void ee_pose_inner_thread(T *s_jointXforms, T *s_XmatsHom, T *s_q, int target_idx) {", True)
+    self.gen_add_code_line("(void)target_idx;")
 
-    if has_fixed_target:
-        self.gen_add_code_line("constexpr int NJ = " + str(n) + ";")
-        self.gen_add_code_line("constexpr int FLANGE_IDX = " + str(flange_idx) + ";")
+    # --- refresh q-dependent cells of s_XmatsHom from s_q (general) ---
+    for jid in range(NJ):
+        if not joint_has_q[jid]:
+            continue
+        qslot = self.robot.get_joint_index_q(jid)
+        if isinstance(qslot, (list, tuple)):
+            qslot = qslot[0]
+        self.gen_add_code_line("// X_hom[" + str(jid) + "] q-dependent cells")
+        self.gen_add_code_line("{", True)
+        self.gen_add_code_line("const T s = static_cast<T>(sin(s_q[" + str(qslot) + "]));")
+        self.gen_add_code_line("const T c = static_cast<T>(cos(s_q[" + str(qslot) + "]));")
+        self.gen_add_code_line("(void)s; (void)c;")
+        M = Xmats_hom[jid]
+        for col in range(4):
+            for row in range(4):
+                val = M[row, col]
+                if self.custom_is_constant(val):
+                    continue
+                str_val = sp.ccode(val)
+                str_val = str_val.replace("sin(theta)", "s").replace("cos(theta)", "c")
+                cell = self.gen_static_array_ind_3d(jid, col, row, ind_stride=16, col_stride=4)
+                self.gen_add_code_line("s_XmatsHom[16*" + str(jid) + " + " + str(cell - 16*jid) +
+                                       "] = static_cast<T>(" + str_val + ");")
+        self.gen_add_end_control_flow()
 
-    # Update s_XmatsHom from s_q
-    # X_hom[0]
-    self.gen_add_code_line("s_XmatsHom[0] = static_cast<T>(cos(s_q[0]));")
-    self.gen_add_code_line("s_XmatsHom[1] = static_cast<T>(sin(s_q[0]));")
-    self.gen_add_code_line("s_XmatsHom[4] = static_cast<T>(-sin(s_q[0]));")
-    self.gen_add_code_line("s_XmatsHom[5] = static_cast<T>(cos(s_q[0]));")
-    # X_hom[1]
-    self.gen_add_code_line("s_XmatsHom[16] = static_cast<T>(cos(s_q[1]));")
-    self.gen_add_code_line("s_XmatsHom[18] = static_cast<T>(-sin(s_q[1]));")
-    self.gen_add_code_line("s_XmatsHom[20] = static_cast<T>(-sin(s_q[1]));")
-    self.gen_add_code_line("s_XmatsHom[22] = static_cast<T>(-cos(s_q[1]));")
-    # X_hom[2]
-    self.gen_add_code_line("s_XmatsHom[32] = static_cast<T>(cos(s_q[2]));")
-    self.gen_add_code_line("s_XmatsHom[34] = static_cast<T>(sin(s_q[2]));")
-    self.gen_add_code_line("s_XmatsHom[36] = static_cast<T>(-sin(s_q[2]));")
-    self.gen_add_code_line("s_XmatsHom[38] = static_cast<T>(cos(s_q[2]));")
-    # X_hom[3]
-    self.gen_add_code_line("s_XmatsHom[48] = static_cast<T>(cos(s_q[3]));")
-    self.gen_add_code_line("s_XmatsHom[50] = static_cast<T>(sin(s_q[3]));")
-    self.gen_add_code_line("s_XmatsHom[52] = static_cast<T>(-sin(s_q[3]));")
-    self.gen_add_code_line("s_XmatsHom[54] = static_cast<T>(cos(s_q[3]));")
-    # X_hom[4]
-    self.gen_add_code_line("s_XmatsHom[64] = static_cast<T>(cos(s_q[4]));")
-    self.gen_add_code_line("s_XmatsHom[66] = static_cast<T>(-sin(s_q[4]));")
-    self.gen_add_code_line("s_XmatsHom[68] = static_cast<T>(-sin(s_q[4]));")
-    self.gen_add_code_line("s_XmatsHom[70] = static_cast<T>(-cos(s_q[4]));")
-    # X_hom[5]
-    self.gen_add_code_line("s_XmatsHom[80] = static_cast<T>(cos(s_q[5]));")
-    self.gen_add_code_line("s_XmatsHom[82] = static_cast<T>(sin(s_q[5]));")
-    self.gen_add_code_line("s_XmatsHom[84] = static_cast<T>(-sin(s_q[5]));")
-    self.gen_add_code_line("s_XmatsHom[86] = static_cast<T>(cos(s_q[5]));")
-    # X_hom[6]
-    self.gen_add_code_line("s_XmatsHom[96] = static_cast<T>(cos(s_q[6]));")
-    self.gen_add_code_line("s_XmatsHom[98] = static_cast<T>(sin(s_q[6]));")
-    self.gen_add_code_line("s_XmatsHom[100] = static_cast<T>(-sin(s_q[6]));")
-    self.gen_add_code_line("s_XmatsHom[102] = static_cast<T>(cos(s_q[6]));")
-
-    # Accumulate global transforms up to 'tid'
-    if has_fixed_target:
-        self.gen_add_code_line("if (tid >= NJ) tid = NJ - 1;")
-    else:
-        self.gen_add_code_line("if (tid >= " + str(n) + ") tid = " + str(n) + "-1;")
-    self.gen_add_code_line("if (tid < 0) { return; }")
-
-    self.gen_add_code_line("{", True)
-    self.gen_add_code_line("const T* c0 = &s_XmatsHom[0];")
-    self.gen_add_code_line("T* o0 = &s_jointXforms[0];")
-    self.gen_add_code_line("o0[0]=c0[0];  o0[1]=c0[1];  o0[2]=c0[2];")
-    self.gen_add_code_line("o0[4]=c0[4];  o0[5]=c0[5];  o0[6]=c0[6];")
-    self.gen_add_code_line("o0[8]=c0[8];  o0[9]=c0[9];  o0[10]=c0[10];")
-    self.gen_add_code_line("o0[12]=c0[12]; o0[13]=c0[13]; o0[14]=c0[14];")
-    self.gen_add_code_line("o0[3]=(T)0; o0[7]=(T)0; o0[11]=(T)0; o0[15]=(T)1;")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("if (tid == 0) { return; }")
-
+    # --- chain walk: world transform of every joint by id order (parent < child) ---
+    self.gen_add_code_line("// chain up cumulative world transforms (parent always < child)")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int j = 1; j <= tid; ++j) {", True)
-    self.gen_add_code_line("const T* p = &s_jointXforms[(j - 1) * 16];")
+    self.gen_add_code_line("for (int j = 0; j < " + str(NJ) + "; ++j) {", True)
     self.gen_add_code_line("const T* c = &s_XmatsHom[j * 16];")
-    self.gen_add_code_line("T r0  = p[0]*c[0]   + p[4]*c[1]   + p[8]*c[2];")
-    self.gen_add_code_line("T r1  = p[1]*c[0]   + p[5]*c[1]   + p[9]*c[2];")
-    self.gen_add_code_line("T r2  = p[2]*c[0]   + p[6]*c[1]   + p[10]*c[2];")
-    self.gen_add_code_line("T r4  = p[0]*c[4]   + p[4]*c[5]   + p[8]*c[6];")
-    self.gen_add_code_line("T r5  = p[1]*c[4]   + p[5]*c[5]   + p[9]*c[6];")
-    self.gen_add_code_line("T r6  = p[2]*c[4]   + p[6]*c[5]   + p[10]*c[6];")
-    self.gen_add_code_line("T r8  = p[0]*c[8]   + p[4]*c[9]   + p[8]*c[10];")
-    self.gen_add_code_line("T r9  = p[1]*c[8]   + p[5]*c[9]   + p[9]*c[10];")
-    self.gen_add_code_line("T r10 = p[2]*c[8]   + p[6]*c[9]   + p[10]*c[10];")
-    self.gen_add_code_line("T r12 = p[0]*c[12]  + p[4]*c[13]  + p[8]*c[14]  + p[12];")
-    self.gen_add_code_line("T r13 = p[1]*c[12]  + p[5]*c[13]  + p[9]*c[14]  + p[13];")
-    self.gen_add_code_line("T r14 = p[2]*c[12]  + p[6]*c[13]  + p[10]*c[14] + p[14];")
     self.gen_add_code_line("T* o = &s_jointXforms[j * 16];")
-    self.gen_add_code_line("o[0]=r0;   o[1]=r1;   o[2]=r2;")
-    self.gen_add_code_line("o[4]=r4;   o[5]=r5;   o[6]=r6;")
-    self.gen_add_code_line("o[8]=r8;   o[9]=r9;   o[10]=r10;")
-    self.gen_add_code_line("o[12]=r12; o[13]=r13; o[14]=r14;")
+    self.gen_add_code_line("int par = " + self.gen_ee_pose_inner_parent_lookup(parents) + ";")
+    self.gen_add_code_line("if (par < 0) {", True)
+    self.gen_add_code_line("o[0]=c[0];   o[1]=c[1];   o[2]=c[2];")
+    self.gen_add_code_line("o[4]=c[4];   o[5]=c[5];   o[6]=c[6];")
+    self.gen_add_code_line("o[8]=c[8];   o[9]=c[9];   o[10]=c[10];")
+    self.gen_add_code_line("o[12]=c[12]; o[13]=c[13]; o[14]=c[14];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("const T* p = &s_jointXforms[par * 16];")
+    self.gen_add_code_line("o[0]  = p[0]*c[0]   + p[4]*c[1]   + p[8]*c[2];")
+    self.gen_add_code_line("o[1]  = p[1]*c[0]   + p[5]*c[1]   + p[9]*c[2];")
+    self.gen_add_code_line("o[2]  = p[2]*c[0]   + p[6]*c[1]   + p[10]*c[2];")
+    self.gen_add_code_line("o[4]  = p[0]*c[4]   + p[4]*c[5]   + p[8]*c[6];")
+    self.gen_add_code_line("o[5]  = p[1]*c[4]   + p[5]*c[5]   + p[9]*c[6];")
+    self.gen_add_code_line("o[6]  = p[2]*c[4]   + p[6]*c[5]   + p[10]*c[6];")
+    self.gen_add_code_line("o[8]  = p[0]*c[8]   + p[4]*c[9]   + p[8]*c[10];")
+    self.gen_add_code_line("o[9]  = p[1]*c[8]   + p[5]*c[9]   + p[9]*c[10];")
+    self.gen_add_code_line("o[10] = p[2]*c[8]   + p[6]*c[9]   + p[10]*c[10];")
+    self.gen_add_code_line("o[12] = p[0]*c[12]  + p[4]*c[13]  + p[8]*c[14]  + p[12];")
+    self.gen_add_code_line("o[13] = p[1]*c[12]  + p[5]*c[13]  + p[9]*c[14]  + p[13];")
+    self.gen_add_code_line("o[14] = p[2]*c[12]  + p[6]*c[13]  + p[10]*c[14] + p[14];")
+    self.gen_add_end_control_flow()
     self.gen_add_code_line("o[3]=(T)0; o[7]=(T)0; o[11]=(T)0; o[15]=(T)1;")
     self.gen_add_end_control_flow()
 
-    if has_fixed_target:
-        self.gen_add_code_line("if (tid == NJ - 1) {", True)
-        self.gen_add_code_line("const T* T6 = &s_jointXforms[(NJ - 1) * 16];")
-        self.gen_add_code_line("T* Tfl = &s_jointXforms[FLANGE_IDX * 16];")
-        self.gen_add_code_line("#pragma unroll")
-        self.gen_add_code_line("for (int k = 0; k < 16; ++k) Tfl[k] = T6[k];")
-        self.gen_add_code_line("T* Tee = &s_jointXforms[NJ * 16];")
-        self.gen_add_code_line("const T* Xfix = &s_XmatsHom[FLANGE_IDX * 16];")
-        self.gen_add_code_line("mat4_mul(Tfl, Xfix, Tee);")
-        self.gen_add_code_line("Tfl[3]=(T)0; Tfl[7]=(T)0; Tfl[11]=(T)0; Tfl[15]=(T)1;")
-        self.gen_add_code_line("Tee[3]=(T)0; Tee[7]=(T)0; Tee[11]=(T)0; Tee[15]=(T)1;")
-        self.gen_add_end_control_flow()
-
     self.gen_add_end_function()
 
-def gen_X_warp(self, fixed_target_name = ""):
-    n = self.robot.get_num_pos()
-    has_fixed_target = fixed_target_name != ""
+def gen_ee_pose_inner_parent_lookup(self, parents):
+    # Emit a constant lookup expression mapping the loop index j -> parent id.
+    # For a serial chain this is just (j-1); otherwise emit a small static table.
+    if all(parents[j] == j - 1 for j in range(len(parents))):
+        return "j - 1"
+    arr = "{" + ",".join(str(p) for p in parents) + "}"
+    return "((const int[]) " + arr + ")[j]"
 
-    if has_fixed_target:
-        fixed_joint = self.robot.get_fixed_joint_by_name(fixed_target_name)
-        fixed_joints = self.robot.get_fixed_joints_ordered_by_id()
-        fixed_offset = fixed_joints.index(fixed_joint)
-        flange_idx = n + fixed_offset
+def gen_ee_pose_inner_warp(self, fixed_target_name = ""):
+    import sympy as sp
+    NJ = self.robot.get_num_joints()
+    parents = [self.robot.get_parent_id(jid) for jid in range(NJ)]
+    Xmats_hom, joint_has_q = self.gen_ee_pose_inner_xform_from_q_lines()
 
     self.gen_add_func_doc(
-        "Warp-cooperative joint transformation matrix accumulation up to joint (tid)",
-        [],
+        "Warp-per-sample forward kinematics: warp-cooperative chain walk that fills "
+        "the full cumulative (world-frame) joint transforms s_jointXforms from s_q. "
+        "Robot-general (any DoF / joint types). 3 lanes own the matrix rows; "
+        "__syncwarp between levels. Reads s_jointXforms[16*target_idx] for the "
+        "world pose of frame target_idx.",
+        ["Assumes the constant (q-independent) cells of s_XmatsHom are pre-loaded; "
+         "only the q-dependent cells are refreshed here."],
         [
-            "s_jointXforms is the pointer to the cumulative joint transfomration matrices",
-            "s_XmatsHom is the pointer to the homogenous transformation matrices",
+            "s_jointXforms is the pointer to the cumulative (world) joint transforms (16 per joint)",
+            "s_XmatsHom is the pointer to the per-joint homogeneous transforms (16 per joint)",
             "s_q is the vector of joint positions",
-            "tid is the joint index up to compute",
+            "target_idx is the joint index whose world transform is desired (full array is filled)",
         ],
         None
     )
     self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__ inline void X_warp(")
+    self.gen_add_code_line("__device__ inline void ee_pose_inner_warp(")
     self.gen_add_code_line("    T* __restrict__ s_jointXforms,")
     self.gen_add_code_line("    T* __restrict__ s_XmatsHom,")
     self.gen_add_code_line("    const T* __restrict__ s_q,")
-    self.gen_add_code_line("    int tid)")
+    self.gen_add_code_line("    int target_idx)")
     self.gen_add_code_line("{", True)
-
-    if has_fixed_target:
-        self.gen_add_code_line("constexpr int NJ = " + str(n) + ";")
-        self.gen_add_code_line("constexpr int FLANGE_IDX = " + str(flange_idx) + ";")
-
+    self.gen_add_code_line("(void)target_idx;")
     self.gen_add_code_line("const int lane = threadIdx.x & 31;")
     self.gen_add_code_line("const unsigned mask = 0xFFFFFFFFu;")
 
-    if has_fixed_target:
-        self.gen_add_code_line("if (tid >= NJ) tid = NJ - 1;")
-    else:
-        self.gen_add_code_line("if (tid >= " + str(n) + ") tid = " + str(n) + "-1;")
-    self.gen_add_code_line("if (tid < 0) return;")
-
-    self.gen_add_code_line("if (lane <= 6) {", True)
-    self.gen_add_code_line("const int j = lane;")
-    self.gen_add_code_line("const T c = static_cast<T>(cos(s_q[j]));")
-    self.gen_add_code_line("const T s = static_cast<T>(sin(s_q[j]));")
-    self.gen_add_code_line("T* X = &s_XmatsHom[j * 16];")
-    self.gen_add_code_line("if (j == 0) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[1] = static_cast<T>(s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[5] = static_cast<T>(c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 1) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(-c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 2) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 3) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 4) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(-c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 5) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("else if (j == 6) {", True)
-    self.gen_add_code_line("X[0] = static_cast<T>(c);")
-    self.gen_add_code_line("X[2] = static_cast<T>(s);")
-    self.gen_add_code_line("X[4] = static_cast<T>(-s);")
-    self.gen_add_code_line("X[6] = static_cast<T>(c);")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_control_flow()
+    # --- refresh q-dependent cells: one lane per joint (lane == jid) ---
+    # joints with q-dependent cells; <=31 lanes cover them, else fall back to a
+    # lane-strided loop so any NJ works.
+    q_joints = [jid for jid in range(NJ) if joint_has_q[jid]]
+    self.gen_add_code_line("// refresh q-dependent X_hom cells: lane j owns joint j")
+    for jid in q_joints:
+        qslot = self.robot.get_joint_index_q(jid)
+        if isinstance(qslot, (list, tuple)):
+            qslot = qslot[0]
+        self.gen_add_code_line("if (lane == " + str(jid) + ") {", True)
+        self.gen_add_code_line("const T s = static_cast<T>(sin(s_q[" + str(qslot) + "]));")
+        self.gen_add_code_line("const T c = static_cast<T>(cos(s_q[" + str(qslot) + "]));")
+        self.gen_add_code_line("(void)s; (void)c;")
+        M = Xmats_hom[jid]
+        for col in range(4):
+            for row in range(4):
+                val = M[row, col]
+                if self.custom_is_constant(val):
+                    continue
+                str_val = sp.ccode(val)
+                str_val = str_val.replace("sin(theta)", "s").replace("cos(theta)", "c")
+                cell = self.gen_static_array_ind_3d(jid, col, row, ind_stride=16, col_stride=4)
+                self.gen_add_code_line("s_XmatsHom[16*" + str(jid) + " + " + str(cell - 16*jid) +
+                                       "] = static_cast<T>(" + str_val + ");")
+        self.gen_add_end_control_flow()
     self.gen_add_code_line("__syncwarp(mask);")
 
-    self.gen_add_code_line("{", True)
-    self.gen_add_code_line("const T* c = &s_XmatsHom[0];")
-    self.gen_add_code_line("T* o = &s_jointXforms[0];")
-    self.gen_add_code_line("if (lane == 0) {")
-    self.gen_add_code_line("    o[0]  = c[0];  o[4]  = c[4];  o[8]  = c[8];  o[12] = c[12];")
-    self.gen_add_code_line("    o[3]  = (T)0;  o[7]  = (T)0;  o[11] = (T)0;  o[15] = (T)1;")
-    self.gen_add_code_line("}")
-    self.gen_add_code_line("else if (lane == 1) {")
-    self.gen_add_code_line("    o[1]  = c[1];  o[5]  = c[5];  o[9]  = c[9];  o[13] = c[13];")
-    self.gen_add_code_line("}")
-    self.gen_add_code_line("else if (lane == 2) {")
-    self.gen_add_code_line("    o[2]  = c[2];  o[6]  = c[6];  o[10] = c[10]; o[14] = c[14];")
-    self.gen_add_code_line("}")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("__syncwarp(mask);")
-    self.gen_add_code_line("if (tid == 0) return;")
-
+    # --- chain walk: 3 row-lanes per joint, parent always < child ---
+    self.gen_add_code_line("// chain up cumulative world transforms (parent always < child)")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int j = 1; j <= tid; ++j) {", True)
-    self.gen_add_code_line("const T* p = &s_jointXforms[(j - 1) * 16];")
+    self.gen_add_code_line("for (int j = 0; j < " + str(NJ) + "; ++j) {", True)
     self.gen_add_code_line("const T* c = &s_XmatsHom[j * 16];")
     self.gen_add_code_line("T* o = &s_jointXforms[j * 16];")
+    self.gen_add_code_line("int par = " + self.gen_ee_pose_inner_parent_lookup(parents) + ";")
 
+    self.gen_add_code_line("if (par < 0) {", True)
+    self.gen_add_code_line("if (lane == 0) { o[0]=c[0]; o[4]=c[4]; o[8]=c[8];  o[12]=c[12]; o[3]=(T)0; o[7]=(T)0; o[11]=(T)0; o[15]=(T)1; }")
+    self.gen_add_code_line("else if (lane == 1) { o[1]=c[1]; o[5]=c[5]; o[9]=c[9];  o[13]=c[13]; }")
+    self.gen_add_code_line("else if (lane == 2) { o[2]=c[2]; o[6]=c[6]; o[10]=c[10]; o[14]=c[14]; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("const T* p = &s_jointXforms[par * 16];")
     self.gen_add_code_line("if (lane == 0) {", True)
     self.gen_add_code_line("o[0]  = p[0]*c[0]  + p[4]*c[1]  + p[8]*c[2];")
     self.gen_add_code_line("o[4]  = p[0]*c[4]  + p[4]*c[5]  + p[8]*c[6];")
@@ -2665,39 +2631,21 @@ def gen_X_warp(self, fixed_target_name = ""):
     self.gen_add_code_line("o[12] = p[0]*c[12] + p[4]*c[13] + p[8]*c[14] + p[12];")
     self.gen_add_code_line("o[3]  = (T)0;      o[7]  = (T)0;      o[11] = (T)0;      o[15] = (T)1;")
     self.gen_add_end_control_flow()
-
     self.gen_add_code_line("else if (lane == 1) {", True)
     self.gen_add_code_line("o[1]  = p[1]*c[0]  + p[5]*c[1]  + p[9]*c[2];")
     self.gen_add_code_line("o[5]  = p[1]*c[4]  + p[5]*c[5]  + p[9]*c[6];")
     self.gen_add_code_line("o[9]  = p[1]*c[8]  + p[5]*c[9]  + p[9]*c[10];")
     self.gen_add_code_line("o[13] = p[1]*c[12] + p[5]*c[13] + p[9]*c[14] + p[13];")
     self.gen_add_end_control_flow()
-
     self.gen_add_code_line("else if (lane == 2) {", True)
     self.gen_add_code_line("o[2]  = p[2]*c[0]  + p[6]*c[1]  + p[10]*c[2];")
     self.gen_add_code_line("o[6]  = p[2]*c[4]  + p[6]*c[5]  + p[10]*c[6];")
     self.gen_add_code_line("o[10] = p[2]*c[8]  + p[6]*c[9]  + p[10]*c[10];")
     self.gen_add_code_line("o[14] = p[2]*c[12] + p[6]*c[13] + p[10]*c[14] + p[14];")
     self.gen_add_end_control_flow()
-
+    self.gen_add_end_control_flow()
     self.gen_add_code_line("__syncwarp(mask);")
     self.gen_add_end_control_flow()
-
-    if has_fixed_target:
-        self.gen_add_code_line("if (tid == NJ - 1) {", True)
-        self.gen_add_code_line("const T* T6 = &s_jointXforms[(NJ - 1) * 16];")
-        self.gen_add_code_line("if (lane == 0) {", True)
-        self.gen_add_code_line("T* Tfl = &s_jointXforms[FLANGE_IDX * 16];")
-        self.gen_add_code_line("#pragma unroll")
-        self.gen_add_code_line("for (int k = 0; k < 16; ++k) Tfl[k] = T6[k];")
-        self.gen_add_code_line("T* Tee = &s_jointXforms[NJ * 16];")
-        self.gen_add_code_line("const T* Xfix = &s_XmatsHom[FLANGE_IDX * 16];")
-        self.gen_add_code_line("mat4_mul(Tfl, Xfix, Tee);")
-        self.gen_add_code_line("Tfl[3]=(T)0; Tfl[7]=(T)0; Tfl[11]=(T)0; Tfl[15]=(T)1;")
-        self.gen_add_code_line("Tee[3]=(T)0; Tee[7]=(T)0; Tee[11]=(T)0; Tee[15]=(T)1;")
-        self.gen_add_end_control_flow()
-        self.gen_add_code_line("__syncwarp(mask);")
-        self.gen_add_end_control_flow()
 
     self.gen_add_end_function()
 
@@ -2749,5 +2697,5 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
         self.gen_end_effector_pose_gradient_hessian_host(2)
 
     if include_pose or include_gradient or include_hessian:
-        self.gen_X_single_thread(fixed_target_name = fixed_target_name)
-        self.gen_X_warp(fixed_target_name = fixed_target_name)
+        self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
+        self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
