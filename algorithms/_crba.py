@@ -2,6 +2,45 @@ import numpy as np
 import copy
 #np.set_printoptions(precision=4, suppress=True, linewidth = 100)
 
+# === CRBA intermediate surgical-spill rung: DEFERRED (K-crbarung, 2026-05-31) ===
+# Goal was to mirror the Minv/FD/idsva_so "surgical spill" pattern — a tier rung
+# between the full-smem PERF rung and the workspace fallback that keeps the HOT
+# scratch in smem while routing only a COLD sub-band to L2-pinned d_workspace —
+# so the MINIMAL tier recovers crba perf on big robots. After auditing the post-
+# I-crba inner band there is NO cold sub-band to relocate, so no intermediate
+# rung can do better than the existing two; deferred (re-confirmed + documented,
+# the same way the idsva_so floating de-alias deferral was handled). Why:
+#
+#  1. I-crba already shrank the inner band to its true live footprint (140*NJ ->
+#     42*NJ fixed; 36*NJ + 36*width floating). The WHOLE band is now hot:
+#       - fixed:    alpha[0,36n) is per-jid Phase-1 transient (the forward
+#                   X^T*IC product, consumed immediately by the backward gemm at
+#                   the SAME jid; the composite-inertia ACCUMULATOR is the XImats
+#                   Imat region, not the band). s_fh[36n,42n) is the Phase-2
+#                   ancestor-chain workspace. Disjoint LIFETIMES but both
+#                   recursion/chain-hot — neither is a write-once cold buffer.
+#       - floating: IC[0,36NJ) is the composite-inertia store CARRIED from Phase 1
+#                   into the Phase-2 chain walk + root block (live across both
+#                   phases); the alpha slab is per-BFS-level transient. Both hot.
+#     There is no idsva-style cold trailing slab (BC / t-p / output tensor) to
+#     truncate, so a surgical rung would have to spill a hot buffer — a perf LOSS,
+#     not the intended win.
+#
+#  2. The whole crba arena is already tiny + smem-resident at every default tier.
+#     Post-I-crba the full arena is ~3.5 KB (iiwa14) / ~17-19 KB (g1 fixed/
+#     floating) — well under the PERF (98304 B) AND LITE (49152 B) targets. So
+#     PERF == LITE == the full rung for all production robots; only MINIMAL (the
+#     always-last "guaranteed-fit" index) ever spills. The current MINIMAL rung
+#     ("workspace") spills ONLY the inner band to d_workspace and keeps s_M +
+#     XImats hot in smem — it is NOT a whole-arena spill. The sole buffer it moves
+#     out is the (now entirely hot) inner band; there is nothing colder to leave
+#     behind, so an "intermediate" rung would be byte-identical to the full rung.
+#
+#  Net: the two existing rungs (full | inner-band-to-workspace) already bracket
+#  the achievable design space. Re-open only if a future crba rewrite introduces
+#  a genuinely cold sub-band (e.g. a materialized composite-inertia output kept
+#  for a downstream consumer). The GCG.py crba tier rows are left at 2 rungs.
+
 def gen_crba_inner_temp_mem_size(self):
     if self.robot.floating_base:
         NJ = self.robot.get_num_joints()
