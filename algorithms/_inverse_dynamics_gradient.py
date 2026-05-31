@@ -1,4 +1,10 @@
 def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
+        if self.robot_has_mimic_joints():
+            # The mimic path emits a DENSE serial fold (6 dense per-body buffers
+            # + Iv) rather than the sparse-compressed band, so it needs its own
+            # (larger) scratch. Big-NB humanoids route this whole pool to
+            # d_workspace at the global-temp tier (SCRATCH_IN_SMEM=false).
+            return _id_du_mimic_temp_count(self)
         return self.gen_inverse_dynamics_gradient_temp_layout()["full_count"]
 
 def gen_inverse_dynamics_gradient_temp_layout(self):
@@ -119,23 +125,18 @@ def gen_inverse_dynamics_gradient_inner(self):
     self.gen_add_code_line(func_def, True)
 
     if self.robot_has_mimic_joints():
-        # MIMIC: the sparse NJ-indexed gradient assembly below writes
-        # s_dc_du columns by raw body id and would write past the reduced
-        # 2*NV*NV output (NB > NV) and read the mis-sized topology helpers.
-        # The mimic-aware reduced gradient (alpha-scaled velocity reads +
-        # per-body v-slot fold) is a later phase (T3-finisher). It used to emit
-        # a SILENTLY-ZEROED output, which is a footgun: callers would consume
-        # all-zero gradients as if valid. `gen_all_code` now refuses gradient
-        # codegen for mimic robots up front (clear NotImplementedError), so this
-        # inner generator should be unreachable for a mimic robot. Guard it as a
-        # hard error in case it is invoked directly, bypassing that check —
-        # never emit silent zeros.
-        raise NotImplementedError(
-            "mimic ID-gradient (inverse_dynamics_gradient_inner) not yet supported — "
-            "deferred to T3-finisher. The mimic-reduced gradient assembly is not "
-            "implemented; refusing to emit silently-zeroed output. Codegen this robot "
-            "with a non-gradient profile/algorithm selection."
-        )
+        # MIMIC (T3-finisher P3): the sparse NJ-indexed gradient assembly below
+        # writes s_dc_du by raw body id and assumes NJ == NV, so it can't fold a
+        # mimic model (NB > NV, shared v-slots). Emit instead a DENSE serial
+        # reduced-space fold that mirrors RBDReference.rnea_grad exactly:
+        # alpha-scaled velocity/accel reads in the forward pass + per-body
+        # v-slot accumulate (+=) in the backward pass. Correctness, not perf, is
+        # the goal here (mimic robots are the gripper/hand class). The large
+        # dense per-body buffers spill to d_temp_spill / d_workspace via the
+        # inner's mimic temp-size; see gen_inverse_dynamics_gradient_inner_temp_mem_size.
+        _gen_id_du_mimic_inner(self, n, NJ)
+        self.gen_add_end_function()
+        return
 
     #
     # Optimize memory requirements due to sparsity induced by branching
@@ -1058,7 +1059,10 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
 
 def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
     n = self.robot.get_num_vel()
-    base_size = 2*n + n*2*n + 18*n + n
+    # s_vaf is 18*NB (body-indexed) for mimic robots; 18*n otherwise (non-mimic
+    # floating has nv > NB so 18*n is the safe/byte-identical size).
+    vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+    base_size = 2*n + n*2*n + vaf_cnt + n
     temp_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
@@ -1072,11 +1076,24 @@ _ID_DU_PICK_FLAGS = [
 def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
                                       use_qdd_input, single_call_timing):
     """Emit the id_du kernel body for one tier's spill flags."""
-    extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", 18*n)]
+    # s_vaf is body-indexed (the ID inner writes NB bodies, stride 6). For a
+    # MIMIC robot (fixed base) NB > nv, so size it 18*NB to avoid overflowing
+    # into the adjacent arena buffers. Non-mimic keeps 18*n (byte-identical;
+    # for floating non-mimic nv > NB so 18*n already covers the body writes).
+    _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+    extra_t_buffers = [("s_q_qd", n + NUM_POS), ("s_dc_du", n*2*n), ("s_vaf", _vaf_cnt)]
     if use_qdd_input:
         extra_t_buffers.append(("s_qdd", n))
+    # Mimic robots use a dense inner with NO sparse-band selective spill, so the
+    # selective-spill smem size collapses to the dense full size (the inner
+    # ignores d_temp_spill and reads the whole dense pool from s_temp/workspace).
+    _selective_shared = (
+        self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+        if self.robot_has_mimic_joints()
+        else self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
+    )
     shared_mem_size = 0 if use_global_temp else (
-        self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
+        _selective_shared
         if use_selective_spill else self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
@@ -1261,3 +1278,227 @@ def gen_inverse_dynamics_gradient(self):
     self.gen_inverse_dynamics_gradient_host(0)
     self.gen_inverse_dynamics_gradient_host(1)
     self.gen_inverse_dynamics_gradient_host(2)
+
+
+def _gen_id_du_mimic_inner(self, nv, NB):
+    """Dense serial mimic ID-gradient (T3-finisher P3, fixed-base).
+
+    Mirrors RBDReference.rnea_grad exactly, in REDUCED v-space:
+      forward pass dq/dqd -> per-body dv_du, da_du, df_du (6 x nv x NB),
+      backward pass       -> dc_dq, dc_dqd (nv x nv).
+    Every joint-velocity read scales by the body's mimic multiplier alpha and
+    every dc_du / df_du write accumulates (+=) into the body's reduced v-slot,
+    so a mimic body and its target fold together. Single-DoF bodies only
+    (fixed base); the multi-DoF floating root mimic-gradient is a separate
+    follow-on and is refused upstream.
+
+    Output s_dc_du is 2*nv*nv, column-major nv x nv per half:
+      dc_dq  at [0, nv*nv)       element [v_i, c] -> s_dc_du[c*nv + v_i]
+      dc_dqd at [nv*nv, 2*nv*nv)  element [v_i, c] -> s_dc_du[nv*nv + c*nv + v_i]
+    s_vaf is body-indexed (stride NB): v @ s_vaf[6*ind], a @ s_vaf[6*NB+6*ind],
+    f @ s_vaf[12*NB+6*ind]. The big dense buffers live in s_temp (routed to
+    workspace at the global-temp tier for humanoid-scale NB)."""
+    import numpy as _np
+    assert not self.robot.floating_base, \
+        "_gen_id_du_mimic_inner is fixed-base only (floating mimic gradient refused upstream)"
+    GRAV_NEG = "gravity"  # s_a base row 5 holds X*gravity already via s_vaf
+
+    bw = 6 * nv * NB  # one dense buffer (6 rows x nv cols x NB bodies)
+    off_dv_dq  = 0
+    off_da_dq  = off_dv_dq  + bw
+    off_df_dq  = off_da_dq  + bw
+    off_dv_dqd = off_df_dq  + bw
+    off_da_dqd = off_dv_dqd + bw
+    off_df_dqd = off_da_dqd + bw
+    off_iv     = off_df_dqd + bw          # Iv per body: 6*NB
+    off_scr    = off_iv + 6 * NB          # scratch 6-vectors (a few)
+
+    def cell(base, ind, c):
+        # &buffer[base] element column c of body ind (6-vector)
+        return base + ind * (6 * nv) + 6 * c
+
+    self.gen_add_code_line("// === mimic ID-gradient (dense serial reduced-space fold) ===")
+    self.gen_add_code_line("// zero the dense fwd buffers + output")
+    self.gen_add_parallel_loop("i", str(off_iv))
+    self.gen_add_code_line("s_temp[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_parallel_loop("i", str(2 * nv * nv))
+    self.gen_add_code_line("s_dc_du[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # ---- forward pass (serial over bodies, root first) ----
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T s_iv6[6];")
+    self.gen_add_code_line("T s_mtmp[6];")
+    self.gen_add_code_line("T s_ftmp[6];")
+    self.gen_add_code_line("T s_Svec[6];")
+    for ind in range(NB):
+        parent = self.robot.get_parent_id(ind)
+        idx = self._v_slot_cpp(ind)
+        alpha = self._alpha_for_jid(ind)
+        s_ind = self.robot.get_S_index_by_id(ind)
+        s_sign = float(self.robot.get_S_sign_by_id(ind))
+        v_ind = 6 * ind                 # s_vaf v
+        a_ind = 6 * NB + 6 * ind        # s_vaf a
+        Xoff = 36 * ind                 # X[ind] col-major in s_XImats
+        Ioff = 36 * NB + 36 * ind       # I[ind]
+        self.gen_add_code_line("// --- body " + str(ind) + " (v-slot " + str(idx) +
+                               ", alpha=" + repr(alpha) + ", S_ind=" + str(s_ind) +
+                               ", S_sign=" + repr(s_sign) + ") ---")
+        self.gen_add_code_line("{", True)  # per-body scope (avoid local redeclare)
+        # Build the S 6-vector (s_sign at row s_ind) for fxS-style products.
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
+        self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
+
+        # Iv = I[ind] * v[ind]
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_iv6[r] = static_cast<T>(0);")
+        self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_iv6[r] += s_XImats[" + str(Ioff) + " + r + 6*p] * s_vaf[" + str(v_ind) + " + p]; }")
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(off_iv + 6*ind) + " + r] = s_iv6[r];")
+
+        if parent != -1:
+            p_dv_dq  = cell(off_dv_dq,  parent, 0)
+            p_da_dq  = cell(off_da_dq,  parent, 0)
+            p_dv_dqd = cell(off_dv_dqd, parent, 0)
+            p_da_dqd = cell(off_da_dqd, parent, 0)
+            c_dv_dq  = cell(off_dv_dq,  ind, 0)
+            c_da_dq  = cell(off_da_dq,  ind, 0)
+            c_dv_dqd = cell(off_dv_dqd, ind, 0)
+            c_da_dqd = cell(off_da_dqd, ind, 0)
+            # dv_du[ind] = X[ind] * dv_du[parent] ; da_du[ind] = X[ind]*da_du[parent]
+            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) {", True)
+            self.gen_add_code_line("T acc_vq=static_cast<T>(0), acc_aq=static_cast<T>(0), acc_vqd=static_cast<T>(0), acc_aqd=static_cast<T>(0);")
+            self.gen_add_code_line("for (int p = 0; p < 6; p++) {", True)
+            self.gen_add_code_line("T xrp = s_XImats[" + str(Xoff) + " + r + 6*p];")
+            self.gen_add_code_line("acc_vq  += xrp * s_temp[" + str(p_dv_dq)  + " + 6*c + p];")
+            self.gen_add_code_line("acc_aq  += xrp * s_temp[" + str(p_da_dq)  + " + 6*c + p];")
+            self.gen_add_code_line("acc_vqd += xrp * s_temp[" + str(p_dv_dqd) + " + 6*c + p];")
+            self.gen_add_code_line("acc_aqd += xrp * s_temp[" + str(p_da_dqd) + " + 6*c + p];")
+            self.gen_add_end_control_flow()
+            self.gen_add_code_line("s_temp[" + str(c_dv_dq)  + " + 6*c + r] = acc_vq;")
+            self.gen_add_code_line("s_temp[" + str(c_da_dq)  + " + 6*c + r] = acc_aq;")
+            self.gen_add_code_line("s_temp[" + str(c_dv_dqd) + " + 6*c + r] = acc_vqd;")
+            self.gen_add_code_line("s_temp[" + str(c_da_dqd) + " + 6*c + r] = acc_aqd;")
+            self.gen_add_end_control_flow()
+            self.gen_add_end_control_flow()
+
+            # dv_dq[:,idx,ind]  += alpha * mxS(S, X*v_parent)  = alpha*s_sign*mx_Sind(X v_parent)
+            # X*v_parent: dv contribution uses v[parent]
+            self.gen_add_code_line("// dv_dq[:,idx] += alpha*mxS(S, X*v_parent); dv_dqd[:,idx] += alpha*S")
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
+            self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*parent) + " + p]; }")
+            # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+
+        # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
+        # adds this for EVERY body including the root (it sits OUTSIDE the
+        # parent!=-1 guard in rnea_grad_fpass_dqd) — the joint's own velocity
+        # subspace contributes to dv/dqd regardless of having a parent.
+        self.gen_add_code_line("// dv_dqd[:,idx] += alpha*S (all bodies incl. root)")
+        self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
+
+        # da_du[:,c,ind] += mxS(S, dv_du[:,c,ind], alpha*qd[idx])   for every column c
+        self.gen_add_code_line("// da_du[:,c] += mxS(S, dv_du[:,c], alpha*qd[idx])")
+        self.gen_add_code_line("T qd_a = static_cast<T>(" + repr(alpha) + ") * s_qd[" + str(idx) + "];")
+        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+        self.gen_add_end_control_flow()
+
+        # da_dq[:,idx,ind] += alpha*mxS(S, X*a_parent or root_gravity)
+        # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
+        self.gen_add_code_line("// da_dq[:,idx] += alpha*mxS(S, X*a_parent); da_dqd[:,idx] += alpha*mxS(S, v[ind])")
+        if parent != -1:
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
+            self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+        else:
+            # root: the base's accel is PURE gravity (NOT the body's own a, which
+            # also carries S*qdd when use_qdd_input — that would corrupt fd_du).
+            # X*gravity is column 5 of X scaled by `gravity`:
+            #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity   (col 5 = +30).
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
+            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha) + "));")
+        # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
+        self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha) + "));")
+
+        # df_du[:,:,ind] = I*da_du + fxv(dv_du, Iv) + fxv(v, I*dv_du)
+        self.gen_add_code_line("// df_du[:,c] = I*da_du[:,c] + fx(dv_du[:,c])*Iv + fx(v)*I*dv_du[:,c]")
+        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+        for (dabuf, dfbuf, dvbuf) in [(off_da_dq, off_df_dq, off_dv_dq), (off_da_dqd, off_df_dqd, off_dv_dqd)]:
+            # I*da_du
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { T acc=static_cast<T>(0);")
+            self.gen_add_code_line("  for (int p = 0; p < 6; p++) acc += s_XImats[" + str(Ioff) + " + r + 6*p] * s_temp[" + str(cell(dabuf, ind, 0)) + " + 6*c + p];")
+            self.gen_add_code_line("  s_temp[" + str(cell(dfbuf, ind, 0)) + " + 6*c + r] = acc; }")
+            # fxv(dv_du[:,c], Iv)
+            self.gen_add_code_line("fx_times_v<T>(s_ftmp, &s_temp[" + str(cell(dvbuf, ind, 0)) + " + 6*c], &s_temp[" + str(off_iv + 6*ind) + "]);")
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(dfbuf, ind, 0)) + " + 6*c + r] += s_ftmp[r];")
+            # I*dv_du[:,c]
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { T acc=static_cast<T>(0);")
+            self.gen_add_code_line("  for (int p = 0; p < 6; p++) acc += s_XImats[" + str(Ioff) + " + r + 6*p] * s_temp[" + str(cell(dvbuf, ind, 0)) + " + 6*c + p];")
+            self.gen_add_code_line("  s_mtmp[r] = acc; }")
+            # fxv(v[ind], I*dv_du[:,c])
+            self.gen_add_code_line("fx_times_v<T>(s_ftmp, &s_vaf[" + str(v_ind) + "], s_mtmp);")
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(dfbuf, ind, 0)) + " + 6*c + r] += s_ftmp[r];")
+        self.gen_add_end_control_flow()  # end for c (df_du)
+        self.gen_add_end_control_flow()  # end per-body scope
+    self.gen_add_end_control_flow()  # end serial fwd
+    self.gen_add_sync()
+
+    # ---- backward pass (serial, deepest first) ----
+    # dc_du[idx,:] += alpha * S^T * df_du[:,:,ind]
+    # df_du[:,idx,parent] += alpha * (X^T * fxS(S, f[ind]))   [dq only]
+    # df_du[:,:,parent]  += X^T * df_du[:,:,ind]
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T s_fxs[6];")
+    self.gen_add_code_line("T s_xtfxs[6];")
+    self.gen_add_code_line("T s_Svec[6];")
+    for ind in range(NB - 1, -1, -1):
+        parent = self.robot.get_parent_id(ind)
+        idx = self._v_slot_cpp(ind)
+        alpha = self._alpha_for_jid(ind)
+        s_ind = self.robot.get_S_index_by_id(ind)
+        s_sign = float(self.robot.get_S_sign_by_id(ind))
+        Xoff = 36 * ind
+        f_ind = 12 * NB + 6 * ind
+        self.gen_add_code_line("// --- bpass body " + str(ind) + " (v-slot " + str(idx) + ") ---")
+        # dc_dq[idx, c]  += alpha * s_sign * df_dq[s_ind, c, ind]
+        # dc_dqd[idx, c] += alpha * s_sign * df_dqd[s_ind, c, ind]
+        coeff = alpha * s_sign
+        self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+        self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
+        self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
+        self.gen_add_end_control_flow()
+        if parent != -1:
+            # df_dq[:,idx,parent] += alpha * X^T * fxS(S, f[ind])
+            # fxS(S, f) = Fx(S)*f = fx_times_v(S, f); S = s_sign*e_{s_ind}
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
+            self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
+            self.gen_add_code_line("fx_times_v<T>(s_fxs, s_Svec, &s_vaf[" + str(f_ind) + "]);")
+            # X^T * s_fxs : (X^T)[r,p] = X[p,r] = s_XImats[Xoff + p + 6*r]
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_xtfxs[r] = static_cast<T>(0);")
+            self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_xtfxs[r] += s_XImats[" + str(Xoff) + " + p + 6*r] * s_fxs[p]; }")
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(off_df_dq, parent, 0)) + " + 6*" + str(idx) + " + r] += static_cast<T>(" + repr(alpha) + ") * s_xtfxs[r];")
+            # df_du[:,:,parent] += X^T * df_du[:,:,ind]   (both dq and dqd)
+            self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) {", True)
+            self.gen_add_code_line("T acc_q=static_cast<T>(0), acc_qd=static_cast<T>(0);")
+            self.gen_add_code_line("for (int p = 0; p < 6; p++) {", True)
+            self.gen_add_code_line("T xtr = s_XImats[" + str(Xoff) + " + p + 6*r];")
+            self.gen_add_code_line("acc_q  += xtr * s_temp[" + str(cell(off_df_dq,  ind, 0)) + " + 6*c + p];")
+            self.gen_add_code_line("acc_qd += xtr * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + p];")
+            self.gen_add_end_control_flow()
+            self.gen_add_code_line("s_temp[" + str(cell(off_df_dq,  parent, 0)) + " + 6*c + r] += acc_q;")
+            self.gen_add_code_line("s_temp[" + str(cell(off_df_dqd, parent, 0)) + " + 6*c + r] += acc_qd;")
+            self.gen_add_end_control_flow()
+            self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # end serial bpass
+    self.gen_add_sync()
+
+
+def _id_du_mimic_temp_count(self):
+    """Dense mimic ID-gradient scratch size: 6 buffers of 6*nv*NB + Iv(6*NB)."""
+    nv = self.robot.get_num_vel()
+    NB = self.robot.get_num_joints()
+    return 6 * (6 * nv * NB) + 6 * NB
