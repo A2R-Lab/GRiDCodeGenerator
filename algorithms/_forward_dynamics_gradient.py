@@ -186,7 +186,8 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
 
 def gen_forward_dynamics_gradient_kernel_max_temp_mem_size(self):
     n = self.robot.get_num_vel()
-    base_size = 2*n + n*2*n + n*2*n + 18*n + n + n*n + n
+    vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+    base_size = 2*n + n*2*n + n*2*n + vaf_cnt + n + n*n + n
     temp_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
@@ -200,9 +201,13 @@ _FD_DU_PICK_FLAGS = [
 def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_temp,
                                       use_qdd_Minv_input, single_call_timing):
     """Emit fd_du kernel body for one tier's spill flags."""
+    # s_vaf is body-indexed (NB bodies, stride 6). For a MIMIC robot (fixed base)
+    # NB > nv, so size 18*NB to keep the ID inner's writes from overflowing into
+    # s_qdd/s_Minv. Non-mimic keeps 18*n (byte-identical; floating nv > NB).
+    _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
     extra_t_buffers = [("s_q_qd", 2*n+self.robot.floating_base),
                        ("s_dc_du", n*2*n),
-                       ("s_vaf", 18*n),
+                       ("s_vaf", _vaf_cnt),
                        ("s_qdd", n),
                        ("s_Minv", n*n)]
     if not use_qdd_Minv_input:

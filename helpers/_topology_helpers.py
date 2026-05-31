@@ -251,6 +251,49 @@ def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_
                                   extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
                                   tier_workspace_expr = tier_workspace_expr)
 
+def _emit_mimic_q_fold(self):
+    """Emit the per-BODY effective-angle q-fold scratch used by every
+    mimic-aware transform path. Layout in s_temp:
+        [0, NB)   s_q_eff   [NB, 2NB) sin   [2NB, 3NB) cos
+    For body `ind` (single-DoF revolute/prismatic) the effective angle is
+    s_q_eff[ind] = alpha_ind * s_q[q_slot(ind)] + offset_ind, mirroring
+    RBDReference.q_for_joint. A mimic body and its target both evaluate their
+    transform at the prescribed scaled+offset coordinate. For NON-mimic bodies
+    alpha==1, offset==0, and q_slot(ind) is the body's own dense q-offset
+    (== ind on a fixed base, == ind+6 on a floating base), so this reduces to a
+    plain copy. The floating root (ind 0, a multi-DoF joint with no `theta`) is
+    skipped — its quaternion transform reads the raw s_q[0..6] directly. This
+    one emit supports BOTH fixed-base and floating-base mimic models."""
+    NB = self.robot.get_num_joints()
+    self.gen_add_serial_ops()
+    for ind in range(NB):
+        qslot = self.robot.get_joint_index_q(ind)
+        if isinstance(qslot, (list, tuple)):
+            if len(qslot) != 1:
+                # Multi-DoF root (floating base): no scalar theta to fold; the
+                # quaternion substitution path reads s_q[0..6] directly. Still
+                # initialize the scratch slot so a stray read is well-defined.
+                self.gen_add_code_line("s_temp[" + str(ind) + "] = static_cast<T>(0);")
+                continue
+            qslot = qslot[0]
+        j = self.robot.get_joint_by_id(ind)
+        if getattr(j, "is_mimic", False):
+            mult = j.get_mimic_multiplier()
+            off = j.get_mimic_offset()
+            expr = "static_cast<T>(" + repr(mult) + ") * s_q[" + str(qslot) + "]"
+            if off != 0.0:
+                expr += " + static_cast<T>(" + repr(off) + ")"
+            self.gen_add_code_line("s_temp[" + str(ind) + "] = " + expr + ";")
+        else:
+            self.gen_add_code_line("s_temp[" + str(ind) + "] = s_q[" + str(qslot) + "];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("k", str(NB))
+    self.gen_add_code_line("s_temp[k+" + str(NB) + "] = static_cast<T>(sin(s_temp[k]));")
+    self.gen_add_code_line("s_temp[k+" + str(2*NB) + "] = static_cast<T>(cos(s_temp[k]));")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
 def _xi_fixed_sincos_subst(self, str_val, ind):
     """Substitute sin/cos/theta for fixed-base body `ind` into a transform
     cell. Mimic-aware: on a model with mimic joints, body `ind` reads its
@@ -319,36 +362,10 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
         if self.robot_has_mimic_joints():
             # Mimic q-fold: build per-BODY effective angle s_q_eff[ind] =
             # alpha_ind * s_q[q_slot(ind)] + offset_ind (mirrors RBDReference's
-            # q_for_joint), then compute per-body sin/cos against it. A mimic
-            # body and its target both evaluate their transform at the
-            # prescribed scaled+offset coordinate. Layout in s_temp:
-            #   [0, NB)      s_q_eff   [NB, 2NB) sin   [2NB, 3NB) cos
-            NB = self.robot.get_num_joints()
-            assert not self.robot.floating_base, \
-                "mimic q-fold path assumes fixed base (no URDF mimic on the floating root)"
-            self.gen_add_serial_ops()
-            for ind in range(NB):
-                qslot = self.robot.get_joint_index_q(ind)
-                if isinstance(qslot, (list, tuple)):
-                    assert len(qslot) == 1
-                    qslot = qslot[0]
-                j = self.robot.get_joint_by_id(ind)
-                if getattr(j, "is_mimic", False):
-                    mult = j.get_mimic_multiplier()
-                    off = j.get_mimic_offset()
-                    expr = "static_cast<T>(" + repr(mult) + ") * s_q[" + str(qslot) + "]"
-                    if off != 0.0:
-                        expr += " + static_cast<T>(" + repr(off) + ")"
-                    self.gen_add_code_line("s_temp[" + str(ind) + "] = " + expr + ";")
-                else:
-                    self.gen_add_code_line("s_temp[" + str(ind) + "] = s_q[" + str(qslot) + "];")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
-            self.gen_add_parallel_loop("k",str(NB))
-            self.gen_add_code_line("s_temp[k+" + str(NB) + "] = static_cast<T>(sin(s_temp[k]));")
-            self.gen_add_code_line("s_temp[k+" + str(2*NB) + "] = static_cast<T>(cos(s_temp[k]));")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
+            # q_for_joint), then compute per-body sin/cos against it. Supports
+            # both fixed-base and floating-base (the floating root's quaternion
+            # transform reads raw s_q[0..6]; only single-DoF bodies are folded).
+            _emit_mimic_q_fold(self)
         else:
             self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
             # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
@@ -384,11 +401,22 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                    
                     if self.robot.floating_base: # extra dof offset due to floating base
                         num_dof = self.robot.get_num_pos()
-                        # revolute
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + 6) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + num_dof + 6) + "]")
-                        # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind + 6) + "]")
+                        if self.robot_has_mimic_joints():
+                            # Floating + mimic: body `ind`'s joint angle is the
+                            # FOLDED per-body effective angle (alpha*q[target]+off)
+                            # stored in the s_q_eff scratch (NB | sin | cos), NOT
+                            # the legacy s_q[ind+6] (which assumes NJ==nq and is
+                            # wrong/OOB once mimic bodies share a q-slot).
+                            NB = self.robot.get_num_joints()
+                            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + NB) + "]")
+                            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
+                            str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
+                        else:
+                            # revolute
+                            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + 6) + "]")
+                            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + num_dof + 6) + "]")
+                            # then just the variable (prismatic)
+                            str_val = str_val.replace("theta","s_q[" + str(ind + 6) + "]")
 
                         # replace floating base linear & quaternion values (s_q[1..6]: [x,y,z,qx,qy,qz,qw])
                         # replace square with self-multiply
@@ -597,33 +625,9 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
             # Mimic q-fold (same scheme as gen_load_update_XImats_helpers):
             # s_temp = [s_q_eff(NB) | sin(NB) | cos(NB)] so body `ind`'s Xhom
             # reads its folded angle/sincos. Avoids the OOB s_q[ind>=nq] the
-            # legacy per-joint substitution would emit for NB > nq.
-            NB = self.robot.get_num_joints()
-            assert not self.robot.floating_base, \
-                "mimic XmatsHom q-fold path assumes fixed base"
-            self.gen_add_serial_ops()
-            for ind in range(NB):
-                qslot = self.robot.get_joint_index_q(ind)
-                if isinstance(qslot, (list, tuple)):
-                    assert len(qslot) == 1
-                    qslot = qslot[0]
-                j = self.robot.get_joint_by_id(ind)
-                if getattr(j, "is_mimic", False):
-                    mult = j.get_mimic_multiplier()
-                    off = j.get_mimic_offset()
-                    expr = "static_cast<T>(" + repr(mult) + ") * s_q[" + str(qslot) + "]"
-                    if off != 0.0:
-                        expr += " + static_cast<T>(" + repr(off) + ")"
-                    self.gen_add_code_line("s_temp[" + str(ind) + "] = " + expr + ";")
-                else:
-                    self.gen_add_code_line("s_temp[" + str(ind) + "] = s_q[" + str(qslot) + "];")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
-            self.gen_add_parallel_loop("k",str(NB))
-            self.gen_add_code_line("s_temp[k+" + str(NB) + "] = static_cast<T>(sin(s_temp[k]));")
-            self.gen_add_code_line("s_temp[k+" + str(2*NB) + "] = static_cast<T>(cos(s_temp[k]));")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
+            # legacy per-joint substitution would emit for NB > nq. Supports
+            # both fixed-base and floating-base mimic models.
+            _emit_mimic_q_fold(self)
         else:
             self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
             # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
@@ -652,9 +656,17 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
     # loop through Xmats and update all non-constant values serially
     def replace_hom_config_symbols(str_val, ind):
         if self.robot.floating_base:
-            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + 6) + "]")
-            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n + 6) + "]")
-            str_val = str_val.replace("theta","s_q[" + str(ind + 6) + "]")
+            if self.robot_has_mimic_joints():
+                # Floating + mimic: read the folded effective angle/sincos from
+                # the s_q_eff scratch (NB | sin | cos) instead of s_q[ind+6].
+                NB = self.robot.get_num_joints()
+                str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + NB) + "]")
+                str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
+                str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
+            else:
+                str_val = str_val.replace("sin(theta)","s_temp[" + str(ind + 6) + "]")
+                str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n + 6) + "]")
+                str_val = str_val.replace("theta","s_q[" + str(ind + 6) + "]")
             str_val = str_val.replace("x_fb**2", "s_q[0]*s_q[0]")
             str_val = str_val.replace("y_fb**2", "s_q[1]*s_q[1]")
             str_val = str_val.replace("z_fb**2", "s_q[2]*s_q[2]")
@@ -747,11 +759,28 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
     self.gen_add_end_function()
 
 def gen_topology_helpers_size(self):
-    n = self.robot.get_num_pos()
+    # The topology-helper sections (parent_inds, num_ancestors, num_subtree,
+    # running sums, S_inds) are BUILT NJ-wide in gen_init_topology_helpers
+    # (n = get_num_joints()), but this size historically used get_num_pos().
+    # For a non-mimic fixed-base chain NJ == nq so they agree. For floating
+    # non-mimic nq > NJ (the floating root's 7 quat coords inflate nq), so the
+    # array was over-allocated-but-correct. For a MIMIC model NJ > nq, so the
+    # old nq sizing UNDER-allocates and the NJ-wide build overflows / the device
+    # reads the wrong parent/S-index at multi-joint BFS levels (h1_2 fixed AND
+    # floating). Size on max(nq, NJ): byte-identical for every non-mimic robot
+    # (nq >= NJ there), and never shrinks (so Gate A is preserved), while
+    # covering the NJ-wide build for mimic robots. The floating read path is
+    # already NJ-consistent (go2/g1 floating build NJ-wide and pass), so a
+    # not-under-allocated array is sufficient for the ID value path.
+    n = max(self.robot.get_num_pos(), self.robot.get_num_joints())
     size = 0
     if not self.robot.is_serial_chain():
         size += 5*n + 1
-    if not self.robot.are_Ss_identical(list(range(n))):
+    # Preserve the legacy are_Ss_identical query set (get_num_pos()) so the
+    # boolean — and thus whether the S_inds section exists at all — is unchanged
+    # for non-mimic robots (Gate A byte-identical). Only the allocated WIDTH (n)
+    # grows to cover the NJ-wide build for mimic models.
+    if not self.robot.are_Ss_identical(list(range(self.robot.get_num_pos()))):
         size += n
     return size
 
@@ -843,6 +872,15 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
             var_names[key] = value
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
+    # FIXED-BASE MIMIC: the topology-helper sections are built NJ-wide, but the
+    # OFFSET=True section strides below use `n` (= get_num_vel()). For a mimic
+    # model NJ > nv, so the device would read parent/S-index at the wrong stride
+    # at multi-joint BFS levels. Use NJ as the stride here (the algorithms also
+    # iterate over NJ bodies for mimic-fixed). Floating-base keeps the legacy
+    # nv stride (its sections + reads are already NJ-consistent via the
+    # floating-specific path, and a swap breaks the byte-identical Gate A).
+    if self.robot_has_mimic_joints() and not self.robot.floating_base:
+        n = NJ
     if inds == None:
         inds = list(range(n))
     IDENTICAL_S_FLAG_INDS = self.robot.are_Ss_identical(inds)
@@ -932,6 +970,10 @@ def gen_topology_S_sign_for_cpp(self, inds = None, updated_var_names = None, OFF
             var_names[key] = value
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
+    # FIXED-BASE MIMIC: S_inds section is NJ-wide; use NJ stride (see the matching
+    # note in gen_topology_helpers_pointers_for_cpp).
+    if self.robot_has_mimic_joints() and not self.robot.floating_base:
+        n = NJ
     if inds == None:
         inds = list(range(n))
 

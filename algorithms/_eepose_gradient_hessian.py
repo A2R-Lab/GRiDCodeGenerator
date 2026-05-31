@@ -530,17 +530,24 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
         for job in jobs:
             flat_jobs.append((ee_idx, ee_anchor, job))
     # Collapse jobs that target the same destination column (same (ee_idx, vi)) —
-    # these occur when several joint ids in a chain map to one velocity coordinate
-    # (e.g. h1_2's finger joints sharing a v-index). The original serial emission
-    # wrote them in order and let the LAST writer win; keeping only the last
-    # occurrence per (ee_idx, vi) reproduces that last-writer-wins result exactly
-    # while making every remaining job's destination column disjoint (a hard
-    # requirement for the block-parallel fill — no two work-items touch one cell).
-    _dedup = {}
+    # these occur when several joint ids in a chain map to one velocity coordinate.
+    # For a NON-mimic robot this only happens degenerately and the legacy emission
+    # let the LAST writer win. For a MIMIC robot a mimic joint SHARES its target's
+    # v-slot and BOTH contribute to that geometric-Jacobian column, each scaled by
+    # its mimic multiplier alpha (the mimic body moves alpha * the target's joint
+    # rate). So group jobs by (ee_idx, vi): single-job groups go to the disjoint
+    # block-parallel fill (byte-identical to the legacy path for non-mimic, where
+    # every group is a singleton with alpha == 1); multi-job groups (mimic) are
+    # emitted as a serial alpha-accumulate fold so the shared column sums all
+    # contributions. Mirrors the id_du / crba mimic v-slot accumulate.
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    _groups = {}
     for entry in flat_jobs:
         ee_idx, _anc, job = entry
-        _dedup[(ee_idx, job["vi"])] = entry  # later entries overwrite earlier
-    flat_jobs = list(_dedup.values())
+        _groups.setdefault((ee_idx, job["vi"]), []).append(entry)
+    single_jobs = [grp[0] for grp in _groups.values() if len(grp) == 1]
+    multi_groups = [grp for grp in _groups.values() if len(grp) > 1]
+    flat_jobs = single_jobs
     n_flat = len(flat_jobs)
     if n_flat > 0:
         self.gen_add_code_line("//")
@@ -603,6 +610,49 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
         # J_v[ee, vi, r] = axw_r; J_w already zero from init
         self.gen_add_code_line("s_Jv[col_base + 0] = axw_0; s_Jv[col_base + 1] = axw_1; s_Jv[col_base + 2] = axw_2;")
         self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+    # ============ Step 3b: MIMIC shared-column alpha-accumulate (serial) ===========
+    # A mimic joint and its target share one velocity coordinate; both contribute
+    # to that geometric-Jacobian column scaled by their mimic multiplier alpha.
+    # Emit these shared columns serially (thread 0), accumulating alpha_j * J_col(j)
+    # over every chain joint j in the group. Only reached for mimic robots (non-mimic
+    # has no multi-job groups), so non-mimic output is byte-identical.
+    if HAS_MIMIC and multi_groups:
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Step 3b: mimic shared-v-slot columns (serial alpha-accumulate)")
+        self.gen_add_code_line("//")
+        self.gen_add_serial_ops()
+        for grp in multi_groups:
+            ee_idx0, _anc0, job0 = grp[0]
+            col_base = 3 * nv * ee_idx0 + 3 * job0["vi"]
+            self.gen_add_code_line("// (ee " + str(ee_idx0) + ", v-slot " + str(job0["vi"]) +
+                                   ") <- " + str(len(grp)) + " chain joints")
+            self.gen_add_code_line("s_Jv[" + str(col_base) + " + 0] = static_cast<T>(0); s_Jv[" + str(col_base) + " + 1] = static_cast<T>(0); s_Jv[" + str(col_base) + " + 2] = static_cast<T>(0);")
+            self.gen_add_code_line("s_Jw[" + str(col_base) + " + 0] = static_cast<T>(0); s_Jw[" + str(col_base) + " + 1] = static_cast<T>(0); s_Jw[" + str(col_base) + " + 2] = static_cast<T>(0);")
+            for (ee_idx, ee_anchor, job) in grp:
+                j = job["j"]
+                alpha = self._alpha_for_jid(j)
+                ax = job["ang"] if job["revolute"] else job["lin"]
+                ax = [float(ax[c]) if abs(ax[c]) >= 1e-15 else 0.0 for c in range(3)]
+                self.gen_add_code_line("{")
+                self.gen_add_code_line("  T ax0 = static_cast<T>({:.17g}); T ax1 = static_cast<T>({:.17g}); T ax2 = static_cast<T>({:.17g});".format(ax[0], ax[1], ax[2]))
+                self.gen_add_code_line("  T axw_0 = s_Xworld[16*" + str(j) + " + 0]*ax0 + s_Xworld[16*" + str(j) + " + 4]*ax1 + s_Xworld[16*" + str(j) + " + 8]*ax2;")
+                self.gen_add_code_line("  T axw_1 = s_Xworld[16*" + str(j) + " + 1]*ax0 + s_Xworld[16*" + str(j) + " + 5]*ax1 + s_Xworld[16*" + str(j) + " + 9]*ax2;")
+                self.gen_add_code_line("  T axw_2 = s_Xworld[16*" + str(j) + " + 2]*ax0 + s_Xworld[16*" + str(j) + " + 6]*ax1 + s_Xworld[16*" + str(j) + " + 10]*ax2;")
+                a = repr(float(alpha))
+                if job["revolute"]:
+                    self.gen_add_code_line("  s_Jw[" + str(col_base) + " + 0] += static_cast<T>(" + a + ") * axw_0; s_Jw[" + str(col_base) + " + 1] += static_cast<T>(" + a + ") * axw_1; s_Jw[" + str(col_base) + " + 2] += static_cast<T>(" + a + ") * axw_2;")
+                    self.gen_add_code_line("  T dx = s_Xworld[16*" + str(ee_anchor) + " + 12] - s_Xworld[16*" + str(j) + " + 12];")
+                    self.gen_add_code_line("  T dy = s_Xworld[16*" + str(ee_anchor) + " + 13] - s_Xworld[16*" + str(j) + " + 13];")
+                    self.gen_add_code_line("  T dz = s_Xworld[16*" + str(ee_anchor) + " + 14] - s_Xworld[16*" + str(j) + " + 14];")
+                    self.gen_add_code_line("  s_Jv[" + str(col_base) + " + 0] += static_cast<T>(" + a + ") * (axw_1*dz - axw_2*dy);")
+                    self.gen_add_code_line("  s_Jv[" + str(col_base) + " + 1] += static_cast<T>(" + a + ") * (axw_2*dx - axw_0*dz);")
+                    self.gen_add_code_line("  s_Jv[" + str(col_base) + " + 2] += static_cast<T>(" + a + ") * (axw_0*dy - axw_1*dx);")
+                else:
+                    self.gen_add_code_line("  s_Jv[" + str(col_base) + " + 0] += static_cast<T>(" + a + ") * axw_0; s_Jv[" + str(col_base) + " + 1] += static_cast<T>(" + a + ") * axw_1; s_Jv[" + str(col_base) + " + 2] += static_cast<T>(" + a + ") * axw_2;")
+                self.gen_add_code_line("}")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 

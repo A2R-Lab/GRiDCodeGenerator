@@ -427,6 +427,18 @@ def gen_crba_inner_floating(self):
             self.gen_add_sync()
             self.gen_add_end_control_flow()  # close the per-level scope
 
+    # Phase 2 (mimic) — for a floating-base model WITH mimic joints, a mimic
+    # body and its target SHARE a v-slot, so the per-jid thread-parallel walk
+    # below (which assumes each thread owns a unique dof = jid+5) would race /
+    # write the wrong slot. Divert to a serial reduced-space fold that mirrors
+    # RBDReference.crba (floating mimic path): per-body alpha-scaled H assembly
+    # with root coupling, then the root-order [3,4,5,0,1,2] reindex of the
+    # root<->joint cross block. The IC band above is already correct.
+    if self.robot_has_mimic_joints():
+        _gen_crba_mimic_floating_phase2(self, NJ)
+        self.gen_add_end_function()
+        return
+
     # Phase 2 — per-jid thread-parallel walk for M's diagonal + scalar-joint
     # off-diagonal + floating-root coupling cells. ONE __syncthreads at the
     # end of the loop, vs the ~3-per-(jid, ancestor) of the prior impl
@@ -505,6 +517,80 @@ def gen_crba_inner_floating(self):
     self.gen_add_sync()
 
     self.gen_add_end_function()
+
+
+def _gen_crba_mimic_floating_phase2(self, NJ):
+    """Mimic-aware floating-base CRBA Phase 2 (serial reduced-space fold).
+
+    Assumes Phase 1 has populated IC[jid] (composite inertias, col-major 6x6)
+    at s_temp[36*jid ...] for jid in [0, NJ). Mirrors RBDReference.crba's
+    floating mimic path:
+      * scalar joints (jid >= 1) accumulate H[v_i, v_j] += alpha_i*alpha_j*...
+        into REDUCED v-slots (v = joint_index_v(jid)); mimic + target share a
+        slot so writes ACCUMULATE,
+      * each scalar joint also couples to the 6-DoF root: cross[k] = alpha_i *
+        (X-chain fh)[k] in SPATIAL order, reindexed to the floating-base
+        v-order via S_col = col<3?col+3:col-3 (== root_order [3,4,5,0,1,2]),
+      * the root block H[:6,:6] = S^T IC[0] S with the same reindex.
+    Serial (thread 0) because v-slots collide for mimic joints. s_M is
+    NV x NV column-major, matching the parallel non-mimic path byte-for-byte
+    on the root block (so non-mimic robots never reach here)."""
+    nv = self.robot.get_num_vel()
+    ICOffset = 0
+    self.gen_add_code_line("// === mimic-aware floating CRBA Phase 2 (serial reduced-space fold) ===")
+    # Clear joint<->joint and joint<->root cells (the root 6x6 block is written
+    # by the parallel loop below, but clear it too for a clean accumulate base).
+    self.gen_add_parallel_loop("i", str(nv * nv))
+    self.gen_add_code_line("s_M[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T s_fh[6];")
+    self.gen_add_code_line("T s_fh2[6];")
+    for ind in range(1, NJ):
+        vi = self._v_slot_cpp(ind)
+        alpha_i = self._alpha_for_jid(ind)
+        s_ind = self.robot.get_S_index_by_id(ind)
+        s_sign = self.robot.get_S_sign_by_id(ind)
+        self.gen_add_code_line("// body " + str(ind) + " -> v-slot " + str(vi) + " (alpha=" + repr(alpha_i) + ")")
+        # fh = IC[ind] * S[ind] = S_sign * column s_ind of IC[ind] (col-major)
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_fh[r] = static_cast<T>(" + repr(float(s_sign)) + ") * s_temp[" + str(36*ind + 6*s_ind) + " + r]; }")
+        # diagonal: H[vi,vi] += alpha_i^2 * S_sign * fh[s_ind]
+        diag_coeff = float(alpha_i) * float(alpha_i) * float(s_sign)
+        self.gen_add_code_line("s_M[" + str(vi + nv*vi) + "] += static_cast<T>(" + repr(diag_coeff) + ") * s_fh[" + str(s_ind) + "];")
+        # walk ancestors (scalar joints with parent > 0)
+        j = ind
+        cur = "s_fh"
+        nxt = "s_fh2"
+        while self.robot.get_parent_id(j) > 0:
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { " + nxt + "[r] = static_cast<T>(0); for (int p = 0; p < 6; p++) { " + nxt + "[r] += s_XImats[" + str(36*j) + " + p + 6*r] * " + cur + "[p]; } }")
+            j = self.robot.get_parent_id(j)
+            vj = self._v_slot_cpp(j)
+            alpha_j = self._alpha_for_jid(j)
+            sj_ind = self.robot.get_S_index_by_id(j)
+            sj_sign = self.robot.get_S_sign_by_id(j)
+            contrib_coeff = float(alpha_i) * float(alpha_j) * float(sj_sign)
+            self.gen_add_code_line("{ T contribution = static_cast<T>(" + repr(contrib_coeff) + ") * " + nxt + "[" + str(sj_ind) + "];")
+            self.gen_add_code_line("  s_M[" + str(vi + nv*vj) + "] += contribution; s_M[" + str(vj + nv*vi) + "] += contribution; }")
+            cur, nxt = nxt, cur
+        # root coupling: fh = X[j]^T fh once more (j is now the body whose
+        # parent is the root 0), then cross[col] = alpha_i * fh_spatial[S_col].
+        self.gen_add_code_line("for (int r = 0; r < 6; r++) { " + nxt + "[r] = static_cast<T>(0); for (int p = 0; p < 6; p++) { " + nxt + "[r] += s_XImats[" + str(36*j) + " + p + 6*r] * " + cur + "[p]; } }")
+        cross_coeff = float(alpha_i)
+        self.gen_add_code_line("for (int col = 0; col < 6; col++) { int S_col = col < 3 ? col + 3 : col - 3;")
+        self.gen_add_code_line("  T cross = static_cast<T>(" + repr(cross_coeff) + ") * " + nxt + "[S_col];")
+        self.gen_add_code_line("  s_M[" + str(vi) + " + " + str(nv) + "*col] += cross; s_M[col + " + str(nv) + "*" + str(vi) + "] += cross; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # root block H[:6,:6] = S^T IC[0] S (same reindex as the non-mimic path).
+    self.gen_add_code_line("// floating-base root block H[:6,:6] = S^T * IC[0] * S")
+    self.gen_add_parallel_loop("ind", "36")
+    self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+    self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
+    self.gen_add_code_line("int S_col = col < 3 ? col + 3 : col - 3;")
+    self.gen_add_code_line("s_M[row + " + str(nv) + "*col] = s_temp[" + str(ICOffset) + " + S_row + 6*S_col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
 
 

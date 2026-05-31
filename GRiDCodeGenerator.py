@@ -413,17 +413,30 @@ class GRiDCodeGenerator:
         self._integrator_du_dqdd_count = _integrator_du_D_qdd_count
         self._integrator_du_dAB_count = _integrator_du_dAB_count
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()
-        id_du_temp_count = id_du_temp_layout["full_count"]
-        id_du_selective_temp_count = id_du_temp_layout["selective_shared_count"]
+        # Mimic robots emit a DENSE serial id_du inner (no sparse-band spill), so
+        # its inner scratch is the dense count; the selective-spill tier doesn't
+        # apply (its band offsets are meaningless for the dense layout). Use the
+        # dense count for full AND selective so the kernel always sizes smem for
+        # the dense buffers and never selects a too-small selective arena.
+        _id_du_has_mimic = self.robot_has_mimic_joints()
+        id_du_temp_count = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+        id_du_selective_temp_count = (
+            id_du_temp_count if _id_du_has_mimic
+            else id_du_temp_layout["selective_shared_count"]
+        )
         fd_du_temp_count = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
         fd_du_selective_temp_count = max(self.gen_direct_minv_inner_temp_mem_size(), id_du_selective_temp_count)
         id_device_t_count = 18*n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
         minv_device_t_count = self.gen_direct_minv_inner_temp_mem_size() + XI_size
         fd_device_t_count = self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
-        id_du_device_t_count = 18*nv + id_du_temp_count + XI_size
-        fd_du_device_t_count = (2*nv*nv) + (18*nv) + nv + (nv*nv) + fd_du_temp_count + XI_size
-        id_du_t_count_full = (nv + n) + (2*nv*nv) + (18*nv) + nv + id_du_temp_count + XI_size
-        fd_du_t_count_full = (3*nv + int(self.robot.floating_base)) + (2*nv*nv) + (18*nv) + nv + (nv*nv) + fd_du_temp_count + XI_size
+        # s_vaf is body-indexed (NB bodies). For a MIMIC robot NB > nv so size
+        # 18*NB; non-mimic keeps 18*nv (byte-identical; floating non-mimic has
+        # nv > NB so 18*nv already covers the body writes).
+        _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
+        id_du_device_t_count = _vaf_cnt + id_du_temp_count + XI_size
+        fd_du_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + fd_du_temp_count + XI_size
+        id_du_t_count_full = (nv + n) + (2*nv*nv) + (_vaf_cnt) + nv + id_du_temp_count + XI_size
+        fd_du_t_count_full = (3*nv + int(self.robot.floating_base)) + (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + fd_du_temp_count + XI_size
         id_du_t_count_selective = id_du_t_count_full - id_du_temp_count + id_du_selective_temp_count
         fd_du_t_count_selective = fd_du_t_count_full - fd_du_temp_count + fd_du_selective_temp_count
         id_du_t_count_emergency = id_du_t_count_full - id_du_temp_count
@@ -1748,12 +1761,20 @@ class GRiDCodeGenerator:
         # silently writing ZEROS. Non-gradient mimic codegen (id/fd/aba/crba/minv/
         # ee_pose/integrator value) is unaffected and still emits normally.
         if self.robot_has_mimic_joints():
+            # T3-finisher: id_du + fd_du mimic gradients have landed (dense
+            # serial reduced-space fold, fixed-base). They are removed from the
+            # refusal set. Floating-base mimic gradients are NOT yet supported,
+            # so refuse them regardless of algorithm (the dense inner asserts
+            # fixed-base). ee_pose_gradient/hessian + idsva_so/fdsva_so + the
+            # integrator gradients remain refused (P4 pending).
             _MIMIC_GRADIENT_ALGORITHMS = {
-                "id_du", "fd_du", "ee_pose_gradient", "ee_pose_hessian",
+                "ee_pose_gradient", "ee_pose_hessian",
                 "idsva_so_body_frame", "fdsva_so",
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
+            if self.robot.floating_base:
+                _MIMIC_GRADIENT_ALGORITHMS |= {"id_du", "fd_du"}
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(

@@ -40,13 +40,22 @@ def _idsva_so_floating_velocity_metadata(robot):
             raise ValueError(
                 "Floating IDSVA-SO velocity metadata expected one S column per velocity index."
             )
+        is_mimic_body = getattr(robot.get_joint_by_id(body_id), "is_mimic", False)
         for local_col, vel_index in enumerate(v_inds):
             body_v_index.append(vel_index)
-            vel_to_body[vel_index] = body_id
-            vel_to_local_col[vel_index] = local_col
-            s_index, s_sign = _idsva_so_unit_axis(S_cols[local_col])
-            vel_s_index[vel_index] = s_index
-            vel_s_sign[vel_index] = s_sign
+            # vel_to_body / vel_to_local_col / vel_s_* map a reduced velocity
+            # slot to its CANONICAL owning body. A mimic joint SHARES its
+            # target's v-slot, so it must NOT overwrite the target's assignment
+            # (the target — a non-mimic joint — is the canonical owner; the
+            # mimic's contribution folds in via its alpha multiplier elsewhere).
+            # Bodies are visited in id order with the target defined before its
+            # mimic, so guarding on is_mimic keeps the target's mapping intact.
+            if not is_mimic_body:
+                vel_to_body[vel_index] = body_id
+                vel_to_local_col[vel_index] = local_col
+                s_index, s_sign = _idsva_so_unit_axis(S_cols[local_col])
+                vel_s_index[vel_index] = s_index
+                vel_s_sign[vel_index] = s_sign
         body_v_start.append(len(body_v_index))
 
     subtree_v_start = [0]
