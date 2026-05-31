@@ -17,3 +17,4 @@ from ._integrator import *
 from ._integrator_gradient import *
 from ._plant import *
 from ._centroidal import *
+from ._frame_jacobian import *
