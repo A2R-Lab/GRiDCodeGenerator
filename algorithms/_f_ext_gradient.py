@@ -258,84 +258,70 @@ def gen_f_ext_gradient_output_size(self):
     return nv * 6 * NB
 
 
-def gen_f_ext_gradient_dq_device(self):
-    """Emit f_ext_gradient_dq_device: the mixed second-order block
-    d(id_du)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv.
+def _f_ext_gradient_dq_smem_count(self):
+    """T-element shared count for the -dJ^T/dq kernel arena (fixed base).
 
-    Strategy: central finite-difference of the analytic A.1 build -J^T over each
-    generalized coordinate (the same FD-on-Jacobian approach the d2ee GPU path
-    uses for the kinematic Hessian; see _eepose_gradient_hessian end_effector_pose
-    _hessian FD oracle). FIXED-BASE ONLY in this first cut: a velocity-coordinate
-    perturbation equals q[i] += h directly. Floating-base A.3 needs the SE(3) Lie
-    integrator on-device to perturb along the root twist and is DEFERRED to the
-    backlog (the numpy + pinocchio oracle ships -dJ^T/dq for BOTH base modes, so
-    the math is validated; only the GPU floating emit is pending).
-
-    The q-dot block is identically zero (J^T is q-only) and is not emitted.
-    """
-    if self.robot.floating_base:
-        # guarded out at the call site; never emitted for floating base.
-        return
+    Layout in s_temp: s_qpert[n_pos] | s_JTp[nv*6NB] | s_JTm[nv*6NB] |
+    s_jt_temp[jt_inner] | s_xi_scratch[xi]. The XImats buffer + s_q live in their
+    own arena regions (declared via gen_XImats_helpers_temp_shared_memory_code)."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
     out6 = 6 * NB
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
-
-    func_params = [
-        "s_did_du_dfext is the output -dJ^T/dq, size NV*(6*NB)*NV = " + str(nv * out6 * nv),
-        "s_q is the joint positions",
-        "d_robotModel is the initialized model helpers on the GPU",
-    ]
-    func_notes = [
-        "Mixed second-order f_ext block: d(id_du)/dfext = -dJ^T/dq (q-only; qd-block=0).",
-        "Central FD of the analytic A.1 -J^T over each q coordinate (fixed base).",
-    ]
-    func_def = ("void f_ext_gradient_dq_device(T *s_did_du_dfext, const T *s_q, "
-                "const robotModel<T> *d_robotModel) {")
-    # scratch: a perturbable q copy (n_pos), two J^T buffers (nv*6NB each), the
-    # J^T inner temp, and a SEPARATE scratch for the per-iteration XImats reload
-    # (the XImats helper would otherwise clobber s_qpert if handed the same temp).
     xi_scratch = self.gen_load_update_XImats_helpers_temp_mem_size()
-    shared_extra = n_pos + 2 * nv * out6 + jt_temp + xi_scratch
-    self.gen_add_func_doc("Compute -dJ^T/dq = d(id_du)/dfext (section A.3, fixed base)",
-                          func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_extra, include_linalg_scratch=True)
+    return n_pos + 2 * nv * out6 + jt_temp + xi_scratch
+
+
+def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
+    """Emit the per-timestep -dJ^T/dq FD body. Assumes s_q (smem), s_XImats, and
+    s_temp arena are already declared/loaded. Writes into `out_ptr_expr` (a global
+    or shared pointer to the nv*6NB*nv output for this timestep)."""
+    NB = self.robot.get_num_bodies()
+    nv = self.robot.get_num_vel()
+    n_pos = self.robot.get_num_pos()
+    out6 = 6 * NB
+    jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
+    self.gen_add_code_line("T *s_did_du_dfext = " + out_ptr_expr + ";")
     self.gen_add_code_line("const T fd_h = static_cast<T>(1e-3);")
     self.gen_add_code_line("T *s_qpert = s_temp;")
     self.gen_add_code_line("T *s_JTp = &s_temp[" + str(n_pos) + "];")
     self.gen_add_code_line("T *s_JTm = &s_temp[" + str(n_pos + nv * out6) + "];")
     self.gen_add_code_line("T *s_jt_temp = &s_temp[" + str(n_pos + 2 * nv * out6) + "];")
     self.gen_add_code_line("T *s_xi_scratch = &s_temp[" + str(n_pos + 2 * nv * out6 + jt_temp) + "];")
-    # loop over each q coordinate i in [0, nv)
+    # loop over each q coordinate qi in [0, nv)
     self.gen_add_code_line("for (int qi = 0; qi < " + str(nv) + "; ++qi) {", True)
-    # s_qpert = s_q (copy)
+    # s_qpert = s_q (copy) for +h
     self.gen_add_parallel_loop("ind", str(n_pos))
     self.gen_add_code_line("s_qpert[ind] = s_q[ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    # + h
     self.gen_add_serial_ops()
     self.gen_add_code_line("s_qpert[qi] += fd_h;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     self.gen_load_update_XImats_helpers_function_call(updated_var_names={"s_q_name": "s_qpert", "s_temp_name": "s_xi_scratch"})
+    self.gen_add_sync()
     self.gen_f_ext_gradient_inner_function_call(updated_var_names={
         "s_dtau_dfext_name": "s_JTp", "s_q_name": "s_qpert", "s_temp_name": "s_jt_temp"})
     self.gen_add_sync()
-    # - h
+    # re-copy s_qpert = s_q then -h (the XImats helper may have written into
+    # s_xi_scratch only, but be defensive and re-seed s_qpert from s_q).
+    self.gen_add_parallel_loop("ind", str(n_pos))
+    self.gen_add_code_line("s_qpert[ind] = s_q[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
     self.gen_add_serial_ops()
-    self.gen_add_code_line("s_qpert[qi] -= static_cast<T>(2)*fd_h;")
+    self.gen_add_code_line("s_qpert[qi] -= fd_h;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     self.gen_load_update_XImats_helpers_function_call(updated_var_names={"s_q_name": "s_qpert", "s_temp_name": "s_xi_scratch"})
+    self.gen_add_sync()
     self.gen_f_ext_gradient_inner_function_call(updated_var_names={
         "s_dtau_dfext_name": "s_JTm", "s_q_name": "s_qpert", "s_temp_name": "s_jt_temp"})
     self.gen_add_sync()
-    # central diff into output column qi: s_did[...][qi] = (JTp - JTm)/(2h)
+    # central diff into output column qi: out[...][qi] = (JTp - JTm)/(2h).
+    # s_JTp/s_JTm already hold -J^T (the inner emits -J^T), so this is -dJ^T/dq.
     # output layout: [ (row v_j) + nv*(6NB col) + nv*6NB*qi ]
     self.gen_add_parallel_loop("ind", str(nv * out6))
     self.gen_add_code_line("s_did_du_dfext[ind + " + str(nv * out6) + "*qi] = "
@@ -343,8 +329,127 @@ def gen_f_ext_gradient_dq_device(self):
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     self.gen_add_end_control_flow()  # for qi
-    # NOTE: s_JTp / s_JTm hold -J^T already (the inner emits -J^T), so the FD is of
-    # -J^T, i.e. the output is -dJ^T/dq directly. No extra sign needed.
+    # Restore s_XImats / s_q-state for the ORIGINAL q so any later use is correct.
+    self.gen_load_update_XImats_helpers_function_call(updated_var_names={"s_temp_name": "s_xi_scratch"})
+    self.gen_add_sync()
+
+
+def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
+    """Emit f_ext_gradient_dq_kernel: the mixed second-order block
+    d(id_du)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv, FIXED-BASE.
+
+    Central finite-difference of the analytic A.1 -J^T over each generalized
+    coordinate (the same FD-on-Jacobian approach the d2ee GPU path uses for the
+    kinematic Hessian). A velocity-coordinate perturbation equals q[i] += h
+    directly on a fixed base. Floating-base A.3 needs the SE(3) Lie integrator to
+    perturb along the root twist and is DEFERRED (the numpy + pinocchio oracle
+    ships -dJ^T/dq for BOTH modes, so the math is validated). The q-dot block is
+    identically zero (J^T is q-only) and is not emitted."""
+    if self.robot.floating_base:
+        return
+    NB = self.robot.get_num_bodies()
+    nv = self.robot.get_num_vel()
+    n_pos = self.robot.get_num_pos()
+    out6 = 6 * NB
+    out_each = nv * out6 * nv
+
+    func_params = [
+        "d_did_du_dfext is the output -dJ^T/dq, size NV*(6*NB)*NV = " + str(out_each) + " per timestep",
+        "d_q is the joint positions, stride_q the per-timestep stride",
+        "d_robotModel is the initialized model helpers on the GPU",
+        "NUM_TIMESTEPS is the trajectory length (or timing reps)",
+    ]
+    func_def_start = ("void f_ext_gradient_dq_kernel(T *d_did_du_dfext, "
+                      "const T *d_q, const int stride_q, ")
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute -dJ^T/dq = d(id_du)/dfext (section A.3, fixed base, batched kernel)",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    shared_extra = _f_ext_gradient_dq_smem_count(self)
+    self.gen_XImats_helpers_temp_shared_memory_code(
+        shared_extra, extra_t_buffers=[("s_q", n_pos)], include_linalg_scratch=True)
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
+        self.gen_add_code_line("// compute")
+        _emit_f_ext_gradient_dq_body(self, "&d_did_du_dfext[k*" + str(out_each) + "]")
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q", str(n_pos))
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="did_du_dfext")
+        _emit_f_ext_gradient_dq_body(self, "d_did_du_dfext")
+        self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_f_ext_gradient_dq_host(self, mode=0):
+    """Host wrapper for the -dJ^T/dq kernel (fixed base only)."""
+    if self.robot.floating_base:
+        return
+    single_call_timing = (mode == 1)
+    compute_only = (mode == 2)
+    func_params = [
+        "hd_data is the packaged input and output pointers",
+        "d_robotModel is the initialized model helpers on the GPU",
+        "num_timesteps is the trajectory length (or timing reps)",
+        "streams are CUDA streams for async transfers",
+    ]
+    func_def_start = ("void f_ext_gradient_dq(gridData<T, KIND> *hd_data, "
+                      "const robotModel<T> *d_robotModel, const int num_timesteps,")
+    func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute -dJ^T/dq = d(id_du)/dfext (host wrapper, fixed base)", [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"f_ext_gradient_dq requires all-data or dynamics gridData\");")
+    out_each = "NUM_VEL*6*NUM_BODIES*NUM_VEL"
+    func_call_start = ("f_ext_gradient_dq_kernel<T><<<block_dimms,thread_dimms,F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
+                       "hd_data->d_did_du_dfext,hd_data->d_q,stride_q,")
+    func_call_end = "d_robotModel,num_timesteps);"
+    if single_call_timing:
+        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// start code with memory transfer",
+            "int stride_q;",
+            "if (USE_COMPRESSED_MEM) {stride_q = NUM_JOINTS; gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+            "else {stride_q = 3*NUM_JOINTS; gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+            "gpuErrchkKernel();"])
+    else:
+        self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call = func_call_start + func_call_end
+    func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q", "hd_data->d_q_qd_u") + "}"
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient_dq\", F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// finally transfer the result back",
+            "gpuErrchk(cudaMemcpy(hd_data->h_did_du_dfext,hd_data->d_did_du_dfext," + out_each + "*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+            "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("f_ext_gradient_dq"))
     self.gen_add_end_function()
 
 
@@ -570,14 +675,26 @@ def gen_f_ext_gradient(self):
     pinocchio oracle ships A.3 for BOTH base modes."""
     self.gen_f_ext_gradient_jacobianT_inner()
     self.gen_f_ext_gradient_device()
-    # A.3 (-dJ^T/dq) GPU device emit: the analytic + FD oracle ships and is
-    # validated for BOTH base modes (numpy + pinocchio), and the on-device emit
-    # exists below (gen_f_ext_gradient_dq_device). It is currently NOT wired into
-    # the emitted header pending a final on-device validation pass (a residual
-    # arena/sync issue in the per-coordinate FD loop). Tracked as a backlog item;
-    # the first-order A.1/A.2 GPU outputs are validated to float32 precision.
+    # A.3 (-dJ^T/dq) GPU device emit: the mixed second-order block. Emitted as a
+    # composable device function for FIXED-BASE robots only (the FD-on-Jacobian
+    # needs the SE(3) Lie integrator for floating-base tangent perturbations;
+    # deferred to backlog). The kernel/host wire it as the third output
+    # (s_did_du_dfext, size nv*6NB*nv) ONLY when emitted (fixed base); on a
+    # floating base the third output is absent and the kernel keeps the two
+    # first-order outputs. The numpy + pinocchio oracle ships A.3 for BOTH modes.
     self.gen_f_ext_gradient_kernel(single_call_timing=False)
     self.gen_f_ext_gradient_kernel(single_call_timing=True)
     self.gen_f_ext_gradient_host(mode=0)
     self.gen_f_ext_gradient_host(mode=1)
     self.gen_f_ext_gradient_host(mode=2)
+    # A.3 (-dJ^T/dq): own kernel + host (fixed base only); separate output buffer
+    # d_did_du_dfext so the first-order kernel/host stay byte-identical. The
+    # _f_ext_grad_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration: True
+    # only when the kernel/macro are actually emitted (fixed base).
+    self._f_ext_grad_dq_emitted = not self.robot.floating_base
+    if not self.robot.floating_base:
+        self.gen_f_ext_gradient_dq_kernel(single_call_timing=False)
+        self.gen_f_ext_gradient_dq_kernel(single_call_timing=True)
+        self.gen_f_ext_gradient_dq_host(mode=0)
+        self.gen_f_ext_gradient_dq_host(mode=1)
+        self.gen_f_ext_gradient_dq_host(mode=2)
