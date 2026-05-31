@@ -218,6 +218,14 @@ class GRiDCodeGenerator:
             algorithms.update({"id", "minv", "fd"})
         if "fdsva_so" in algorithms:
             algorithms.update({"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame"})
+        # Mimic Minv routes through crba_inner (see _direct_minv.py: the reduced-space
+        # M is built via CRBA then inverted), so any mimic robot emitting `minv` has a
+        # hidden dependency on `crba` for the crba_inner definition. Declare it so the
+        # forward-decl'd crba_inner is actually emitted (else nvlink: unresolved extern
+        # crba_inner). Non-mimic minv doesn't touch crba, so this is additive — FLAG for
+        # main reconcile (shared GCG.py edit; unblocks floating-mimic fdsva_so).
+        if "minv" in algorithms and self.robot_has_mimic_joints():
+            algorithms.add("crba")
         if "idsva_so_body_frame" in algorithms:
             algorithms.add("id")
             if self.robot.floating_base:
@@ -1978,15 +1986,16 @@ class GRiDCodeGenerator:
                 "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
-            if self.robot.floating_base:
-                # Floating-base mimic SECOND-ORDER (idsva_so/fdsva_so) stays
-                # refused: the floating root's 6-DoF subspace needs a per-root-DoF
-                # fold, not the scalar v-slot/alpha fold that the fixed-base
-                # internal-NB sweep uses (B2-SO landed FIXED-base only). Floating
-                # mimic ee_pose grad/hessian ARE supported (B2-ee FLOATING; the 6
-                # independent root v-slots decompose into singleton columns), so
-                # they are NOT added here.
-                _MIMIC_GRADIENT_ALGORITHMS |= {"idsva_so_body_frame", "fdsva_so"}
+            # B2-SO FLOATING (FLAG for main reconcile — additive ungate): floating-base
+            # mimic SECOND-ORDER is now supported via the WORLD-frame inner (the production
+            # floating SO path). The world inner runs the triple ancestor walk in per-column
+            # INTERNAL coordinates (n_int = total S-column count; the floating root's 6 DoF
+            # get 6 distinct internal slots) into a 4*n_int^3 slab, then alpha-folds each axis
+            # to the reduced 4*NV^3 public output — exactly RBDReference.idsva_so_world_frame's
+            # has_mimic path. The per-root-DoF treatment is emergent from the per-column
+            # internal slotting (the root's columns fold identity, alpha=1), so no separate
+            # 6-DoF root fold is needed. fdsva_so composes the world inner on floating, so it
+            # is supported too. (Floating mimic SO previously stayed refused here.)
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(
