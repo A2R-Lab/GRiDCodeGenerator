@@ -11,8 +11,29 @@ def gen_crba_inner_temp_mem_size(self):
         # level the slab is exactly 36 (same as the old single-alpha buffer).
         max_bfs_width = max(1, self.robot.get_max_bfs_width())
         return 36*NJ + 36*max_bfs_width
-    n = self.robot.get_num_pos()
-    return 140*n
+    # Fixed-base live scratch is exactly two HOT buffers (offsets in NJ, the
+    # body's `n = get_num_joints()`):
+    #   alpha  [0, 36*NJ)     — Phase-1 composite-inertia accumulation (RMW
+    #                           across the BFS gemms; serially built up the chain).
+    #   s_fh   [36*NJ, 42*NJ) — Phase-2 per-jid ancestor-chain workspace
+    #                           (randomly accessed, serially advanced one Xmat^T
+    #                           per step). Init loop spans NJ*6 = 6*NJ floats.
+    # The historical 140*num_pos band also carved a `beta` (36*num_pos) and
+    # `s_jid_list` slot that are DEAD (declared but never referenced) plus a big
+    # padding margin. That ~3.3x over-allocation is what pushed CRBA past the
+    # smem target and forced the whole-arena spill of the HOT band on the
+    # MINIMAL tier (the measured 2.5-6x CRBA regression). Sizing the band to its
+    # true live footprint keeps the hot path in smem at PERF/LITE and shrinks the
+    # MINIMAL fallback spill ~3.3x.
+    #
+    # Size by NJ, not num_pos: the non-mimic body indexes alpha/s_fh by joint id
+    # (42*NJ), and the mimic serial-fold path (_gen_crba_inner_mimic_fixed) uses
+    # s_temp as a 36*NJ IC scratch. For mimic robots num_pos < NJ (a mimic dof
+    # collapses), so sizing by num_pos would UNDER-allocate the 36*NJ IC band
+    # (h1_2-fixed: num_pos=39, NJ=51 -> 42*39=1638 < 36*51=1836 = OOB). 42*NJ
+    # covers both paths (42*NJ >= 36*NJ).
+    NJ = self.robot.get_num_joints()
+    return 42*NJ
 
 def gen_crba_inner_function_call(self, updated_var_names = None,
                                  temp_in_smem_expr = "true"):
@@ -163,17 +184,14 @@ def gen_crba_inner(self):
     self.gen_add_code_line('s_M[i] = static_cast<T>(0);')
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    #deal with like memory for variables --> memory is taken care of in device and host 
-    alpha_offset = 0
-    beta_offset = alpha_offset + 36*n
-    fh_offset = beta_offset + 36*n 
-    parent_offset = fh_offset + 6*n #bc j is 1 int 
-    jid_offset = parent_offset + n
+    # Two HOT scratch buffers, packed contiguously (band = 42*NJ, see
+    # gen_crba_inner_temp_mem_size). The former `beta` (36n) and `s_jid_list`
+    # slots were dead (declared, never referenced) and are removed so s_fh sits
+    # right after alpha — no dead 36n gap to allocate (or to spill at MINIMAL).
+    alpha_offset = 0                 # [0, 36n)  HOT: Phase-1 composite inertia
+    fh_offset = alpha_offset + 36*n  # [36n,42n) HOT: Phase-2 chain workspace
     self.gen_add_code_line("T *alpha = &s_temp[" + str(alpha_offset) + "];")
-    self.gen_add_code_line("T *beta = &s_temp[" + str(beta_offset) + "];")
     self.gen_add_code_line("T *s_fh = &s_temp[" + str(fh_offset) + "];")
-    # self.gen_add_code_line("T *s_parent_inds = &s_temp[" + str(parent_offset) + "];")
-    self.gen_add_code_line("T *s_jid_list = &s_temp[" + str(jid_offset) + "];")
 
     self.gen_add_code_line("//")
     self.gen_add_code_line("// first loop (split into 2 parallel loops in bfs loop)")
