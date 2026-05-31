@@ -26,6 +26,10 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_regressor_inner, gen_inverse_dynamics_regressor_device_temp_mem_size, \
                             gen_inverse_dynamics_regressor_device, gen_inverse_dynamics_regressor_kernel, \
                             gen_inverse_dynamics_regressor_host, gen_inverse_dynamics_regressor, \
+                            gen_fd_parameter_gradient_inner_temp_mem_size, gen_fd_parameter_gradient_inner_function_call, \
+                            gen_fd_parameter_gradient_inner, gen_fd_parameter_gradient_device_temp_mem_size, \
+                            gen_fd_parameter_gradient_device, gen_fd_parameter_gradient_kernel, \
+                            gen_fd_parameter_gradient_host, gen_fd_parameter_gradient, \
                             gen_direct_minv_inner_temp_mem_size, gen_direct_minv_inner_F_size, gen_direct_minv_inner_no_F_size, gen_direct_minv_inner_function_call, gen_direct_minv_inner, \
                             gen_direct_minv_device, gen_direct_minv_kernel, gen_direct_minv_host, gen_direct_minv, \
                             gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_inner_F_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
@@ -109,7 +113,7 @@ class GRiDCodeGenerator:
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
-            "f_ext_grad", "regressor",
+            "f_ext_grad", "regressor", "fd_parameter_gradient",
         }
         profile_algorithms = {
             "all": all_algorithms,
@@ -118,6 +122,7 @@ class GRiDCodeGenerator:
             "dynamics-core": {"id", "minv", "fd"},
             "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du", "f_ext_grad"},
             "regressor": {"id", "regressor"},
+            "fd-param-gradient": {"id", "minv", "fd", "regressor", "fd_parameter_gradient"},
             "f-ext-gradient": {"id", "minv", "f_ext_grad"},
             "kinematics": {"ee_pose"},
             "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
@@ -301,6 +306,13 @@ class GRiDCodeGenerator:
         regressor_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() + 18*n \
             + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size
         self.regressor_t_count = regressor_t_count
+        # FD param gradient: kernel smem = XI + s_q_qd_u(NUM_POS+2nv) + s_dqdd_dpi
+        # + s_Minv(nv*nv) + s_Y(nv x 10*NB) + s_qdd(nv) + s_vaf(18*NUM_POS) + s_c(nv)
+        # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
+        fd_param_grad_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() \
+            + nv*nv + nv*10*self.robot.get_num_bodies() + nv + 18*n + nv \
+            + self.gen_fd_parameter_gradient_inner_temp_mem_size() + XI_size
+        self.fd_param_grad_t_count = fd_param_grad_t_count
         # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
         # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
         _n_pos = self.robot.get_num_pos()
@@ -928,6 +940,7 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T> __host__ __device__ inline size_t FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_param_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] + [
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
@@ -1470,6 +1483,14 @@ class GRiDCodeGenerator:
             ("inverse_dynamics_regressor_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_regressor_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        # FD param gradient dqdd/dpi = -Minv . Y: output is nv x 10*NUM_BODIES (same
+        # size class as the regressor), can exceed the 48 KB default cap; opt in.
+        ("fd_parameter_gradient", "fd_parameter_gradient", None, "FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("fd_parameter_gradient_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("fd_parameter_gradient_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
@@ -2080,6 +2101,11 @@ class GRiDCodeGenerator:
             self.gen_direct_minv()
         if "fd" in algorithms:
             self.gen_forward_dynamics()
+        # FD parameter gradient dqdd/dpi = -Minv . Y. Additive; composes the
+        # regressor (Y), direct_minv (Minv) and inverse_dynamics/forward_dynamics
+        # inners, so it requires "id", "minv", "fd" and "regressor" co-emitted.
+        if "fd_parameter_gradient" in algorithms:
+            self.gen_fd_parameter_gradient()
         if "id_du" in algorithms:
             self.gen_inverse_dynamics_gradient()
         if "fd_du" in algorithms:
