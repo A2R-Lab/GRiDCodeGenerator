@@ -325,6 +325,21 @@ class GRiDCodeGenerator:
             + nv*nv + nv*10*self.robot.get_num_bodies() + nv + 18*n + nv \
             + self.gen_fd_parameter_gradient_inner_temp_mem_size() + XI_size
         self.fd_param_grad_t_count = fd_param_grad_t_count
+        # FD-param-gradient g1-spill: 2-level surgical ladder. Level 0 keeps every
+        # buffer in smem (current behavior on robots that fit). Level 1 spills the
+        # s_Y regressor scratch (nv*10*NB, write-once / consumed-once in the final
+        # -Minv.Y GEMM) to the L2-pinned d_workspace SO section -- the hot Minv +
+        # vaf + inner-RNEA path stays in smem. On g1-floating this drops the arena
+        # from ~135 KB to ~94 KB, under the sm_120 ~99 KB cap. The picker selects
+        # level 1 for any tier whose level-0 arena overflows the smem target.
+        _fpg_Y_count = nv * 10 * self.robot.get_num_bodies()
+        _fpg_t_count_full     = fd_param_grad_t_count
+        _fpg_t_count_surgical = fd_param_grad_t_count - _fpg_Y_count
+        self.fd_param_grad_spill_tier_3way = select_shared_tier_3way(_fpg_t_count_full, _fpg_t_count_surgical)
+        self.fd_param_grad_t_count_per_tier = tuple(
+            (_fpg_t_count_full, _fpg_t_count_surgical)[i] for i in self.fd_param_grad_spill_tier_3way
+        )
+        self.fd_param_grad_spill_Y_ws_count = _fpg_Y_count
         # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
         # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
         _n_pos = self.robot.get_num_pos()
@@ -333,6 +348,20 @@ class GRiDCodeGenerator:
         _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                 self.gen_direct_minv_inner_temp_mem_size())
         f_ext_grad_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
+        # f_ext-gradient (first-order) g1-spill: 2-level surgical ladder. Level 0
+        # keeps both outputs (s_dtau_dfext, s_dqdd_dfext) in smem. Level 1 spills
+        # s_dqdd_dfext (the SECOND output, written write-once by the final
+        # -Minv@s_dtau GEMM) to the L2-pinned d_workspace SO section; s_dtau_dfext
+        # (read by that GEMM) + s_Minv + the inner stay in smem. On g1-floating the
+        # level-0 arena is ~99.3 KB -- 272 bytes over the sm_120 ~99 KB cap -- so
+        # level 1 (~74.6 KB) is what lets it run. Small robots keep level 0.
+        _feg_t_count_full     = f_ext_grad_t_count
+        _feg_t_count_surgical = f_ext_grad_t_count - _feg_out
+        self.f_ext_grad_spill_tier_3way = select_shared_tier_3way(_feg_t_count_full, _feg_t_count_surgical)
+        self.f_ext_grad_t_count_per_tier = tuple(
+            (_feg_t_count_full, _feg_t_count_surgical)[i] for i in self.f_ext_grad_spill_tier_3way
+        )
+        self.f_ext_grad_spill_out_ws_count = _feg_out
         # A.3 (-dJ^T/dq) FD kernel (both base modes): arena = XI + s_q + the FD
         # scratch (s_qpert | [floating: s_dv(nv)] | 2x J^T buffers | J^T-inner temp
         # | XImats reload). Floating base adds an nv-sized velocity-perturbation
@@ -824,7 +853,14 @@ class GRiDCodeGenerator:
         # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
         # tensors live in d_workspace instead of shared memory for larger robots.
         idsva_so_body_frame_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, ee_grad_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count)
+        # g1-spill: fd_parameter_gradient (s_Y) and f_ext_gradient (s_dqdd_dfext)
+        # surgically spill into this same SO workspace section when their tier picks
+        # level >= 1. They never run concurrently with the SO/d2ee/ee_grad kernels,
+        # so reuse is safe and costs no new allocation. Fold their spill counts into
+        # the max so the per-timestep workspace always covers them.
+        _fpg_spill_ws = self.fd_param_grad_spill_Y_ws_count if any(p >= 1 for p in self.fd_param_grad_spill_tier_3way) else 0
+        _feg_spill_ws = self.f_ext_grad_spill_out_ws_count if any(p >= 1 for p in self.f_ext_grad_spill_tier_3way) else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, ee_grad_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -952,8 +988,24 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t ID_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_param_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 # g1-spill: tier-aware. At a spilled tier the s_Y regressor
+                                 # scratch moves to d_workspace, shrinking the smem arena. Default
+                                 # TIER = TIER_SHARED keeps every existing single-arg call site working.
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.fd_param_grad_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.fd_param_grad_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.fd_param_grad_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 # g1-spill: per-tier placement of s_Y -- true => smem, false => d_workspace.
+                                 "template <int TIER> __host__ __device__ constexpr bool FD_PARAMETER_GRADIENT_Y_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.fd_param_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fd_param_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.fd_param_grad_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 # g1-spill: tier-aware. At a spilled tier s_dqdd_dfext (2nd output) moves to d_workspace.
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 # g1-spill: per-tier placement of s_dqdd_dfext -- true => smem, false => d_workspace.
+                                 "template <int TIER> __host__ __device__ constexpr bool F_EXT_GRAD_DQDD_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.f_ext_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.f_ext_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.f_ext_grad_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] + [
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1473,11 +1525,13 @@ class GRiDCodeGenerator:
             ("forward_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
+        # g1-spill: f_ext_gradient_kernel gained `unsigned char *d_workspace` as its
+        # 3rd arg (after the two outputs) so s_dqdd_dfext can spill there at LITE/MINIMAL.
         ("f_ext_gradient", "f_ext_grad", None, "F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("f_ext_gradient_kernel<T>",
-             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
-             "void (*)(T *, T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         # A.3 (-dJ^T/dq): own kernel + smem macro, fixed-base only. Gated on the
         # instance attr _f_ext_grad_dq_emitted (set True only when the kernel is
@@ -1499,11 +1553,13 @@ class GRiDCodeGenerator:
         ]),
         # FD param gradient dqdd/dpi = -Minv . Y: output is nv x 10*NUM_BODIES (same
         # size class as the regressor), can exceed the 48 KB default cap; opt in.
+        # g1-spill: fd_parameter_gradient_kernel gained `unsigned char *d_workspace`
+        # as its 2nd arg (after d_dqdd_dpi) so s_Y can spill there at LITE/MINIMAL.
         ("fd_parameter_gradient", "fd_parameter_gradient", None, "FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("fd_parameter_gradient_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("fd_parameter_gradient_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("idsva_so_body_frame_kernel<T>",

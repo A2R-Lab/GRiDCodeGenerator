@@ -574,7 +574,12 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
         "d_robotModel is the initialized model helpers on the GPU",
         "NUM_TIMESTEPS is the trajectory length (or timing reps)",
     ]
-    func_def_start = ("void f_ext_gradient_kernel(T *d_dtau_dfext, T *d_dqdd_dfext, "
+    # g1-spill: the kernel takes d_workspace as its 2nd arg. At a spilled tier
+    # (F_EXT_GRAD_DQDD_IN_SMEM<TIER>()==false) the s_dqdd_dfext output (written
+    # write-once by the final -Minv@s_dtau GEMM) lives in the L2-pinned
+    # d_workspace SO section instead of smem; s_dtau_dfext (read by that GEMM) +
+    # s_Minv + the inner stay in smem. Default TIER keeps the arena byte-identical.
+    func_def_start = ("void f_ext_gradient_kernel(T *d_dtau_dfext, T *d_dqdd_dfext, unsigned char *d_workspace, "
                       "const T *d_q, const int stride_q, ")
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
@@ -589,10 +594,28 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
     minv_temp = self.gen_direct_minv_inner_temp_mem_size()
     shared_extra = nv * nv + max(jt_temp, minv_temp)
+    # g1-spill: s_dqdd_dfext is the LAST t_buffer; sized out_each at TIER_SHARED, 0
+    # at spilled tiers (then routed to d_workspace below). Single arena declaration
+    # keeps every pointer in this scope; the smem footprint shrinks to match
+    # F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES.
+    self.gen_add_code_line("constexpr bool FEG_DQDD_IN_SMEM = F_EXT_GRAD_DQDD_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int FEG_DQDD_SLOT = FEG_DQDD_IN_SMEM ? " + str(out_each) + " : 0;")
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_extra, extra_t_buffers=[("s_q", n_pos), ("s_dtau_dfext", out_each),
-                                       ("s_dqdd_dfext", out_each)],
+                                       ("s_dqdd_dfext", "FEG_DQDD_SLOT")],
         include_linalg_scratch=True)
+    self.gen_add_code_line("if constexpr (FEG_DQDD_IN_SMEM) { (void)d_workspace; }")
+
+    def _repoint_spilled_output(in_timestep_loop):
+        # When spilled, repoint s_dqdd_dfext at the L2-pinned d_workspace SO section
+        # (per-timestep slot; reused safely -- f_ext_gradient never runs concurrently
+        # with the SO kernels). Emitted inside the per-timestep loop so `k` is in scope.
+        self.gen_add_code_line("if constexpr (!FEG_DQDD_IN_SMEM) {", True)
+        if in_timestep_loop:
+            self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_end_control_flow()
 
     def _body():
         self.gen_add_code_line("T *s_Minv = s_temp;")
@@ -621,6 +644,7 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
+        _repoint_spilled_output(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
         _body()
         self.gen_kernel_save_result("dtau_dfext", str(out_each), stride=str(out_each))
@@ -628,6 +652,7 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q", str(n_pos))
+        _repoint_spilled_output(in_timestep_loop=False)
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="dtau_dfext")
@@ -666,8 +691,10 @@ def gen_f_ext_gradient_host(self, mode=0):
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     out_each = "NUM_VEL*6*NUM_BODIES"
+    # g1-spill: pass hd_data->d_workspace as the kernel's 3rd arg. At the spilled
+    # default tier (s_dqdd_dfext in d_workspace) it is read; at TIER_SHARED unused.
     func_call_start = ("f_ext_gradient_kernel<T><<<block_dimms,thread_dimms,F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
-                       "hd_data->d_dtau_dfext,hd_data->d_dqdd_dfext,hd_data->d_q,stride_q,")
+                       "hd_data->d_dtau_dfext,hd_data->d_dqdd_dfext,hd_data->d_workspace,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -689,6 +716,10 @@ def gen_f_ext_gradient_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient\", F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    # g1-spill: L2-pin d_workspace when the default tier spills s_dqdd_dfext into it.
+    _feg_ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                     else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!F_EXT_GRAD_DQDD_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + _feg_ws_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([
