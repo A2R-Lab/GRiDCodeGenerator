@@ -259,62 +259,102 @@ def gen_f_ext_gradient_output_size(self):
 
 
 def _f_ext_gradient_dq_smem_count(self):
-    """T-element shared count for the -dJ^T/dq kernel arena (fixed base).
+    """T-element shared count for the -dJ^T/dq kernel arena.
 
     Layout in s_temp: s_qpert[n_pos] | s_JTp[nv*6NB] | s_JTm[nv*6NB] |
     s_jt_temp[jt_inner] | s_xi_scratch[xi]. The XImats buffer + s_q live in their
-    own arena regions (declared via gen_XImats_helpers_temp_shared_memory_code)."""
+    own arena regions (declared via gen_XImats_helpers_temp_shared_memory_code).
+
+    Floating base additionally needs an nv-sized velocity-perturbation buffer
+    (s_dv) for the SE(3) Lie-group retract that perturbs the root twist (and the
+    revolute joints) for the central FD -- the root's 6-DoF tangent cannot be a
+    scalar q[i] += h, it must go through grid_integrate_floating_q."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
     out6 = 6 * NB
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
     xi_scratch = self.gen_load_update_XImats_helpers_temp_mem_size()
-    return n_pos + 2 * nv * out6 + jt_temp + xi_scratch
+    dv_extra = nv if self.robot.floating_base else 0
+    return n_pos + dv_extra + 2 * nv * out6 + jt_temp + xi_scratch
+
+
+def _emit_f_ext_gradient_dq_perturb(self, sign):
+    """Emit the FD perturbation of s_q into s_qpert by `sign`*fd_h on coordinate qi.
+
+    Fixed base: a plain scalar retract q[qi] += sign*h (re-seeded from s_q each
+    time). The position and velocity coordinates coincide, so this is exact.
+
+    Floating base: the root (jid 0) carries a 6-DoF SE(3) twist, so a scalar add
+    on the quaternion prefix is NOT the tangent perturbation the oracle uses. We
+    instead build a velocity perturbation dv (size nv, all zero except
+    dv[qi] = sign*h) and apply the SAME on-device Lie-group retract the integrator
+    uses, grid_integrate_floating_q(s_q, dv, s_qpert). For root qi in [0,6) this
+    is an SE(3)-exp of the perturbed twist (matching RBDReference.integrate, which
+    the numpy/pin oracle calls with dv[i]=h); for revolute qi >= 6 the helper's
+    tail does the plain Euler add q[7+...] += dv[6+...]. This makes the FD
+    perturbation uniform across root + joints and exactly mirrors the oracle."""
+    nv = self.robot.get_num_vel()
+    n_pos = self.robot.get_num_pos()
+    if not self.robot.floating_base:
+        # scalar retract: s_qpert = s_q then s_qpert[qi] += sign*h
+        self.gen_add_parallel_loop("ind", str(n_pos))
+        self.gen_add_code_line("s_qpert[ind] = s_q[ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
+        self.gen_add_code_line("s_qpert[qi] " + ("+= fd_h;" if sign > 0 else "-= fd_h;"))
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        return
+    # floating: build dv (nv) then grid_integrate_floating_q(s_q, dv, s_qpert).
+    self.gen_add_parallel_loop("ind", str(nv))
+    self.gen_add_code_line("s_dv[ind] = (ind == qi) ? (" + ("fd_h" if sign > 0 else "-fd_h") + ") : static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("grid_integrate_floating_q<T, " + str(n_pos) + ">(s_q, s_dv, s_qpert);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
 
 def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
     """Emit the per-timestep -dJ^T/dq FD body. Assumes s_q (smem), s_XImats, and
     s_temp arena are already declared/loaded. Writes into `out_ptr_expr` (a global
-    or shared pointer to the nv*6NB*nv output for this timestep)."""
+    or shared pointer to the nv*6NB*nv output for this timestep).
+
+    The per-coordinate perturbation is a scalar retract on a fixed base and an
+    SE(3) Lie-group retract on a floating base (see
+    _emit_f_ext_gradient_dq_perturb); both feed the same central FD of -J^T."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
+    fb = self.robot.floating_base
     out6 = 6 * NB
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
     self.gen_add_code_line("T *s_did_du_dfext = " + out_ptr_expr + ";")
     self.gen_add_code_line("const T fd_h = static_cast<T>(1e-3);")
     self.gen_add_code_line("T *s_qpert = s_temp;")
-    self.gen_add_code_line("T *s_JTp = &s_temp[" + str(n_pos) + "];")
-    self.gen_add_code_line("T *s_JTm = &s_temp[" + str(n_pos + nv * out6) + "];")
-    self.gen_add_code_line("T *s_jt_temp = &s_temp[" + str(n_pos + 2 * nv * out6) + "];")
-    self.gen_add_code_line("T *s_xi_scratch = &s_temp[" + str(n_pos + 2 * nv * out6 + jt_temp) + "];")
+    dv_extra = nv if fb else 0
+    if fb:
+        # s_dv velocity-perturbation buffer (nv) lives at the head, after s_qpert.
+        self.gen_add_code_line("T *s_dv = &s_temp[" + str(n_pos) + "];")
+    base = n_pos + dv_extra
+    self.gen_add_code_line("T *s_JTp = &s_temp[" + str(base) + "];")
+    self.gen_add_code_line("T *s_JTm = &s_temp[" + str(base + nv * out6) + "];")
+    self.gen_add_code_line("T *s_jt_temp = &s_temp[" + str(base + 2 * nv * out6) + "];")
+    self.gen_add_code_line("T *s_xi_scratch = &s_temp[" + str(base + 2 * nv * out6 + jt_temp) + "];")
     # loop over each q coordinate qi in [0, nv)
     self.gen_add_code_line("for (int qi = 0; qi < " + str(nv) + "; ++qi) {", True)
-    # s_qpert = s_q (copy) for +h
-    self.gen_add_parallel_loop("ind", str(n_pos))
-    self.gen_add_code_line("s_qpert[ind] = s_q[ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("s_qpert[qi] += fd_h;")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
+    # +h perturbation -> s_qpert
+    _emit_f_ext_gradient_dq_perturb(self, +1)
     self.gen_load_update_XImats_helpers_function_call(updated_var_names={"s_q_name": "s_qpert", "s_temp_name": "s_xi_scratch"})
     self.gen_add_sync()
     self.gen_f_ext_gradient_inner_function_call(updated_var_names={
         "s_dtau_dfext_name": "s_JTp", "s_q_name": "s_qpert", "s_temp_name": "s_jt_temp"})
     self.gen_add_sync()
-    # re-copy s_qpert = s_q then -h (the XImats helper may have written into
-    # s_xi_scratch only, but be defensive and re-seed s_qpert from s_q).
-    self.gen_add_parallel_loop("ind", str(n_pos))
-    self.gen_add_code_line("s_qpert[ind] = s_q[ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("s_qpert[qi] -= fd_h;")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
+    # -h perturbation -> s_qpert (re-seeded from s_q inside the perturb helper)
+    _emit_f_ext_gradient_dq_perturb(self, -1)
     self.gen_load_update_XImats_helpers_function_call(updated_var_names={"s_q_name": "s_qpert", "s_temp_name": "s_xi_scratch"})
     self.gen_add_sync()
     self.gen_f_ext_gradient_inner_function_call(updated_var_names={
@@ -336,17 +376,16 @@ def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
 
 def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
     """Emit f_ext_gradient_dq_kernel: the mixed second-order block
-    d(id_du)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv, FIXED-BASE.
+    d(id_du)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv.
 
     Central finite-difference of the analytic A.1 -J^T over each generalized
     coordinate (the same FD-on-Jacobian approach the d2ee GPU path uses for the
     kinematic Hessian). A velocity-coordinate perturbation equals q[i] += h
-    directly on a fixed base. Floating-base A.3 needs the SE(3) Lie integrator to
-    perturb along the root twist and is DEFERRED (the numpy + pinocchio oracle
-    ships -dJ^T/dq for BOTH modes, so the math is validated). The q-dot block is
-    identically zero (J^T is q-only) and is not emitted."""
-    if self.robot.floating_base:
-        return
+    directly on a fixed base; on a floating base the root (jid 0) is perturbed
+    along its 6-DoF twist via the on-device SE(3) Lie-group retract
+    grid_integrate_floating_q (revolute joints keep the scalar add), exactly
+    mirroring the numpy + pinocchio oracle's self.integrate(q, dv) FD. The q-dot
+    block is identically zero (J^T is q-only) and is not emitted."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
@@ -391,9 +430,7 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
 
 
 def gen_f_ext_gradient_dq_host(self, mode=0):
-    """Host wrapper for the -dJ^T/dq kernel (fixed base only)."""
-    if self.robot.floating_base:
-        return
+    """Host wrapper for the -dJ^T/dq kernel (fixed + floating base)."""
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
     func_params = [
@@ -669,32 +706,36 @@ def gen_f_ext_gradient(self):
     """Emit the full f_ext-gradient family: J^T inner, device, kernels, hosts.
 
     A.1 (-J^T) and A.2 (M^-1 J^T) are emitted for ALL base modes. A.3 (-dJ^T/dq,
-    the mixed second-order block) is emitted as a composable device function for
-    FIXED-BASE robots only (the FD-on-Jacobian needs the SE(3) Lie integrator for
-    floating-base tangent perturbations; deferred to backlog). The numpy +
+    the mixed second-order block) is now emitted for BOTH base modes: fixed-base
+    perturbs each q coordinate by a scalar q[i] += h, floating-base perturbs the
+    root (jid 0) along its 6-DoF twist via the on-device SE(3) Lie-group retract
+    grid_integrate_floating_q (revolute joints keep the scalar add). The numpy +
     pinocchio oracle ships A.3 for BOTH base modes."""
+    # The A.3 floating-base FD calls grid_integrate_floating_q (an SE(3) Lie-group
+    # helper). gen_f_ext_gradient runs BEFORE gen_integrator in gen_all_code, and
+    # ee_pose_hessian (the only other early emitter) may not be requested, so emit
+    # the Lie helpers here if floating and not already emitted (gen_integrator then
+    # skips its own emit via the same _lie_helpers_emitted flag, avoiding a C++
+    # redefinition).
+    if self.robot.floating_base and not getattr(self, "_lie_helpers_emitted", False):
+        self.gen_lie_group_helpers()
+        self._lie_helpers_emitted = True
     self.gen_f_ext_gradient_jacobianT_inner()
     self.gen_f_ext_gradient_device()
-    # A.3 (-dJ^T/dq) GPU device emit: the mixed second-order block. Emitted as a
-    # composable device function for FIXED-BASE robots only (the FD-on-Jacobian
-    # needs the SE(3) Lie integrator for floating-base tangent perturbations;
-    # deferred to backlog). The kernel/host wire it as the third output
-    # (s_did_du_dfext, size nv*6NB*nv) ONLY when emitted (fixed base); on a
-    # floating base the third output is absent and the kernel keeps the two
-    # first-order outputs. The numpy + pinocchio oracle ships A.3 for BOTH modes.
+    # A.3 (-dJ^T/dq) GPU device emit: the mixed second-order block, now emitted for
+    # both base modes. The kernel/host wire it as the third output
+    # (s_did_du_dfext, size nv*6NB*nv); the first-order kernel/host are unchanged.
     self.gen_f_ext_gradient_kernel(single_call_timing=False)
     self.gen_f_ext_gradient_kernel(single_call_timing=True)
     self.gen_f_ext_gradient_host(mode=0)
     self.gen_f_ext_gradient_host(mode=1)
     self.gen_f_ext_gradient_host(mode=2)
-    # A.3 (-dJ^T/dq): own kernel + host (fixed base only); separate output buffer
+    # A.3 (-dJ^T/dq): own kernel + host (both base modes); separate output buffer
     # d_did_du_dfext so the first-order kernel/host stay byte-identical. The
-    # _f_ext_grad_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration: True
-    # only when the kernel/macro are actually emitted (fixed base).
-    self._f_ext_grad_dq_emitted = not self.robot.floating_base
-    if not self.robot.floating_base:
-        self.gen_f_ext_gradient_dq_kernel(single_call_timing=False)
-        self.gen_f_ext_gradient_dq_kernel(single_call_timing=True)
-        self.gen_f_ext_gradient_dq_host(mode=0)
-        self.gen_f_ext_gradient_dq_host(mode=1)
-        self.gen_f_ext_gradient_dq_host(mode=2)
+    # _f_ext_grad_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration.
+    self._f_ext_grad_dq_emitted = True
+    self.gen_f_ext_gradient_dq_kernel(single_call_timing=False)
+    self.gen_f_ext_gradient_dq_kernel(single_call_timing=True)
+    self.gen_f_ext_gradient_dq_host(mode=0)
+    self.gen_f_ext_gradient_dq_host(mode=1)
+    self.gen_f_ext_gradient_dq_host(mode=2)
