@@ -78,7 +78,15 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     # vars on branched levels) folds correctly without restructuring.
     HAS_MIMIC = self.robot_has_mimic_joints()
     if HAS_MIMIC and (compute_c or True):
-        vslot_arr = ", ".join(str(self._v_slot_cpp(j)) for j in range(n))
+        # The floating root (jid 0) is a 6-DoF joint whose qd is read through
+        # the dedicated fb_col path (never via this single-DoF table), so emit a
+        # harmless sentinel (v-slot 0, alpha 1) for it rather than asking the
+        # single-DoF _v_slot_cpp helper (which asserts on multi-DoF joints).
+        def _vslot_tbl(j):
+            if self.robot.floating_base and j == 0:
+                return 0
+            return self._v_slot_cpp(j)
+        vslot_arr = ", ".join(str(_vslot_tbl(j)) for j in range(n))
         alpha_arr = ", ".join(repr(self._alpha_for_jid(j)) for j in range(n))
         self.gen_add_code_line("// mimic per-body v-slot + multiplier tables")
         self.gen_add_code_line("const int s_mimic_vslot[" + str(n) + "] = {" + vslot_arr + "};")
@@ -382,6 +390,22 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         for vs in range(self.robot.get_num_vel()):
             self.gen_add_code_line("s_c[" + str(vs) + "] = static_cast<T>(0);")
         for jid in range(n):
+            # The floating root (jid 0 on a floating base) is a 6-DoF joint with
+            # a full 6x6 motion subspace S; it is NEVER a mimic joint and its
+            # six DoFs map directly to v-slots 0..5 via c[k] = sum_row S[row,k]*f.
+            # Fold each of its DoFs from the S matrix (alpha == 1). All other
+            # bodies are single-DoF, possibly mimic: c[v_slot] += alpha * S_sign*f.
+            if self.robot.floating_base and jid == 0:
+                import numpy as _np
+                S0 = _np.array(self.robot.get_S_by_id(0))
+                for k in range(S0.shape[1]):
+                    rows = _np.nonzero(S0[:, k])[0]
+                    for row in rows:
+                        sgn = float(S0[row, k])
+                        self.gen_add_code_line(
+                            "s_c[" + str(k) + "] += static_cast<T>(" + repr(sgn)
+                            + ") * s_vaf[" + str(12*n + 6*jid + int(row)) + "];")
+                continue
             vs = self._v_slot_cpp(jid)
             s_ind = self.robot.get_S_index_by_id(jid)
             s_sign = self.robot.get_S_sign_by_id(jid)
