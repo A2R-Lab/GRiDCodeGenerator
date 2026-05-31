@@ -80,6 +80,18 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("fdsva_so",             "FDSVA_SO (2nd-order FD)",
               "Second-Order", legacy_labels=("fd_so",)),
 
+    # Centroidal / Energy / CoM (G2 quick-wins, R1-R3)
+    AlgoEntry("generalized_gravity", "Generalized Gravity g(q)=RNEA(q,0,0)",
+              "Centroidal"),
+    AlgoEntry("nonlinear_effects",   "Nonlinear Effects c(q,qd)=RNEA(q,qd,0)",
+              "Centroidal"),
+    AlgoEntry("energy",              "Energy (KE/PE/mechanical)",
+              "Centroidal"),
+    AlgoEntry("com",                 "CoM + CoM Jacobian",
+              "Centroidal"),
+    AlgoEntry("ccrba",               "CCRBA (A, h)",
+              "Centroidal"),
+
     # Plant (T6): cost / constraint / plant-step primitives emitted in the
     # sibling `grid_plant` namespace. No standalone benchmarked kernel — this
     # entry exists so the family has a registry key (display / sectioning) and
