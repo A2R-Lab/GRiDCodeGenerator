@@ -37,12 +37,22 @@ def _f_ext_grad_chain_jobs(self):
       { 'i': body id, 'j': chain joint id, 'vi': velocity slot, 'Scol': the 6-vec
         motion subspace column, 'tf_chain': the ordered joint ids [j+1, ..., i]
         whose local 6x6 motion transforms X[m] are applied (left-fold) to Scol to
-        push it from joint j's frame down to body i's frame. }
+        push it from joint j's frame down to body i's frame, 'alpha': the mimic
+        multiplier of joint j (1.0 for non-mimic). }
 
     The body-Jacobian column of body i for chain joint j is
       col = X[i] X[i-1] ... X[j+1] S_j   (Featherstone motion transforms),
     written to row v_j, column-block i of -J^T (negated). Out-of-chain columns are
     absent here (left zero by the inner's init).
+
+    MIMIC fold: a mimic joint j shares its TARGET's reduced v-slot
+    (get_joint_index_v(j) == get_joint_index_v(target)) and its body moves
+    alpha * the target's rate, so its geometric-Jacobian column folds into the
+    shared slot scaled by alpha (== RBDReference.rnea_bpass:
+    c[inds_f] += mimic_scale * S^T f). The reduction below already accumulates
+    (+=) all jobs sharing one (i, v_j); baking 'alpha' lets each contribution be
+    alpha-weighted. For a non-mimic robot every alpha == 1.0, so the emit is
+    byte-identical to the legacy path (guarded by robot_has_mimic_joints()).
     """
     import numpy as _np
     NB = self.robot.get_num_bodies()
@@ -75,12 +85,13 @@ def _f_ext_grad_chain_jobs(self):
                 tf_chain.append(int(m))
                 m = self.robot.get_parent_id(m)
             tf_chain = list(reversed(tf_chain))  # j+1, j+2, ..., i
+            alpha = self._alpha_for_jid(j)
             for c in range(S.shape[1]):
                 vi = vinds[c] if c < len(vinds) else vinds[-1]
                 Scol = [float(x) for x in S[:6, c]]
                 jobs.append({
                     "i": int(i), "j": int(j), "vi": int(vi),
-                    "Scol": Scol, "tf_chain": tf_chain,
+                    "Scol": Scol, "tf_chain": tf_chain, "alpha": float(alpha),
                 })
     return NB, nv, jobs
 
@@ -118,6 +129,7 @@ def gen_f_ext_gradient_jacobianT_inner(self):
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     _, _, jobs = _f_ext_grad_chain_jobs(self)
+    HAS_MIMIC = self.robot_has_mimic_joints()
 
     func_params = [
         "s_dtau_dfext is the output dtau/dfext = -J^T, size NV*(6*NB) = " + str(nv * 6 * NB),
@@ -163,6 +175,13 @@ def gen_f_ext_gradient_jacobianT_inner(self):
     # (i, v_j) accumulate (+=) -- matching the reference's S-column / mimic v-slot
     # fold. To keep the parallel slab-fill race-free the final += reduction is run
     # serially on lane 0 (the slab itself is filled fully in parallel).
+    #
+    # MIMIC: a mimic joint j shares its TARGET's v_j slot, so its column folds into
+    # that shared slot scaled by its mimic multiplier alpha (the mimic body moves
+    # alpha * the target's rate) -- exactly RBDReference.rnea_bpass's
+    # c[inds_f] += mimic_scale * S^T f. Each job's -col is therefore scaled by its
+    # baked alpha (1.0 for non-mimic). The alpha factor is only emitted for mimic
+    # robots (HAS_MIMIC), so non-mimic grid.cuh is byte-identical to the legacy emit.
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Per chain job: col(v_j, body i) = -(X[i]..X[j+1] S_j) (motion-transform pushdown)")
     self.gen_add_code_line("//")
@@ -176,6 +195,7 @@ def gen_f_ext_gradient_jacobianT_inner(self):
         job_i = []
         job_vrow = []
         job_S = []
+        job_alpha = []
         for job in jobs:
             job_off.append(len(flat_chain))
             job_len.append(len(job["tf_chain"]))
@@ -183,6 +203,7 @@ def gen_f_ext_gradient_jacobianT_inner(self):
             job_i.append(job["i"])
             job_vrow.append(job["vi"])
             job_S.append(job["Scol"])
+            job_alpha.append(job.get("alpha", 1.0))
 
         def _ints(vals):
             return "{ " + ", ".join(str(v) for v in vals) + " }"
@@ -199,6 +220,10 @@ def gen_f_ext_gradient_jacobianT_inner(self):
         self.gen_add_code_line("static const int feg_job_vrow[] = " + _ints(job_vrow) + ";")
         flatS = [s for job in job_S for s in job]
         self.gen_add_code_line("const T feg_job_S[] = " + _floats(flatS) + ";")
+        # MIMIC fold: per-job mimic multiplier alpha (only emitted for mimic robots
+        # so non-mimic grid.cuh stays byte-identical; alpha == 1.0 for non-mimic).
+        if HAS_MIMIC:
+            self.gen_add_code_line("const T feg_job_alpha[] = " + _floats(job_alpha) + ";")
 
         njobs = len(jobs)
         # Two-phase to avoid += races on shared (i, v_j) destinations: (1) each job
@@ -230,7 +255,13 @@ def gen_f_ext_gradient_jacobianT_inner(self):
         self.gen_add_code_line("for (int r = 0; r < 6; ++r) { col[r] = tmp[r]; }")
         self.gen_add_end_control_flow()
         self.gen_add_code_line("#pragma unroll")
-        self.gen_add_code_line("for (int r = 0; r < 6; ++r) { s_feg_slab[6*jb + r] = -col[r]; }")
+        if HAS_MIMIC:
+            # mimic fold: scale this job's column by its mimic multiplier so jobs
+            # sharing a v-slot (mimic + target) accumulate alpha-weighted in reduce.
+            self.gen_add_code_line("T a = feg_job_alpha[jb];")
+            self.gen_add_code_line("for (int r = 0; r < 6; ++r) { s_feg_slab[6*jb + r] = -a * col[r]; }")
+        else:
+            self.gen_add_code_line("for (int r = 0; r < 6; ++r) { s_feg_slab[6*jb + r] = -col[r]; }")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 

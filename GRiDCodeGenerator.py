@@ -1980,11 +1980,18 @@ class GRiDCodeGenerator:
             # 4*NB^3 slab and alpha-folds to the reduced 4*NV^3 public output (see
             # _idsva_so.py gen_idsva_so_body_frame_inner is_mimic path; also fixed a
             # shared matmul %NUM_JOINTS->%NUM_BODIES block-wrap bug). Floating-base
-            # mimic SO stays refused (added below). The integrator gradients +
-            # f_ext_grad remain refused for both bases (P4 pending).
+            # mimic SO stays refused (added below). The integrator gradients remain
+            # refused for both bases (P4 pending).
+            # FLAG (additive ungate — main reconcile): f_ext_grad is now SUPPORTED for
+            # mimic robots (both bases). The geometric-Jacobian column of a mimic joint
+            # folds into its TARGET's reduced v-slot scaled by the mimic multiplier alpha
+            # (the alpha-weighted column accumulate in _f_ext_gradient.py's J^T inner —
+            # the SAME template as ee_pose_gradient Step 3b — mirroring
+            # RBDReference.rnea_bpass's c[inds_f] += mimic_scale * S^T f). The A.2/A.3
+            # outputs compose on top (M^-1 J^T and the FD of -J^T), so removing
+            # f_ext_grad here un-refuses the whole family. (Previously refused below.)
             _MIMIC_GRADIENT_ALGORITHMS = {
                 "integrator_gradient", "integrator_with_gradient",
-                "f_ext_grad",
             }
             # B2-SO FLOATING (FLAG for main reconcile — additive ungate): floating-base
             # mimic SECOND-ORDER is now supported via the WORLD-frame inner (the production
