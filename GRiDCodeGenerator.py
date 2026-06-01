@@ -2280,16 +2280,17 @@ class GRiDCodeGenerator:
                     self.gen_lie_group_helpers()
                     self._lie_helpers_emitted = True
                 self.gen_frame_jacobian_dot()
-            # Lambda (osc_inertia) stays ¬mimic for now: it composes Minv on
-            # device via direct_minv_inner, whose mimic path routes through
-            # crba_inner. On a mimic robot the device returns an all-zero Lambda
-            # (the on-device mimic-Minv composition does not produce a valid
-            # reduced Minv in this arena — same gap the floating-mimic-SO work
-            # owns). J (and J-dot, which only reuses frame_jacobian_inner) ARE
-            # mimic-correct; only the Minv-dependent Lambda is deferred. DEFER:
-            # extend osc_inertia mimic once the mimic direct_minv_inner-in-arena
-            # path is validated.  (FLAGGED.)
-            if "osc_inertia" in algorithms and not self.robot_has_mimic_joints():
+            # Lambda (osc_inertia) is emitted for mimic robots too. It composes
+            # Minv on device via direct_minv_inner, whose mimic path routes
+            # through crba_inner -> invert_matrix (== RBDReference.minv's mimic
+            # fast path inv(CRBA(q))). That compose is correct in this arena: the
+            # fr3-fixed CUDA crba/minv equivalence tests already prove it, and the
+            # fr3 Lambda matches the numpy oracle to float32 across all 3 reference
+            # frames. (The earlier all-zero Lambda was a SMOKE-RUNNER artifact: the
+            # heavy osc kernel overflowed the register budget at 512 threads and
+            # silently failed; the runner now clamps to the kernel's
+            # maxThreadsPerBlock and checks the launch.)  (FLAGGED: un-gated mimic.)
+            if "osc_inertia" in algorithms:
                 # Lambda is SELF-CONTAINED: it composes Minv on device via
                 # direct_minv_inner, so the arena carries BOTH transform families
                 # (spatial s_XImats for minv + homogeneous s_XmatsHom for J) plus
@@ -2310,10 +2311,12 @@ class GRiDCodeGenerator:
                 self.gen_osc_inertia()
         # Mimic-only marker: signal to consumers (e.g. the frame_jacobian smoke
         # runner) that this is a mimic header where osc_inertia (Lambda) was NOT
-        # emitted (its on-device mimic-Minv route is deferred). Emitted ONLY for
-        # mimic robots so non-mimic headers stay byte-identical; the runner gates
-        # its Lambda machinery on #ifndef GRID_FRAME_JAC_MIMIC.
-        if "frame_jacobian" in algorithms and "ee_pose" in algorithms and self.robot_has_mimic_joints():
+        # emitted -- which now only happens when osc_inertia was not selected at
+        # all (mimic Lambda IS emitted otherwise). Emitted ONLY for mimic robots
+        # so non-mimic headers stay byte-identical; the runner gates its Lambda
+        # machinery on #ifndef GRID_FRAME_JAC_MIMIC.
+        if ("frame_jacobian" in algorithms and "ee_pose" in algorithms
+                and self.robot_has_mimic_joints() and "osc_inertia" not in algorithms):
             self.gen_add_code_line("#define GRID_FRAME_JAC_MIMIC 1")
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
