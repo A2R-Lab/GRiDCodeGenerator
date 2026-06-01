@@ -456,10 +456,16 @@ class GRiDCodeGenerator:
         # The multi-stage scratch is always allocated even for single-stage IT;
         # cost is small relative to total (~12*nv² for iiwa14 ≈ 588 floats).
         _max_stages = 4
+        # s_vaf is body-indexed (stride 6 over NB bodies). For a MIMIC robot
+        # (fixed base) NB > nv, so the composed FD-grad inner writes 18*NB — size
+        # the arena's s_vaf term 18*NB to match _emit_body's ("s_vaf", 18*NB)
+        # exactly (else the launched dynamic-smem is short and the kernel overruns
+        # smem). Non-mimic keeps 18*nv (byte-identical; floating nv > NB).
+        _vaf_count = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
         # +72 for the two 6x6 SE(3) dIntegrate blocks (floating-base gradient;
         # allocated for fixed-base too but unused there).
         integrator_du_t_count = ((3*nv + int(self.robot.floating_base)) + 2*nv*3*nv + 2*(nv*2*nv)
-                                 + 18*nv + nv*nv + nv
+                                 + _vaf_count + nv*nv + nv
                                  + (2*nv + int(self.robot.floating_base)) + _max_stages * nv + _max_stages * nv * 3*nv
                                  + 72
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
@@ -1980,12 +1986,37 @@ class GRiDCodeGenerator:
             # 4*NB^3 slab and alpha-folds to the reduced 4*NV^3 public output (see
             # _idsva_so.py gen_idsva_so_body_frame_inner is_mimic path; also fixed a
             # shared matmul %NUM_JOINTS->%NUM_BODIES block-wrap bug). Floating-base
-            # mimic SO stays refused (added below). The integrator gradients +
-            # f_ext_grad remain refused for both bases (P4 pending).
+            # mimic SO stays refused (added below). f_ext_grad remains refused for
+            # both bases (P4 pending).
+            # B-integrator-grad (FLAG for main reconcile — additive ungate, FIXED
+            # base only): the integrator gradients (integrator_gradient +
+            # integrator_with_gradient) are now supported for FIXED-base mimic
+            # robots, ALL integrator types (Euler / SI-Euler / Midpoint / RK3 /
+            # RK4). They COMPOSE the mimic-reduced FD gradient (s_df_du / s_Minv) +
+            # the SE(3) dIntegrate blocks and assemble dAB entirely in reduced
+            # NV space (n = get_num_vel()), exactly as RBDReference.integrator_grad
+            # composes forward_dynamics_grad / minv / dIntegrate (all mimic-aware).
+            # The mimic fix was sizing s_vaf at 18*NB (NB>NV for fixed mimic) so
+            # the composed FD-grad inner's body-indexed writes don't overflow into
+            # s_Minv/s_qdd (mirrors fd_du's kernel sizing). fr3-fixed validates
+            # bit-exact (norm_rel ~0 even on RK4 oracle magnitudes ~5e7).
+            #
+            # FLOATING-base mimic stays REFUSED (added below): the floating
+            # SINGLE-stage (Euler / SI-Euler) gradient is correct, but the floating
+            # MULTI-stage (Midpoint / RK3 / RK4) gradient is WRONG for mimic only
+            # (norm_rel 0.32 / 0.50 / 3.5 on energetic samples) — the bug lives at
+            # the floating + multi-stage + mimic intersection (fixed multi-stage
+            # mimic is exact; floating multi-stage NON-mimic, e.g. go2, is exact;
+            # floating single-stage mimic is float32-clean). Since codegen emits all
+            # integrator types into one header, refusing avoids shipping a silently
+            # wrong floating-mimic RK gradient. Deferred to a follow-up.
             _MIMIC_GRADIENT_ALGORITHMS = {
-                "integrator_gradient", "integrator_with_gradient",
                 "f_ext_grad",
             }
+            if self.robot.floating_base:
+                _MIMIC_GRADIENT_ALGORITHMS |= {
+                    "integrator_gradient", "integrator_with_gradient",
+                }
             # B2-SO FLOATING (FLAG for main reconcile — additive ungate): floating-base
             # mimic SECOND-ORDER is now supported via the WORLD-frame inner (the production
             # floating SO path). The world inner runs the triple ancestor walk in per-column

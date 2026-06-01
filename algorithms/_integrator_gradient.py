@@ -753,13 +753,20 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         # only slices the band base pointers + passes the per-rung flags as literals.
         inner_temp_size = (inner_temp_full if inner_level == 0
                            else (inner_temp_selective if inner_level == 1 else 0))
+        # s_vaf is body-indexed (NB bodies, stride 6). For a MIMIC robot (fixed
+        # base) NB > nv, so the composed FD-grad inner's ID sub-inner writes
+        # 18*NB entries — size it 18*NB to keep those writes from overflowing
+        # into the adjacent s_Minv/s_qdd buffers (mirrors fd_du's kernel sizing
+        # in _forward_dynamics_gradient.py). Non-mimic keeps 18*n (byte-identical;
+        # floating nv > NB).
+        vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
         extra_t_buffers = [("s_q_qd_u", 3 * n + fb)]
         if dab_in_smem:
             extra_t_buffers.append(("s_dAB", 2 * n * 3 * n))
         extra_t_buffers += [
             ("s_df_du", n * 2 * n),
             ("s_dc_du", n * 2 * n),
-            ("s_vaf", 18 * n),
+            ("s_vaf", vaf_cnt),
             ("s_Minv", n * n),
             ("s_qdd", n),
             # Multi-stage scratch — allocated for every IT (single-stage just doesn't use it).
