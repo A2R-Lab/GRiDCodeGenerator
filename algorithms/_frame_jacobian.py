@@ -111,7 +111,17 @@ def gen_frame_jacobian_inner(self):
     # the world contribution to J[:, vi] is the screw of joint jj evaluated at
     # the frame origin p_f (= s_Xworld[16*target_jid + 12..14]).
     self.gen_add_code_line("// Step 3: geometric Jacobian at frame origin, world axes")
-    jobs = []  # (target_jid, jj, vi, ang_local[3], lin_local[3])
+    # MIMIC fold: a mimic joint and its target share ONE velocity coordinate
+    # (get_joint_index_v(mimic) == get_joint_index_v(target)), so several chain
+    # joints accumulate into the same J column. The mimic body's generalized
+    # velocity is alpha * v_target, so its geometric-Jacobian column contribution
+    # is alpha-weighted (mirrors RBDReference.frame_jacobian's `scale = mimic_scale(j)`
+    # applied to Jw/Jv, and the ee_pose_gradient Step 3b alpha-accumulate). The
+    # serial accumulate already sums shared-vi columns; the only missing piece is
+    # the per-job alpha. For a NON-mimic robot every alpha == 1.0, so the alpha
+    # array/multiply is gated on HAS_MIMIC to keep non-mimic emit byte-identical.
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    jobs = []  # (target_jid, jj, vi, ang_local[3], lin_local[3], alpha)
     for jid in range(NJ):
         if self.robot.get_parent_id(jid) == -1 and jid != 0:
             pass
@@ -125,11 +135,12 @@ def gen_frame_jacobian_inner(self):
                 vinds = [vinds]
             else:
                 vinds = list(vinds)
+            alpha = self._alpha_for_jid(jj) if HAS_MIMIC else 1.0
             for c in range(S.shape[1]):
                 vi = vinds[c] if c < len(vinds) else vinds[-1]
                 ang = [float(S[0, c]), float(S[1, c]), float(S[2, c])]
                 lin = [float(S[3, c]), float(S[4, c]), float(S[5, c])]
-                jobs.append((jid, jj, vi, ang, lin))
+                jobs.append((jid, jj, vi, ang, lin, alpha))
 
     njobs = len(jobs)
     if njobs > 0:
@@ -143,6 +154,9 @@ def gen_frame_jacobian_inner(self):
         self.gen_add_code_line("const int fj_vi[" + str(njobs) + "] = {" + vi_arr + "};")
         self.gen_add_code_line("const T fj_ang[" + str(3 * njobs) + "] = {" + ax_arr + "};")
         self.gen_add_code_line("const T fj_lin[" + str(3 * njobs) + "] = {" + lx_arr + "};")
+        if HAS_MIMIC:
+            al_arr = ", ".join("static_cast<T>({:.17g})".format(j[5]) for j in jobs)
+            self.gen_add_code_line("const T fj_alpha[" + str(njobs) + "] = {" + al_arr + "};")
         # Serial accumulation (correctness-first; columns may repeat vi).
         self.gen_add_serial_ops()
         # frame origin p_f in world.
@@ -168,9 +182,16 @@ def gen_frame_jacobian_inner(self):
         self.gen_add_code_line("T linf0 = lw0 + (aw1*dz - aw2*dy);")
         self.gen_add_code_line("T linf1 = lw1 + (aw2*dx - aw0*dz);")
         self.gen_add_code_line("T linf2 = lw2 + (aw0*dy - aw1*dx);")
-        # accumulate into J[:, vi] ([linear; angular] col-major 6 x NV)
+        # accumulate into J[:, vi] ([linear; angular] col-major 6 x NV).
+        # MIMIC: scale this chain joint's column contribution by its multiplier
+        # alpha (the mimic body moves alpha * v_target; non-mimic alpha == 1.0,
+        # and the alpha term is omitted entirely so non-mimic emit is unchanged).
         self.gen_add_code_line("T *Jc = &s_J[6*vi];")
-        self.gen_add_code_line("Jc[0]+=linf0; Jc[1]+=linf1; Jc[2]+=linf2; Jc[3]+=aw0; Jc[4]+=aw1; Jc[5]+=aw2;")
+        if HAS_MIMIC:
+            self.gen_add_code_line("T al = fj_alpha[t];")
+            self.gen_add_code_line("Jc[0]+=al*linf0; Jc[1]+=al*linf1; Jc[2]+=al*linf2; Jc[3]+=al*aw0; Jc[4]+=al*aw1; Jc[5]+=al*aw2;")
+        else:
+            self.gen_add_code_line("Jc[0]+=linf0; Jc[1]+=linf1; Jc[2]+=linf2; Jc[3]+=aw0; Jc[4]+=aw1; Jc[5]+=aw2;")
         self.gen_add_end_control_flow()  # for t
         self.gen_add_end_control_flow()  # serial
         self.gen_add_sync()

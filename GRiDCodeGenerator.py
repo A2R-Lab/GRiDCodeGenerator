@@ -2245,7 +2245,16 @@ class GRiDCodeGenerator:
         # when the `frame_jacobian` key is explicitly selected, so every existing
         # profile's header is byte-identical. Needs ee_pose's world-transform
         # machinery (pulled in by _normalize_codegen_algorithms).
-        if "frame_jacobian" in algorithms and "ee_pose" in algorithms and not self.robot_has_mimic_joints():
+        # FLAG (shared GCG.py edit, additive — minimal gate relax): mimic robots
+        # are now supported for the frame_jacobian family. The geometric Jacobian J
+        # gained the alpha-weighted shared-v-slot fold (mirrors the ee_pose_gradient
+        # Step 3b mimic accumulate); J-dot reuses frame_jacobian_inner at perturbed
+        # q (mimic q-fold baked into s_XmatsHom by the XmatsHom helper) and osc_inertia
+        # routes mimic Minv through crba_inner (the `minv`->`crba` dep above). The
+        # ee_pose dependency itself is mimic-gated elsewhere (kin_ok), but the
+        # frame_jacobian family only needs ee_pose's world-transform machinery, which
+        # is emitted whenever the frame_jacobian key is selected.
+        if "frame_jacobian" in algorithms and "ee_pose" in algorithms:
             NJ_fj = self.robot.get_num_joints()
             nv_fj = self.robot.get_num_vel()
             n_pos_fj = self.robot.get_num_pos()
@@ -2271,7 +2280,16 @@ class GRiDCodeGenerator:
                     self.gen_lie_group_helpers()
                     self._lie_helpers_emitted = True
                 self.gen_frame_jacobian_dot()
-            if "osc_inertia" in algorithms:
+            # Lambda (osc_inertia) stays ¬mimic for now: it composes Minv on
+            # device via direct_minv_inner, whose mimic path routes through
+            # crba_inner. On a mimic robot the device returns an all-zero Lambda
+            # (the on-device mimic-Minv composition does not produce a valid
+            # reduced Minv in this arena — same gap the floating-mimic-SO work
+            # owns). J (and J-dot, which only reuses frame_jacobian_inner) ARE
+            # mimic-correct; only the Minv-dependent Lambda is deferred. DEFER:
+            # extend osc_inertia mimic once the mimic direct_minv_inner-in-arena
+            # path is validated.  (FLAGGED.)
+            if "osc_inertia" in algorithms and not self.robot_has_mimic_joints():
                 # Lambda is SELF-CONTAINED: it composes Minv on device via
                 # direct_minv_inner, so the arena carries BOTH transform families
                 # (spatial s_XImats for minv + homogeneous s_XmatsHom for J) plus
@@ -2290,6 +2308,13 @@ class GRiDCodeGenerator:
                     "{ return grid_shared_arena_bytes<T>(" + str(osc_t_count) +
                     ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
                 self.gen_osc_inertia()
+        # Mimic-only marker: signal to consumers (e.g. the frame_jacobian smoke
+        # runner) that this is a mimic header where osc_inertia (Lambda) was NOT
+        # emitted (its on-device mimic-Minv route is deferred). Emitted ONLY for
+        # mimic robots so non-mimic headers stay byte-identical; the runner gates
+        # its Lambda machinery on #ifndef GRID_FRAME_JAC_MIMIC.
+        if "frame_jacobian" in algorithms and "ee_pose" in algorithms and self.robot_has_mimic_joints():
+            self.gen_add_code_line("#define GRID_FRAME_JAC_MIMIC 1")
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()
