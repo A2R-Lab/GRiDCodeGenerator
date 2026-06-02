@@ -61,7 +61,12 @@ def gen_id_bias_device(self, gravity_only):
                 "const robotModel<T> *d_robotModel, const T gravity) {")
     desc = ("Compute the generalized gravity g(q) = RNEA(q, 0, 0)" if gravity_only
             else "Compute the nonlinear (bias) effects c(q,qd) = RNEA(q, qd, 0)")
-    extra = [("s_vaf", 18 * n)]
+    # s_vaf is consumed by inverse_dynamics_inner, which writes it body-indexed by
+    # RAW body id (v/a/f blocks each span get_num_joints() bodies). For mimic robots
+    # get_num_joints() (NB) > get_num_pos() (NV), so size it 18*NB or the high-body
+    # f-writes overflow into the next arena region. Non-mimic keeps 18*n byte-identical.
+    nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+    extra = [("s_vaf", 18 * nb_vaf)]
     if gravity_only:
         extra.append(("s_qd0", nv))
 
@@ -85,7 +90,11 @@ def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     input_count = 2 * n
-    extra = [("s_q_qd", input_count), ("s_out", nv), ("s_vaf", 18 * n)]
+    # s_vaf is body-indexed by RAW body id inside inverse_dynamics_inner; size by
+    # NB (get_num_joints) for mimic robots (NB > NV) so the high-body f-writes never
+    # overflow into the next arena region. Non-mimic keeps 18*n byte-identical.
+    nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+    extra = [("s_q_qd", input_count), ("s_out", nv), ("s_vaf", 18 * nb_vaf)]
     if gravity_only:
         extra.append(("s_qd0", nv))
     self.gen_XImats_helpers_temp_shared_memory_code(
