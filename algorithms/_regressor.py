@@ -31,11 +31,11 @@ fat inner):
   inverse_dynamics_regressor_inner   (__device__, placement-free; assumes XImats)
   inverse_dynamics_regressor_device  (__device__; owns XImats load + scratch)
   inverse_dynamics_regressor_kernel  (__global__; batched, writes d_Y)
-  inverse_dynamics_regressor         (__host__ launcher; explicit d_Y output)
+  inverse_dynamics_regressor         (__host__ launcher; writes hd_data->d_Y)
 
-The output is shaped nv x 10*NB and is NOT a gridData field (additive, keeps the
-gridData struct untouched); the host launcher takes an explicit `d_Y` device
-pointer the caller allocates (10*NB*nv*num_timesteps floats).
+The output is shaped nv x 10*NB. R2: it is a gridData field (hd_data->d_Y, sized
+10*NB*nv*num_timesteps floats); the host launcher writes it and copies the result
+back into hd_data->h_Y (uniform `(hd_data, model, ...)` host signature).
 """
 
 # The 10 basis spatial-inertia derivatives dI/dpi_k in GRiD [angular; linear]
@@ -358,14 +358,13 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
     nv = self.robot.get_num_vel()
     out_size = nv * 10 * NB
     func_params = [
-        "hd_data is the packaged input and output pointers (q/qd/qdd inputs)",
-        "d_Y is the caller-allocated output regressor (10*NB*nv*num_timesteps floats)",
+        "hd_data is the packaged input and output pointers (q/qd/qdd inputs; output regressor written to hd_data->d_Y, 10*NB*nv*num_timesteps floats)",
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
         "gravity is the gravity constant",
         "num_timesteps is the length of the trajectory points",
         "streams are pointers to CUDA streams for async memory transfers",
     ]
-    func_def_start = "void inverse_dynamics_regressor(gridData<T, KIND> *hd_data, T *d_Y, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void inverse_dynamics_regressor(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -379,7 +378,7 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics_regressor requires all-data or dynamics gridData\");")
-    func_call_start = "inverse_dynamics_regressor_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_Y,hd_data->d_q_qd_u,stride_q_qd_qdd,"
+    func_call_start = "inverse_dynamics_regressor_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Y,hd_data->d_q_qd_u,stride_q_qd_qdd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -403,7 +402,9 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([
-            "// finally transfer the result back (caller owns d_Y; copy into the caller's host buffer via hd_data is not wired -> caller reads d_Y)",
+            "// finally transfer the result back into the gridData host buffer (hd_data->d_Y -> hd_data->h_Y)",
+            "gpuErrchk(cudaMemcpy(hd_data->h_Y,hd_data->d_Y," +
+            ("num_timesteps*" if not single_call_timing else "") + str(out_size) + "*sizeof(T),cudaMemcpyDeviceToHost));",
             "gpuErrchkKernel();",
         ])
     else:
@@ -433,8 +434,8 @@ def gen_inverse_dynamics_regressor(self):
 # because ID = M qdd + c is affine in pi with Jacobian Y at the *actual* qdd.
 # Composes existing device inners: minv (Minv), inverse_dynamics (bias c
 # -> qdd_actual via Minv.(u-c)), then the regressor Y at qdd_actual, then the
-# symmetric-upper -Minv . Y apply. Output is nv x 10*NUM_BODIES, NOT a gridData
-# field (additive); the host launcher takes an explicit d_dqdd_dpi pointer.
+# symmetric-upper -Minv . Y apply. Output is nv x 10*NUM_BODIES. R2: it is a
+# gridData field (hd_data->d_dqdd_dpi); the host launcher writes it + copies back.
 # ===========================================================================
 
 def gen_forward_dynamics_parameter_gradient_inner_temp_mem_size(self):
@@ -673,14 +674,13 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     NB = self.robot.get_num_bodies()
     out_size = nv * 10 * NB
     func_params = [
-        "hd_data is the packaged input and output pointers (q/qd/u inputs)",
-        "d_dqdd_dpi is the caller-allocated output (10*NB*nv*num_timesteps floats)",
+        "hd_data is the packaged input and output pointers (q/qd/u inputs; output written to hd_data->d_dqdd_dpi, 10*NB*nv*num_timesteps floats)",
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
         "gravity is the gravity constant",
         "num_timesteps is the length of the trajectory points",
         "streams are pointers to CUDA streams for async memory transfers",
     ]
-    func_def_start = "void forward_dynamics_parameter_gradient(gridData<T, KIND> *hd_data, T *d_dqdd_dpi, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void forward_dynamics_parameter_gradient(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -696,7 +696,7 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_parameter_gradient requires all-data or dynamics gridData\");")
     # g1-spill: pass hd_data->d_workspace as the kernel's 2nd arg. At the spilled
     # default tier (s_Y in d_workspace) it is read; at TIER_SHARED it is unused.
-    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -721,6 +721,13 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_parameter_gradient\", FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     self.gen_add_code_line("gpuErrchkKernel();")
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// finally transfer the result back into the gridData host buffer (hd_data->d_dqdd_dpi -> hd_data->h_dqdd_dpi)",
+            "gpuErrchk(cudaMemcpy(hd_data->h_dqdd_dpi,hd_data->d_dqdd_dpi," +
+            ("num_timesteps*" if not single_call_timing else "") + str(out_size) + "*sizeof(T),cudaMemcpyDeviceToHost));",
+            "gpuErrchkKernel();",
+        ])
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
         self.gen_add_code_line(single_call_printf_line("forward_dynamics_parameter_gradient"))

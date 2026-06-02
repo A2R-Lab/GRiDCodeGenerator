@@ -1316,7 +1316,10 @@ class GRiDCodeGenerator:
                                  # dqdd/dfext = M^-1 J^T; each nv x (6*NB), body-major.
                                  "    T *d_dtau_dfext;",
                                  "    T *d_dqdd_dfext;",
-                                 "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)"]
+                                 "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)",
+                                 # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
+                                 "    T *d_Y;          // inverse_dynamics_regressor (tau = Y . pi), nv*10NB",
+                                 "    T *d_dqdd_dpi;   // forward_dynamics_parameter_gradient (-Minv . Y), nv*10NB"]
                                  + [
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
@@ -1342,7 +1345,10 @@ class GRiDCodeGenerator:
                                  "    T *h_df_du;", \
                                  "    T *h_dtau_dfext;",
                                  "    T *h_dqdd_dfext;",
-                                 "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (both base modes)"]
+                                 "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (both base modes)",
+                                 # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
+                                 "    T *h_Y;",
+                                 "    T *h_dqdd_dpi;"]
                                  + [
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
@@ -1396,7 +1402,12 @@ class GRiDCodeGenerator:
                       "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
                       "    // f_ext A.3: -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)",
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_did_du_dfext, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
-                      "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));"]
+                      "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));",
+                      "    // R2: regressor Y and FD param-gradient dqdd/dpi (each nv x 10*NUM_BODIES)",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_Y, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dpi, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
+                      "    hd_data->h_Y = (T *)malloc(NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
+                      "    hd_data->h_dqdd_dpi = (T *)malloc(NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));"]
                       + [
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
@@ -1766,7 +1777,10 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));",
                                  "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);",
-                                 "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);"]
+                                 "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);",
+                                 # R2: regressor Y + FD param-gradient dqdd/dpi outputs
+                                 "gpuErrchk(cudaFree(hd_data->d_Y)); gpuErrchk(cudaFree(hd_data->d_dqdd_dpi));",
+                                 "free(hd_data->h_Y); free(hd_data->h_dqdd_dpi);"]
                                  + [
                                  "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
