@@ -721,7 +721,7 @@ def gen_aba_inner(self):
                 jid = str(inds[0])
                 self.gen_add_code_line("int jid = " + jid + ";")
             self.gen_add_code_line("int jid6 = 6*" + jid + ";")
-            self.gen_add_code_line("T gravity_vec[] = {0,0,0,0,0,gravity};")
+            self.gen_add_code_line("T gravity_vec[] = {0,0,0,0,0,-gravity}; // -gravity = +9.81 matches RBDReference gravity_vec[5] = -GRAVITY (gravity=-9.81)")
             self.gen_add_code_line("s_va[6*"+str(n)+"+jid6+row] = dot_prod<T,6,6,1>(&s_XImats[36 * jid + row], &gravity_vec[0]) + s_temp[72*"+str(n)+"+jid6+row];")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
