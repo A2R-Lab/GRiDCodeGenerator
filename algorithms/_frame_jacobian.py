@@ -333,8 +333,10 @@ def gen_frame_jacobian_host(self, mode=0):
                    "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (default LWA)"]
     # target_jid / reference_frame are trailing defaulted params so existing
     # call sites (which omit them) keep the leaf-EE / LWA behavior.
-    frame_args = (", const int target_jid = " + str(default_tjid) +
-                  ", const int reference_frame = " + str(_REF_LWA))
+    # Non-const so the body can resolve a -1 "use default" sentinel independently
+    # per arg (a binding may request the default target but an explicit frame).
+    frame_args = (", int target_jid = " + str(default_tjid) +
+                  ", int reference_frame = " + str(_REF_LWA))
     func_def_start = "void frame_jacobian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams" + frame_args + ") {"
     if single_call_timing:
@@ -350,6 +352,8 @@ def gen_frame_jacobian_host(self, mode=0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian requires all-data or kinematics gridData\");")
+    self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default (frame still honored)")
+    self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
     func_call_start = ("frame_jacobian_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                        "(hd_data->d_frame_jacobian,hd_data->d_q,stride_q,target_jid,reference_frame,")
     func_call_end = "d_robotModel,num_timesteps);"
@@ -552,8 +556,10 @@ def gen_frame_jacobian_dot_host(self, mode=0):
                    "streams are pointers to CUDA streams for async memory transfers (if needed)",
                    "target_jid is the joint id of the requested frame (default leaf-EE)",
                    "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (default LWA)"]
-    frame_args = (", const int target_jid = " + str(default_tjid) +
-                  ", const int reference_frame = " + str(_REF_LWA))
+    # Non-const so the body can resolve a -1 "use default" sentinel independently
+    # per arg (a binding may request the default target but an explicit frame).
+    frame_args = (", int target_jid = " + str(default_tjid) +
+                  ", int reference_frame = " + str(_REF_LWA))
     func_def_start = "void frame_jacobian_dot(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams" + frame_args + ") {"
     if single_call_timing:
@@ -569,6 +575,8 @@ def gen_frame_jacobian_dot_host(self, mode=0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian_dot requires all-data or kinematics gridData\");")
+    self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default (frame still honored)")
+    self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
     # Jdot needs qd; always source from the full q|qd|u buffer (stride 3*NUM_JOINTS),
     # the kernel reads the leading [q; qd] slice.
     func_call = ("frame_jacobian_dot_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
