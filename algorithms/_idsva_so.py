@@ -240,9 +240,21 @@ def gen_idsva_so_body_frame_inner_temp_mem_size(self):
         # 36-float kernel-local array per body, so subtract it from the count.
         body_mat_count = 7 * 36 * num_bodies
         body_vec_count = 7 * 6 * num_bodies
-        vel_vec_count = 12 * 6 * NV
-        vel_mat_count = 9 * 36 * NV
-        base_count = body_mat_count + body_vec_count + vel_vec_count + vel_mat_count + 6 + 64
+        # B4 FIX: for a mimic robot the floating body-frame inner runs the velocity-indexed
+        # sweep in UNIQUE per-column INTERNAL coordinates (n_int = total column count > NV)
+        # and assembles into a 4*n_int^3 internal slab before alpha-folding to the reduced
+        # 4*NV^3 caller output. So the vel-indexed bands are sized by n_int and the internal
+        # slab is appended. Non-mimic: n_int == NV and no slab, so the size is unchanged.
+        if self.robot_has_mimic_joints():
+            n_int = _idsva_so_floating_velocity_metadata(self.robot)["n_int"]
+            vel_n = n_int
+            internal_slab = 4 * n_int ** 3
+        else:
+            vel_n = NV
+            internal_slab = 0
+        vel_vec_count = 12 * 6 * vel_n
+        vel_mat_count = 9 * 36 * vel_n
+        base_count = body_mat_count + body_vec_count + vel_vec_count + vel_mat_count + 6 + 64 + internal_slab
         # Gravity-shim shared portion only — d2X / d2a / d2f spill to `d_workspace`
         # (see `gen_floating_gravity_d2tau_dq_spill_count`).
         return int(base_count + gen_floating_gravity_d2tau_dq_shared_count(self))
@@ -291,6 +303,19 @@ def _floating_gravity_lie_metadata(robot):
     s_sign = [1] * num_vel
     lie_sign_flip = [0] * num_vel
 
+    # B4 FIX: internal-slot (UNIQUE per-column) variants of the same per-velocity Lie
+    # tables, mirroring _idsva_so_floating_velocity_metadata. For a mimic robot the
+    # gravity shim runs in internal coords so a mimic joint and its target get distinct
+    # slots (the reduced `body[vel_index]` would otherwise overwrite the shared slot,
+    # dropping the target's gravity contribution). Each internal slot also records its
+    # true reduced slot + mimic alpha for the shared fold. Non-mimic: internal == reduced.
+    int_body = []
+    int_s_index = []
+    int_s_sign = []
+    int_lie_sign_flip = []
+    int_true = []
+    int_alpha = []
+
     for body_id in range(num_bodies):
         v_inds = _idsva_so_as_index_list(robot.get_joint_index_v(body_id))
         S = robot.get_S_by_id(body_id)
@@ -298,17 +323,28 @@ def _floating_gravity_lie_metadata(robot):
             S_cols = [S]
         else:
             S_cols = [S[:, col] for col in range(S.shape[1])]
+        joint = robot.get_joint_by_id(body_id)
+        is_mimic_body = getattr(joint, "is_mimic", False)
+        alpha = float(joint.get_mimic_multiplier()) if is_mimic_body else 1.0
         for local_col, vel_index in enumerate(v_inds):
             row_idx, sign = _idsva_so_unit_axis(S_cols[local_col])
-            body[vel_index] = body_id
-            s_index[vel_index] = row_idx
-            s_sign[vel_index] = sign
-            # Flip sign for non-root joints (sympy Xmat convention) and for root
-            # translation columns (Featherstone xlt sign convention).
-            if body_id != 0:
-                lie_sign_flip[vel_index] = 1
-            elif local_col < 3:
-                lie_sign_flip[vel_index] = 1
+            flip = 1 if (body_id != 0 or local_col < 3) else 0
+            # Reduced (legacy) tables: guard on is_mimic so the mimic does not overwrite
+            # its target's slot (matches the velocity-metadata convention).
+            if not is_mimic_body:
+                body[vel_index] = body_id
+                s_index[vel_index] = row_idx
+                s_sign[vel_index] = sign
+                # Flip sign for non-root joints (sympy Xmat convention) and for root
+                # translation columns (Featherstone xlt sign convention).
+                lie_sign_flip[vel_index] = flip
+            # Internal tables: one UNIQUE slot per column.
+            int_body.append(body_id)
+            int_s_index.append(row_idx)
+            int_s_sign.append(sign)
+            int_lie_sign_flip.append(flip)
+            int_true.append(vel_index)
+            int_alpha.append(alpha)
 
     return {
         "body": body,
@@ -317,6 +353,14 @@ def _floating_gravity_lie_metadata(robot):
         # Keep the field name `is_root_translation` for backwards-compat with
         # the existing emission code; it now means "needs Lie-sign flip".
         "is_root_translation": lie_sign_flip,
+        # Internal-slot (UNIQUE per-column) variants for the mimic gravity-shim path.
+        "n_int": len(int_body),
+        "int_body": int_body,
+        "int_s_index": int_s_index,
+        "int_s_sign": int_s_sign,
+        "int_is_root_translation": int_lie_sign_flip,
+        "int_true": int_true,
+        "int_alpha": int_alpha,
     }
 
 def _gravity_shim_use_full_spill(self):
@@ -340,15 +384,20 @@ def gen_floating_gravity_d2tau_dq_spill_count(self):
     """
     NV = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
-    d2X_count = 36 * NV * NV
-    d2a_count = 6 * NV * NV * NB
-    d2f_count = 6 * NV * NV * NB
+    # B4 FIX: the mimic gravity shim runs its q-perturbation (vi/vj) axes in UNIQUE
+    # internal slots (n_int >= NV) so a mimic + its target get distinct columns; the
+    # d2X/d2a/d2f/dX/da/df tensors are therefore sized by n_int on those axes. Non-mimic:
+    # n_int == NV, byte-identical sizing.
+    grav_n = _floating_gravity_lie_metadata(self.robot)["n_int"] if self.robot_has_mimic_joints() else NV
+    d2X_count = 36 * grav_n * grav_n
+    d2a_count = 6 * grav_n * grav_n * NB
+    d2f_count = 6 * grav_n * grav_n * NB
     total = d2X_count + d2a_count + d2f_count
     if _gravity_shim_use_full_spill(self):
         # When fully spilled, dX/a/da/f/df move to d_workspace too. The 4*36
         # scratch buffers become kernel-local arrays (not in workspace).
-        NV_ = NV; NB_ = NB
-        total += 36 * NV_ + 6 * NB_ + 6 * NV_ * NB_ + 6 * NB_ + 6 * NV_ * NB_
+        NB_ = NB
+        total += 36 * grav_n + 6 * NB_ + 6 * grav_n * NB_ + 6 * NB_ + 6 * grav_n * NB_
     return int(total)
 
 
@@ -363,9 +412,11 @@ def gen_floating_gravity_d2tau_dq_shared_count(self):
         return 0
     NV = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
-    dX_count = 36 * NV
+    # B4 FIX: mimic shim sizes the vi-axis (dX/da/df) by internal slot count n_int.
+    grav_n = _floating_gravity_lie_metadata(self.robot)["n_int"] if self.robot_has_mimic_joints() else NV
+    dX_count = 36 * grav_n
     a_count = 6 * NB
-    da_count = 6 * NV * NB
+    da_count = 6 * grav_n * NB
     f_count = a_count
     df_count = da_count
     scratch_count = 4 * 36
@@ -415,10 +466,40 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self):
     NB = self.robot.get_num_bodies()
     lie_meta = _floating_gravity_lie_metadata(self.robot)
     parent_ids = [self.robot.get_parent_id(b) for b in range(NB)]
+    # B4 FIX: for a mimic robot this shim runs in UNIQUE per-column INTERNAL slots
+    # (grav_n = n_int > NV) and ADDS into the caller's INTERNAL d2tau_dq slab (SO_N_INT
+    # stride); the caller's single alpha-fold then reduces sweep + gravity together. The
+    # perturbation axes (vi/vj) and the output q-axis use grav_n; the projection writes
+    # internal slot finds_c (from the caller's internal body_v_index) at SO_N_INT stride.
+    # Non-mimic: grav_n == NV, GN == "NUM_VEL", GO == "NUM_VEL", byte-identical emission.
+    grav_is_mimic = self.robot_has_mimic_joints()
+    # GN spans the q-perturbation axes AND the internal d2tau_dq output stride. For mimic
+    # n_int == SO_N_INT (the caller's internal-slab stride), so a single token suffices.
+    GN = "GRAV_N_INT" if grav_is_mimic else "NUM_VEL"
+
+    # MIMIC: every C-level `NUM_VEL` in this shim is a q-perturbation / output q-axis that
+    # must become the internal-slot count. Route all C emission through a wrapper that
+    # rewrites the token to GRAV_N_INT so the (large, single-threaded) body below stays
+    # verbatim. For non-mimic the rewrite is a no-op (gn == "NUM_VEL"), so the emitted code
+    # is BYTE-IDENTICAL to before. The wrapper is installed AFTER the GRAV_N_INT constexpr
+    # is emitted (so that line keeps its literal value) and restored at function end.
+    _orig_gen_add_code_line = self.gen_add_code_line
+    _orig_gen_add_code_lines = self.gen_add_code_lines
 
     # Wrap the entire emission in a single-thread block so the helper is self-contained
     # and safe to call regardless of whether the caller is already in a thread-zero scope.
     self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
+    if grav_is_mimic:
+        self.gen_add_code_line(f"constexpr int GRAV_N_INT = {lie_meta['n_int']};")
+        def _gl_line(line, *a, **k):
+            if isinstance(line, str):
+                line = line.replace("NUM_VEL", "GRAV_N_INT")
+            return _orig_gen_add_code_line(line, *a, **k)
+        def _gl_lines(lines, *a, **k):
+            lines = [(ln.replace("NUM_VEL", "GRAV_N_INT") if isinstance(ln, str) else ln) for ln in lines]
+            return _orig_gen_add_code_lines(lines, *a, **k)
+        self.gen_add_code_line = _gl_line
+        self.gen_add_code_lines = _gl_lines
     # Compute the shared-memory base offset: existing main-sweep temp size MINUS the
     # gravity-shim's shared portion (we want grav_scratch to point at where the helper's
     # shared arrays live, which is right after the main-sweep allocations).
@@ -434,10 +515,10 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self):
     self.gen_add_code_lines([
         "// ===== Gravity-Hessian (Lie-tangent) addition into d2tau_dq2 =====",
         *layout_comment.split("\n"),
-        f"static const int grav_lie_body[] = {{ {_idsva_so_int_array(lie_meta['body'])} }};",
-        f"static const int grav_lie_s_index[] = {{ {_idsva_so_int_array(lie_meta['s_index'])} }};",
-        f"static const int grav_lie_s_sign[] = {{ {_idsva_so_int_array(lie_meta['s_sign'])} }};",
-        f"static const int grav_lie_is_root_translation[] = {{ {_idsva_so_int_array(lie_meta['is_root_translation'])} }};",
+        f"static const int grav_lie_body[] = {{ {_idsva_so_int_array(lie_meta['int_body'] if grav_is_mimic else lie_meta['body'])} }};",
+        f"static const int grav_lie_s_index[] = {{ {_idsva_so_int_array(lie_meta['int_s_index'] if grav_is_mimic else lie_meta['s_index'])} }};",
+        f"static const int grav_lie_s_sign[] = {{ {_idsva_so_int_array(lie_meta['int_s_sign'] if grav_is_mimic else lie_meta['s_sign'])} }};",
+        f"static const int grav_lie_is_root_translation[] = {{ {_idsva_so_int_array(lie_meta['int_is_root_translation'] if grav_is_mimic else lie_meta['is_root_translation'])} }};",
         f"static const int grav_lie_parent[] = {{ {_idsva_so_int_array(parent_ids)} }};",
         "",
     ])
@@ -880,6 +961,9 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self):
     self.gen_add_end_control_flow()  # vi loop for d2f
     self.gen_add_end_control_flow()  # jid backward loop
     self.gen_add_end_control_flow()  # close thread-zero wrap
+    # Restore the un-wrapped emission methods (mimic NUM_VEL->GRAV_N_INT rewrite is local).
+    self.gen_add_code_line = _orig_gen_add_code_line
+    self.gen_add_code_lines = _orig_gen_add_code_lines
     self.gen_add_sync()
 
 def gen_idsva_so_body_frame_inner_function_call(self, use_qdd_input = False, updated_var_names = None, bc_in_smem_expr = None, scratch_in_smem_expr = None, tp_in_smem_expr = None):
@@ -1011,7 +1095,16 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
     self.gen_add_code_line(f"static const int idsva_ref_pair_jid[] = {{ {int_array(pair_jid)} }};")
     self.gen_add_code_line(f"static const int idsva_ref_pair_anc[] = {{ {int_array(pair_anc)} }};")
     # Pass 1: zero the whole output tensor in parallel.
-    self.gen_add_parallel_loop("out_idx", "SECOND_ORDER_TENSOR_SIZE")
+    # MIMIC: the caller shadows SECOND_ORDER_COORDS to NUM_BODIES and repoints
+    # s_idsva_so at the 4*NB^3 INTERNAL slab (it is folded to the reduced 4*NV^3
+    # public output afterwards). SECOND_ORDER_TENSOR_SIZE stays the NV-based
+    # 4*NV^3 macro, so zeroing only that many cells leaves the upper internal
+    # slots (incl. the entire dM_dq block + the dvdq tail for NB>NV) stale; the
+    # fold then reads garbage. Zero the full internal 4*NB^3 span for mimic
+    # (byte-identical for non-mimic, where NB==NV). Mirrors the mimic-aware zero
+    # in gen_idsva_so_device's output-init (the `4*n_int^3 if is_mimic` site).
+    zero_span = "4*NUM_BODIES*NUM_BODIES*NUM_BODIES" if self.robot_has_mimic_joints() else "SECOND_ORDER_TENSOR_SIZE"
+    self.gen_add_parallel_loop("out_idx", zero_span)
     self.gen_add_code_line("s_idsva_so[out_idx] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
@@ -1095,6 +1188,63 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     metadata = _idsva_so_floating_velocity_metadata(self.robot)
     parent_ids = [self.robot.get_parent_id(body_id) for body_id in range(num_bodies)]
 
+    # ---- Floating-base mimic: per-column INTERNAL-coordinate sweep + alpha fold ----
+    # B4 FIX (2026-06-02): for a mimic robot NB>NV and several body-velocity columns
+    # share one reduced v-slot (a mimic joint + its target). The original emission keyed
+    # every per-column buffer AND the output on the REDUCED slot (`body_v_index`, which
+    # carries the duplicate, e.g. fr3-floating `...,13,13`) with plain `=` writes, so the
+    # mimic sibling's contribution CLOBBERED the target's instead of alpha-folding onto
+    # the shared slot — wrong on exactly the mimic column (fr3 col 13). Mirror the (already
+    # correct) world-frame inner: run the whole sweep in UNIQUE per-column internal slots
+    # (n_int = total column count), assemble into a 4*n_int^3 internal slab, then
+    # alpha-fold each axis to the reduced 4*NV^3 public output (R[i,v(i)] += alpha_i).
+    # Non-mimic robots keep n_int == NV and the legacy reduced tables, so the emission is
+    # byte-identical for them.
+    is_mimic = self.robot_has_mimic_joints()
+    n_int = metadata["n_int"]
+    SO_N = "SO_N_INT" if is_mimic else "NUM_VEL"
+    # Internal-slot variants of the per-body / subtree / successor column-index tables.
+    # The shared metadata builds these on REDUCED slots (body_v_index); rebuild them here
+    # on the UNIQUE internal slots (body_vint_index) so mimic siblings never collide. This
+    # is body-frame-local (the world-frame inner has its own per-column loop structure and
+    # does not consume subtree/successor lists), so the shared metadata stays untouched.
+    body_v_start = metadata["body_v_start"]
+    body_vint_index = metadata["body_vint_index"]
+    def _internal_cols_for_body(b):
+        return body_vint_index[body_v_start[b]:body_v_start[b + 1]]
+    if is_mimic:
+        int_body_v_index = list(body_vint_index)
+        int_subtree_v_index = []
+        int_subtree_v_start = [0]
+        int_successor_v_index = []
+        int_successor_v_start = [0]
+        for body_id in range(num_bodies):
+            subtree = list(self.robot.get_subtree_by_id(body_id))
+            for sb in subtree:
+                int_subtree_v_index.extend(_internal_cols_for_body(sb))
+            int_subtree_v_start.append(len(int_subtree_v_index))
+            for sb in subtree:
+                if sb != body_id:
+                    int_successor_v_index.extend(_internal_cols_for_body(sb))
+            int_successor_v_start.append(len(int_successor_v_index))
+        emit_body_v_index = int_body_v_index
+        emit_subtree_v_index = int_subtree_v_index
+        emit_subtree_v_start = int_subtree_v_start
+        emit_successor_v_index = int_successor_v_index
+        emit_successor_v_start = int_successor_v_start
+        emit_vel_to_body = metadata["vel_to_body"]      # reduced (only used for S build, see below)
+        emit_vel_s_index = metadata["int_s_index"]      # internal-slot S unit-axis row
+        emit_vel_s_sign = metadata["int_s_sign"]        # internal-slot S unit-axis sign
+    else:
+        emit_body_v_index = metadata["body_v_index"]
+        emit_subtree_v_index = metadata["subtree_v_index"]
+        emit_subtree_v_start = metadata["subtree_v_start"]
+        emit_successor_v_index = metadata["successor_v_index"]
+        emit_successor_v_start = metadata["successor_v_start"]
+        emit_vel_to_body = metadata["vel_to_body"]
+        emit_vel_s_index = metadata["vel_s_index"]
+        emit_vel_s_sign = metadata["vel_s_sign"]
+
     func_params = ["s_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*NV**3), \
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
@@ -1129,7 +1279,16 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)0; }")
     self.gen_load_update_XImats_helpers_function_call()
 
-    self.gen_add_code_lines([
+    # int_to_body[s] = owning body of internal slot s (for the per-internal-slot S build).
+    int_to_body = [0] * n_int
+    for body_id in range(num_bodies):
+        for s in _internal_cols_for_body(body_id):
+            int_to_body[s] = body_id
+    self.gen_add_code_lines(([
+        # SO_N_INT = per-column internal coordinate count; drives the vel-band sizes and
+        # the internal output-slab strides. Only emitted (and used) for mimic robots.
+        f"constexpr int SO_N_INT = {n_int};",
+    ] if is_mimic else []) + [
         "// Floating IDSVA-SO split-memory layout.",
         "T *I = s_XImats + XIMAT_SIZE*NUM_BODIES;",
         "T *Xdown = s_temp;",
@@ -1147,51 +1306,73 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
         "T *IC_v = f + 6*NUM_BODIES;",
         "T *a_world = IC_v + 6*NUM_BODIES;",
         "T *S_vel = a_world + 6;",
-        "T *Sd_vel = S_vel + 6*NUM_VEL;",
-        "T *psid_vel = Sd_vel + 6*NUM_VEL;",
-        "T *psidd_vel = psid_vel + 6*NUM_VEL;",
-        "T *psid_Sd_vel = psidd_vel + 6*NUM_VEL;",
-        "T *IC_S = psid_Sd_vel + 6*NUM_VEL;",
-        "T *IC_psid = IC_S + 6*NUM_VEL;",
-        "T *ICT_S = IC_psid + 6*NUM_VEL;",
+        f"T *Sd_vel = S_vel + 6*{SO_N};",
+        f"T *psid_vel = Sd_vel + 6*{SO_N};",
+        f"T *psidd_vel = psid_vel + 6*{SO_N};",
+        f"T *psid_Sd_vel = psidd_vel + 6*{SO_N};",
+        f"T *IC_S = psid_Sd_vel + 6*{SO_N};",
+        f"T *IC_psid = IC_S + 6*{SO_N};",
+        f"T *ICT_S = IC_psid + 6*{SO_N};",
         "T *T1 = IC_S;",
-        "T *T2 = ICT_S + 6*NUM_VEL;",
-        "T *T3 = T2 + 6*NUM_VEL;",
-        "T *T4 = T3 + 6*NUM_VEL;",
-        "T *crm_S = T4 + 6*NUM_VEL;",
-        "T *crf_S = crm_S + 36*NUM_VEL;",
-        "T *crm_psid = crf_S + 36*NUM_VEL;",
-        "T *crf_psid = crm_psid + 36*NUM_VEL;",
+        f"T *T2 = ICT_S + 6*{SO_N};",
+        f"T *T3 = T2 + 6*{SO_N};",
+        f"T *T4 = T3 + 6*{SO_N};",
+        f"T *crm_S = T4 + 6*{SO_N};",
+        f"T *crf_S = crm_S + 36*{SO_N};",
+        f"T *crm_psid = crf_S + 36*{SO_N};",
+        f"T *crf_psid = crm_psid + 36*{SO_N};",
         "// icrf_f used to live here (size 36*NUM_BODIES) but is now a kernel-local",
         "// per-body 36-float array; saves NUM_BODIES * 36 floats of shared memory.",
-        "T *B_IC_S = crf_psid + 36*NUM_VEL;",
-        "T *D1 = B_IC_S + 36*NUM_VEL;",
-        "T *D2 = D1 + 36*NUM_VEL;",
+        f"T *B_IC_S = crf_psid + 36*{SO_N};",
+        f"T *D1 = B_IC_S + 36*{SO_N};",
+        f"T *D2 = D1 + 36*{SO_N};",
         "T *D3 = B_IC_S;",
-        "T *D4 = D2 + 36*NUM_VEL;",
-        "T *crf_S_IC = D4 + 36*NUM_VEL;",
+        f"T *D4 = D2 + 36*{SO_N};",
+        f"T *crf_S_IC = D4 + 36*{SO_N};",] + ([
+        # Mimic: a 4*n_int^3 INTERNAL slab placed after the vel bands. The sweep assembles
+        # into it (SO_N_INT stride); the public reduced caller dest is saved and folded last.
+        f"T *so_internal = crf_S_IC + 36*{SO_N};",
+        "T *s_idsva_so_public = s_idsva_so;  // reduced 4*NV^3 caller dest (saved before repoint)",
+        "T *d2tau_dq2 = so_internal;",
+        "T *d2tau_dqd2 = d2tau_dq2 + SO_N_INT*SO_N_INT*SO_N_INT;",
+        "T *d2tau_dvdq = d2tau_dqd2 + SO_N_INT*SO_N_INT*SO_N_INT;",
+        "T *dM_dq = d2tau_dvdq + SO_N_INT*SO_N_INT*SO_N_INT;",
+    ] if is_mimic else [
         "T *d2tau_dq2 = s_idsva_so;",
         "T *d2tau_dqd2 = d2tau_dq2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
         "T *d2tau_dvdq = d2tau_dqd2 + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
         "T *dM_dq = d2tau_dvdq + SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS;",
+    ]) + [
         "",
         f"static const int idsva_float_parent[] = {{ {_idsva_so_int_array(parent_ids)} }};",
         f"static const int body_v_start[] = {{ {_idsva_so_int_array(metadata['body_v_start'])} }};",
-        f"static const int body_v_index[] = {{ {_idsva_so_int_array(metadata['body_v_index'])} }};",
-        f"static const int vel_to_body[] = {{ {_idsva_so_int_array(metadata['vel_to_body'])} }};",
-        f"static const int vel_s_index[] = {{ {_idsva_so_int_array(metadata['vel_s_index'])} }};",
-        f"static const int vel_s_sign[] = {{ {_idsva_so_int_array(metadata['vel_s_sign'])} }};",
-        f"static const int subtree_v_start[] = {{ {_idsva_so_int_array(metadata['subtree_v_start'])} }};",
-        f"static const int subtree_v_index[] = {{ {_idsva_so_int_array(metadata['subtree_v_index'])} }};",
-        f"static const int successor_v_start[] = {{ {_idsva_so_int_array(metadata['successor_v_start'])} }};",
-        f"static const int successor_v_index[] = {{ {_idsva_so_int_array(metadata['successor_v_index'])} }};",
+        f"static const int body_v_index[] = {{ {_idsva_so_int_array(emit_body_v_index)} }};",
+        f"static const int vel_to_body[] = {{ {_idsva_so_int_array(emit_vel_to_body)} }};",
+        f"static const int vel_s_index[] = {{ {_idsva_so_int_array(emit_vel_s_index)} }};",
+        f"static const int vel_s_sign[] = {{ {_idsva_so_int_array(emit_vel_s_sign)} }};",
+        f"static const int subtree_v_start[] = {{ {_idsva_so_int_array(emit_subtree_v_start)} }};",
+        f"static const int subtree_v_index[] = {{ {_idsva_so_int_array(emit_subtree_v_index)} }};",
+        f"static const int successor_v_start[] = {{ {_idsva_so_int_array(emit_successor_v_start)} }};",
+        f"static const int successor_v_index[] = {{ {_idsva_so_int_array(emit_successor_v_index)} }};",
         f"static const int ancestor_body_start[] = {{ {_idsva_so_int_array(metadata['ancestor_body_start'])} }};",
-        f"static const int ancestor_body_index[] = {{ {_idsva_so_int_array(metadata['ancestor_body_index'])} }};",
+        f"static const int ancestor_body_index[] = {{ {_idsva_so_int_array(metadata['ancestor_body_index'])} }};",] + ([
+        # internal slot -> owning body (per-internal-slot S build), -> true reduced v-slot
+        # (alpha-scaled qd/qdd reads), -> mimic alpha (qd/qdd reads + the final axis fold).
+        f"static const int int_to_body[] = {{ {_idsva_so_int_array(int_to_body)} }};",
+        f"static const int int_true_vel[] = {{ {_idsva_so_int_array(metadata['int_true_vel'])} }};",
+        "static const T int_alpha[] = { " + ", ".join(
+            "static_cast<T>(" + repr(a) + ")" for a in metadata['int_alpha']) + " };",
+    ] if is_mimic else []) + [
         "",
     ])
 
     self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
-    self.gen_add_code_line("for (int out_idx = 0; out_idx < SECOND_ORDER_TENSOR_SIZE; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
+    if is_mimic:
+        # Mimic: zero the 4*n_int^3 INTERNAL slab (d2tau_dq2 points at it). The reduced
+        # 4*NV^3 public output is zeroed separately just before the fold.
+        self.gen_add_code_line("for (int out_idx = 0; out_idx < 4*SO_N_INT*SO_N_INT*SO_N_INT; ++out_idx) d2tau_dq2[out_idx] = static_cast<T>(0);")
+    else:
+        self.gen_add_code_line("for (int out_idx = 0; out_idx < SECOND_ORDER_TENSOR_SIZE; ++out_idx) s_idsva_so[out_idx] = static_cast<T>(0);")
     self.gen_add_code_line("// Floating-base: run main sweep with gravity = 0; gravity Hessian added below by")
     self.gen_add_code_line("// `gen_floating_gravity_d2tau_dq_lie_inline` (mirrors Python idsva_gravity = 0.0 + shim).")
     self.gen_add_code_line("a_world[0] = static_cast<T>(0); a_world[1] = static_cast<T>(0); a_world[2] = static_cast<T>(0);")
@@ -1234,8 +1415,11 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_idsva_so_xdown_plucker_inverse("floating_serial")
 
     self.gen_add_code_line("// Transform each velocity-coordinate S column.")
-    self.gen_add_code_line("for (int vel = 0; vel < NUM_VEL; ++vel) {", True)
-    self.gen_add_code_line("int jid = vel_to_body[vel];")
+    # Mimic: iterate UNIQUE internal slots (n_int), each mapped to its owning body via
+    # int_to_body and its internal-slot S-axis via vel_s_index/sign (internal-indexed).
+    # Non-mimic: byte-identical legacy reduced-slot loop (NUM_VEL, vel_to_body).
+    self.gen_add_code_line(f"for (int vel = 0; vel < {SO_N}; ++vel) {{", True)
+    self.gen_add_code_line(("int jid = int_to_body[vel];" if is_mimic else "int jid = vel_to_body[vel];"))
     self.gen_add_code_line("int s_col = vel_s_index[vel];")
     self.gen_add_code_line("T s_sign = static_cast<T>(vel_s_sign[vel]);")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) S_vel[vel*6 + row] = s_sign * Xdown[jid*36 + s_col*6 + row];")
@@ -1249,8 +1433,18 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_code_line("aJ[jid*6 + row] = static_cast<T>(0);")
     self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
     self.gen_add_code_line("int vel = body_v_index[pos];")
-    self.gen_add_code_line("vJ[jid*6 + row] += S_vel[vel*6 + row] * s_qd[vel];")
-    self.gen_add_code_line("aJ[jid*6 + row] += S_vel[vel*6 + row] * s_qdd[vel];")
+    if is_mimic:
+        # Mimic: `vel` is a unique internal slot; read the (possibly shared) reduced qd/qdd
+        # slot and scale by the joint's mimic multiplier (mirrors the oracle's
+        # `_qd = alpha_i * qd[inds_v_true]`). The fold below applies the remaining alpha
+        # factors on the OTHER axes.
+        self.gen_add_code_line("T qd_v = int_alpha[vel] * s_qd[int_true_vel[vel]];")
+        self.gen_add_code_line("T qdd_v = int_alpha[vel] * s_qdd[int_true_vel[vel]];")
+        self.gen_add_code_line("vJ[jid*6 + row] += S_vel[vel*6 + row] * qd_v;")
+        self.gen_add_code_line("aJ[jid*6 + row] += S_vel[vel*6 + row] * qdd_v;")
+    else:
+        self.gen_add_code_line("vJ[jid*6 + row] += S_vel[vel*6 + row] * s_qd[vel];")
+        self.gen_add_code_line("aJ[jid*6 + row] += S_vel[vel*6 + row] * s_qdd[vel];")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (parent < 0) {", True)
     self.gen_add_code_line("v[jid*6 + row] = static_cast<T>(0);")
@@ -1343,6 +1537,9 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
 
+    # Output-stride token: the internal slab uses the SO_N_INT stride for mimic, else the
+    # legacy SECOND_ORDER_COORDS (== NUM_VEL) so non-mimic emission stays byte-identical.
+    SO = "SO_N_INT" if is_mimic else "SECOND_ORDER_COORDS"
     self.gen_add_code_line("// Reference-order velocity-indexed tensor assembly.")
     self.gen_add_code_line("T rt1[36], rt2[36], rt3[36], rt4[36], rt5[36], rt6[36], rt7[36], rt8[36], rt9[36];")
     self.gen_add_code_line("T rp1[6], rp2[6], rp3[6], rp4[6], rp5[6], rp6[6];")
@@ -1360,55 +1557,55 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
         "S_vel", "psid_vel", "psidd_vel", "psid_Sd_vel", "dd", "cc", inline_row_col=True)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
-    self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_vel*6]);")
-    self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt1, &D3[st_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dq2[st_vel*{SO}*{SO} + dd*{SO} + cc] = -dot_prod<T, 36, 1, 1>(rt3, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp1, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp2, &T1[st_vel*6]);")
+    self.gen_add_code_line(f"d2tau_dvdq[st_vel*{SO}*{SO} + dd*{SO} + cc] = -dot_prod<T, 36, 1, 1>(rt1, &D3[st_vel*36]);")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (ancestor_body < jid) {", True)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
-    self.gen_add_code_line("d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = d2tau_dq2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc];")
+    self.gen_add_code_line(f"d2tau_dq2[st_vel*{SO}*{SO} + cc*{SO} + dd] = d2tau_dq2[st_vel*{SO}*{SO} + dd*{SO} + cc];")
     self.gen_add_code_line("T dqd_val = -dot_prod<T, 36, 1, 1>(rt2, &D3[st_vel*36]);")
-    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = dqd_val;")
-    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = dqd_val;")
-    self.gen_add_code_line("d2tau_dvdq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = -dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp3, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp4, &T1[st_vel*6]);")
-    self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D2[st_vel*36]) + dot_prod<T, 36, 1, 1>(rt7, &D1[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T3[st_vel*6]);")
-    self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T4[st_vel*6]);")
+    self.gen_add_code_line(f"d2tau_dqd2[st_vel*{SO}*{SO} + cc*{SO} + dd] = dqd_val;")
+    self.gen_add_code_line(f"d2tau_dqd2[st_vel*{SO}*{SO} + dd*{SO} + cc] = dqd_val;")
+    self.gen_add_code_line(f"d2tau_dvdq[st_vel*{SO}*{SO} + cc*{SO} + dd] = -dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp3, &T2[st_vel*6]) + dot_prod<T, 6, 1, 1>(rp4, &T1[st_vel*6]);")
+    self.gen_add_code_line(f"d2tau_dq2[cc*{SO}*{SO} + st_vel*{SO} + dd] = dot_prod<T, 36, 1, 1>(rt6, &D2[st_vel*36]) + dot_prod<T, 36, 1, 1>(rt7, &D1[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T3[st_vel*6]);")
+    self.gen_add_code_line(f"d2tau_dvdq[cc*{SO}*{SO} + st_vel*{SO} + dd] = dot_prod<T, 36, 1, 1>(rt6, &D3[st_vel*36]) - dot_prod<T, 6, 1, 1>(rp5, &T4[st_vel*6]);")
     self.gen_add_code_line("T dm_val = dot_prod<T, 36, 1, 1>(rt8, &D4[st_vel*36]);")
-    self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + st_vel*SECOND_ORDER_COORDS + dd] = dm_val;")
-    self.gen_add_code_line("dM_dq[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + dd] = dm_val;")
+    self.gen_add_code_line(f"dM_dq[cc*{SO}*{SO} + st_vel*{SO} + dd] = dm_val;")
+    self.gen_add_code_line(f"dM_dq[st_vel*{SO}*{SO} + cc*{SO} + dd] = dm_val;")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("T dqd_diag = static_cast<T>(0);")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) {", True)
     self.gen_add_code_line("dqd_diag += S_vel[dd*6 + row] * dot_prod<T, 6, 6, 1>(&IC[jid*36 + row], rp3);")
     self.gen_add_code_line("dqd_diag += S_vel[cc*6 + row] * dot_prod<T, 6, 6, 1>(&crf_S[dd*36 + row], &IC_S[dd*6]);")
     self.gen_add_end_control_flow()
-    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + dd] = dqd_diag;")
+    self.gen_add_code_line(f"d2tau_dqd2[cc*{SO}*{SO} + dd*{SO} + dd] = dqd_diag;")
     self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
     self.gen_add_code_line("int succ_vel = successor_v_index[succ_pos];")
     self.gen_add_code_line("T dqd_succ = dot_prod<T, 36, 1, 1>(rt8, &D3[succ_vel*36]);")
-    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd] = dqd_succ;")
-    self.gen_add_code_line("d2tau_dqd2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dqd_succ;")
-    self.gen_add_code_line("d2tau_dvdq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt8, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt9, &D1[succ_vel*36]);")
-    self.gen_add_code_line("d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = d2tau_dq2[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + dd];")
+    self.gen_add_code_line(f"d2tau_dqd2[cc*{SO}*{SO} + succ_vel*{SO} + dd] = dqd_succ;")
+    self.gen_add_code_line(f"d2tau_dqd2[cc*{SO}*{SO} + dd*{SO} + succ_vel] = dqd_succ;")
+    self.gen_add_code_line(f"d2tau_dvdq[cc*{SO}*{SO} + dd*{SO} + succ_vel] = dot_prod<T, 36, 1, 1>(rt8, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt9, &D1[succ_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dq2[cc*{SO}*{SO} + dd*{SO} + succ_vel] = d2tau_dq2[cc*{SO}*{SO} + succ_vel*{SO} + dd];")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_code_line("for (int succ_pos = succ_begin; succ_pos < succ_end; ++succ_pos) {", True)
     self.gen_add_code_line("int succ_vel = successor_v_index[succ_pos];")
-    self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt1, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt4, &D1[succ_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dq2[dd*{SO}*{SO} + cc*{SO} + succ_vel] = dot_prod<T, 36, 1, 1>(rt1, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt4, &D1[succ_vel*36]);")
     self.gen_add_code_line("T dqd_child = dot_prod<T, 36, 1, 1>(rt2, &D3[succ_vel*36]);")
-    self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dqd_child;")
-    self.gen_add_code_line("d2tau_dqd2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dqd_child;")
-    self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = dot_prod<T, 36, 1, 1>(rt1, &D3[succ_vel*36]);")
-    self.gen_add_code_line("d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + succ_vel*SECOND_ORDER_COORDS + cc] = d2tau_dq2[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel];")
-    self.gen_add_code_line("d2tau_dvdq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dot_prod<T, 36, 1, 1>(rt2, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt5, &D1[succ_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dqd2[dd*{SO}*{SO} + cc*{SO} + succ_vel] = dqd_child;")
+    self.gen_add_code_line(f"d2tau_dqd2[dd*{SO}*{SO} + succ_vel*{SO} + cc] = dqd_child;")
+    self.gen_add_code_line(f"d2tau_dvdq[dd*{SO}*{SO} + succ_vel*{SO} + cc] = dot_prod<T, 36, 1, 1>(rt1, &D3[succ_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dq2[dd*{SO}*{SO} + succ_vel*{SO} + cc] = d2tau_dq2[dd*{SO}*{SO} + cc*{SO} + succ_vel];")
+    self.gen_add_code_line(f"d2tau_dvdq[dd*{SO}*{SO} + cc*{SO} + succ_vel] = dot_prod<T, 36, 1, 1>(rt2, &D2[succ_vel*36]) + dot_prod<T, 36, 1, 1>(rt5, &D1[succ_vel*36]);")
     self.gen_add_code_line("T dm_child = dot_prod<T, 36, 1, 1>(rt8, &D1[succ_vel*36]);")
-    self.gen_add_code_line("dM_dq[cc*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + succ_vel] = dm_child;")
-    self.gen_add_code_line("dM_dq[dd*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + cc*SECOND_ORDER_COORDS + succ_vel] = dm_child;")
+    self.gen_add_code_line(f"dM_dq[cc*{SO}*{SO} + dd*{SO} + succ_vel] = dm_child;")
+    self.gen_add_code_line(f"dM_dq[dd*{SO}*{SO} + cc*{SO} + succ_vel] = dm_child;")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (ancestor_body == jid) {", True)
     self.gen_add_code_line("for (int st_pos = st_begin; st_pos < st_end; ++st_pos) {", True)
     self.gen_add_code_line("int st_vel = subtree_v_index[st_pos];")
-    self.gen_add_code_line("d2tau_dqd2[st_vel*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS + dd*SECOND_ORDER_COORDS + cc] = -dot_prod<T, 36, 1, 1>(rt2, &D1[st_vel*36]);")
+    self.gen_add_code_line(f"d2tau_dqd2[st_vel*{SO}*{SO} + dd*{SO} + cc] = -dot_prod<T, 36, 1, 1>(rt2, &D1[st_vel*36]);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
@@ -1416,18 +1613,47 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
 
-    self.gen_add_end_control_flow()
     if self.robot.floating_base and self.robot.using_quaternion:
         self.gen_add_code_line("// Reduced quaternion-vector q columns differentiate rotation with a factor of two at the identity convention used by GRiD/RBDReference.")
-        self.gen_add_code_line("for (int q_col = 3; q_col < 6 && q_col < NUM_VEL; ++q_col) {", True)
-        self.gen_add_code_line("for (int rc = 0; rc < NUM_VEL*NUM_VEL; ++rc) {", True)
-        self.gen_add_code_line("d2tau_dq2[rc*NUM_VEL + q_col] *= static_cast<T>(2);")
+        # The root q-columns 3..5 occupy internal slots 3..5 (alpha=1, identity fold), so
+        # the factor-2 is applied on the internal slab (SO stride) BEFORE the fold.
+        self.gen_add_code_line(f"for (int q_col = 3; q_col < 6 && q_col < {SO}; ++q_col) {{", True)
+        self.gen_add_code_line(f"for (int rc = 0; rc < {SO}*{SO}; ++rc) {{", True)
+        self.gen_add_code_line(f"d2tau_dq2[rc*{SO} + q_col] *= static_cast<T>(2);")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # close main thread-0 block
     # Phase B: emit the Lie-tangent gravity-Hessian addition. Main sweep above ran with
     # a_world[5] = 0, so this call provides the missing gravity contribution to d2tau_dq2
     # (mirrors the Python `idsva_so` + `_floating_gravity_d2tau_dq_lie_direct` pattern).
+    # For mimic, d2tau_dq2 still points at the INTERNAL slab (internal coords): the shim
+    # runs in internal slots and ADDS into the internal d2tau_dq block, so the single fold
+    # below reduces sweep + gravity together (matching the oracle, which folds its
+    # internal-coord gravity Hessian the same way). For non-mimic d2tau_dq2 == s_idsva_so
+    # (the public reduced output) and the shim adds directly there.
     self.gen_floating_gravity_d2tau_dq_lie_inline()
+    if is_mimic:
+        # ---- Mimic fold: reduce the internal 4*n_int^3 slab (sweep + gravity) to the
+        # reduced 4*NV^3 public output. public[v(i),v(j),v(k)] +=
+        # alpha_i*alpha_j*alpha_k * internal[i,j,k] (the einsum('ia,ijk,jb,kc->abc',
+        # R, T, R, R) reduction the oracle applies, with R[i,v(i)] = alpha_i).
+        self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {", True)
+        self.gen_add_code_line("// Mimic fold: internal n_int^3 sweep+gravity -> reduced NV^3 public output.")
+        self.gen_add_code_line("for (int i = 0; i < SECOND_ORDER_TENSOR_SIZE; ++i) s_idsva_so_public[i] = static_cast<T>(0);")
+        self.gen_add_code_line("for (int blk = 0; blk < 4; ++blk) {", True)
+        self.gen_add_code_line("for (int ii = 0; ii < SO_N_INT; ++ii) {", True)
+        self.gen_add_code_line("for (int jj = 0; jj < SO_N_INT; ++jj) {", True)
+        self.gen_add_code_line("for (int kk = 0; kk < SO_N_INT; ++kk) {", True)
+        self.gen_add_code_line("T val = so_internal[blk*SO_N_INT*SO_N_INT*SO_N_INT + ii*SO_N_INT*SO_N_INT + jj*SO_N_INT + kk];")
+        self.gen_add_code_line("if (val != static_cast<T>(0)) {", True)
+        self.gen_add_code_line("T w = int_alpha[ii] * int_alpha[jj] * int_alpha[kk];")
+        self.gen_add_code_line("s_idsva_so_public[blk*NUM_VEL*NUM_VEL*NUM_VEL + int_true_vel[ii]*NUM_VEL*NUM_VEL + int_true_vel[jj]*NUM_VEL + int_true_vel[kk]] += w * val;")
+        self.gen_add_end_control_flow()  # close if (val != 0)
+        self.gen_add_end_control_flow()  # close for kk
+        self.gen_add_end_control_flow()  # close for jj
+        self.gen_add_end_control_flow()  # close for ii
+        self.gen_add_end_control_flow()  # close for blk
+        self.gen_add_end_control_flow()  # close fold thread-0 block
     self.gen_add_sync()
     self.gen_add_end_function()
 
