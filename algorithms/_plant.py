@@ -769,7 +769,7 @@ def gen_ee_pos_cost_kernel(self):
 
     Calls grid_plant::ee_pos_cost[_gradient/_hessian], which call the
     auto-allocating grid::end_effector_pose[_gradient]_device. Global in/out;
-    reuses grid::EE_POS_DYNAMIC_SHARED_MEM_BYTES for the launch smem.
+    reuses grid::END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES for the launch smem.
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()

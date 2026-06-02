@@ -619,7 +619,7 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     # TIER_SHARED and 0 at spilled tiers (the real s_Y is then routed to
     # d_workspace below). Sizing the slot via a per-tier constexpr keeps a single
     # arena declaration (all pointers stay in this scope) while shrinking the
-    # smem footprint exactly to match FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
+    # smem footprint exactly to match FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
     self.gen_add_code_line("constexpr bool FPG_Y_IN_SMEM = FD_PARAMETER_GRADIENT_Y_IN_SMEM<RESOURCE_TIER>();")
     self.gen_add_code_line("constexpr int FPG_Y_SLOT = FPG_Y_IN_SMEM ? " + str(out_size) + " : 0;")
     extra_t_buffers = [
@@ -696,7 +696,7 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_parameter_gradient requires all-data or dynamics gridData\");")
     # g1-spill: pass hd_data->d_workspace as the kernel's 2nd arg. At the spilled
     # default tier (s_Y in d_workspace) it is read; at TIER_SHARED it is unused.
-    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -718,7 +718,7 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_parameter_gradient\", FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_parameter_gradient\", FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     self.gen_add_code_line("gpuErrchkKernel();")
     if not compute_only:

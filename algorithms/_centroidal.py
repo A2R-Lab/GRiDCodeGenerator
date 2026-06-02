@@ -152,7 +152,7 @@ def gen_id_bias_kernel(self, gravity_only, single_call_timing=False):
 
 def gen_id_bias_host(self, gravity_only, mode=0):
     name = "generalized_gravity" if gravity_only else "nonlinear_effects"
-    macro = "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    macro = "INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()"
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
     func_def_start = ("void " + name + "(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, "
