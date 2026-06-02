@@ -675,22 +675,7 @@ def gen_inverse_dynamics(self):
     self.gen_inverse_dynamics_host(0)
     self.gen_inverse_dynamics_host(1)
     self.gen_inverse_dynamics_host(2)
-    self.gen_add_func_doc("Alias for inverse_dynamics using the conventional RNEA name", [], [], None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
-    self.gen_add_code_line("__host__")
-    self.gen_add_code_line("void rnea(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
-    self.gen_add_code_line("          const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {", True)
-    self.gen_add_code_line("inverse_dynamics<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);")
-    self.gen_add_end_function()
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
-    self.gen_add_code_line("__host__")
-    self.gen_add_code_line("void rnea_single_timing(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
-    self.gen_add_code_line("                        const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {", True)
-    self.gen_add_code_line("inverse_dynamics_single_timing<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);")
-    self.gen_add_end_function()
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
-    self.gen_add_code_line("__host__")
-    self.gen_add_code_line("void rnea_compute_only(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,", False)
-    self.gen_add_code_line("                       const dim3 block_dimms, const dim3 thread_dimms) {", True)
-    self.gen_add_code_line("inverse_dynamics_compute_only<T,USE_QDD_FLAG,USE_COMPRESSED_MEM,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms);")
-    self.gen_add_end_function()
+    # NOTE: `inverse_dynamics` IS the RNEA (Recursive Newton-Euler Algorithm). There is
+    # deliberately NO `grid::rnea` alias symbol — the single canonical name is
+    # `inverse_dynamics` (clean-break API). The RNEA name is kept greppable via this
+    # comment and the per-function docstrings above ("Compute the RNEA ...").

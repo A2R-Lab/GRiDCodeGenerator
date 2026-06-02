@@ -1,15 +1,16 @@
 """Single source of truth for GRiD algorithm metadata.
 
+ONE verbose canonical name per algorithm, used IDENTICALLY as: registry `key` ==
+emitted `grid::` symbol == bench key == algorithm_list token == printf label. There
+are NO short aliases or legacy labels here — this is a deliberate clean break.
+
 Each entry binds:
   - `key`: the JSON output key (lowercase) — also the parser's lowercased label match
   - `display`: the verbose label rendered in benchmark reports
   - `section`: the section heading in the report (Core Dynamics / Gradients / ...)
-  - `legacy_labels`: alternate (case-insensitive) labels accepted by the parser,
-    for backwards compatibility with older generated binaries
 
 The codegen's printf label is `key.upper()` unless `printf_label` is overridden.
-The parser then lowercases the matched line and looks it up against `key` (or one of
-the legacy labels).
+The parser then lowercases the matched line and looks it up against `key`.
 
 Consumers:
   - `test/benchmarks/timing_parser.py` builds its label→key maps from this list.
@@ -22,7 +23,7 @@ emission of the kernel + the bench's `#if GRID_HAS_X` measure wrappers).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,6 @@ class AlgoEntry:
     key: str
     display: str
     section: str
-    legacy_labels: tuple[str, ...] = ()
     printf_label_override: str | None = None
 
     @property
@@ -42,12 +42,12 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     # Core Dynamics
     AlgoEntry("inverse_dynamics",     "Inverse Dynamics (RNEA / Recursive Newton-Euler Algorithm)",
               "Core Dynamics"),
-    AlgoEntry("minv",                 "Minv (M⁻¹)",
-              "Core Dynamics", legacy_labels=("minv (direct)",)),
+    AlgoEntry("minv",                 "Minv (M⁻¹, computed directly)",
+              "Core Dynamics"),
     AlgoEntry("forward_dynamics",     "Forward Dynamics (Minv+RNEA)",
-              "Core Dynamics", legacy_labels=("forward dynamics",)),
-    AlgoEntry("aba",                  "ABA (Articulated Body)",
-              "Core Dynamics", legacy_labels=("aba (articulated body)",)),
+              "Core Dynamics"),
+    AlgoEntry("aba",                  "ABA (Articulated Body Algorithm)",
+              "Core Dynamics"),
     AlgoEntry("crba",                 "CRBA",
               "Core Dynamics"),
 
@@ -83,11 +83,11 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("idsva_so",             "IDSVA_SO (dispatched: body for fixed, world for floating)",
               "Second-Order"),
     AlgoEntry("idsva_so_body_frame",  "IDSVA_SO_BODY_FRAME (2nd-order ID, body-frame)",
-              "Second-Order", legacy_labels=("id_so",)),
+              "Second-Order"),
     AlgoEntry("idsva_so_world_frame", "IDSVA_SO_WORLD_FRAME (2nd-order ID, world-frame)",
               "Second-Order"),
     AlgoEntry("fdsva_so",             "FDSVA_SO (2nd-order FD)",
-              "Second-Order", legacy_labels=("fd_so",)),
+              "Second-Order"),
 
     # Centroidal / Energy / CoM (G2 quick-wins, R1-R3)
     AlgoEntry("generalized_gravity", "Generalized Gravity g(q)=RNEA(q,0,0)",
@@ -110,38 +110,19 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
 )
 
 
-def _all_label_forms(entry: AlgoEntry) -> tuple[str, ...]:
-    """Every lowercased label string that parses to this entry's key."""
-    forms = [entry.printf_label.lower()]
-    forms.extend(label.lower() for label in entry.legacy_labels)
-    return tuple(forms)
-
-
 def build_single_label_map() -> dict[str, str]:
-    """e.g. {'single call id': 'id', 'single call idsva_so_body_frame': 'idsva_so_body_frame', ...}."""
-    out: dict[str, str] = {}
-    for entry in ALGO_REGISTRY:
-        for form in _all_label_forms(entry):
-            out[f"single call {form}"] = entry.key
-    return out
+    """e.g. {'single call inverse_dynamics': 'inverse_dynamics', 'single call idsva_so_body_frame': 'idsva_so_body_frame', ...}."""
+    return {f"single call {e.printf_label.lower()}": e.key for e in ALGO_REGISTRY}
 
 
 def build_batch_with_mem_label_map() -> dict[str, str]:
-    """e.g. {'id with memory': 'id', 'fdsva_so with memory': 'fdsva_so', ...}."""
-    out: dict[str, str] = {}
-    for entry in ALGO_REGISTRY:
-        for form in _all_label_forms(entry):
-            out[f"{form} with memory"] = entry.key
-    return out
+    """e.g. {'inverse_dynamics with memory': 'inverse_dynamics', 'fdsva_so with memory': 'fdsva_so', ...}."""
+    return {f"{e.printf_label.lower()} with memory": e.key for e in ALGO_REGISTRY}
 
 
 def build_batch_compute_only_label_map() -> dict[str, str]:
-    """e.g. {'id compute only': 'id', 'fdsva_so compute only': 'fdsva_so', ...}."""
-    out: dict[str, str] = {}
-    for entry in ALGO_REGISTRY:
-        for form in _all_label_forms(entry):
-            out[f"{form} compute only"] = entry.key
-    return out
+    """e.g. {'inverse_dynamics compute only': 'inverse_dynamics', 'fdsva_so compute only': 'fdsva_so', ...}."""
+    return {f"{e.printf_label.lower()} compute only": e.key for e in ALGO_REGISTRY}
 
 
 def build_display_map() -> dict[str, str]:
