@@ -1195,32 +1195,21 @@ def gen_end_effector_pose_hessian_inner(self):
     # Then emit per (ee, chain-joint, S-col) the explicit 4x4 fill. Serial-ops
     # per slot — total work is small (chain_depth * dofs_per_joint * num_ees blocks).
     #
-    # MIMIC fold: a mimic joint and its target share one velocity slot vi
-    # (get_joint_index_v(mimic) == get_joint_index_v(target)), so several chain
-    # joints map to the SAME s_Sworld[16*(ee*nv+vi)] generator. The world-frame
-    # twist generator S_world is LINEAR in the joint rate, so the shared column is
-    # the alpha-weighted SUM of each contributing joint's generator (the mimic
-    # body moves alpha * the target's rate). Every downstream step (the d2M
-    # bilinear products, the J_w/J_v readout, the rpy chain rule) is expressed
-    # purely in terms of s_Sworld[vi] / s_deePos[vi], so folding the generator
-    # here is sufficient — no other step needs a mimic branch. The signed motion
-    # subspace S is baked directly into `ax` (= the full S column, sign included),
-    # so unlike the unit-axis id_du path no separate s_sign factor is needed; the
-    # only scalar fold is the mimic multiplier alpha. For a non-mimic robot every
-    # (ee, vi) slot is written exactly once with alpha == 1.0, so the emitted code
-    # below is byte-identical to the legacy "=" assignment (no spurious accumulate
-    # or 1.0* factor) — gated by HAS_MIMIC / first-writer tracking.
+    # MIMIC fold: a mimic joint and its target share one velocity slot vi, so
+    # several chain joints map to the SAME s_Sworld[16*(ee*nv+vi)] generator. S_world
+    # is LINEAR in the joint rate, so the shared column is the alpha-weighted SUM of
+    # each contributing joint's generator (the mimic body moves alpha*target_rate).
+    # Every downstream step (d2M products, J_w/J_v readout, rpy chain rule) reads only
+    # s_Sworld[vi] / s_deePos[vi], so folding the generator here is sufficient. The
+    # signed S column is baked into `ax`, so (unlike the unit-axis id_du path) the only
+    # scalar fold is alpha — no separate s_sign. Non-mimic: each (ee,vi) slot written
+    # once with alpha==1.0 => byte-identical to the legacy "=" assignment.
     #
-    # PARALLELIZATION: each (ee, vi) s_Sworld slot is a DISJOINT 16-float region
-    # (base = 16*(ee*nv+vi)), zero-filled above with a sync, so the slots are
-    # independent. We group the chain DOFs by (ee_idx, vi) — a MIMIC slot collects
-    # several chain joints (target + mimics) that fold into ONE slot via the
-    # alpha-weighted "=" then "+=" accumulate — and dispatch one-thread-per-slot
-    # via a single block-parallel loop over a flat slot index (`sworld_slot`).
-    # Every writer to a slot lives in the SAME guard (one thread owns the slot and
-    # accumulates its writers serially) so the mimic reduction is never split.
-    # The per-writer emitted arithmetic is byte-identical to the old thread-0
-    # serial path (first writer "=", later mimic writers "+=").
+    # PARALLELIZATION: each (ee,vi) s_Sworld slot is a DISJOINT 16-float region,
+    # zero-filled above with a sync, so slots are independent. Group chain DOFs by
+    # (ee_idx, vi) and dispatch one-thread-per-slot over a flat index — every writer
+    # to a slot lives in the SAME guard (first writer "=", later mimic writers "+=")
+    # so the mimic reduction is never split across threads.
     HAS_MIMIC = self.robot_has_mimic_joints()
     slot_groups = []     # list of (ee_idx, vi, [dof, ...]) in stable first-seen order
     slot_index = {}      # (ee_idx, vi) -> position in slot_groups
@@ -2723,9 +2712,7 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
         # standalone warp/thread FK inners + batched convenience path.
         # Skip ENTIRELY for floating-base / mimic robots: the standalone inner
         # does not support those (it raises) — they route through
-        # end_effector_pose instead. (The inner emission was previously outside
-        # this guard, which made codegen raise for every floating/mimic robot
-        # that includes ee_pose.)
+        # end_effector_pose instead.
         if not self.robot.floating_base and not self.robot_has_mimic_joints():
             self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)

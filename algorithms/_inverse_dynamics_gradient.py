@@ -913,25 +913,20 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_sync()
 
     else:
-        # WIN A: branched fixed-base dc/du extraction, fanned to one thread per
-        # OUTPUT element (2*n*n) instead of 2*NJ lanes that each serially marched
-        # all NJ du-columns. Each output element s_dc_du[half, body=jid, du=djid]
-        # is INDEPENDENT and DISJOINT, so the fan needs no extra sync and is
-        # bit-exact with the old serial march.
+        # Branched fixed-base dc/du extraction, fanned to one thread per OUTPUT
+        # element (2*n*n) instead of 2*NJ lanes each serially marching all NJ
+        # du-columns. Each s_dc_du[half, body=jid, du=djid] is INDEPENDENT/DISJOINT,
+        # so the fan needs no extra sync and is bit-exact with the old serial march.
         #
-        # The old code advanced Offset_src by flag*6 over djid=0..NJ-1, so the
-        # df-source column for a (jid, djid) pair that couples is
-        #   running_sum_df_cols_per_jid[jid] + (#coupling djid' < djid),
-        # i.e. running_sum_df_cols_per_jid[jid] (= df_col_offset_for_jid_cpp at
-        # runtime) plus the within-block RANK of djid among jid's coupling set.
-        # We resolve that (jid, djid) -> rank map at codegen time and select the
-        # per-element src column / write-flag from it (no running pointer). The
-        # base offset df_col_offset_for_jid_cpp + S_ind stay as the existing
-        # runtime topology-helper expressions keyed on jid (the output body row),
-        # so the emitted arithmetic is the same modulo the rank decode.
-        # Build the per-(jid, djid) within-block rank + coupling table. For body
-        # jid, march djid=0..NJ-1 (mirrors the OLD Offset_src += flag*6 order) and
-        # assign increasing ranks to coupling columns.
+        # The old code advanced Offset_src by flag*6 over djid=0..NJ-1, so a coupling
+        # (jid, djid) pair's df-source column is df_col_offset_for_jid_cpp[jid] plus
+        # the within-block RANK of djid among jid's coupling set. We resolve that
+        # rank map at codegen time and select the per-element src column / write-flag
+        # from it (no running pointer); the base offset + S_ind stay as the existing
+        # runtime topology-helper expressions, so the emitted arithmetic is the same
+        # modulo the rank decode.
+        # Build the per-(jid, djid) rank + coupling table: march djid=0..NJ-1
+        # (mirrors the old Offset_src += flag*6 order), ranking coupling columns.
         rank_table = [[None]*NJ for _ in range(NJ)]
         for jid in range(NJ):
             rank = 0

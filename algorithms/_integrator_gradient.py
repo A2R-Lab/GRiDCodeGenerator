@@ -744,8 +744,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         #       1: da_df-band SELECTIVE spill (s_temp shrinks, only the id_du band
         #          leaves smem to d_temp_spill; SCRATCH_IN_SMEM=true, USE_DA_DF_SPILL=true);
         #       2: whole inner POOL -> inner region (SCRATCH_IN_SMEM=false; the inner
-        #          repoints s_temp=d_workspace at its top — this is the migrated
-        #          former kernel line-744 repoint).
+        #          repoints s_temp=d_workspace at its top).
         # The hot scaffold (s_dc_du / s_vaf / s_Minv) always stays in smem. The kernel
         # only slices the band base pointers + passes the per-rung flags as literals.
         inner_temp_size = (inner_temp_full if inner_level == 0

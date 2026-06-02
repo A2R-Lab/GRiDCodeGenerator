@@ -164,24 +164,18 @@ def gen_f_ext_gradient_jacobianT_inner(self):
 
     # For each job (body i, chain joint j): the -J^T column block is -col, where
     #   col = X[i] X[i-1] ... X[j+1] S_j   (push the motion subspace S_j from joint
-    # j's frame down to body i's frame via the local 6x6 motion transforms X[m]).
-    # We build col as a left-fold over a running 6-vector: start col = S_j, then
-    # apply col := X[m] @ col for m = j+1, j+2, ..., i (tf_chain order). This is the
-    # transpose of the RNEA backward force sweep's S_j^T (X[j+1]^T...X[i]^T) and was
-    # verified bit-exact vs the rnea_bpass unit-wrench oracle (and the GPU emit vs
-    # the numpy + pinocchio f_ext_gradient oracle on iiwa14-fixed and go2-floating).
-    #
-    # The result -col is written to output row v_j, column block i. Jobs that share
-    # (i, v_j) accumulate (+=) -- matching the reference's S-column / mimic v-slot
-    # fold. To keep the parallel slab-fill race-free the final += reduction is run
-    # serially on lane 0 (the slab itself is filled fully in parallel).
+    # j's frame down to body i's frame). Built as a left-fold over a running 6-vector:
+    # col = S_j, then col := X[m] @ col for m = j+1..i. This is the transpose of the
+    # RNEA backward force sweep's S_j^T (X[j+1]^T...X[i]^T).
+    # -col writes to output row v_j, column block i. Jobs sharing (i, v_j) accumulate
+    # (+=); the final += reduction runs serially on lane 0 (the slab is filled in
+    # parallel) to keep it race-free.
     #
     # MIMIC: a mimic joint j shares its TARGET's v_j slot, so its column folds into
-    # that shared slot scaled by its mimic multiplier alpha (the mimic body moves
-    # alpha * the target's rate) -- exactly RBDReference.rnea_bpass's
-    # c[inds_f] += mimic_scale * S^T f. Each job's -col is therefore scaled by its
-    # baked alpha (1.0 for non-mimic). The alpha factor is only emitted for mimic
-    # robots (HAS_MIMIC), so non-mimic grid.cuh is byte-identical to the legacy emit.
+    # that shared slot scaled by its multiplier alpha (the mimic body moves alpha*
+    # target_rate) -- matching RBDReference.rnea_bpass's c[inds_f] += mimic_scale*S^T f.
+    # alpha is baked per-job (1.0 non-mimic) and only emitted for mimic robots, so
+    # non-mimic grid.cuh is byte-identical.
     self.gen_add_code_line("//")
     self.gen_add_code_line("// Per chain job: col(v_j, body i) = -(X[i]..X[j+1] S_j) (motion-transform pushdown)")
     self.gen_add_code_line("//")

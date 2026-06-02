@@ -101,47 +101,19 @@ def gen_fdsva_so_contract(self):
 
     # 2Dx3D tensor computation defined as iL,Ljk->ijk
     self.gen_add_code_line('// Multiply by -Minv to finish algorithm')
-    # PERF EXPERIMENT CANDIDATE (2026-05-18): this 4*n^3 parallel_loop has the
-    # highest FMA count in fdsva_so_contract (g1_floating: ~6M FMAs out of ~9M
-    # total). Each thread does a serial n-element dot_prod, so total FMAs ~
-    # 4*n^4. Structurally an iL,Ljk->ijk tensor contraction — could be
-    # rewritten as 4*n batched n×n×n gemms or 4 large n × n² × n gemms.
-    #
-    # Standalone autotune on sm_120 says cuBLASDx wins 2.4-5.2× at 24-48
-    # size range, BUT standalone-gemm wins do NOT directly translate into
-    # hot-kernel wins. In-kernel concerns: register pressure with all SO
-    # state live, shared-mem layout cost (current iL,Ljk strides aren't
-    # gemm-friendly), tier pressure (g1_floating already in spill tier and
-    # cuBLASDx wants more shared-mem), per-block-per-timestep sync overhead.
-    #
-    # First step before any refactor: profile this loop in-context (ptxas
-    # occupancy / nsight compute trace) to confirm it really is the
-    # bottleneck — could equally be memory-bandwidth or sync-bound, in
-    # which case cuBLASDx won't help. Then prototype on a single robot
-    # before generalizing.
-    #
-    # COALESCED-DOT EXPERIMENT (2026-05-26, EVALUATED, NOT TAKEN): the spilled
-    # operand (inner_dq/inner_cross/inner_tau/d2tau_dvdv, in d_workspace when
-    # CONTRACT_IN_SMEM=false) is gathered with stride n^2 over the contracted
-    # axis L — inner_dq[j + k*n + L*n^2] reads the SAME buffer that was written
-    # as [i][j][k], so L (the sum axis) maps to the buffer's slowest, stride-n^2
-    # index. grid_linalg_dot_strided_coalesced coalesces ALONG the contraction
-    # stride (consecutive thread ranks read x[rank*SX], y[rank*SY]), so applying
-    # it here would issue stride-n^2 loads across the warp — WORSE than the
-    # current stride-n warp gather, not better; the primitive only helps when the
-    # summed axis is the contiguous (small-stride) one, which it is not in this
-    # iL,Ljk->ijk layout. Worse still, it is BLOCK-COOPERATIVE (one scalar per
-    # call): producing 4*n^3 outputs would mean 4*n^3 sequential block-reductions
-    # (g1: ~171.5k dots, ~343k __syncthreads), each n-element dot using only
-    # ~n/blockDim of the threads — collapsing the current embarrassingly-parallel
-    # 4*n^3-way thread parallelism. Making the primitive coalesce would require
-    # transposing inner_* so L is contiguous (an extra full global read+write of
-    # the 4*n^3 tensor) AND still pay the per-output block-reduction serialization.
-    # Both effects are large regressions, so the contraction is LEFT AS-IS (the
-    # smem path is already fine; the spilled path's stride-n^2 gather is the cost
-    # of spilling, not something this primitive fixes). Profiled/reasoned and
-    # rejected — do not re-attempt with this primitive without a layout that puts
-    # the contracted axis contiguous AND avoids one-dot-per-block serialization.
+    # PERF NOTE: this 4*n^3 iL,Ljk->ijk contraction (each thread a serial n-element
+    # dot, ~4*n^4 FMAs) is the hottest loop in fdsva_so_contract. Two rewrites were
+    # evaluated and REJECTED:
+    #  - cuBLASDx gemm: standalone-gemm wins (2.4-5.2x) don't survive in-kernel
+    #    (register pressure with SO state live, non-gemm-friendly iL,Ljk strides,
+    #    tier/smem pressure on already-spilled g1_floating). Profile in-context
+    #    before retrying — may be bandwidth/sync-bound, not FMA-bound.
+    #  - grid_linalg_dot_strided_coalesced: the contracted axis L is the buffer's
+    #    stride-n^2 slowest index, so coalescing along L issues WORSE stride-n^2
+    #    warp loads; and the block-cooperative primitive would serialize 4*n^3
+    #    block-reductions, collapsing the current 4*n^3-way thread parallelism.
+    # Left AS-IS; don't re-attempt without a layout that makes the contracted axis
+    # contiguous AND avoids one-dot-per-block serialization.
     self.gen_add_parallel_loop("ind",str(4*n**3))
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
     self.gen_add_code_line(f'if (ind < {n**3}) d2a_dqdq[i*{n*n} + j*{n} + k] = -dot_prod<T, {n}, {n}, {n*n}>(&s_Minv[i], &inner_dq[j + k*{n}]);')

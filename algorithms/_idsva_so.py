@@ -236,8 +236,8 @@ def gen_idsva_so_body_frame_inner_temp_mem_size(self):
     NV = self.robot.get_num_vel()
     num_bodies = self.robot.get_num_bodies()
     if self.robot.floating_base:
-        # icrf_f used to be in shared (one of the 8 36*NB body matrices); it's now a
-        # 36-float kernel-local array per body, so subtract it from the count.
+        # 7 (not 8) 36*NB body matrices: icrf_f is a kernel-local 36-float array per
+        # body, not a shared buffer.
         body_mat_count = 7 * 36 * num_bodies
         body_vec_count = 7 * 6 * num_bodies
         # B4 FIX: for a mimic robot the floating body-frame inner runs the velocity-indexed
@@ -1166,16 +1166,13 @@ def gen_idsva_so_body_frame_reference_order_output_repair(self):
     self.gen_add_sync()
 
 # ============================================================================
-# SO-AUDIT FLAG (2026-05-31): KEPT NON-PRODUCTION FALLBACK — do NOT delete without
-# the dedicated SO audit (docs/open-tasks/so_audit_plan.md, HANDOFF G4).
-# `gen_idsva_so_body_frame_floating_reference_inner` (+ its gravity-shim family) is
-# the body-frame floating-base second-order path. It is NOT emitted in production:
-# the dispatcher routes ALL floating-base SO to world_frame (see `frame_suffix` /
-# `gen_idsva_so_device`), so the floating branch of the body-frame inner (~L1363) is
-# unreachable. It is also NOT a live test oracle. It is ~entirely single-threaded
-# (one big `if(threadIdx==0)` block) — the largest serial surface in this file, but
-# zero production impact. Deliberately retained as a fallback/reference ("world-frame
-# co-exists with" it, see module note below). The SO audit decides keep-vs-retire.
+# KEPT NON-PRODUCTION FALLBACK — do NOT delete without the dedicated SO audit
+# (docs/open-tasks/so_audit_plan.md). `gen_idsva_so_body_frame_floating_reference_inner`
+# (+ its gravity-shim family) is the body-frame floating-base SO path. It is NOT
+# emitted in production (the dispatcher routes ALL floating-base SO to world_frame, so
+# the floating branch of the body-frame inner is unreachable) and not a test oracle.
+# It is ~entirely single-threaded — the largest serial surface in this file, but zero
+# production impact. Retained as a reference; the SO audit decides keep-vs-retire.
 # ============================================================================
 def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False):
     """
@@ -1455,13 +1452,10 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) aJ[jid*6 + row] += crm_mul<T>(row, &v[jid*6], &vJ[jid*6]);")
-    # BUG FIX (2026-05-15): the previous emission fused the psid_vel and psidd_vel rows
-    # into one inner loop, which caused `crm_mul(row, &v, &psid_vel[vel*6])` to read
-    # rows of `psid_vel[vel*6 + 1..5]` that had not yet been written in the current
-    # outer iteration. That left a stale (or zero) value in those slots, producing
-    # wrong psidd_vel rows 0, 1, 3, 4 (rows 2 and 5 happened to be correct because
-    # crm_mul only reads psid_vel components <= row for those indices). The fix is to
-    # fully populate psid_vel for the current vel BEFORE consuming it in psidd_vel.
+    # psid_vel and psidd_vel must stay in SEPARATE loops: fusing them makes
+    # `crm_mul(row, &v, &psid_vel[vel*6])` read psid_vel rows 1..5 not yet written
+    # in the current iteration (stale/zero => wrong psidd_vel rows). Fully populate
+    # psid_vel for the current vel BEFORE consuming it in psidd_vel.
     self.gen_add_code_line("for (int pos = body_v_start[jid]; pos < body_v_start[jid + 1]; ++pos) {", True)
     self.gen_add_code_line("int vel = body_v_index[pos];")
     self.gen_add_code_line("for (int row = 0; row < 6; ++row) psid_vel[vel*6 + row] = crm_mul<T>(row, &v[jid*6], &S_vel[vel*6]);")

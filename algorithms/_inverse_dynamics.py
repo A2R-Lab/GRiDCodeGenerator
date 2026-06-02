@@ -1,12 +1,10 @@
 def gen_inverse_dynamics_inner_temp_mem_size(self):
         # The forward f-pass stashes each BODY's I*v product in s_temp indexed by
-        # raw body id (6*jid+row, jid in [0, get_num_joints())), so the scratch
-        # must hold 6*get_num_joints() floats. For non-mimic robots this matches
-        # the legacy 6*get_num_pos() exactly (fixed-base: both == NJ; floating-base:
-        # the legacy value was if anything LARGER, never smaller) so we keep the
-        # legacy expression there to stay byte-identical. For mimic robots
-        # get_num_joints() > get_num_pos() (mimic joints carry 0 DoF), so
-        # 6*get_num_pos() under-sizes s_temp by 6*num_mimic and the I*v writes
+        # raw body id (6*jid+row, jid in [0, get_num_joints())), so the scratch must
+        # hold 6*get_num_joints() floats. Non-mimic keeps the 6*get_num_pos() form
+        # (byte-identical: both == NJ fixed; floating's value is never smaller). For
+        # mimic robots get_num_joints() > get_num_pos() (mimic joints carry 0 DoF),
+        # so 6*get_num_pos() under-sizes s_temp by 6*num_mimic and the I*v writes
         # overflow into the next shared-arena region, corrupting per-body forces.
         if self.robot_has_mimic_joints():
             return 6 * self.robot.get_num_joints()

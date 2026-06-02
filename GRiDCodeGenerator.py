@@ -845,11 +845,9 @@ class GRiDCodeGenerator:
                                            _minv_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_du_workspace_count)
-        # D2EE no longer needs d_workspace: under the FD-on-Jacobian inner the
-        # ONLY large buffer is the nv^2 output, and when it's spilled the inner
-        # writes directly into d_d2eePos (the persistent output buffer) -- not
-        # into a per-timestep workspace slice. The new spill thus costs no extra
-        # workspace allocation.
+        # D2EE needs no d_workspace: under the FD-on-Jacobian inner the only large
+        # buffer is the nv^2 output, and when spilled the inner writes directly into
+        # d_d2eePos (the persistent output) -- not a per-timestep workspace slice.
         d2ee_workspace_t_count = 0
         # Phase 3d: max workspace required by EE_POSE_GRAD across any tier (PERF
         # may pick 0, but the workspace allocation must cover what LITE/MINIMAL
@@ -1447,23 +1445,19 @@ class GRiDCodeGenerator:
     #   (algo_label, algo_short_name, gate_attr, bytes_macro, [(kernel_name, signature), ...])
     #
     # algo_short_name matches the keys used in self.generated_algorithms (see
-    # _normalize_codegen_algorithms). gate_attr is the legacy `self.generate_*`
-    # bool — when present we honor it for back-compat; otherwise we rely on
-    # algo_short_name membership in self.generated_algorithms.
+    # _normalize_codegen_algorithms). gate_attr is the `self.generate_*` bool —
+    # honored when present, else we rely on algo_short_name membership.
     #
-    # Why we apply this to EVERY kernel, not just the historically-large ones:
-    # without cudaFuncSetAttribute(MaxDynamicSharedMemorySize, BYTES), a kernel
-    # whose dynamic shared mem at runtime exceeds the device default per-block
-    # limit (48 KB on most consumer NVIDIA GPUs incl. sm_8x) launches and fails
-    # silently with cudaErrorInvalidConfiguration. The launch error doesn't
-    # propagate through cudaDeviceSynchronize() reliably, so timings come back
-    # as bogus ~0 us values. We hit this on g1 floating where ABA / FD / MINV
-    # need 52-57 KB shared mem. The call is a no-op when BYTES is already
+    # Applied to EVERY kernel, not just the historically-large ones: without
+    # cudaFuncSetAttribute(MaxDynamicSharedMemorySize, BYTES), a kernel whose
+    # runtime dynamic smem exceeds the device default per-block limit (48 KB on
+    # most consumer NVIDIA GPUs incl. sm_8x) fails to launch silently with
+    # cudaErrorInvalidConfiguration — the error doesn't propagate through
+    # cudaDeviceSynchronize() reliably, so timings come back as bogus ~0 us (hit
+    # on g1 floating where ABA/FD/MINV need 52-57 KB). No-op when BYTES is already
     # under the device default.
-    # Default False so the f_ext A.3 (-dJ^T/dq) kernel is registered ONLY when
-    # gen_f_ext_gradient actually emitted it. gen_f_ext_gradient now emits it for
-    # BOTH base modes (fixed: scalar FD; floating: SE(3) Lie-group root retract),
-    # so the instance attr is set True whenever f_ext_grad is generated.
+    # Default False: the f_ext A.3 (-dJ^T/dq) kernel is registered only when
+    # gen_f_ext_gradient actually emitted it (set True whenever f_ext_grad runs).
     _f_ext_grad_dq_emitted = False
 
     KERNEL_ATTR_MANIFEST = [
@@ -1950,59 +1944,22 @@ class GRiDCodeGenerator:
         # silently writing ZEROS. Non-gradient mimic codegen (id/fd/aba/crba/minv/
         # ee_pose/integrator value) is unaffected and still emits normally.
         if self.robot_has_mimic_joints():
-            # T3-finisher: id_du + fd_du mimic gradients have landed (dense
-            # serial reduced-space fold). FIXED-BASE (P3) and now FLOATING-BASE
-            # (B1: the floating root's 6-DoF motion subspace is folded via a
-            # per-root-DoF loop in _gen_id_du_mimic_inner, mirroring the numpy
-            # reference rnea_grad_fpass_dq's `for ii in range(len(idx))`). Both
-            # are removed from the refusal set. B2-ee: ee_pose_gradient +
-            # ee_pose_hessian mimic folds have landed for FIXED-BASE (alpha-
-            # weighted geometric-Jacobian column / world-frame generator
-            # accumulate; see _eepose_gradient_hessian.py Step 3b / Step 2),
-            # removed from the fixed-base refusal set. B2-ee FLOATING: the
-            # floating root contributes 6 INDEPENDENT velocity slots (vi 0..5),
-            # so it decomposes into 6 singleton single-column geometric-Jacobian /
-            # world-generator fills — never a shared-v-slot mimic group. The mimic
-            # alpha fold (Step 3b grad / Step 2 hess) operates orthogonally on the
-            # 1-DoF mimic joints' shared slots, so floating + mimic compose with no
-            # separate 6-DoF root fold. ee_pose_gradient/ee_pose_hessian are now
-            # supported for FLOATING-base mimic robots too (removed below).
-            # B2-SO: FIXED-base mimic idsva_so/fdsva_so un-refused — the body-frame
-            # inner runs the per-body INTERNAL NUM_BODIES-coordinate sweep into a
-            # 4*NB^3 slab and alpha-folds to the reduced 4*NV^3 public output (see
-            # _idsva_so.py gen_idsva_so_body_frame_inner is_mimic path; also fixed a
-            # shared matmul %NUM_JOINTS->%NUM_BODIES block-wrap bug). Floating-base
-            # mimic SO stays refused (added below). RECONCILED UNION of two ungates:
-            # (1) f_ext_grad now SUPPORTED for mimic (both bases, mimic-f-ext-grad) — the
-            #     alpha-weighted geometric-Jacobian column folds into the target's reduced
-            #     v-slot (ee_pose_gradient Step 3b template); A.2/A.3 compose on top.
-            # (2) integrator_gradient / integrator_with_gradient now SUPPORTED for
-            #     FIXED-base mimic, ALL 5 integrator types (mimic-integrator-grad). The fix
-            #     = size s_vaf at 18*NB (NB>NV for mimic) so the composed FD-grad inner's
-            #     body-indexed writes don't overflow s_Minv; dAB assembles in reduced NV
-            #     space. fr3-fixed bit-exact (norm_rel ~0 even at RK4 magnitudes ~5e7).
-            # => FIXED-base mimic now refuses NOTHING. FLOATING-base mimic still refuses the
-            # integrator gradients (added below): floating + MULTI-stage (Midpoint/RK3/RK4) +
-            # mimic is wrong (norm_rel 0.32/0.50/3.5) — a stage-projection bug at that exact
-            # intersection (fixed multi-stage mimic exact; floating multi-stage NON-mimic
-            # exact; floating single-stage mimic clean). Codegen emits all integrator types
-            # into one header, so refuse rather than ship a silently-wrong floating-mimic RK
-            # gradient. Follow-up: floating multi-stage mimic stage-point/projection path.
+            # Mimic gradient support: all first/second-order mimic gradients (id_du,
+            # fd_du, ee_pose grad/hess, f_ext_grad, idsva_so/fdsva_so) are supported
+            # for BOTH bases via the alpha-weighted reduced-v-slot column fold (the
+            # SO world inner runs a per-column INTERNAL-coordinate sweep then folds to
+            # the reduced 4*NV^3 output; the floating root's 6 DoF emerge as 6 distinct
+            # internal slots, alpha=1, so no separate root fold).
+            # The ONE refusal: FLOATING-base + MULTI-stage (Midpoint/RK3/RK4) + mimic
+            # integrator gradients are wrong (stage-projection bug isolated to that exact
+            # intersection — fixed-mimic, floating-nonmimic, and floating-single-stage-mimic
+            # are all exact). Codegen emits all integrator types into one header, so refuse
+            # rather than ship a silently-wrong floating-mimic RK gradient.
             _MIMIC_GRADIENT_ALGORITHMS = set()
             if self.robot.floating_base:
                 _MIMIC_GRADIENT_ALGORITHMS |= {
                     "integrator_gradient", "integrator_with_gradient",
                 }
-            # B2-SO FLOATING (FLAG for main reconcile — additive ungate): floating-base
-            # mimic SECOND-ORDER is now supported via the WORLD-frame inner (the production
-            # floating SO path). The world inner runs the triple ancestor walk in per-column
-            # INTERNAL coordinates (n_int = total S-column count; the floating root's 6 DoF
-            # get 6 distinct internal slots) into a 4*n_int^3 slab, then alpha-folds each axis
-            # to the reduced 4*NV^3 public output — exactly RBDReference.idsva_so_world_frame's
-            # has_mimic path. The per-root-DoF treatment is emergent from the per-column
-            # internal slotting (the root's columns fold identity, alpha=1), so no separate
-            # 6-DoF root fold is needed. fdsva_so composes the world inner on floating, so it
-            # is supported too. (Floating mimic SO previously stayed refused here.)
             requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
             if requested_gradients:
                 raise NotImplementedError(

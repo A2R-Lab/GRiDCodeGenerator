@@ -196,7 +196,7 @@ def gen_minv_inner(self):
         if self.robot.floating_base and bfs_level == 0:
             # U = IA because S is identity, so Dinv = IA^{-1}, Top left 6x6 in minv = Dinv
             self.gen_add_code_line("// U = IA*S = IA, D = S^T*U = U = IA => Minv[:6, :6] = IA^{-1}")
-            # Ainv=I pre-init dropped 2026-05-29: glass::invertMatrix_dense seeds Ainv internally.
+            # No Ainv=I pre-init: glass::invertMatrix_dense seeds Ainv internally.
             self.gen_add_code_line(f"invert_matrix(6, &s_temp[{str(IAOffset)}], &s_temp[{str(fb_DinvOffset)}], &s_temp[{IaTempOffset}]);")
 
             # Top left 6x6 in minv <- Dinv

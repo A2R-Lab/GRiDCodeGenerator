@@ -350,7 +350,7 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
         if len(mat.atoms(sp.sin, sp.cos)) > 0:
             use_trig = True
             break
-    # if we need trig then compute sin and cos while loading in XI from global to shared (if possible to do async)
+    # if trig is needed, compute sin/cos while loading XImats from global to shared
     if use_trig:
         self.gen_add_parallel_loop("ind",str(XI_size))
         self.gen_add_code_line("s_XImats[ind] = d_robotModel->d_XImats[ind];")
@@ -368,7 +368,6 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
             _emit_mimic_q_fold(self)
         else:
             self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
-            # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
             self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
             self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
             self.gen_add_end_control_flow()
@@ -604,7 +603,7 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
         if len(mat.atoms(sp.sin, sp.cos)) > 0:
             use_trig = True
             break
-    # if we need trig then compute sin and cos while loading in XI from global to shared (if possible to do async)
+    # if trig is needed, compute sin/cos while loading XImats from global to shared
     if use_trig:
         self.gen_add_parallel_loop("ind",str(Xhom_size))
         self.gen_add_code_line("s_XmatsHom[ind] = d_robotModel->d_XImats[ind+" + str(baseXI_size) + "];")
@@ -630,7 +629,6 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
             _emit_mimic_q_fold(self)
         else:
             self.gen_add_parallel_loop("k",str(self.robot.get_num_pos()))
-            # self.gen_add_code_line("sincosf(s_q[k],&s_temp[k],&s_temp[k+" + str(self.robot.get_num_pos()) + "]);")
             self.gen_add_code_line("s_temp[k] = static_cast<T>(sin(s_q[k]));")
             self.gen_add_code_line("s_temp[k+" + str(self.robot.get_num_pos()) + "] = static_cast<T>(cos(s_q[k]));")
             self.gen_add_end_control_flow()
@@ -704,10 +702,9 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
     # bigger robots impose (140+ regs vs cap of 128 at MAX_PERF_LEVEL_THREADS=512).
     # Three smaller serial sections drop peak per-thread reg usage to a
     # function of the largest individual matrix group, not the sum.
-    # NOTE on future work: the entire serial section can be parallelized
-    # by fanning each per-matrix block out across threads via parallel_loop —
-    # would let any thread count consume the function, not just thread 0.
-    # See conversation 2026-05-16 for the design discussion.
+    # FUTURE: this serial section could be parallelized by fanning each per-matrix
+    # block across threads via parallel_loop (let any thread count consume it, not
+    # just thread 0).
     self.gen_add_serial_ops()
     for ind in range(NJ):
         self.gen_add_code_line("// X_hom[" + str(ind) + "]")
