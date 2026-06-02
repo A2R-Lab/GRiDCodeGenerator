@@ -100,6 +100,20 @@ class GRiDCodeGenerator:
     # initialize the object
     def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid"):
         self.robot = robotObj
+        # planar/spherical joints PARSE (URDFParser groundwork) but the CUDA
+        # codegen transform chain does not yet emit them and RBDReference does
+        # not model them — fail loudly here rather than silently mis-generating.
+        # See docs/open-tasks/joint_types_plan.md (backlog A2).
+        _unsupported = {
+            jt for jt in robotObj.get_joint_types_by_id().values()
+            if jt in ("planar", "spherical")
+        }
+        if _unsupported:
+            raise NotImplementedError(
+                f"GRiD codegen does not yet support joint type(s) {sorted(_unsupported)}; "
+                "they parse as groundwork but have no CUDA transform / RBDReference model. "
+                "See docs/open-tasks/joint_types_plan.md."
+            )
         self.code_str = ""
         self.indent_level = 0
         self.DEBUG_MODE = DEBUG_MODE
