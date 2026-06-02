@@ -38,6 +38,8 @@ __all__ = [
     "gen_frame_jacobian_dot_host",
     "gen_frame_jacobian_dot",
     "gen_osc_inertia_device",
+    "gen_osc_inertia_kernel",
+    "gen_osc_inertia_host",
     "gen_osc_inertia",
 ]
 
@@ -699,5 +701,125 @@ def gen_osc_inertia_device(self):
     self.gen_add_end_function()
 
 
+def gen_osc_inertia_kernel(self, single_call_timing=False):
+    """Emit osc_inertia_kernel: batched launcher of the 6x6 operational-space
+    inertia Lambda. SELF-CONTAINED (osc_inertia_device composes Minv on device
+    from q alone). target_jid + reference_frame baked as the leaf-EE /
+    LOCAL_WORLD_ALIGNED defaults. Output 6x6 (column-major) per timestep.
+
+    Like frame_jacobian_dot_kernel, osc_inertia_device is a full auto-smem
+    wrapper that owns the ENTIRE dynamic-smem arena, so the kernel keeps its
+    input s_q and output s_osc_inertia in STATIC __shared__ (avoids aliasing the
+    wrapper's heavy minv/J/compose scratch). The __launch_bounds__ lets nvcc fit
+    the heavy register footprint to the tier thread cap (mirrors the other
+    benchmarked kernels; the un-annotated smoke runner needs manual clamping)."""
+    n = self.robot.get_num_pos()
+    default_tjid = self.robot.get_leaf_nodes()[0]
+    func_params = ["d_osc_inertia is the vector of 6 x 6 operational-space inertias Lambda (column-major)",
+                   "d_q is the vector of joint positions",
+                   "stride_q is the stride between each q",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_def_start = "void osc_inertia_kernel(T *d_osc_inertia, const T *d_q, const int stride_q, "
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute the operational-space (task) inertia", [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("const int target_jid = " + str(default_tjid) + ";")
+    self.gen_add_code_line("const int reference_frame = " + str(_REF_LWA) + ";")
+    self.gen_add_code_line("__shared__ T s_q[" + str(n) + "];")
+    self.gen_add_code_line("__shared__ T s_osc_inertia[36];")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q", str(n), stride="stride_q")
+        self.gen_add_code_line("// compute")
+        self.gen_add_code_line("osc_inertia_device<T>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel);")
+        self.gen_add_sync()
+        self.gen_kernel_save_result("osc_inertia", "36", stride="36")
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q", str(n))
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q", str(n), feedback_from="osc_inertia")
+        self.gen_add_code_line("osc_inertia_device<T>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel);")
+        self.gen_anti_licm_output_write("osc_inertia")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("osc_inertia", "36")
+    self.gen_add_end_function()
+
+
+def gen_osc_inertia_host(self, mode=0):
+    """Emit osc_inertia host launcher (3 modes). Kinematic (q-only input):
+    SELF-CONTAINED Minv compose, so the q-only / q|qd|u memory split mirrors
+    frame_jacobian."""
+    single_call_timing = True if mode == 1 else False
+    compute_only = True if mode == 2 else False
+    func_params = ["hd_data is the packaged input and output pointers",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+    func_def_start = "void osc_inertia(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute the operational-space (task) inertia", [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"osc_inertia requires all-data or kinematics gridData\");")
+    func_call_start = ("osc_inertia_kernel<T><<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+                       "(hd_data->d_osc_inertia,hd_data->d_q,stride_q,")
+    func_call_end = "d_robotModel,num_timesteps);"
+    if single_call_timing:
+        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+    if not compute_only:
+        self.gen_add_code_lines(["// start code with memory transfer",
+                                 "int stride_q;",
+                                 "if (USE_COMPRESSED_MEM) {stride_q = NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "else {stride_q = 3*NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "gpuErrchkKernel();"])
+    else:
+        self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call = func_call_start + func_call_end
+    func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q", "hd_data->d_q_qd_u") + "}"
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"osc_inertia\", OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines(["// finally transfer the result back",
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_osc_inertia,hd_data->d_osc_inertia,36*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("osc_inertia"))
+    self.gen_add_end_function()
+
+
 def gen_osc_inertia(self):
     self.gen_osc_inertia_device()
+    self.gen_osc_inertia_kernel(single_call_timing=False)
+    self.gen_osc_inertia_kernel(single_call_timing=True)
+    self.gen_osc_inertia_host(mode=0)
+    self.gen_osc_inertia_host(mode=1)
+    self.gen_osc_inertia_host(mode=2)

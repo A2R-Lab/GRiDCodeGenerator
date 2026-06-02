@@ -90,7 +90,8 @@ class GRiDCodeGenerator:
                             gen_frame_jacobian_kernel, gen_frame_jacobian_host, gen_frame_jacobian, \
                             gen_frame_jacobian_dot_device, gen_frame_jacobian_dot_kernel, \
                             gen_frame_jacobian_dot_host, gen_frame_jacobian_dot, \
-                            gen_osc_inertia_device, gen_osc_inertia
+                            gen_osc_inertia_device, gen_osc_inertia_kernel, \
+                            gen_osc_inertia_host, gen_osc_inertia
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -1693,6 +1694,12 @@ class GRiDCodeGenerator:
             ("frame_jacobian_dot_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
+        ("osc_inertia", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("osc_inertia_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("osc_inertia_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
         ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
@@ -2361,6 +2368,7 @@ class GRiDCodeGenerator:
                     "template <typename T> __host__ __device__ inline size_t OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES() "
                     "{ return grid_shared_arena_bytes<T>(" + str(osc_t_count) +
                     ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_add_code_line("#define GRID_HAS_OSC_INERTIA 1")
                 self.gen_osc_inertia()
         # Mimic-only marker: signal to consumers (e.g. the frame_jacobian smoke
         # runner) that this is a mimic header where osc_inertia (Lambda) was NOT
