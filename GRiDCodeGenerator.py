@@ -118,6 +118,11 @@ class GRiDCodeGenerator:
             "idsva_so_body_frame", "fdsva_so", "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
             "f_ext_gradient", "inverse_dynamics_regressor", "forward_dynamics_parameter_gradient",
+            # G2 centroidal quick-wins: each is its OWN first-class key (R6). They
+            # expand to their real deps below (com/ccrba/energy -> ee_pose kin
+            # machinery; generalized_gravity/nonlinear_effects -> id RNEA-bias), but
+            # requesting a SIBLING dep no longer silently emits them.
+            "com", "ccrba", "energy", "generalized_gravity", "nonlinear_effects",
         }
         # E2 (additive, opt-in only): frame_jacobian is NOT part of the default
         # `all` profile so the default-profile header stays byte-identical. It is
@@ -222,6 +227,15 @@ class GRiDCodeGenerator:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient"})
+        # R6 centroidal deps: com/ccrba/energy reuse the ee_pose homogeneous-
+        # transform world-frame machinery; generalized_gravity/nonlinear_effects
+        # are RNEA-bias wrappers around the id inner. Expanding the DEP is correct;
+        # the R6 fix is that requesting only the dep no longer pulls the centroidal
+        # OUTPUT (gen_centroidal_quickwins now gates on these own keys).
+        if algorithms & {"com", "ccrba", "energy"}:
+            algorithms.add("end_effector_pose")
+        if algorithms & {"generalized_gravity", "nonlinear_effects"}:
+            algorithms.add("inverse_dynamics")
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -1620,35 +1634,34 @@ class GRiDCodeGenerator:
             ("end_effector_pose_hessian_kernel_single_timing<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        # G2 centroidal quick-wins. gravity/nonlinear_effects gate on `id`
-        # (RNEA bias wrappers); com/ccrba/energy gate on `ee_pose` (homogeneous-
-        # transform world-frame machinery). algo_short keys an entry that is in
-        # generated_algorithms exactly when the dep is present.
-        ("generalized_gravity", "inverse_dynamics", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        # G2 centroidal quick-wins. R6: each registers on its OWN key (matching
+        # gen_centroidal_quickwins' per-key emit) — algo_short keys an entry that
+        # is in generated_algorithms exactly when THAT centroidal fn was emitted.
+        ("generalized_gravity", "generalized_gravity", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("generalized_gravity_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("generalized_gravity_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("nonlinear_effects", "inverse_dynamics", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("nonlinear_effects", "nonlinear_effects", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("nonlinear_effects_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("nonlinear_effects_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("com", "end_effector_pose", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("com_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("ccrba", "end_effector_pose", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("ccrba", "ccrba", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("ccrba_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("ccrba_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("energy", "end_effector_pose", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("energy", "energy", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("energy_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("energy_kernel_single_timing<T>",
@@ -1894,24 +1907,38 @@ class GRiDCodeGenerator:
         robots are skipped for the kinematics-domain centroidal families (the
         per-body Jacobian fold isn't mimic-reduced yet) — gravity/bias still
         emit since they reuse the mimic-aware RNEA inner."""
-        # R1 generalized_gravity / nonlinear_effects: RNEA bias wrappers.
-        if "inverse_dynamics" in algorithms:
-            self.gen_id_bias(gravity_only=True)
-            self.gen_id_bias(gravity_only=False)
+        # R1 generalized_gravity / nonlinear_effects: RNEA bias wrappers. R6: each
+        # emits when ITS OWN key is requested (its 'id' dep is auto-expanded by
+        # _normalize_codegen_algorithms); requesting only 'id' no longer emits them.
+        want_gg = "generalized_gravity" in algorithms
+        want_nle = "nonlinear_effects" in algorithms
+        if want_gg or want_nle:
+            # gen_id_bias depends on grid::inverse_dynamics_inner (auto-pulled).
+            if want_gg:
+                self.gen_id_bias(gravity_only=True)
+            if want_nle:
+                self.gen_id_bias(gravity_only=False)
         else:
-            self.gen_add_code_line("// [centroidal] generalized_gravity/nonlinear_effects skipped: require 'id' (grid::inverse_dynamics_inner).")
-        # R3/R2/energy: kinematics-domain centroidal families. Need homogeneous
-        # transforms (always present when ee_pose is generated).
-        kin_ok = ("end_effector_pose" in algorithms) and not self.robot_has_mimic_joints()
-        if kin_ok:
-            self.gen_centroidal_inner()
-            self.gen_com()
-            self.gen_ccrba()
-            self.gen_energy()
-        elif "end_effector_pose" not in algorithms:
-            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: require 'ee_pose' (homogeneous-transform world-frame machinery).")
-        else:
+            self.gen_add_code_line("// [centroidal] generalized_gravity/nonlinear_effects skipped: not requested (request 'generalized_gravity'/'nonlinear_effects').")
+        # R3/R2/energy: kinematics-domain centroidal families. R6: each emits on
+        # its OWN key (com/ccrba/energy); the ee_pose homogeneous-transform world-
+        # frame machinery is auto-expanded as their dep. Mimic robots skip them
+        # (per-body Jacobian fold isn't mimic-reduced yet).
+        want_com = "com" in algorithms
+        want_ccrba = "ccrba" in algorithms
+        want_energy = "energy" in algorithms
+        if (want_com or want_ccrba or want_energy) and self.robot_has_mimic_joints():
             self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
+        elif want_com or want_ccrba or want_energy:
+            self.gen_centroidal_inner()
+            if want_com:
+                self.gen_com()
+            if want_ccrba:
+                self.gen_ccrba()
+            if want_energy:
+                self.gen_energy()
+        else:
+            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: not requested (request 'com'/'ccrba'/'energy').")
 
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
