@@ -729,6 +729,177 @@ def gen_plant_step_kernel(self):
     self.gen_add_end_function()
 
 
+def gen_plant_step_gradient_kernel(self):
+    """`plant_step_gradient_kernel` — one block/timestep [A|B] = s_dAB.
+
+    plant_step_gradient is an inner-owns-placement orchestrator (it forwards to
+    grid::integrator_gradient_device, which OWNS its FD-grad s_temp pool
+    placement). The kernel therefore sets up the WHOLE scratch arena in shared
+    memory itself — mirroring grid::integrator_gradient_kernel's PERF/full-smem
+    body (every band in smem: SCRATCH_IN_SMEM=true, no workspace/spill) — then
+    calls grid_plant::plant_step_gradient (the thin pass-through). The emitted
+    s_dAB is byte-identical to grid::integrator_gradient's. Inputs/outputs are
+    global; the launch reserves grid::INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES.
+
+    x = [q (NUM_POS); qd (NUM_VEL)] (NON-const: the multi-stage RK path mutates
+    q/qd across stages in smem); u = control torque (NUM_VEL)."""
+    n = self.robot.get_num_vel()
+    fb = 1 if self.robot.floating_base else 0
+    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
+    from ._integrator import _max_stages_in_use
+    max_stages = _max_stages_in_use()
+    d_qdd_count = max_stages * n * 3 * n
+    inner_temp_full = self.gen_integrator_gradient_inner_temp_mem_size()
+    # s_vaf is body-indexed (NB bodies, stride 6); size by NB for mimic robots
+    # (NB>nv) so the composed FD-grad ID sub-inner's 18*NB writes don't overflow
+    # the adjacent buffers (mirrors integrator_gradient_kernel's vaf sizing).
+    vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
+    self.gen_add_func_doc("plant_step_gradient kernel: [A|B] = integrator_gradient([q;qd], u, dt) per timestep "
+                          "(full-smem scratch arena; pass-through to grid::integrator_gradient_device)",
+                          [],
+                          ["d_dAB is the [A|B] output (2*NUM_VEL*3*NUM_VEL per timestep, column-major)",
+                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
+                           "d_u is the packed control torque (NUM_VEL per timestep)",
+                           "stride_x / stride_u are the per-timestep strides",
+                           "d_robotModel / gravity / dt as for plant_step",
+                           "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
+    self.gen_add_code_line("void plant_step_gradient_kernel(T *d_dAB, const T *d_x, const T *d_u, "
+                           "const int stride_x, const int stride_u, "
+                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
+    # The shared-arena machinery (grid_align_up / grid_arena_ptr / the *_BYTES
+    # helpers) + IntegratorType / robotModel live in `namespace grid`; this
+    # kernel is in the sibling `grid_plant`, so pull them into scope. The only
+    # grid_plant symbol the body references (plant_step_gradient) is found by
+    # enclosing-namespace lookup.
+    self.gen_add_code_line("using namespace grid;")
+    # Whole scratch arena in shared memory (PERF/full-smem; mirrors the
+    # integrator_gradient_kernel _emit_body(dqdd_in_smem=True, dab_in_smem=True,
+    # inner_level=0) layout). s_x (= s_q;s_qd) + s_u are staged from global; the
+    # FD-grad bands, the dAB output, and the multi-stage scratch all live here.
+    extra_t_buffers = [
+        ("s_x", nx),
+        ("s_u", n),
+        ("s_dAB", 2 * n * 3 * n),
+        ("s_df_du", n * 2 * n),
+        ("s_dc_du", n * 2 * n),
+        ("s_vaf", vaf_cnt),
+        ("s_Minv", n * n),
+        ("s_qdd", n),
+        ("s_q_orig", n + fb),
+        ("s_qd_orig", n),
+        ("s_stage_grad_qdd", max_stages * n),
+        ("s_D_qdd_stage", d_qdd_count),
+        ("s_dInt_q_6x6", 36),
+        ("s_dInt_v_6x6", 36),
+    ]
+    self.gen_XImats_helpers_temp_shared_memory_code(
+        inner_temp_full, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    # stage x (q;qd) + u into smem (plant_step_gradient mutates q/qd across stages).
+    self.gen_add_parallel_loop("ind", str(nx))
+    self.gen_add_code_line("s_x[ind] = d_x[k*stride_x + ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_parallel_loop("ind", str(n))
+    self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # All scratch is smem (SCRATCH_IN_SMEM=true, no spill): pass nullptr for the
+    # global workspace + spill regions. The orchestrator owns its s_temp pool.
+    self.gen_add_code_line("plant_step_gradient<T, IT, true, false>("
+                           "s_dAB, s_x, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
+                           "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
+                           "s_dInt_q_6x6, s_dInt_v_6x6, "
+                           + self.gen_insert_helpers_function_call()
+                           + "s_temp, nullptr, nullptr, d_robotModel, gravity, dt);")
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("for (int ind = 0; ind < " + str(2 * n * 3 * n) + "; ++ind) d_dAB[k*" + str(2 * n * 3 * n) + " + ind] = s_dAB[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_com_cost_kernel(self):
+    """`com_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
+
+    Calls grid_plant::com_cost[_gradient/_hessian], which call the
+    auto-allocating grid::com_device. Global in/out; reuses
+    grid::COM_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Mirrors
+    gen_ee_pos_cost_kernel (CoM position/Jacobian in place of EE)."""
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nx = nq + nv
+    com_out = 3 + 3 * nv  # grid::com_device output: [p_com(3); J_com(3 x NV)]
+    self.gen_add_func_doc("com_cost_kernel: value + grad_x + GN hess_x per timestep",
+                          [], ["d_out scalar cost (1 per timestep)",
+                               "d_grad grad over x (" + str(nx) + " per timestep)",
+                               "d_hess dense col-major x-hessian (" + str(nx*nx) + " per timestep)",
+                               "d_q joint positions (NUM_POS per timestep)",
+                               "d_p_des desired CoM position (3 per timestep)",
+                               "d_W per-axis weight (3 per timestep)",
+                               "d_com global scratch (3 + 3*NUM_VEL per timestep)",
+                               "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
+                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_com, "
+                           "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
+    self.gen_add_code_line("T *s_com = &d_com[k*" + str(com_out) + "];")
+    self.gen_add_code_line("com_cost<T>(&d_out[k], s_q, s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("com_cost_gradient<T>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("com_cost_hessian<T>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_com, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+def gen_momentum_cost_kernel(self):
+    """`momentum_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
+
+    Calls grid_plant::momentum_cost[_gradient/_hessian], which call the
+    auto-allocating grid::ccrba_device. Global in/out; reuses
+    grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Reads q + qd (the
+    momentum h = A qd depends on qd)."""
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nx = nq + nv
+    ccrba_out = 6 * nv + 6  # grid::ccrba_device output: [A(6 x NV); h(6)]
+    self.gen_add_func_doc("momentum_cost_kernel: value + grad_x + GN hess_x per timestep",
+                          [], ["d_out scalar cost (1 per timestep)",
+                               "d_grad grad over x (" + str(nx) + " per timestep)",
+                               "d_hess dense col-major x-hessian (" + str(nx*nx) + " per timestep)",
+                               "d_q / d_qd joint positions/velocities (NUM_POS / NUM_VEL per timestep)",
+                               "d_h_des desired centroidal momentum (6 per timestep)",
+                               "d_W per-component weight (6 per timestep)",
+                               "d_ccrba global scratch (6*NUM_VEL + 6 per timestep)",
+                               "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
+                           "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, T *d_ccrba, "
+                           "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_qd = &d_qd[k*" + str(nv) + "];")
+    self.gen_add_code_line("const T *s_h_des = &d_h_des[k*6]; const T *s_W = &d_W[k*6];")
+    self.gen_add_code_line("T *s_ccrba = &d_ccrba[k*" + str(ccrba_out) + "];")
+    self.gen_add_code_line("momentum_cost<T>(&d_out[k], s_q, s_qd, s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("momentum_cost_gradient<T>(&d_grad[k*" + str(nx) + "], s_q, s_qd, s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("momentum_cost_hessian<T>(&d_hess[k*" + str(nx*nx) + "], s_q, s_qd, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
 def gen_quadratic_cost_kernel(self, which):
     """`<base>_kernel` — one block/timestep value+grad+GN-diag-hess.
 
@@ -856,9 +1027,22 @@ def gen_plant_kernels(self, algorithms):
         gen_plant_step_kernel(self)
         # Signal to the binding layer (wrapper_template.cu) that plant_step exists.
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP 1")
+    if ("integrator_gradient" in algorithms) or ("integrator_with_gradient" in algorithms):
+        gen_plant_step_gradient_kernel(self)
+        self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_GRADIENT 1")
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         gen_ee_pos_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
+    # CoM / centroidal-momentum cost kernels emit whenever their device fns do
+    # (gated identically to gen_com_cost/gen_momentum_cost in gen_grid_plant:
+    # require grid::com_device + grid::ccrba_device, non-mimic).
+    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms
+                     and not self.robot_has_mimic_joints())
+    if centroidal_ok:
+        gen_com_cost_kernel(self)
+        self.gen_add_code_line("#define GRID_PLANT_HAS_COM_COST 1")
+        gen_momentum_cost_kernel(self)
+        self.gen_add_code_line("#define GRID_PLANT_HAS_MOMENTUM_COST 1")
 
 
 # ---------------------------------------------------------------------------

@@ -263,19 +263,23 @@ def gen_frame_jacobian_device(self):
 
 def gen_frame_jacobian_kernel(self, single_call_timing=False):
     """Emit frame_jacobian_kernel: batched (one block per timestep) launcher of
-    the general-frame geometric Jacobian. target_jid + reference_frame are baked
-    as compile-time launch defaults (the leaf-EE joint, LOCAL_WORLD_ALIGNED) so
-    the kernel/host surface mirrors the fixed-target ee_pose pattern. Output is
-    6 x NUM_VEL column-major per timestep."""
+    the general-frame geometric Jacobian. target_jid + reference_frame are
+    RUNTIME kernel parameters (the inner already supports them); the host
+    defaults them to the leaf-EE joint / LOCAL_WORLD_ALIGNED so a binding that
+    doesn't pass a frame gets the historical fixed-target behavior, while a
+    caller can request any frame at launch time. Output is 6 x NUM_VEL
+    column-major per timestep."""
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    default_tjid = self.robot.get_leaf_nodes()[0]
     func_params = ["d_frame_jacobian is the vector of 6 x NUM_VEL geometric Jacobians (column-major, [linear; angular])",
                    "d_q is the vector of joint positions",
                    "stride_q is the stride between each q",
+                   "target_jid is the joint id whose frame Jacobian is requested (runtime)",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (runtime)",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_def_start = "void frame_jacobian_kernel(T *d_frame_jacobian, const T *d_q, const int stride_q, "
+    func_def_start = ("void frame_jacobian_kernel(T *d_frame_jacobian, const T *d_q, const int stride_q, "
+                      "const int target_jid, const int reference_frame, ")
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -285,9 +289,6 @@ def gen_frame_jacobian_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    # Fixed target/frame for the launchable surface (mirrors ee_pose fixed-target).
-    self.gen_add_code_line("const int target_jid = " + str(default_tjid) + ";")
-    self.gen_add_code_line("const int reference_frame = " + str(_REF_LWA) + ";")
     # arena: world-transform machinery + inner scratch + s_q + s_frame_jacobian.
     self.gen_XmatsHom_helpers_temp_shared_memory_code(
         _frame_jacobian_inner_temp_mem_size(self),
@@ -317,21 +318,32 @@ def gen_frame_jacobian_kernel(self, single_call_timing=False):
 
 def gen_frame_jacobian_host(self, mode=0):
     """Emit frame_jacobian host launcher (3 modes: 0=batch w/ mem, 1=single-call
-    timing, 2=batch compute-only)."""
+    timing, 2=batch compute-only). target_jid / reference_frame are trailing
+    host params with defaults (leaf-EE joint / LOCAL_WORLD_ALIGNED) so a caller
+    that omits them gets the historical fixed-target behavior; both are forwarded
+    to the kernel's runtime frame params."""
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
+    default_tjid = self.robot.get_leaf_nodes()[0]
     func_params = ["hd_data is the packaged input and output pointers",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
-                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)",
+                   "target_jid is the joint id of the requested frame (default leaf-EE)",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (default LWA)"]
+    # target_jid / reference_frame are trailing defaulted params so existing
+    # call sites (which omit them) keep the leaf-EE / LWA behavior.
+    frame_args = (", const int target_jid = " + str(default_tjid) +
+                  ", const int reference_frame = " + str(_REF_LWA))
     func_def_start = "void frame_jacobian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
-    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams" + frame_args + ") {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
         func_def_end = "              " + func_def_end
     if compute_only:
+        func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms" + frame_args + ") {"
         func_def_start = func_def_start.replace("(", "_compute_only(")
-        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+        func_def_end = "             " + func_def_end
     self.gen_add_func_doc("Compute a general-frame geometric Jacobian", [], func_params, None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
@@ -339,7 +351,7 @@ def gen_frame_jacobian_host(self, mode=0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian requires all-data or kinematics gridData\");")
     func_call_start = ("frame_jacobian_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
-                       "(hd_data->d_frame_jacobian,hd_data->d_q,stride_q,")
+                       "(hd_data->d_frame_jacobian,hd_data->d_q,stride_q,target_jid,reference_frame,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -472,18 +484,21 @@ def gen_frame_jacobian_dot_device(self):
 def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
     """Emit frame_jacobian_dot_kernel: batched launcher of the general-frame
     Jacobian time-derivative Jdot. Reads q (NUM_POS) + qd (NUM_VEL) from the
-    packed d_q_qd_u buffer; target_jid + reference_frame baked as the leaf-EE /
-    LOCAL_WORLD_ALIGNED defaults (mirrors frame_jacobian_kernel). Output 6 x NV."""
+    packed d_q_qd_u buffer; target_jid + reference_frame are RUNTIME kernel
+    params (the inner already supports them), defaulted by the host to leaf-EE /
+    LOCAL_WORLD_ALIGNED (mirrors frame_jacobian_kernel). Output 6 x NV."""
     n_vel = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
     fb = 1 if self.robot.floating_base else 0
-    default_tjid = self.robot.get_leaf_nodes()[0]
     func_params = ["d_frame_jacobian_dot is the vector of 6 x NUM_VEL Jacobian time-derivatives (column-major, [linear; angular])",
                    "d_q_qd is the packed [q (NUM_POS); qd (NUM_VEL)] input",
                    "stride_q_qd is the stride between each (q, qd) tuple",
+                   "target_jid is the joint id whose frame Jacobian time-derivative is requested (runtime)",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (runtime)",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_def_start = "void frame_jacobian_dot_kernel(T *d_frame_jacobian_dot, const T *d_q_qd, const int stride_q_qd, "
+    func_def_start = ("void frame_jacobian_dot_kernel(T *d_frame_jacobian_dot, const T *d_q_qd, const int stride_q_qd, "
+                      "const int target_jid, const int reference_frame, ")
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -493,8 +508,6 @@ def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    self.gen_add_code_line("const int target_jid = " + str(default_tjid) + ";")
-    self.gen_add_code_line("const int reference_frame = " + str(_REF_LWA) + ";")
     # frame_jacobian_dot_device is a full auto-smem wrapper: it owns the ENTIRE
     # dynamic-smem arena (s_XmatsHom + s_qpert + s_Jp + s_Jm + s_temp), sized by
     # FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES, and reads s_q/s_qd + writes
@@ -527,21 +540,29 @@ def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
 
 def gen_frame_jacobian_dot_host(self, mode=0):
     """Emit frame_jacobian_dot host launcher (3 modes). Always uses the full
-    q|qd|u memory (Jdot needs qd, which the compressed q-only layout lacks)."""
+    q|qd|u memory (Jdot needs qd, which the compressed q-only layout lacks).
+    target_jid / reference_frame are trailing defaulted host params (leaf-EE /
+    LWA) forwarded to the kernel's runtime frame params."""
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
+    default_tjid = self.robot.get_leaf_nodes()[0]
     func_params = ["hd_data is the packaged input and output pointers",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
-                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)",
+                   "target_jid is the joint id of the requested frame (default leaf-EE)",
+                   "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED (default LWA)"]
+    frame_args = (", const int target_jid = " + str(default_tjid) +
+                  ", const int reference_frame = " + str(_REF_LWA))
     func_def_start = "void frame_jacobian_dot(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
-    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams" + frame_args + ") {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
         func_def_end = "              " + func_def_end
     if compute_only:
+        func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms" + frame_args + ") {"
         func_def_start = func_def_start.replace("(", "_compute_only(")
-        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+        func_def_end = "             " + func_def_end
     self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian", [], func_params, None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
@@ -551,7 +572,7 @@ def gen_frame_jacobian_dot_host(self, mode=0):
     # Jdot needs qd; always source from the full q|qd|u buffer (stride 3*NUM_JOINTS),
     # the kernel reads the leading [q; qd] slice.
     func_call = ("frame_jacobian_dot_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
-                 "(hd_data->d_frame_jacobian_dot,hd_data->d_q_qd_u,stride_q_qd,d_robotModel,num_timesteps);")
+                 "(hd_data->d_frame_jacobian_dot,hd_data->d_q_qd_u,stride_q_qd,target_jid,reference_frame,d_robotModel,num_timesteps);")
     if single_call_timing:
         func_call = func_call.replace("kernel<T>", "kernel_single_timing<T>")
     if not compute_only:
