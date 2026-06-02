@@ -144,41 +144,15 @@ class GRiDCodeGenerator:
             "integrators": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "integrator", "integrator_gradient",
                             "integrator_with_gradient"},
         }
+        # Clean break: NO algorithm-name aliases. Every algorithm is requested by its
+        # ONE canonical verbose key (== emitted grid:: symbol == bench key == printf
+        # label); canonicalize() below tolerates dash-vs-underscore spelling only.
+        # The only entries here are PROFILE-selection conveniences (curated algo SETS,
+        # a distinct concept from algo naming) — they alias to profile_algorithms keys.
         aliases = {
             "all-dynamics": "dynamics",
             "dynamics-only": "dynamics",
             "kinematics-only": "kinematics",
-            "id": "inverse_dynamics",
-            "inverse-dynamics": "inverse_dynamics",
-            "rnea": "inverse_dynamics",
-            "direct-minv": "minv",
-            "fd": "forward_dynamics",
-            "forward-dynamics": "forward_dynamics",
-            "id-du": "inverse_dynamics_gradient",
-            "inverse-dynamics-gradient": "inverse_dynamics_gradient",
-            "id-gradient": "inverse_dynamics_gradient",
-            "fd-du": "forward_dynamics_gradient",
-            "forward-dynamics-gradient": "forward_dynamics_gradient",
-            "fd-gradient": "forward_dynamics_gradient",
-            "f-ext-grad": "f_ext_gradient",
-            "fext-grad": "f_ext_gradient",
-            "f-ext-gradient-only": "f_ext_gradient",
-            "joint-torque-regressor": "inverse_dynamics_regressor",
-            "inverse-dynamics-regressor": "inverse_dynamics_regressor",
-            "fd-parameter-gradient": "forward_dynamics_parameter_gradient",
-            "forward-dynamics-parameter-gradient": "forward_dynamics_parameter_gradient",
-            "idsva-so": "idsva_so_body_frame",
-            "fdsva-so": "fdsva_so",
-            "ee-pose": "end_effector_pose",
-            "end-effector-pose": "end_effector_pose",
-            "ee-pose-gradient": "end_effector_pose_gradient",
-            "end-effector-pose-gradient": "end_effector_pose_gradient",
-            "ee-pose-hessian": "end_effector_pose_hessian",
-            "end-effector-pose-hessian": "end_effector_pose_hessian",
-            "euler": "integrator",
-            "integrator-euler": "integrator",
-            "integrator-gradient": "integrator_gradient",
-            "integrator-with-gradient": "integrator_with_gradient",
         }
 
         def canonicalize(name):
