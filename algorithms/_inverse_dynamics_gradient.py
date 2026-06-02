@@ -257,10 +257,10 @@ def gen_inverse_dynamics_gradient_inner(self):
                              "int dstOffset = comp1 * " + str(Offset_Iv) + " + !comp1 * " + str(Offset_FxvI) + " + comp3 * " + str(6*NJ) + " + jid6 + row; // rowCol of dst"])
     if self.robot.floating_base:
         self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ?",
-                                 "                           (comp3 ? (row < 3 ? static_cast<T>(0) : s_XImats[6*jid6 + 6*row + 5] * gravity) : static_cast<T>(0)) :",
+                                 "                           (comp3 ? (row < 3 ? static_cast<T>(0) : -s_XImats[6*jid6 + 6*row + 5] * gravity) : static_cast<T>(0)) :",
                                  "                           dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
     else:
-        self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ? comp3 * s_XImats[XIOffset + 30] * gravity : ",
+        self.gen_add_code_lines(["s_temp[dstOffset] = (parentIsBase && !comp1) ? comp3 * -s_XImats[XIOffset + 30] * gravity :",
                                  "                                               dot_prod<T,6,6,1>(&s_XImats[XIOffset],&s_vaf[vaOffset]);"])
     self.gen_add_end_control_flow()
     self.gen_add_sync()
@@ -1333,7 +1333,6 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     f @ s_vaf[12*NB+6*ind]. The big dense buffers live in s_temp (routed to
     workspace at the global-temp tier for humanoid-scale NB)."""
     import numpy as _np
-    GRAV_NEG = "gravity"  # s_a base row 5 holds X*gravity already via s_vaf
     fb = self.robot.floating_base
 
     # Floating-base root (jid 0) per-DoF motion-subspace metadata. The root's S
@@ -1506,9 +1505,9 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             self.gen_add_code_line("T s_mtmp[6];")
             self.gen_add_code_line("// FLOATING ROOT: da_dq[:,ii] += sgn*mx_k(inv(X)*gravity_vec)")
             self.gen_add_code_line("s_mtmp[0] = static_cast<T>(0); s_mtmp[1] = static_cast<T>(0); s_mtmp[2] = static_cast<T>(0);")
-            self.gen_add_code_line("s_mtmp[3] = s_XImats[" + str(Xoff + 2) + "] * gravity;")
-            self.gen_add_code_line("s_mtmp[4] = s_XImats[" + str(Xoff + 8) + "] * gravity;")
-            self.gen_add_code_line("s_mtmp[5] = s_XImats[" + str(Xoff + 14) + "] * gravity;")
+            self.gen_add_code_line("s_mtmp[3] = -s_XImats[" + str(Xoff + 2) + "] * gravity;")
+            self.gen_add_code_line("s_mtmp[4] = -s_XImats[" + str(Xoff + 8) + "] * gravity;")
+            self.gen_add_code_line("s_mtmp[5] = -s_XImats[" + str(Xoff + 14) + "] * gravity;")
             for ii in range(6):
                 k, sgn = root_dof_axes[ii]
                 self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, ii)) + "], s_mtmp, static_cast<T>(" + repr(sgn) + "));")
@@ -1557,7 +1556,7 @@ def _gen_id_du_mimic_inner(self, nv, NB):
                 # own a, which also carries S*qdd when use_qdd_input — that would
                 # corrupt fd_du). X*gravity is column 5 of X scaled by `gravity`:
                 #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity (col5=+30).
-                self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = -s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
                 self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
             # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
             self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")

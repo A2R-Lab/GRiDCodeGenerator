@@ -270,7 +270,7 @@ def gen_aba_inner_floating(self):
             self.gen_add_sync()
             self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
             self.gen_add_parallel_loop("row", "6")
-            self.gen_add_code_line("s_va[" + str(6 * NJ) + " + row] = s_temp[" + str(tempVecOffset) + " + row + 6*5] * gravity;")
+            self.gen_add_code_line("s_va[" + str(6 * NJ) + " + row] = -s_temp[" + str(tempVecOffset) + " + row + 6*5] * gravity;")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
             self.gen_add_parallel_loop("row", "6")

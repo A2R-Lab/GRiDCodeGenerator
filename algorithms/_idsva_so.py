@@ -564,13 +564,12 @@ def gen_floating_gravity_d2tau_dq_lie_inline(self):
         ])
     self.gen_add_code_lines([
         "",
-        "// gravity_vec mirrors Python's `gravity_vec[5] = -GRAVITY`. In CUDA the `gravity`",
-        "// parameter is the *positive magnitude* of gravitational acceleration (= 9.81),",
-        "// matching the convention used by the rest of the GRiD CUDA functions; the Python",
-        "// helper takes signed GRAVITY = -9.81. So Python's `gravity_vec[5] = -GRAVITY = +9.81`",
-        "// equals CUDA's `gravity_vec[5] = +gravity`.",
+        "// gravity_vec mirrors Python's `gravity_vec[5] = -GRAVITY`. The CUDA `gravity`",
+        "// parameter is the SIGNED gravitational acceleration (= -9.81, the unified GRiD",
+        "// convention matching RBDReference's GRAVITY). So `gravity_vec[5] = -GRAVITY = +9.81`",
+        "// equals CUDA's `gravity_vec[5] = -gravity`.",
         "T grav_gravity_vec[6] = { static_cast<T>(0), static_cast<T>(0), static_cast<T>(0),",
-        "                          static_cast<T>(0), static_cast<T>(0), gravity };",
+        "                          static_cast<T>(0), static_cast<T>(0), -gravity };",
         "",
         "// Zero scratch (single-thread; could be parallelised across threadIdx for speed).",
         "for (int idx = 0; idx < 36*NUM_VEL; ++idx) grav_dX[idx] = static_cast<T>(0);",
@@ -2081,7 +2080,7 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
         self.gen_add_code_line('#pragma unroll')
         self.gen_add_code_line('for (int jid = 0; jid < NUM_BODIES; ++jid) {', 1)
         self.gen_add_parallel_loop('i','6')
-        self.gen_add_code_line(f"if ({parent_ind_cpp} == -1) a[jid*6+ i] = aJ[jid*6 + i] + gravity * (i == 5); // Base joint's parent is the world")
+        self.gen_add_code_line(f"if ({parent_ind_cpp} == -1) a[jid*6+ i] = aJ[jid*6 + i] - gravity * (i == 5); // Base joint's parent is the world")
         self.gen_add_code_line(f'else a[jid*6 + i] = a[{parent_ind_cpp}*6 + i] + aJ[jid*6 + i];')
         self.gen_add_end_control_flow()
         self.gen_add_sync()
@@ -2100,7 +2099,7 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
                 jid_cpp = str(inds[0])
                 level_parent_ind_cpp = str(self.robot.get_parent_id(inds[0]))
             self.gen_add_code_line(f'int idx = i % 6;')
-            if bfs_level == 0: self.gen_add_code_line(f"a[{jid_cpp}*6+ idx] = aJ[{jid_cpp}*6 + idx] + gravity * (idx == 5); // Base joint's parent is the world")
+            if bfs_level == 0: self.gen_add_code_line(f"a[{jid_cpp}*6+ idx] = aJ[{jid_cpp}*6 + idx] - gravity * (idx == 5); // Base joint's parent is the world")
             else: self.gen_add_code_line(f'a[{jid_cpp}*6 + idx] = a[{level_parent_ind_cpp}*6 + idx] + aJ[{jid_cpp}*6 + idx];')
             self.gen_add_end_control_flow()
             self.gen_add_sync()
@@ -2111,7 +2110,7 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     self.gen_add_code_line('// Initialize a_world')
     self.gen_add_parallel_loop('i','6')
     self.gen_add_code_line('if (i < 5) a_world[i] = 0;')
-    self.gen_add_code_line('else a_world[5] = gravity;')
+    self.gen_add_code_line('else a_world[5] = -gravity; // a_base = gravity_vec[5] = -GRAVITY = +9.81 (gravity=-9.81)')
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     
@@ -3230,10 +3229,10 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_end_control_flow()
     self.gen_add_serial_ops()
     self.gen_add_code_line("// MATLAB convention: a_grav vector with a_grav[5] = GRAVITY (signed, e.g. -9.81).")
-    self.gen_add_code_line("// The CUDA `gravity` parameter is the positive magnitude (+9.81) by GRiD convention,")
-    self.gen_add_code_line("// so use -gravity here to match RBDReference.idsva_so_world_frame's `a_grav[5] = GRAVITY`.")
+    self.gen_add_code_line("// The CUDA `gravity` parameter is the SIGNED gravitational acceleration (-9.81, the")
+    self.gen_add_code_line("// unified GRiD convention), so a_grav[5] = gravity matches RBDReference.idsva_so_world_frame's `a_grav[5] = GRAVITY`.")
     self.gen_add_code_line("S_agrav[0] = static_cast<T>(0); S_agrav[1] = static_cast<T>(0); S_agrav[2] = static_cast<T>(0);")
-    self.gen_add_code_line("S_agrav[3] = static_cast<T>(0); S_agrav[4] = static_cast<T>(0); S_agrav[5] = -gravity;")
+    self.gen_add_code_line("S_agrav[3] = static_cast<T>(0); S_agrav[4] = static_cast<T>(0); S_agrav[5] = gravity;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 

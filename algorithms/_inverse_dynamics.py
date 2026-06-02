@@ -164,10 +164,10 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_lines(["int jid6 = 6*" + jid + ";", \
                                         "s_vaf[jid6 + row] = static_cast<T>(0);",])
             if self.robot.floating_base:
-                root_gravity_code = "(row < 3 ? static_cast<T>(0) : s_XImats[6*jid6 + 6*row + 5] * gravity)"
+                root_gravity_code = "(row < 3 ? static_cast<T>(0) : -s_XImats[6*jid6 + 6*row + 5] * gravity)"
                 self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = " + root_gravity_code + ";")
             else:
-                self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = s_XImats[6*jid6 + 30 + row]*gravity;")
+                self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = -s_XImats[6*jid6 + 30 + row]*gravity;")
             # then add in qd and qdd
             if S_ind_cpp == '-1': # floating base uses the root motion subspace, not raw row-wise copies
                 qd_qdd_code = "int fb_col = row < 3 ? row + 3 : row - 3; s_vaf[jid6 + row] = s_qd[fb_col];"
