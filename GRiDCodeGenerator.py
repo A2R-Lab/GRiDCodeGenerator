@@ -1023,14 +1023,14 @@ class GRiDCodeGenerator:
                                  # g1-spill: per-tier placement of s_Y -- true => smem, false => d_workspace.
                                  "template <int TIER> __host__ __device__ constexpr bool FD_PARAMETER_GRADIENT_Y_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.fd_param_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fd_param_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.fd_param_grad_spill_tier_3way[2] == 0 else "false") + "; }",
                                  # g1-spill: tier-aware. At a spilled tier s_dqdd_dfext (2nd output) moves to d_workspace.
-                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.f_ext_grad_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
                                  # g1-spill: per-tier placement of s_dqdd_dfext -- true => smem, false => d_workspace.
-                                 "template <int TIER> __host__ __device__ constexpr bool F_EXT_GRAD_DQDD_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.f_ext_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.f_ext_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.f_ext_grad_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] + [
+                                 "template <int TIER> __host__ __device__ constexpr bool F_EXT_GRADIENT_DQDD_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.f_ext_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.f_ext_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.f_ext_grad_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "template <typename T> __host__ __device__ inline size_t F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(f_ext_grad_dq_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }"] + [
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MINV_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.minv_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
@@ -1574,7 +1574,7 @@ class GRiDCodeGenerator:
         ]),
         # g1-spill: f_ext_gradient_kernel gained `unsigned char *d_workspace` as its
         # 3rd arg (after the two outputs) so s_dqdd_dfext can spill there at LITE/MINIMAL.
-        ("f_ext_gradient", "f_ext_gradient", None, "F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("f_ext_gradient", "f_ext_gradient", None, "F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("f_ext_gradient_kernel<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
@@ -1583,8 +1583,8 @@ class GRiDCodeGenerator:
         # A.3 (-dJ^T/dq): own kernel + smem macro, fixed-base only. Gated on the
         # instance attr _f_ext_grad_dq_emitted (set True only when the kernel is
         # actually emitted) so the floating-base header — which has neither the
-        # kernel nor the F_EXT_GRAD_DQ_* macro — never references them.
-        ("f_ext_gradient_dq", "f_ext_gradient_dq", "_f_ext_grad_dq_emitted", "F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        # kernel nor the F_EXT_GRADIENT_DQ_* macro — never references them.
+        ("f_ext_gradient_dq", "f_ext_gradient_dq", "_f_ext_grad_dq_emitted", "F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("f_ext_gradient_dq_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_dq_kernel_single_timing<T>",
