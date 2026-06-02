@@ -114,7 +114,7 @@ class GRiDCodeGenerator:
 
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
         all_algorithms = {
-            "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
+            "inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
             "f_ext_grad", "regressor", "fd_parameter_gradient",
@@ -131,31 +131,35 @@ class GRiDCodeGenerator:
             "all": all_algorithms,
             "frame-jacobian": {"end_effector_pose", "minv", "frame_jacobian",
                                "frame_jacobian_dot", "osc_inertia"},
-            "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
+            "dynamics": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
-            "dynamics-core": {"id", "minv", "fd"},
-            "dynamics-gradients": {"id", "minv", "fd", "id_du", "fd_du", "f_ext_grad"},
-            "regressor": {"id", "regressor"},
-            "fd-param-gradient": {"id", "minv", "fd", "regressor", "fd_parameter_gradient"},
-            "f-ext-gradient": {"id", "minv", "f_ext_grad"},
+            "dynamics-core": {"inverse_dynamics", "minv", "forward_dynamics"},
+            "dynamics-gradients": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "f_ext_grad"},
+            "regressor": {"inverse_dynamics", "regressor"},
+            "fd-param-gradient": {"inverse_dynamics", "minv", "forward_dynamics", "regressor", "fd_parameter_gradient"},
+            "f-ext-gradient": {"inverse_dynamics", "minv", "f_ext_grad"},
             "kinematics": {"end_effector_pose"},
             "kinematics-derivatives": {"end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian"},
-            "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame", "fdsva_so"},
-            "integrators": {"id", "minv", "fd", "id_du", "fd_du", "integrator", "integrator_gradient",
+            "second-order": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame", "fdsva_so"},
+            "integrators": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "integrator", "integrator_gradient",
                             "integrator_with_gradient"},
         }
         aliases = {
             "all-dynamics": "dynamics",
             "dynamics-only": "dynamics",
             "kinematics-only": "kinematics",
-            "inverse-dynamics": "id",
-            "rnea": "id",
+            "id": "inverse_dynamics",
+            "inverse-dynamics": "inverse_dynamics",
+            "rnea": "inverse_dynamics",
             "direct-minv": "minv",
-            "forward-dynamics": "fd",
-            "inverse-dynamics-gradient": "id_du",
-            "id-gradient": "id_du",
-            "forward-dynamics-gradient": "fd_du",
-            "fd-gradient": "fd_du",
+            "fd": "forward_dynamics",
+            "forward-dynamics": "forward_dynamics",
+            "id-du": "inverse_dynamics_gradient",
+            "inverse-dynamics-gradient": "inverse_dynamics_gradient",
+            "id-gradient": "inverse_dynamics_gradient",
+            "fd-du": "forward_dynamics_gradient",
+            "forward-dynamics-gradient": "forward_dynamics_gradient",
+            "fd-gradient": "forward_dynamics_gradient",
             "f-ext-grad": "f_ext_grad",
             "fext-grad": "f_ext_grad",
             "f-ext-gradient-only": "f_ext_grad",
@@ -206,18 +210,18 @@ class GRiDCodeGenerator:
             algorithms.add("frame_jacobian")
         if "frame_jacobian" in algorithms:
             algorithms.update({"end_effector_pose", "minv"})
-        if "fd_du" in algorithms:
-            algorithms.update({"id", "minv", "fd", "id_du"})
-        if "id_du" in algorithms:
-            algorithms.add("id")
+        if "forward_dynamics_gradient" in algorithms:
+            algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient"})
+        if "inverse_dynamics_gradient" in algorithms:
+            algorithms.add("inverse_dynamics")
         # f_ext gradient: dtau/dfext reuses the RNEA spatial-transform load (id),
         # dqdd/dfext reuses direct_minv's inner (minv).
         if "f_ext_grad" in algorithms:
-            algorithms.update({"id", "minv"})
+            algorithms.update({"inverse_dynamics", "minv"})
         if "aba" in algorithms and self.robot.floating_base:
-            algorithms.update({"id", "minv", "fd"})
+            algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "fdsva_so" in algorithms:
-            algorithms.update({"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame"})
+            algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame"})
         # Mimic Minv routes through crba_inner (see _direct_minv.py: the reduced-space
         # M is built via CRBA then inverted), so any mimic robot emitting `minv` has a
         # hidden dependency on `crba` for the crba_inner definition. Declare it so the
@@ -227,9 +231,9 @@ class GRiDCodeGenerator:
         if "minv" in algorithms and self.robot_has_mimic_joints():
             algorithms.add("crba")
         if "idsva_so_body_frame" in algorithms:
-            algorithms.add("id")
+            algorithms.add("inverse_dynamics")
             if self.robot.floating_base:
-                algorithms.add("id_du")
+                algorithms.add("inverse_dynamics_gradient")
         # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
         # Floating-base integrator gradients are emitted for all five types
         # (Euler / SI-Euler / Midpoint / RK3 / RK4) and validated against
@@ -239,9 +243,9 @@ class GRiDCodeGenerator:
         # (missing __syncthreads + a 6-way root accumulation), correct at 32
         # threads and racing above one warp. Fixed; see HANDOFF.md §3.
         if "integrator" in algorithms:
-            algorithms.update({"id", "minv", "fd"})
+            algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
-            algorithms.update({"id", "minv", "fd", "id_du", "fd_du"})
+            algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient"})
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -1488,7 +1492,7 @@ class GRiDCodeGenerator:
 
     KERNEL_ATTR_MANIFEST = [
         # (algo_label, algo_short, gate_attr, bytes_macro, [(kernel_name<T>, signature), ...])
-        ("inverse_dynamics", "id", None, "ID_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("inverse_dynamics", "inverse_dynamics", None, "ID_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_kernel<T>",
              "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel<T>",
@@ -1504,7 +1508,7 @@ class GRiDCodeGenerator:
             ("direct_minv_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("forward_dynamics", "fd", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("forward_dynamics", "forward_dynamics", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("forward_dynamics_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_kernel_single_timing<T>",
@@ -1534,7 +1538,7 @@ class GRiDCodeGenerator:
             ("end_effector_pose_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("inverse_dynamics_gradient", "id_du", "generate_id_du", "ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("inverse_dynamics_gradient", "inverse_dynamics_gradient", "generate_id_du", "ID_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel<T>",
@@ -1544,7 +1548,7 @@ class GRiDCodeGenerator:
             ("inverse_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
-        ("forward_dynamics_gradient", "fd_du", "generate_fd_du", "FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("forward_dynamics_gradient", "forward_dynamics_gradient", "generate_fd_du", "FD_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("forward_dynamics_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel<T>",
@@ -1650,13 +1654,13 @@ class GRiDCodeGenerator:
         # (RNEA bias wrappers); com/ccrba/energy gate on `ee_pose` (homogeneous-
         # transform world-frame machinery). algo_short keys an entry that is in
         # generated_algorithms exactly when the dep is present.
-        ("generalized_gravity", "id", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("generalized_gravity", "inverse_dynamics", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("generalized_gravity_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("generalized_gravity_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("nonlinear_effects", "id", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("nonlinear_effects", "inverse_dynamics", None, "ID_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("nonlinear_effects_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("nonlinear_effects_kernel_single_timing<T>",
@@ -1833,21 +1837,21 @@ class GRiDCodeGenerator:
         aba_call = "aba<T,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
         crba_call = "crba<T,false,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
 
-        if has_all(("id", "minv", "fd")):
+        if has_all(("inverse_dynamics", "minv", "forward_dynamics")):
             core_calls = [id_call, minv_call, fd_call]
             emit_dynamics_combo("dynamics_core", "Run inverse dynamics, Minv, and forward dynamics in sequence", core_calls)
             emit_dynamics_combo("id_minv_fd", "Run inverse dynamics, Minv, and forward dynamics in sequence", core_calls)
 
-        if has_all(("id", "id_du")):
+        if has_all(("inverse_dynamics", "inverse_dynamics_gradient")):
             emit_dynamics_combo("id_and_id_gradient", "Run inverse dynamics and its first derivative in sequence", [id_call, id_du_call])
 
-        if has_all(("fd", "fd_du")):
+        if has_all(("forward_dynamics", "forward_dynamics_gradient")):
             emit_dynamics_combo("fd_and_fd_gradient", "Run forward dynamics and its first derivative in sequence", [fd_call, fd_du_call])
 
-        if has_all(("id_du", "fd_du")):
+        if has_all(("inverse_dynamics_gradient", "forward_dynamics_gradient")):
             emit_dynamics_combo("dynamics_gradients", "Run inverse and forward dynamics gradients in sequence", [id_du_call, fd_du_call])
 
-        if has_all(("id", "minv", "fd", "id_du", "fd_du")):
+        if has_all(("inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient")):
             calls = [id_call, minv_call, fd_call, id_du_call, fd_du_call]
             if "aba" in algorithms:
                 calls.append(aba_call)
@@ -1921,7 +1925,7 @@ class GRiDCodeGenerator:
         per-body Jacobian fold isn't mimic-reduced yet) — gravity/bias still
         emit since they reuse the mimic-aware RNEA inner."""
         # R1 generalized_gravity / nonlinear_effects: RNEA bias wrappers.
-        if "id" in algorithms:
+        if "inverse_dynamics" in algorithms:
             self.gen_id_bias(gravity_only=True)
             self.gen_id_bias(gravity_only=False)
         else:
@@ -2031,11 +2035,11 @@ class GRiDCodeGenerator:
                     "gradient algorithm(s) " + ", ".join(requested_gradients) + ". "
                     "These would emit silently-zeroed output (no valid mimic-reduced "
                     "gradient exists yet). Re-run with a non-gradient profile/algorithm "
-                    "list (e.g. 'dynamics-core', or id/fd/aba/crba/minv/ee_pose/integrator) "
+                    "list (e.g. 'dynamics-core', or inverse_dynamics/forward_dynamics/aba/crba/minv/end_effector_pose/integrator) "
                     "to codegen this robot."
                 )
-        self.generate_id_du = "id_du" in algorithms
-        self.generate_fd_du = "fd_du" in algorithms
+        self.generate_id_du = "inverse_dynamics_gradient" in algorithms
+        self.generate_fd_du = "forward_dynamics_gradient" in algorithms
         self.generate_end_effector_pose_hessian = "end_effector_pose_hessian" in algorithms
         self.enable_floating_second_order = enable_floating_second_order
         allow_second_order = (not self.robot.floating_base) or enable_floating_second_order
@@ -2217,24 +2221,24 @@ class GRiDCodeGenerator:
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
-        if "id" in algorithms:
+        if "inverse_dynamics" in algorithms:
             self.gen_inverse_dynamics()
         # E1: joint-torque regressor Y (tau = Y . pi). Additive; reuses the RNEA
-        # forward sweep emitted by gen_inverse_dynamics (requires "id").
+        # forward sweep emitted by gen_inverse_dynamics (requires "inverse_dynamics").
         if "regressor" in algorithms:
             self.gen_inverse_dynamics_regressor()
         if "minv" in algorithms:
             self.gen_direct_minv()
-        if "fd" in algorithms:
+        if "forward_dynamics" in algorithms:
             self.gen_forward_dynamics()
         # FD parameter gradient dqdd/dpi = -Minv . Y. Additive; composes the
         # regressor (Y), direct_minv (Minv) and inverse_dynamics/forward_dynamics
-        # inners, so it requires "id", "minv", "fd" and "regressor" co-emitted.
+        # inners, so it requires "inverse_dynamics", "minv", "forward_dynamics" and "regressor" co-emitted.
         if "fd_parameter_gradient" in algorithms:
             self.gen_fd_parameter_gradient()
-        if "id_du" in algorithms:
+        if "inverse_dynamics_gradient" in algorithms:
             self.gen_inverse_dynamics_gradient()
-        if "fd_du" in algorithms:
+        if "forward_dynamics_gradient" in algorithms:
             self.gen_forward_dynamics_gradient()
         if "f_ext_grad" in algorithms:
             self.gen_f_ext_gradient()

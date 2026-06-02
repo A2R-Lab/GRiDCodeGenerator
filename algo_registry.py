@@ -40,11 +40,11 @@ class AlgoEntry:
 
 ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     # Core Dynamics
-    AlgoEntry("id",                   "ID (Inverse Dynamics)",
-              "Core Dynamics", legacy_labels=("inverse dynamics",)),
+    AlgoEntry("inverse_dynamics",     "Inverse Dynamics (RNEA / Recursive Newton-Euler Algorithm)",
+              "Core Dynamics"),
     AlgoEntry("minv",                 "Minv (M⁻¹)",
               "Core Dynamics", legacy_labels=("minv (direct)",)),
-    AlgoEntry("fd",                   "FD (Minv+RNEA)",
+    AlgoEntry("forward_dynamics",     "Forward Dynamics (Minv+RNEA)",
               "Core Dynamics", legacy_labels=("forward dynamics",)),
     AlgoEntry("aba",                  "ABA (Articulated Body)",
               "Core Dynamics", legacy_labels=("aba (articulated body)",)),
@@ -52,8 +52,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Core Dynamics"),
 
     # Gradients
-    AlgoEntry("id_du",                "ID_DU (∂ID/∂q,v)",                  "Gradients"),
-    AlgoEntry("fd_du",                "FD_DU (∂FD/∂q,v)",                  "Gradients"),
+    AlgoEntry("inverse_dynamics_gradient", "Inverse Dynamics Gradient (∂ID/∂q,v)", "Gradients"),
+    AlgoEntry("forward_dynamics_gradient", "Forward Dynamics Gradient (∂FD/∂q,v)", "Gradients"),
     AlgoEntry("f_ext_gradient",       "F_EXT_GRAD (∂tau/∂fext=-Jᵀ, ∂q̈/∂fext=M⁻¹Jᵀ)",
               "Gradients"),
     AlgoEntry("f_ext_gradient_dq",    "F_EXT_GRAD_DQ (∂(id_du)/∂fext=-∂Jᵀ/∂q, fixed base)",

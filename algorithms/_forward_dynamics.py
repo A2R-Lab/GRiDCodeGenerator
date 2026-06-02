@@ -312,7 +312,7 @@ def gen_forward_dynamics_host(self, mode = 0):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("fd"))
+        self.gen_add_code_line(single_call_printf_line("forward_dynamics"))
     self.gen_add_end_function()
 
 def gen_forward_dynamics(self):

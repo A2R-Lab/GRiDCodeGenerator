@@ -652,7 +652,7 @@ def gen_inverse_dynamics_host(self, mode = 0):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("id"))
+        self.gen_add_code_line(single_call_printf_line("inverse_dynamics"))
     self.gen_add_end_function()
 
 def gen_inverse_dynamics(self):
