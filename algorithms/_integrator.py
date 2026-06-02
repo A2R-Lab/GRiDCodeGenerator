@@ -737,7 +737,7 @@ def gen_integrator_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (the PERF cap), NOT tier_max_threads:
     # the integrator is register-bound by its RBD callees (load_update_XImats ~86,
-    # direct_minv_inner ~92, inverse_dynamics_gradient_inner ~99 regs), so the
+    # minv_inner ~92, inverse_dynamics_gradient_inner ~99 regs), so the
     # LITE/MINIMAL thread-count bump (-> fewer regs/thread) starves them and ptxas
     # errors under -rdc=true (callee regcount > caller cap). The integrator's tier
     # behavior is the surgical Minv-F smem spill, which is independent of launch_bounds.

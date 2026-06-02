@@ -573,8 +573,7 @@ def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
     (d_temp_spill) default to nullptr (unused under the matching if-constexpr); the
     kernel passes real pointers per tier. s_D_qdd_stage / s_dAB remain SEPARATE
     caller-placed pointers — they are threaded through unchanged."""
-    suffix = "_with_x_kp1" if compute_x_kp1 else ""
-    fname = "integrator_gradient" + suffix + "_device"
+    fname = ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient") + "_device"
     tmpl = "<T, IT, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + ">"
     start = fname + tmpl + "(s_dAB, "
     if compute_x_kp1:
@@ -619,8 +618,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
     XImats from the freshly-mutated s_q)."""
     n = self.robot.get_num_vel()
     fb = self.robot.floating_base
-    suffix = "_with_x_kp1" if compute_x_kp1 else ""
-    fname = "integrator_gradient" + suffix + "_device"
+    fname = ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient") + "_device"
     func_params = [
         "s_dAB is the output [A | B] buffer (caller places); size 2*NUM_VEL*3*NUM_VEL = " + str(2 * n * 3 * n),
     ]
@@ -693,7 +691,6 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
 
 def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing=False):
     n = self.robot.get_num_vel()
-    suffix = "_with_x_kp1" if compute_x_kp1 else ""
     func_params = ["d_dAB is a pointer to memory for [A | B] of size 2*NUM_VEL*3*NUM_VEL per timestep"]
     if compute_x_kp1:
         func_params.append("d_x_kp1 is a pointer to memory for the next state (size 2*NUM_VEL per timestep)")
@@ -708,7 +705,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     sig_x_kp1 = "T *d_x_kp1, " if compute_x_kp1 else ""
     # d_workspace holds the L2-pinned scratch the s_D_qdd_stage buffer spills to
     # at LITE/MINIMAL (mirrors forward_dynamics_gradient_kernel's d_workspace).
-    func_def_start = ("void integrator_gradient" + suffix + "_kernel(T *d_dAB, " + sig_x_kp1 +
+    func_def_start = ("void " + ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient") + "_kernel(T *d_dAB, " + sig_x_kp1 +
                       "unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, ")
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
@@ -728,7 +725,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     self.gen_add_code_line("__launch_bounds__(MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line(func_def, True)
     inner_temp_full = self.gen_integrator_gradient_inner_temp_mem_size()
-    inner_temp_selective = max(self.gen_direct_minv_inner_temp_mem_size(),
+    inner_temp_selective = max(self.gen_minv_inner_temp_mem_size(),
                                self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
     fb = self.robot.floating_base
     max_stages = _max_stages_in_use()
@@ -887,8 +884,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
 def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     single_call_timing = mode == 1
     compute_only = mode == 2
-    suffix = "_with_x_kp1" if compute_x_kp1 else ""
-    base_name = "integrator_gradient" + suffix
+    base_name = ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient")
     func_params = ["hd_data is the packaged input and output pointers",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
                    "gravity is the gravity constant",

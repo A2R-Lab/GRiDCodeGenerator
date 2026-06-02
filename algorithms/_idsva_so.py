@@ -2917,7 +2917,7 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void idsva_so_body_frame_host(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void idsva_so_body_frame(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -2932,7 +2932,7 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_body_frame_host requires all-data or dynamics gridData\");")
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_body_frame requires all-data or dynamics gridData\");")
     func_call_start = "idsva_so_body_frame_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
@@ -3897,7 +3897,7 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
         "num_timesteps is the length of the trajectory points",
         "streams are pointers to CUDA streams",
     ]
-    func_def_start = "void idsva_so_world_frame_host(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void idsva_so_world_frame(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end =   "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -3910,7 +3910,7 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_world_frame_host requires all-data or dynamics gridData\");")
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_world_frame requires all-data or dynamics gridData\");")
     func_call_start = "idsva_so_world_frame_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
@@ -4108,7 +4108,7 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         # The underlying wrapper handles all memcpy + launch + sync correctly,
         # and neither mode emits a single-call printf label — so the label
         # collision doesn't apply here.
-        target = f"idsva_so_{frame_suffix}_host"
+        target = f"idsva_so_{frame_suffix}"
         if compute_only:
             target += "_compute_only"
         forward_args = "hd_data, d_robotModel, gravity, num_timesteps, block_dimms, thread_dimms"

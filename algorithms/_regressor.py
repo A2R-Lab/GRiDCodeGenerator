@@ -410,7 +410,7 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
         self.gen_add_code_line("gpuErrchkKernel();")
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("regressor"))
+        self.gen_add_code_line(single_call_printf_line("inverse_dynamics_regressor"))
     self.gen_add_end_function()
 
 
@@ -431,25 +431,25 @@ def gen_inverse_dynamics_regressor(self):
 # From M(pi) qdd + c(q,qd,pi) = u (u fixed), d/dpi gives
 #     dqdd/dpi = -Minv . Y(q, qd, qdd_actual)
 # because ID = M qdd + c is affine in pi with Jacobian Y at the *actual* qdd.
-# Composes existing device inners: direct_minv (Minv), inverse_dynamics (bias c
+# Composes existing device inners: minv (Minv), inverse_dynamics (bias c
 # -> qdd_actual via Minv.(u-c)), then the regressor Y at qdd_actual, then the
 # symmetric-upper -Minv . Y apply. Output is nv x 10*NUM_BODIES, NOT a gridData
 # field (additive); the host launcher takes an explicit d_dqdd_dpi pointer.
 # ===========================================================================
 
-def gen_fd_parameter_gradient_inner_temp_mem_size(self):
+def gen_forward_dynamics_parameter_gradient_inner_temp_mem_size(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
     # live footprint = max of the sub-step temps; the regressor inner temp is the
-    # RNEA forward scratch (== id inner temp), direct_minv inner temp is its own.
-    minv_temp = self.gen_direct_minv_inner_temp_mem_size()
+    # RNEA forward scratch (== id inner temp), minv inner temp is its own.
+    minv_temp = self.gen_minv_inner_temp_mem_size()
     reg_temp = self.gen_inverse_dynamics_regressor_inner_temp_mem_size()
     id_temp = self.gen_inverse_dynamics_inner_temp_mem_size()
     return max(minv_temp, reg_temp, id_temp)
 
 
-def gen_fd_parameter_gradient_inner_function_call(self, updated_var_names=None):
+def gen_forward_dynamics_parameter_gradient_inner_function_call(self, updated_var_names=None):
     var_names = dict(
         s_dqdd_dpi_name="s_dqdd_dpi",
         s_Minv_name="s_Minv",
@@ -466,7 +466,7 @@ def gen_fd_parameter_gradient_inner_function_call(self, updated_var_names=None):
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
             var_names[key] = value
-    code_start = "fd_parameter_gradient_inner<T>(" + var_names["s_dqdd_dpi_name"] + ", " + \
+    code_start = "forward_dynamics_parameter_gradient_inner<T>(" + var_names["s_dqdd_dpi_name"] + ", " + \
         var_names["s_Minv_name"] + ", " + var_names["s_Y_name"] + ", " + \
         var_names["s_qdd_name"] + ", " + var_names["s_vaf_name"] + ", " + \
         var_names["s_c_name"] + ", " + var_names["s_q_name"] + ", " + \
@@ -476,7 +476,7 @@ def gen_fd_parameter_gradient_inner_function_call(self, updated_var_names=None):
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 
-def gen_fd_parameter_gradient_inner(self):
+def gen_forward_dynamics_parameter_gradient_inner(self):
     n = self.robot.get_num_joints()
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
@@ -491,14 +491,14 @@ def gen_fd_parameter_gradient_inner(self):
         "s_q is the vector of joint positions",
         "s_qd is the vector of joint velocities",
         "s_u is the vector of joint input torques",
-        "s_temp is helper shared memory of size " + str(self.gen_fd_parameter_gradient_inner_temp_mem_size()),
+        "s_temp is helper shared memory of size " + str(self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size()),
         "gravity is the gravity constant",
     ]
     func_notes = [
         "Assumes the XI matricies have already been updated for the given q",
         "dqdd/dpi = -Minv . Y(q,qd,qdd_actual) with qdd_actual = Minv.(u-c)",
     ]
-    func_def_start = "void fd_parameter_gradient_inner(T *s_dqdd_dpi, T *s_Minv, T *s_Y, T *s_qdd, T *s_vaf, T *s_c, const T *s_q, const T *s_qd, const T *s_u, "
+    func_def_start = "void forward_dynamics_parameter_gradient_inner(T *s_dqdd_dpi, T *s_Minv, T *s_Y, T *s_qdd, T *s_vaf, T *s_c, const T *s_q, const T *s_qd, const T *s_u, "
     func_def_end = "T *s_temp, const T gravity) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params("", func_params, -1)
     func_def = func_def_start + func_def_middle + func_def_end
@@ -509,9 +509,9 @@ def gen_fd_parameter_gradient_inner(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    # 1) Minv (symmetric-upper) via direct_minv inner (F kept in smem).
+    # 1) Minv (symmetric-upper) via minv inner (F kept in smem).
     self.gen_add_code_line("// Minv = inv(M(q)) (symmetric-upper)")
-    self.gen_direct_minv_inner_function_call(f_in_smem_expr="true")
+    self.gen_minv_inner_function_call(f_in_smem_expr="true")
     self.gen_add_sync()
 
     # 2) bias c = ID(q, qd, qdd=0) via inverse_dynamics inner (compute_c, no qdd).
@@ -550,14 +550,14 @@ def gen_fd_parameter_gradient_inner(self):
     self.gen_add_end_function()
 
 
-def gen_fd_parameter_gradient_device_temp_mem_size(self):
+def gen_forward_dynamics_parameter_gradient_device_temp_mem_size(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    return self.gen_fd_parameter_gradient_inner_temp_mem_size() + \
+    return self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size() + \
         18 * n + self.gen_topology_helpers_size() + 72 * n
 
 
-def gen_fd_parameter_gradient_device(self):
+def gen_forward_dynamics_parameter_gradient_device(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
@@ -569,9 +569,9 @@ def gen_fd_parameter_gradient_device(self):
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
         "gravity is the gravity constant",
     ]
-    func_def = ("void fd_parameter_gradient_device(T *s_dqdd_dpi, const T *s_q, const T *s_qd, const T *s_u, "
+    func_def = ("void forward_dynamics_parameter_gradient_device(T *s_dqdd_dpi, const T *s_q, const T *s_qd, const T *s_u, "
                 "const robotModel<T> *d_robotModel, const T gravity) {")
-    shared_mem_size = self.gen_fd_parameter_gradient_inner_temp_mem_size()
+    shared_mem_size = self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size()
     extra_t_buffers = [
         ("s_Minv", nv * nv), ("s_Y", nv * 10 * NB), ("s_qdd", nv),
         ("s_vaf", 18 * n), ("s_c", nv),
@@ -579,12 +579,12 @@ def gen_fd_parameter_gradient_device(self):
     self.gen_device_wrapper(
         "Compute the FD param gradient dqdd/dpi = -Minv . Y", func_def,
         shared_mem_size,
-        lambda: self.gen_fd_parameter_gradient_inner_function_call(),
+        lambda: self.gen_forward_dynamics_parameter_gradient_inner_function_call(),
         func_params=func_params,
         extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
 
 
-def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
+def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=False):
     NUM_POS = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
@@ -604,7 +604,7 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
     # (default) it stays in smem and d_workspace is unused. Default TIER keeps the
     # arena byte-identical, but the extra arg changes the signature -- the host
     # wrapper passes hd_data->d_workspace.
-    func_def_start = "void fd_parameter_gradient_kernel(T *d_dqdd_dpi, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
+    func_def_start = "void forward_dynamics_parameter_gradient_kernel(T *d_dqdd_dpi, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -625,7 +625,7 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
         ("s_q_qd_u", in_size), ("s_dqdd_dpi", out_size), ("s_Minv", nv * nv),
         ("s_qdd", nv), ("s_vaf", 18 * NUM_POS), ("s_c", nv), ("s_Y", "FPG_Y_SLOT"),
     ]
-    shared_mem_size = self.gen_fd_parameter_gradient_inner_temp_mem_size()
+    shared_mem_size = self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("if constexpr (FPG_Y_IN_SMEM) { (void)d_workspace; }")
@@ -649,7 +649,7 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
         _repoint_spilled_Y(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
-        self.gen_fd_parameter_gradient_inner_function_call()
+        self.gen_forward_dynamics_parameter_gradient_inner_function_call()
         self.gen_add_sync()
         self.gen_kernel_save_result("dqdd_dpi", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
@@ -659,14 +659,14 @@ def gen_fd_parameter_gradient_kernel(self, single_call_timing=False):
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call()
-        self.gen_fd_parameter_gradient_inner_function_call()
+        self.gen_forward_dynamics_parameter_gradient_inner_function_call()
         self.gen_add_sync()
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("dqdd_dpi", str(out_size))
     self.gen_add_end_function()
 
 
-def gen_fd_parameter_gradient_host(self, mode=0):
+def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
     nv = self.robot.get_num_vel()
@@ -680,7 +680,7 @@ def gen_fd_parameter_gradient_host(self, mode=0):
         "num_timesteps is the length of the trajectory points",
         "streams are pointers to CUDA streams for async memory transfers",
     ]
-    func_def_start = "void fd_parameter_gradient(gridData<T, KIND> *hd_data, T *d_dqdd_dpi, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
+    func_def_start = "void forward_dynamics_parameter_gradient(gridData<T, KIND> *hd_data, T *d_dqdd_dpi, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"
     func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -693,10 +693,10 @@ def gen_fd_parameter_gradient_host(self, mode=0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fd_parameter_gradient requires all-data or dynamics gridData\");")
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_parameter_gradient requires all-data or dynamics gridData\");")
     # g1-spill: pass hd_data->d_workspace as the kernel's 2nd arg. At the spilled
     # default tier (s_Y in d_workspace) it is read; at TIER_SHARED it is unused.
-    func_call_start = "fd_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -718,21 +718,21 @@ def gen_fd_parameter_gradient_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fd_parameter_gradient\", FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_parameter_gradient\", FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     self.gen_add_code_line("gpuErrchkKernel();")
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("fd_parameter_gradient"))
+        self.gen_add_code_line(single_call_printf_line("forward_dynamics_parameter_gradient"))
     self.gen_add_end_function()
 
 
-def gen_fd_parameter_gradient(self):
+def gen_forward_dynamics_parameter_gradient(self):
     # inner -> device -> kernel(s) -> host(s)
-    self.gen_fd_parameter_gradient_inner()
-    self.gen_fd_parameter_gradient_device()
-    self.gen_fd_parameter_gradient_kernel(single_call_timing=False)
-    self.gen_fd_parameter_gradient_kernel(single_call_timing=True)
-    self.gen_fd_parameter_gradient_host(0)
-    self.gen_fd_parameter_gradient_host(1)
-    self.gen_fd_parameter_gradient_host(2)
+    self.gen_forward_dynamics_parameter_gradient_inner()
+    self.gen_forward_dynamics_parameter_gradient_device()
+    self.gen_forward_dynamics_parameter_gradient_kernel(single_call_timing=False)
+    self.gen_forward_dynamics_parameter_gradient_kernel(single_call_timing=True)
+    self.gen_forward_dynamics_parameter_gradient_host(0)
+    self.gen_forward_dynamics_parameter_gradient_host(1)
+    self.gen_forward_dynamics_parameter_gradient_host(2)

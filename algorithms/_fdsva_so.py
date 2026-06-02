@@ -271,7 +271,7 @@ def gen_fdsva_so_device(self):
     """Emit `fdsva_so_device` — the whole fdsva_so orchestration as ONE
     inner that OWNS its scratch (s_temp) placement (inner-owns-placement; see
     docs/idsva_so_inner_refactor_notes.md). It wraps, in order:
-      load_update_XImats -> direct_minv_inner -> forward_dynamics_inner ->
+      load_update_XImats -> minv_inner -> forward_dynamics_inner ->
       fd-gradient-inline -> idsva_so_{world,body}_inner -> fdsva_so_contract.
     Because the s_temp repoint happens at the very top, EVERY consumer below —
     including the XImats helper's sincos scratch — follows the placement, so the
@@ -310,7 +310,7 @@ def gen_fdsva_so_device(self):
     self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc (single-call/anti-LICM build) a separate __device__ wrapper keeps
-    # its callees (e.g. direct_minv_inner, ~108 regs) as distinct functions whose
+    # its callees (e.g. minv_inner, ~108 regs) as distinct functions whose
     # regcount must fit the kernel's launch_bounds budget (80 at LITE / 64 at
     # MINIMAL) -> ptxas regcount error. Inlining folds them into the kernel (as the
     # pre-refactor inline orchestration did). See HANDOFF.md / "Problem 1".
@@ -321,7 +321,7 @@ def gen_fdsva_so_device(self):
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;  // idsva uses the (placed) s_temp pool directly")
     self.gen_load_update_XImats_helpers_function_call()
-    self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
+    self.gen_minv_inner_function_call(f_in_smem_expr = "true")
     self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, nullptr, gravity);")
     self.gen_add_sync()
     # fd-gradient inline; the band-spill variant is a compile-time choice.

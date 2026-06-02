@@ -317,7 +317,7 @@ def _gen_aba_inner_mimic_fixed(self, NB):
     """Mimic fixed-base aba_inner = ID(bias) + Minv + qdd = Minv*(tau - bias).
 
     Composes the already-mimic-aware inverse_dynamics_inner (compute_c) and
-    direct_minv_inner (= inv(CRBA)). s_temp layout (sized in
+    minv_inner (= inv(CRBA)). s_temp layout (sized in
     gen_aba_inner_temp_mem_size):
       [0, NV)                  s_c       (bias / generalized force)
       [NV, NV+18*NB)           s_vaf     (ID intermediate band)
@@ -342,8 +342,8 @@ def _gen_aba_inner_mimic_fixed(self, NB):
         updated_var_names=dict(s_c_name="s_aba_c", s_vaf_name="s_aba_vaf",
                                s_temp_name="s_aba_work"))
     self.gen_add_sync()
-    # Minv = inv(CRBA(q)) via the mimic direct_minv_inner path.
-    self.gen_direct_minv_inner_function_call(
+    # Minv = inv(CRBA(q)) via the mimic minv_inner path.
+    self.gen_minv_inner_function_call(
         updated_var_names=dict(s_Minv_name="s_aba_Minv", s_temp_name="s_aba_work",
                                d_workspace_name="nullptr"),
         f_in_smem_expr="true")
@@ -797,7 +797,7 @@ def gen_aba_inner_temp_mem_size(self):
         # s_work is shared by ID's inner temp (6*NJ) and minv's full inner band
         # (F = 6*NV*NV + no_F), which run sequentially.
         nv = self.robot.get_num_vel()
-        minv_full = self.gen_direct_minv_inner_temp_mem_size()  # 6*NV*NV + no_F
+        minv_full = self.gen_minv_inner_temp_mem_size()  # 6*NV*NV + no_F
         work = max(self.gen_inverse_dynamics_inner_temp_mem_size(), minv_full)
         return nv + 18 * n + nv * nv + work
     if self.robot.floating_base:

@@ -23,7 +23,7 @@ def gen_forward_dynamics_inner_temp_mem_size(self, minv_f_in_smem = True):
         NJ = self.robot.get_num_joints()
         id_band = (n + 18 * (NJ if self.robot_has_mimic_joints() else n)
                    + self.gen_inverse_dynamics_inner_temp_mem_size())
-        minv_footprint = self.gen_direct_minv_inner_no_F_size() + (6*nv*nv if minv_f_in_smem else 0)
+        minv_footprint = self.gen_minv_inner_no_F_size() + (6*nv*nv if minv_f_in_smem else 0)
         return n*n + max(minv_footprint, id_band)
 
 def gen_forward_dynamics_finish_function_call(self, updated_var_names = None):
@@ -118,7 +118,7 @@ def gen_forward_dynamics_inner(self):
     updated_var_names = dict(s_Minv_name = "s_temp",
                              s_temp_name = "&s_temp[" + str(n*n) + "]",
                              d_workspace_name = "d_workspace")
-    self.gen_direct_minv_inner_function_call(updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
+    self.gen_minv_inner_function_call(updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
     updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
     self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
     

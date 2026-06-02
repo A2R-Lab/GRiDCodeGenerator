@@ -104,7 +104,7 @@ def gen_plant_step_gradient(self, with_value=False):
     ]
     nq = self.robot.get_num_pos()
     self.gen_add_func_doc("Plant step gradient [A|B]" + (" + value" if with_value else "") +
-                          " (thin wrapper over grid::integrator_gradient" + ("_with_x_kp1" if with_value else "") +
+                          " (thin wrapper over grid::" + ("integrator_with_gradient" if with_value else "integrator_gradient") +
                           "_device — pass-through)",
                           [], func_params, None)
     self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
@@ -126,7 +126,7 @@ def gen_plant_step_gradient(self, with_value=False):
     self.gen_add_code_line(sig + sig_middle + sig_end, True)
     self.gen_add_code_line("T *s_q  = s_x;")
     self.gen_add_code_line("T *s_qd = &s_x[" + str(nq) + "];")
-    inner = "grid::integrator_gradient" + ("_with_x_kp1" if with_value else "") + "_device" \
+    inner = "grid::" + ("integrator_with_gradient" if with_value else "integrator_gradient") + "_device" \
             "<T, IT, SCRATCH_IN_SMEM, USE_DA_DF_SPILL>(s_dAB, "
     if with_value:
         inner += "s_x_kp1, "

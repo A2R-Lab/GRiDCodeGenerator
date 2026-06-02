@@ -712,7 +712,7 @@ def gen_device_wrapper(self, func_desc, func_def, shared_mem_size, inner_call_fn
                        extra_t_buffers = None, include_linalg_scratch = True,
                        tier_workspace_expr = None, skip_floating_base_X = False):
     """Emit the shared `__device__` wrapper skeleton common to the simple
-    inline-CUDA device entry points (id / fd / aba / crba / direct_minv /
+    inline-CUDA device entry points (id / fd / aba / crba / minv /
     idsva_so / integrator). Each of these repeats the identical sequence:
 
         gen_add_func_doc(...)

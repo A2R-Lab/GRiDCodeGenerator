@@ -356,28 +356,28 @@ def gen_osc_inertia_device(self):
     joint-space inverse mass matrix Minv, then invert the 6x6 task matrix via
     the block-cooperative GLASS Gauss-Jordan (`invert_matrix`).
 
-    SELF-CONTAINED: Minv is composed ON DEVICE here via `direct_minv_inner`
+    SELF-CONTAINED: Minv is composed ON DEVICE here via `minv_inner`
     (the kernel takes only q, no caller-provided Minv). The arena carries BOTH
-    transform families — the spatial `s_XImats` (6x6) that direct_minv consumes
+    transform families — the spatial `s_XImats` (6x6) that minv consumes
     AND the homogeneous `s_XmatsHom` (4x4) that the Jacobian consumes — loaded
     by their respective `load_update_*` helpers (both already emitted whenever
     the frame_jacobian key is selected, since it pulls in {ee_pose, minv}).
 
     Plumbing:
-      * direct_minv_inner is templated <T, F_IN_SMEM>; we pass F_IN_SMEM=false
+      * minv_inner is templated <T, F_IN_SMEM>; we pass F_IN_SMEM=false
         and hand it a dedicated SHARED `s_F` buffer (6*NV*NV) as its
         `d_workspace` arg, so the heavy F-region lives in smem WITHOUT having to
         thread it through the tail of s_temp (avoids the no_F+F contiguity the
-        F_IN_SMEM=true path assumes). s_temp is sized to direct_minv's no_F
+        F_IN_SMEM=true path assumes). s_temp is sized to minv's no_F
         region (>= the Jacobian inner's 16*NJ world-transform scratch).
-      * direct_minv emits SYMMETRIC_UPPER; we densify to a full symmetric
+      * minv emits SYMMETRIC_UPPER; we densify to a full symmetric
         s_Minv before the J*Minv*J^T contraction (floating-base output is
         already full-symmetric, but the densify read is symmetric-safe either
         way: read the upper-triangle source for every (r,c))."""
     nv = self.robot.get_num_vel()
     Xhom_size, _, _ = self.gen_get_Xhom_size()             # local homogeneous 4x4 transforms
-    no_F_size = self.gen_direct_minv_inner_no_F_size()
-    F_size = self.gen_direct_minv_inner_F_size()
+    no_F_size = self.gen_minv_inner_no_F_size()
+    F_size = self.gen_minv_inner_F_size()
     # s_temp serves BOTH the minv inner (no_F region) and the Jacobian inner
     # (16*NJ world-transform scratch); they run sequentially so size by the max.
     temp_size = max(no_F_size, _frame_jacobian_inner_temp_mem_size(self))
@@ -390,14 +390,14 @@ def gen_osc_inertia_device(self):
                    "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
                    "s_q is the joint position vector",
                    "d_robotModel is the GPU model helpers"]
-    func_notes = ["Lambda = (J Minv J^T)^{-1}; self-contained — Minv is composed on device via direct_minv_inner (no caller Minv)."]
+    func_notes = ["Lambda = (J Minv J^T)^{-1}; self-contained — Minv is composed on device via minv_inner (no caller Minv)."]
     self.gen_add_func_doc("Compute the operational-space (task) inertia",
                           func_notes, func_params, None)
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    # Arena: BOTH transform families + Minv + the direct_minv F-region (passed
+    # Arena: BOTH transform families + Minv + the minv F-region (passed
     # as d_workspace) + the Jacobian J + the J*Minv*J^T compose scratch.
     # s_Lambda is a param. s_XImats / s_temp / topology / linalg are emitted by
     # gen_XImats_helpers_temp_shared_memory_code; the rest are extra_t_buffers.
@@ -407,12 +407,12 @@ def gen_osc_inertia_device(self):
         temp_size, extra_t_buffers=extra,
         include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
 
-    # ---- Step 1: spatial transforms -> direct_minv_inner -> SYMMETRIC_UPPER Minv ----
+    # ---- Step 1: spatial transforms -> minv_inner -> SYMMETRIC_UPPER Minv ----
     self.gen_load_update_XImats_helpers_function_call()
     self.gen_add_sync()
     # F_IN_SMEM=false + s_F (shared) as d_workspace: keeps F in smem without the
     # no_F+F s_temp contiguity the smem-tail path requires.
-    self.gen_direct_minv_inner_function_call(
+    self.gen_minv_inner_function_call(
         updated_var_names=dict(d_workspace_name="s_F"), f_in_smem_expr="false")
     self.gen_add_sync()
 
@@ -427,7 +427,7 @@ def gen_osc_inertia_device(self):
     # MJt = Minv @ J^T  (nv x 6, column-major: MJt[k + nv*c]). J is 6 x nv
     # column-major so J^T(m,c) == J[c + 6*m], giving
     #   (Minv J^T)[k,c] = sum_m Minv(k,m) * J[c + 6*m].
-    # direct_minv emits SYMMETRIC_UPPER, so read the upper-triangle entry
+    # minv emits SYMMETRIC_UPPER, so read the upper-triangle entry
     # Minv[min(k,m), max(k,m)] to get the full symmetric Minv(k,m).
     self.gen_add_parallel_loop("ind", str(nv * 6))
     self.gen_add_code_line("int k = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")

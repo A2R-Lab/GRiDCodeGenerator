@@ -1,13 +1,13 @@
-def gen_direct_minv_inner_F_size(self):
-    """Size of the F-region buffer used by direct_minv_inner (6 * NV * NV
+def gen_minv_inner_F_size(self):
+    """Size of the F-region buffer used by minv_inner (6 * NV * NV
     floats). Phase 3a splits this out as a separate `s_F` parameter so
     callers can surgically spill it to L2-pinned workspace on humanoid-scale
     robots while keeping IA / U / Dinv / Ia / IaTemp in shared memory."""
     n = self.robot.get_num_vel()
     return 6 * n * n
 
-def gen_direct_minv_inner_no_F_size(self):
-    """Size of the s_temp arena passed to direct_minv_inner — IA + U + Dinv
+def gen_minv_inner_no_F_size(self):
+    """Size of the s_temp arena passed to minv_inner — IA + U + Dinv
     + Ia + IaTemp (everything except the F-region, which moved to s_F)."""
     n = self.robot.get_num_vel()
     NJ = self.robot.get_num_joints()
@@ -15,13 +15,13 @@ def gen_direct_minv_inner_no_F_size(self):
     d_inv_count = NJ + 36 if self.robot.floating_base else n
     return 36*n + 6*n + d_inv_count + 36*2*max_bfs_width
 
-def gen_direct_minv_inner_temp_mem_size(self):
+def gen_minv_inner_temp_mem_size(self):
     """Legacy: full inner-temp size = F-region + everything else. Callers
     that pre-date Phase 3a allocate this much smem and pass it as both s_F
-    (at offset 0) and s_temp (at offset 6*NV*NV) to direct_minv_inner."""
-    return self.gen_direct_minv_inner_F_size() + self.gen_direct_minv_inner_no_F_size()
+    (at offset 0) and s_temp (at offset 6*NV*NV) to minv_inner."""
+    return self.gen_minv_inner_F_size() + self.gen_minv_inner_no_F_size()
 
-def gen_direct_minv_inner_function_call(self, updated_var_names = None,
+def gen_minv_inner_function_call(self, updated_var_names = None,
                                         f_in_smem_expr = "true"):
     var_names = dict( \
         s_Minv_name = "s_Minv", \
@@ -32,18 +32,18 @@ def gen_direct_minv_inner_function_call(self, updated_var_names = None,
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    # Inner-controlled placement (design rollout): direct_minv_inner is keyed on
+    # Inner-controlled placement (design rollout): minv_inner is keyed on
     # bool F_IN_SMEM and decides at the top of the fn whether the 6*NV*NV F-region
     # lives in s_temp (smem) or d_workspace (L2-pinned global). The caller just
     # passes both arenas + the placement; sizes come from
     # MINV_INNER_{SMEM,WORKSPACE}_BYTES<T, F_IN_SMEM>().
-    minv_code_start = "direct_minv_inner<T, " + f_in_smem_expr + ">(" + var_names["s_Minv_name"] + ", " + var_names["s_q_name"] + ", "
+    minv_code_start = "minv_inner<T, " + f_in_smem_expr + ">(" + var_names["s_Minv_name"] + ", " + var_names["s_q_name"] + ", "
     minv_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ");"
     minv_code_middle = self.gen_insert_helpers_function_call()
     minv_code = minv_code_start + minv_code_middle + minv_code_end
     self.gen_add_code_line(minv_code)
 
-def _gen_direct_minv_inner_mimic(self, n, no_F_size):
+def _gen_minv_inner_mimic(self, n, no_F_size):
     """Emit the mimic Minv path: M = crba_inner(q); Minv = inv(M); symmetrize.
 
     n = NV. s_F (6*NV*NV) is the scratch arena here (F is never built on this
@@ -71,7 +71,7 @@ def _gen_direct_minv_inner_mimic(self, n, no_F_size):
     self.gen_add_end_function()
 
 
-def gen_direct_minv_inner(self):
+def gen_minv_inner(self):
     NJ = self.robot.get_num_joints()
     n = self.robot.get_num_vel()
     max_bfs_levels = self.robot.get_max_bfs_level()
@@ -86,8 +86,8 @@ def gen_direct_minv_inner(self):
         self.gen_add_code_line("__device__")
         self.gen_add_code_line("void crba_inner(T *s_M, const T *s_q, const T *s_qd, T *s_XImats, int *s_topology_helpers, T *s_temp, T *d_workspace, const T gravity);")
     # construct the boilerplate and function definition
-    no_F_size = self.gen_direct_minv_inner_no_F_size()
-    F_size = self.gen_direct_minv_inner_F_size()
+    no_F_size = self.gen_minv_inner_no_F_size()
+    F_size = self.gen_minv_inner_F_size()
     func_params = ["s_Minv is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
                    "s_temp is the (shared) scratch; size MINV_INNER_SMEM_BYTES<T, F_IN_SMEM>() (= " + str(no_F_size) + " always, plus the " + str(F_size) + "-float F-region when F_IN_SMEM)", \
@@ -99,7 +99,7 @@ def gen_direct_minv_inner(self):
                   "The choice is made at the top of this fn so the caller just sizes both arenas from", \
                   "the MINV_INNER_*_BYTES constants and hands both pointers in. Codegen maps each", \
                   "RESOURCE_TIER to an F_IN_SMEM value per robot (MINV_F_IN_SMEM<TIER>())."]
-    func_def_start = "void direct_minv_inner(T *s_Minv, const T *s_q, "
+    func_def_start = "void minv_inner(T *s_Minv, const T *s_q, "
     func_def_end = "T *s_temp, T *d_workspace) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -1)
     func_def = func_def_start + func_def_end
@@ -134,7 +134,7 @@ def gen_direct_minv_inner(self):
         # reduced mass matrix via crba_inner and invert it (NV x NV). s_F is large
         # (6*NV*NV) and unused on this path, so we carve M + the CRBA scratch band
         # out of it; the inverse is written straight into s_Minv.
-        _gen_direct_minv_inner_mimic(self, n, no_F_size)
+        _gen_minv_inner_mimic(self, n, no_F_size)
         return
     FOffset = 0   # within s_F
     IAOffset = 0  # within s_temp
@@ -571,35 +571,35 @@ def gen_direct_minv_inner(self):
         self.gen_add_sync()
     self.gen_add_end_function()
 
-def gen_direct_minv_device(self):
+def gen_minv_device(self):
     # construct the boilerplate and function definition
     func_params = ["s_Minv is a pointer to memory for the final result", \
                    "s_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
-    func_def = "void direct_minv_device(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel){"
+    func_def = "void minv_device(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel){"
     func_notes = ["Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
     # then generate the code (shared device-wrapper skeleton; B+C §1.1).
     # Full smem layout: no_F + F packed contiguously. Inner-callable device path
     # keeps F in smem (F_IN_SMEM=true); the inner slices s_F from the tail of
     # s_temp itself.
     n = self.robot.get_num_vel()
-    shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()  # no_F + F
+    shared_mem_size = self.gen_minv_inner_temp_mem_size()  # no_F + F
     self.gen_device_wrapper(
         "Compute the inverse of the mass matrix", func_def, shared_mem_size,
-        lambda: self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true"),
+        lambda: self.gen_minv_inner_function_call(f_in_smem_expr = "true"),
         func_notes = func_notes, func_params = func_params,
         include_linalg_scratch = True)
 
 def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
-    """Emit direct_minv_kernel body for one tier's spill flag.
+    """Emit minv_kernel body for one tier's spill flag.
     spill_F=False: s_F lives at &s_temp[0]; s_temp_inner at &s_temp[6*NV*NV]; smem holds everything.
     spill_F=True:  s_F lives at &d_workspace[...]; s_temp_inner at &s_temp[0]; saves 6*NV*NV from smem."""
     n_pos = self.robot.get_num_pos()  # NUM_POS (= NV for fixed, NV+1 for floating quaternion)
-    F_size = self.gen_direct_minv_inner_F_size()
+    F_size = self.gen_minv_inner_F_size()
     if spill_F:
-        shared_mem_size = self.gen_direct_minv_inner_no_F_size()
+        shared_mem_size = self.gen_minv_inner_no_F_size()
     else:
-        shared_mem_size = self.gen_direct_minv_inner_temp_mem_size()
+        shared_mem_size = self.gen_minv_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q", n_pos), ("s_Minv", n*n)], include_linalg_scratch=True)
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
@@ -611,7 +611,7 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
             self.gen_add_code_line("(void)d_workspace;")
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
-        self.gen_direct_minv_inner_function_call(
+        self.gen_minv_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "minv_d_workspace") if spill_F else None),
             f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_add_sync()
@@ -627,7 +627,7 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q",str(n_pos),feedback_from="Minv")
         self.gen_load_update_XImats_helpers_function_call()
-        self.gen_direct_minv_inner_function_call(
+        self.gen_minv_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "minv_d_workspace") if spill_F else None),
             f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_anti_licm_output_write("Minv")
@@ -635,7 +635,7 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
         self.gen_kernel_save_result("Minv",str(n*n))
 
 
-def gen_direct_minv_kernel(self, single_call_timing = False):
+def gen_minv_kernel(self, single_call_timing = False):
     n_pos = self.robot.get_num_pos()
     n_vel = self.robot.get_num_vel()
     func_params = ["d_Minv is a pointer to memory for the final result", \
@@ -643,7 +643,7 @@ def gen_direct_minv_kernel(self, single_call_timing = False):
                    "d_q is the vector of joint positions", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_def = "void direct_minv_kernel(T *d_Minv, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS){"
+    func_def = "void minv_kernel(T *d_Minv, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS){"
     func_notes = ["Outputs a SYMMETRIC_UPPER triangular matrix for Minv"]
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
@@ -660,7 +660,7 @@ def gen_direct_minv_kernel(self, single_call_timing = False):
         _emit_minv_kernel_body_for_flags(self, n_vel, n_vel, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
-def gen_direct_minv_host(self, mode = 0):
+def gen_minv_host(self, mode = 0):
     # default is to do the full kernel call -- options are for single timing or compute only kernel wrapper
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
@@ -671,7 +671,7 @@ def gen_direct_minv_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void direct_minv(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void minv(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                 const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -685,8 +685,8 @@ def gen_direct_minv_host(self, mode = 0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"direct_minv requires all-data or dynamics gridData\");")
-    func_call_start = "direct_minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_workspace,hd_data->d_q,stride_q,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"minv requires all-data or dynamics gridData\");")
+    func_call_start = "minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -712,7 +712,7 @@ def gen_direct_minv_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"direct_minv\", MINV_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"minv\", MINV_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -726,15 +726,15 @@ def gen_direct_minv_host(self, mode = 0):
         self.gen_add_code_line(single_call_printf_line("minv"))
     self.gen_add_end_function()
 
-def gen_direct_minv(self):
+def gen_minv(self):
     # gen inner
-    self.gen_direct_minv_inner()
+    self.gen_minv_inner()
     # and device wrapper
-    self.gen_direct_minv_device()
+    self.gen_minv_device()
     # and kernel wrappers
-    self.gen_direct_minv_kernel(True)
-    self.gen_direct_minv_kernel(False)
+    self.gen_minv_kernel(True)
+    self.gen_minv_kernel(False)
     # and host function call wrappers
-    self.gen_direct_minv_host(0)
-    self.gen_direct_minv_host(1)
-    self.gen_direct_minv_host(2)
+    self.gen_minv_host(0)
+    self.gen_minv_host(1)
+    self.gen_minv_host(2)

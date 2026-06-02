@@ -24,7 +24,7 @@ The output layout is body-major: s_dtau_dfext is nv x (6*NB), column-major in th
 [v_row + nv*col] sense used by the rest of GRiD's dense gradient outputs.
 
 dqdd/dfext is -s_Minv @ s_dtau_dfext (a single nv x nv * nv x 6NB GEMM reusing the
-direct_minv s_Minv). dJ^T/dq is central-FD of the analytic -J^T over each
+minv s_Minv). dJ^T/dq is central-FD of the analytic -J^T over each
 generalized coordinate (the same FD-on-Jacobian strategy the d2ee GPU path uses);
 the q-dot block is identically zero (J^T is q-only) and is not stored.
 """
@@ -525,7 +525,7 @@ def gen_f_ext_gradient_device(self):
     """Emit f_ext_gradient_device: computes dtau/dfext = -J^T and
     dqdd/dfext = M^{-1} J^T into caller-provided shared buffers.
 
-    Reuses direct_minv_inner for s_Minv (the same inverse-inertia buffer fd_du
+    Reuses minv_inner for s_Minv (the same inverse-inertia buffer fd_du
     consumes) and the f_ext_gradient_jacobianT_inner for -J^T, then one
     nv x nv * nv x 6NB GEMM (dqdd = -Minv @ dtau). Both outputs are q-only and
     f_ext-VALUE independent (so this device takes q, not f_ext)."""
@@ -545,10 +545,10 @@ def gen_f_ext_gradient_device(self):
     ]
     func_def = ("void f_ext_gradient_device(T *s_dtau_dfext, T *s_dqdd_dfext, "
                 "const T *s_q, const robotModel<T> *d_robotModel) {")
-    # scratch: max of the J^T inner temp and the direct_minv inner temp, plus an
+    # scratch: max of the J^T inner temp and the minv inner temp, plus an
     # nv*nv s_Minv buffer.
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
-    minv_temp = self.gen_direct_minv_inner_temp_mem_size()
+    minv_temp = self.gen_minv_inner_temp_mem_size()
     shared_extra = nv * nv + max(jt_temp, minv_temp)
 
     self.gen_add_func_doc("Compute the f_ext gradient (dtau/dfext, dqdd/dfext)",
@@ -567,12 +567,12 @@ def gen_f_ext_gradient_device(self):
         updated_var_names={"s_temp_name": "s_fext_temp"})
     self.gen_add_sync()
     # Minv into s_Minv (F kept in smem; inner slices it from the tail of its temp)
-    self.gen_direct_minv_inner_function_call(
+    self.gen_minv_inner_function_call(
         updated_var_names={"s_Minv_name": "s_Minv", "s_temp_name": "s_fext_temp"},
         f_in_smem_expr="true")
     self.gen_add_sync()
-    # densify Minv upper->full (direct_minv outputs SYMMETRIC_UPPER)
-    self.gen_add_code_line("// densify Minv (direct_minv emits symmetric-upper)")
+    # densify Minv upper->full (minv outputs SYMMETRIC_UPPER)
+    self.gen_add_code_line("// densify Minv (minv emits symmetric-upper)")
     self.gen_add_parallel_loop("ind", str(nv * nv))
     self.gen_add_code_line("int r = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
     self.gen_add_code_line("if (c < r) { s_Minv[r + " + str(nv) + "*c] = s_Minv[c + " + str(nv) + "*r]; }")
@@ -623,7 +623,7 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
-    minv_temp = self.gen_direct_minv_inner_temp_mem_size()
+    minv_temp = self.gen_minv_inner_temp_mem_size()
     shared_extra = nv * nv + max(jt_temp, minv_temp)
     # g1-spill: s_dqdd_dfext is the LAST t_buffer; sized out_each at TIER_SHARED, 0
     # at spilled tiers (then routed to d_workspace below). Single arena declaration
@@ -655,7 +655,7 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
         self.gen_f_ext_gradient_inner_function_call(
             updated_var_names={"s_temp_name": "s_fext_temp"})
         self.gen_add_sync()
-        self.gen_direct_minv_inner_function_call(
+        self.gen_minv_inner_function_call(
             updated_var_names={"s_Minv_name": "s_Minv", "s_temp_name": "s_fext_temp"},
             f_in_smem_expr="true")
         self.gen_add_sync()

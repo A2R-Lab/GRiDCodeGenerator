@@ -26,12 +26,12 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_regressor_inner, gen_inverse_dynamics_regressor_device_temp_mem_size, \
                             gen_inverse_dynamics_regressor_device, gen_inverse_dynamics_regressor_kernel, \
                             gen_inverse_dynamics_regressor_host, gen_inverse_dynamics_regressor, \
-                            gen_fd_parameter_gradient_inner_temp_mem_size, gen_fd_parameter_gradient_inner_function_call, \
-                            gen_fd_parameter_gradient_inner, gen_fd_parameter_gradient_device_temp_mem_size, \
-                            gen_fd_parameter_gradient_device, gen_fd_parameter_gradient_kernel, \
-                            gen_fd_parameter_gradient_host, gen_fd_parameter_gradient, \
-                            gen_direct_minv_inner_temp_mem_size, gen_direct_minv_inner_F_size, gen_direct_minv_inner_no_F_size, gen_direct_minv_inner_function_call, gen_direct_minv_inner, \
-                            gen_direct_minv_device, gen_direct_minv_kernel, gen_direct_minv_host, gen_direct_minv, \
+                            gen_forward_dynamics_parameter_gradient_inner_temp_mem_size, gen_forward_dynamics_parameter_gradient_inner_function_call, \
+                            gen_forward_dynamics_parameter_gradient_inner, gen_forward_dynamics_parameter_gradient_device_temp_mem_size, \
+                            gen_forward_dynamics_parameter_gradient_device, gen_forward_dynamics_parameter_gradient_kernel, \
+                            gen_forward_dynamics_parameter_gradient_host, gen_forward_dynamics_parameter_gradient, \
+                            gen_minv_inner_temp_mem_size, gen_minv_inner_F_size, gen_minv_inner_no_F_size, gen_minv_inner_function_call, gen_minv_inner, \
+                            gen_minv_device, gen_minv_kernel, gen_minv_host, gen_minv, \
                             gen_forward_dynamics_inner_temp_mem_size, gen_forward_dynamics_inner_F_size, gen_forward_dynamics_finish_function_call, gen_forward_dynamics_finish, \
                             gen_forward_dynamics_inner_function_call, gen_forward_dynamics_inner, gen_forward_dynamics_device, \
                             gen_forward_dynamics_kernel, gen_forward_dynamics_host, gen_forward_dynamics, \
@@ -117,7 +117,7 @@ class GRiDCodeGenerator:
             "inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "aba", "crba",
             "idsva_so_body_frame", "fdsva_so", "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
-            "f_ext_grad", "regressor", "fd_parameter_gradient",
+            "f_ext_gradient", "inverse_dynamics_regressor", "forward_dynamics_parameter_gradient",
         }
         # E2 (additive, opt-in only): frame_jacobian is NOT part of the default
         # `all` profile so the default-profile header stays byte-identical. It is
@@ -134,10 +134,10 @@ class GRiDCodeGenerator:
             "dynamics": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"inverse_dynamics", "minv", "forward_dynamics"},
-            "dynamics-gradients": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "f_ext_grad"},
-            "regressor": {"inverse_dynamics", "regressor"},
-            "fd-param-gradient": {"inverse_dynamics", "minv", "forward_dynamics", "regressor", "fd_parameter_gradient"},
-            "f-ext-gradient": {"inverse_dynamics", "minv", "f_ext_grad"},
+            "dynamics-gradients": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "f_ext_gradient"},
+            "regressor": {"inverse_dynamics", "inverse_dynamics_regressor"},
+            "fd-param-gradient": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_regressor", "forward_dynamics_parameter_gradient"},
+            "f-ext-gradient": {"inverse_dynamics", "minv", "f_ext_gradient"},
             "kinematics": {"end_effector_pose"},
             "kinematics-derivatives": {"end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian"},
             "second-order": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame", "fdsva_so"},
@@ -160,11 +160,13 @@ class GRiDCodeGenerator:
             "fd-du": "forward_dynamics_gradient",
             "forward-dynamics-gradient": "forward_dynamics_gradient",
             "fd-gradient": "forward_dynamics_gradient",
-            "f-ext-grad": "f_ext_grad",
-            "fext-grad": "f_ext_grad",
-            "f-ext-gradient-only": "f_ext_grad",
-            "joint-torque-regressor": "regressor",
-            "inverse-dynamics-regressor": "regressor",
+            "f-ext-grad": "f_ext_gradient",
+            "fext-grad": "f_ext_gradient",
+            "f-ext-gradient-only": "f_ext_gradient",
+            "joint-torque-regressor": "inverse_dynamics_regressor",
+            "inverse-dynamics-regressor": "inverse_dynamics_regressor",
+            "fd-parameter-gradient": "forward_dynamics_parameter_gradient",
+            "forward-dynamics-parameter-gradient": "forward_dynamics_parameter_gradient",
             "idsva-so": "idsva_so_body_frame",
             "fdsva-so": "fdsva_so",
             "ee-pose": "end_effector_pose",
@@ -215,14 +217,14 @@ class GRiDCodeGenerator:
         if "inverse_dynamics_gradient" in algorithms:
             algorithms.add("inverse_dynamics")
         # f_ext gradient: dtau/dfext reuses the RNEA spatial-transform load (id),
-        # dqdd/dfext reuses direct_minv's inner (minv).
-        if "f_ext_grad" in algorithms:
+        # dqdd/dfext reuses minv's inner (minv).
+        if "f_ext_gradient" in algorithms:
             algorithms.update({"inverse_dynamics", "minv"})
         if "aba" in algorithms and self.robot.floating_base:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "fdsva_so" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame"})
-        # Mimic Minv routes through crba_inner (see _direct_minv.py: the reduced-space
+        # Mimic Minv routes through crba_inner (see _minv.py: the reduced-space
         # M is built via CRBA then inverted), so any mimic robot emitting `minv` has a
         # hidden dependency on `crba` for the crba_inner definition. Declare it so the
         # forward-decl'd crba_inner is actually emitted (else nvlink: unresolved extern
@@ -344,7 +346,7 @@ class GRiDCodeGenerator:
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
         fd_param_grad_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() \
             + nv*nv + nv*10*self.robot.get_num_bodies() + nv + 18*n + nv \
-            + self.gen_fd_parameter_gradient_inner_temp_mem_size() + XI_size
+            + self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size() + XI_size
         self.fd_param_grad_t_count = fd_param_grad_t_count
         # FD-param-gradient g1-spill: 2-level surgical ladder. Level 0 keeps every
         # buffer in smem (current behavior on robots that fit). Level 1 spills the
@@ -362,12 +364,12 @@ class GRiDCodeGenerator:
         )
         self.fd_param_grad_spill_Y_ws_count = _fpg_Y_count
         # f_ext gradient (section A): kernel smem = XI + s_q + the two nv x (6*NB)
-        # outputs + temp (nv*nv s_Minv + max(J^T-inner, direct_minv-inner) scratch).
+        # outputs + temp (nv*nv s_Minv + max(J^T-inner, minv-inner) scratch).
         _n_pos = self.robot.get_num_pos()
         _NB = self.robot.get_num_bodies()
         _feg_out = nv * 6 * _NB
         _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
-                                self.gen_direct_minv_inner_temp_mem_size())
+                                self.gen_minv_inner_temp_mem_size())
         f_ext_grad_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
         # f_ext-gradient (first-order) g1-spill: 2-level surgical ladder. Level 0
         # keeps both outputs (s_dtau_dfext, s_dqdd_dfext) in smem. Level 1 spills
@@ -394,8 +396,8 @@ class GRiDCodeGenerator:
         f_ext_grad_dq_t_count = _n_pos + _feg_dq_extra + XI_size
         # Minv Phase 3a: per-tier spill picks. Level 0 = F in smem (6*NV*NV
         # bytes); Level 1 = surgical F to L2-pinned workspace.
-        _minv_F_count = self.gen_direct_minv_inner_F_size()
-        _minv_no_F_count = self.gen_direct_minv_inner_no_F_size()
+        _minv_F_count = self.gen_minv_inner_F_size()
+        _minv_no_F_count = self.gen_minv_inner_no_F_size()
         _minv_t_count_full     = n + n*n + _minv_F_count + _minv_no_F_count + XI_size
         _minv_t_count_surgical = n + n*n                 + _minv_no_F_count + XI_size
         self.minv_spill_tier_3way = select_shared_tier_3way(_minv_t_count_full, _minv_t_count_surgical)
@@ -444,7 +446,7 @@ class GRiDCodeGenerator:
         self.integrator_t_count_per_tier = tuple(
             (_integrator_t_count_full, _integrator_t_count_Fspill)[i] for i in self.integrator_spill_tier_3way)
         # F float-count the value path spills (for grad-section sizing); 0 if no tier spills.
-        self.integrator_minv_F_workspace_count = (self.gen_direct_minv_inner_F_size()
+        self.integrator_minv_F_workspace_count = (self.gen_minv_inner_F_size()
                                                   if any(p == 1 for p in self.integrator_spill_tier_3way) else 0)
         # Integrator gradient: kernel-shared t-count layout is
         #   s_q_qd_u (3nv+fb) + s_dAB (2nv*3nv) + s_df_du (nv*2nv) + s_dc_du (nv*2nv) +
@@ -492,7 +494,7 @@ class GRiDCodeGenerator:
         _integrator_du_D_qdd_count = _max_stages * nv * 3 * nv
         _integrator_du_dAB_count = 2 * nv * 3 * nv
         _integrator_du_inner_full = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
-        _integrator_du_inner_selective = max(self.gen_direct_minv_inner_temp_mem_size(),
+        _integrator_du_inner_selective = max(self.gen_minv_inner_temp_mem_size(),
                                              self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         _integrator_du_full = max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)
         _integrator_du_arenas = (
@@ -531,7 +533,7 @@ class GRiDCodeGenerator:
             else id_du_temp_layout["selective_shared_count"]
         )
         fd_du_temp_count = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
-        fd_du_selective_temp_count = max(self.gen_direct_minv_inner_temp_mem_size(), id_du_selective_temp_count)
+        fd_du_selective_temp_count = max(self.gen_minv_inner_temp_mem_size(), id_du_selective_temp_count)
         # s_vaf is body-indexed (NB bodies). For a MIMIC robot NB > nv so size
         # 18*NB; non-mimic keeps 18*nv/18*n (byte-identical; floating non-mimic has
         # nv > NB so 18*nv already covers the body writes). The id_device path uses
@@ -541,7 +543,7 @@ class GRiDCodeGenerator:
         _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
         _vaf_cnt_id = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
         id_device_t_count = _vaf_cnt_id + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
-        minv_device_t_count = self.gen_direct_minv_inner_temp_mem_size() + XI_size
+        minv_device_t_count = self.gen_minv_inner_temp_mem_size() + XI_size
         fd_device_t_count = self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
         id_du_device_t_count = _vaf_cnt + id_du_temp_count + XI_size
         fd_du_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + fd_du_temp_count + XI_size
@@ -854,7 +856,7 @@ class GRiDCodeGenerator:
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before id_du_grad / fd_grad in any kernel that
         # composes both — they sequentially reuse the same workspace bytes).
-        _minv_F_workspace_count = self.gen_direct_minv_inner_F_size() if any(p == 1 for p in self.minv_spill_tier_3way) else 0
+        _minv_F_workspace_count = self.gen_minv_inner_F_size() if any(p == 1 for p in self.minv_spill_tier_3way) else 0
         # CRBA whole-arena spill: when crba_inner's scratch band is redirected to
         # d_workspace (LITE/MINIMAL, or a forced deep-spill tier), the per-timestep
         # workspace must be able to back the full 140*NJ-class band. Include it in
@@ -1169,8 +1171,8 @@ class GRiDCodeGenerator:
                                  "// placement bool and decides arena pointers itself. *_INNER_{SMEM,WORKSPACE}_BYTES<T, IN_SMEM>",
                                  "// give the two arena sizes; *_<...>_IN_SMEM<TIER>() give the per-robot tier->placement",
                                  "// map codegen assigned (multiple tiers may share a placement on small robots).",
-                                 "// --- direct_minv_inner (F-region) ---",
-                                 "template <typename T, bool F_IN_SMEM = true> __host__ __device__ constexpr size_t MINV_INNER_SMEM_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self.gen_direct_minv_inner_no_F_size()) + (" + " + str(6*nv*nv) + " * (F_IN_SMEM ? 1 : 0)") + "); }",
+                                 "// --- minv_inner (F-region) ---",
+                                 "template <typename T, bool F_IN_SMEM = true> __host__ __device__ constexpr size_t MINV_INNER_SMEM_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self.gen_minv_inner_no_F_size()) + (" + " + str(6*nv*nv) + " * (F_IN_SMEM ? 1 : 0)") + "); }",
                                  "template <typename T, bool F_IN_SMEM = true> __host__ __device__ constexpr size_t MINV_INNER_WORKSPACE_BYTES() { return F_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(6*nv*nv) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool MINV_F_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.minv_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.minv_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.minv_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// --- forward_dynamics_inner (internal Minv F-region) ---",
@@ -1502,10 +1504,10 @@ class GRiDCodeGenerator:
             ("inverse_dynamics_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
-        ("direct_minv", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("direct_minv_kernel<T>",
+        ("minv", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("minv_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-            ("direct_minv_kernel_single_timing<T>",
+            ("minv_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("forward_dynamics", "forward_dynamics", None, "FD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
@@ -1560,7 +1562,7 @@ class GRiDCodeGenerator:
         ]),
         # g1-spill: f_ext_gradient_kernel gained `unsigned char *d_workspace` as its
         # 3rd arg (after the two outputs) so s_dqdd_dfext can spill there at LITE/MINIMAL.
-        ("f_ext_gradient", "f_ext_grad", None, "F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("f_ext_gradient", "f_ext_gradient", None, "F_EXT_GRAD_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("f_ext_gradient_kernel<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
@@ -1570,7 +1572,7 @@ class GRiDCodeGenerator:
         # instance attr _f_ext_grad_dq_emitted (set True only when the kernel is
         # actually emitted) so the floating-base header — which has neither the
         # kernel nor the F_EXT_GRAD_DQ_* macro — never references them.
-        ("f_ext_gradient_dq", "f_ext_grad_dq", "_f_ext_grad_dq_emitted", "F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("f_ext_gradient_dq", "f_ext_gradient_dq", "_f_ext_grad_dq_emitted", "F_EXT_GRAD_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("f_ext_gradient_dq_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_dq_kernel_single_timing<T>",
@@ -1578,7 +1580,7 @@ class GRiDCodeGenerator:
         ]),
         # E1 joint-torque regressor: Y is nv x 10*NUM_BODIES, can exceed the 48 KB
         # default dynamic-smem cap on big robots (g1: ~55 KB), so it MUST opt in.
-        ("regressor", "regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("inverse_dynamics_regressor", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_regressor_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_regressor_kernel_single_timing<T>",
@@ -1586,12 +1588,12 @@ class GRiDCodeGenerator:
         ]),
         # FD param gradient dqdd/dpi = -Minv . Y: output is nv x 10*NUM_BODIES (same
         # size class as the regressor), can exceed the 48 KB default cap; opt in.
-        # g1-spill: fd_parameter_gradient_kernel gained `unsigned char *d_workspace`
+        # g1-spill: forward_dynamics_parameter_gradient_kernel gained `unsigned char *d_workspace`
         # as its 2nd arg (after d_dqdd_dpi) so s_Y can spill there at LITE/MINIMAL.
-        ("fd_parameter_gradient", "fd_parameter_gradient", None, "FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("fd_parameter_gradient_kernel<T>",
+        ("forward_dynamics_parameter_gradient", "forward_dynamics_parameter_gradient", None, "FD_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("forward_dynamics_parameter_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-            ("fd_parameter_gradient_kernel_single_timing<T>",
+            ("forward_dynamics_parameter_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
@@ -1634,8 +1636,8 @@ class GRiDCodeGenerator:
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
-        ("integrator_gradient_with_x_kp1", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            (f"integrator_gradient_with_x_kp1_kernel{suffix}<T, IntegratorType::{it}>",
+        ("integrator_with_gradient", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            (f"integrator_with_gradient_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
@@ -1830,7 +1832,7 @@ class GRiDCodeGenerator:
             self.gen_add_end_function()
 
         id_call = "inverse_dynamics<T,false,false,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
-        minv_call = "direct_minv<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);"
+        minv_call = "minv<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);"
         fd_call = "forward_dynamics<T,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
         id_du_call = "inverse_dynamics_gradient<T,false,false,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
         fd_du_call = "forward_dynamics_gradient<T,false,KIND>(hd_data,d_robotModel,gravity,num_timesteps,block_dimms,thread_dimms,streams);"
@@ -2079,10 +2081,10 @@ class GRiDCodeGenerator:
             "    __device__ inverse_dynamics_vaf_device<T>(T *s_vaf, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel, const T gravity)", \
             "    __device__ inverse_dynamics_vaf_device<T>(T *s_vaf, const T *s_q, const T *s_qd, const T *s_qdd, const robotModel<T> *d_robotModel, const T gravity)", \
             "",\
-            "    __device__ direct_minv_inner<T>(T *s_Minv, T *s_F, const T *s_q, T *s_XImats, int *s_topology_helpers, T *s_temp)",\
-            "    __device__ direct_minv_device<T>(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ direct_minv_Kernel<T>(T *d_Minv, unsigned char *d_workspace, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
-            "    __host__   direct_minv<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __device__ minv_inner<T>(T *s_Minv, T *s_F, const T *s_q, T *s_XImats, int *s_topology_helpers, T *s_temp)",\
+            "    __device__ minv_device<T>(T *s_Minv, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ minv_Kernel<T>(T *d_Minv, unsigned char *d_workspace, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __host__   minv<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ forward_dynamics_inner<T>(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, T *s_minv_F, T *s_XImats, int *s_topology_helpers, T *s_temp, const T gravity)",\
             "    __device__ forward_dynamics_device<T, RESOURCE_TIER=TIER_SHARED>(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr)", \
@@ -2119,7 +2121,7 @@ class GRiDCodeGenerator:
             "",\
             "    __device__ idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, T *s_XImats, T *s_mem, const T gravity)",\
             "    __global__ idsva_so_body_frame_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
-            "    __host__   idsva_so_body_frame_host<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __host__   idsva_so_body_frame<T>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ fdsva_so_contract(T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_q, T *s_qd, const T *s_qdd, const T *s_tau, T *s_XImats, T *s_temp, const T gravity)",\
             "    __device__ fdsva_so_device(T *s_df2, T *s_df_du, const T *s_q, const T *s_qd, const T *s_u, const robotModel<T> *d_robotModel, const T gravity)", \
@@ -2225,22 +2227,22 @@ class GRiDCodeGenerator:
             self.gen_inverse_dynamics()
         # E1: joint-torque regressor Y (tau = Y . pi). Additive; reuses the RNEA
         # forward sweep emitted by gen_inverse_dynamics (requires "inverse_dynamics").
-        if "regressor" in algorithms:
+        if "inverse_dynamics_regressor" in algorithms:
             self.gen_inverse_dynamics_regressor()
         if "minv" in algorithms:
-            self.gen_direct_minv()
+            self.gen_minv()
         if "forward_dynamics" in algorithms:
             self.gen_forward_dynamics()
         # FD parameter gradient dqdd/dpi = -Minv . Y. Additive; composes the
-        # regressor (Y), direct_minv (Minv) and inverse_dynamics/forward_dynamics
-        # inners, so it requires "inverse_dynamics", "minv", "forward_dynamics" and "regressor" co-emitted.
-        if "fd_parameter_gradient" in algorithms:
-            self.gen_fd_parameter_gradient()
+        # regressor (Y), minv (Minv) and inverse_dynamics/forward_dynamics
+        # inners, so it requires "inverse_dynamics", "minv", "forward_dynamics" and "inverse_dynamics_regressor" co-emitted.
+        if "forward_dynamics_parameter_gradient" in algorithms:
+            self.gen_forward_dynamics_parameter_gradient()
         if "inverse_dynamics_gradient" in algorithms:
             self.gen_inverse_dynamics_gradient()
         if "forward_dynamics_gradient" in algorithms:
             self.gen_forward_dynamics_gradient()
-        if "f_ext_grad" in algorithms:
+        if "f_ext_gradient" in algorithms:
             self.gen_f_ext_gradient()
         if "aba" in algorithms:
             self.gen_aba()
@@ -2312,7 +2314,7 @@ class GRiDCodeGenerator:
                     self._lie_helpers_emitted = True
                 self.gen_frame_jacobian_dot()
             # Lambda (osc_inertia) is emitted for mimic robots too. It composes
-            # Minv on device via direct_minv_inner, whose mimic path routes
+            # Minv on device via minv_inner, whose mimic path routes
             # through crba_inner -> invert_matrix (== RBDReference.minv's mimic
             # fast path inv(CRBA(q))). That compose is correct in this arena: the
             # fr3-fixed CUDA crba/minv equivalence tests already prove it, and the
@@ -2323,15 +2325,15 @@ class GRiDCodeGenerator:
             # maxThreadsPerBlock and checks the launch.)  (FLAGGED: un-gated mimic.)
             if "osc_inertia" in algorithms:
                 # Lambda is SELF-CONTAINED: it composes Minv on device via
-                # direct_minv_inner, so the arena carries BOTH transform families
+                # minv_inner, so the arena carries BOTH transform families
                 # (spatial s_XImats for minv + homogeneous s_XmatsHom for J) plus
                 # the minv buffers (s_Minv + the spilled F-region passed as
                 # d_workspace) and the J*Minv*J^T compose scratch.
                 # arena = s_XImats(XI) + extras + s_temp(max(no_F, 16*NJ)) where
                 # extras = s_XmatsHom + s_Minv + s_F + s_Jfj + s_MJt + s_task + s_taskinv.
                 osc_XI_size = self.gen_get_XI_size(False, False)
-                osc_noF = self.gen_direct_minv_inner_no_F_size()
-                osc_F = self.gen_direct_minv_inner_F_size()
+                osc_noF = self.gen_minv_inner_no_F_size()
+                osc_F = self.gen_minv_inner_F_size()
                 osc_temp = max(osc_noF, 16 * NJ_fj)
                 osc_t_count = (osc_XI_size + Xhom_size_fj + (nv_fj * nv_fj) + osc_F
                                + (6 * nv_fj) + (nv_fj * 6) + 36 + 36 + osc_temp)

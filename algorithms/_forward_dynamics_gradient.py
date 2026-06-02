@@ -1,6 +1,6 @@
 def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input = False):
     n = self.robot.get_num_vel()
-    minv_temp = self.gen_direct_minv_inner_temp_mem_size()
+    minv_temp = self.gen_minv_inner_temp_mem_size()
     id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return max(minv_temp,id_du_temp) if not use_qdd_Minv_input else id_du_temp
 
@@ -16,11 +16,11 @@ def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
         #       but that requires a custom function to be written
         #
         self.gen_add_code_line("//TODO: there is a slightly faster way as s_v does not change -- thus no recompute needed")
-        # Inner-controlled placement: direct_minv_inner slices its own F-region
+        # Inner-controlled placement: minv_inner slices its own F-region
         # from the tail of s_temp (FD_DU keeps Minv-F in smem; its surgical spill
         # is the id_du da_df band, handled separately). After Minv returns, the
         # c+vaf/ID code reuses these bytes (the steps run sequentially).
-        self.gen_direct_minv_inner_function_call(f_in_smem_expr = "true")
+        self.gen_minv_inner_function_call(f_in_smem_expr = "true")
         # updated_var_names = dict(s_c_name = "s_temp", s_vaf_name = "&s_temp[" + str(n) + "]", s_temp_name = "&s_temp[" + str(19*n) + "]")
         updated_var_names = dict(s_c_name = "s_temp", s_temp_name = "&s_temp[" + str(n) + "]", d_f_ext_name = d_f_ext_name)
         self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
@@ -94,11 +94,11 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
     mirrors gen_inverse_dynamics_gradient_device / gen_fdsva_so_device). It
     wraps, in order:
-      [repoint s_temp] -> load_update_XImats -> direct_minv_inner (f_in_smem=true)
+      [repoint s_temp] -> load_update_XImats -> minv_inner (f_in_smem=true)
       -> inverse_dynamics_inner (c+vaf) -> forward_dynamics_finish -> id_inner (vaf)
       -> inverse_dynamics_gradient_inner (the id_du BAND sub-inner) -> df/du = -Minv*dc/du.
     Because the s_temp repoint happens at the very top, EVERY consumer below —
-    including the XImats helper's sincos scratch and direct_minv's own F-region —
+    including the XImats helper's sincos scratch and minv's own F-region —
     follows the placement, so the kernel never repoints s_temp from the outside.
 
     TWO independent template flags:
@@ -111,7 +111,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     The 3-rung menu (see _FD_DU_PICK_FLAGS): pick0=(SMEM=true, SPILL=false) full;
     pick1=(true, true) selective band; pick2=(false, false) whole-pool global.
 
-    Pointer params are caller-supplied. The composed sub-inners (direct_minv_inner,
+    Pointer params are caller-supplied. The composed sub-inners (minv_inner,
     inverse_dynamics_inner, inverse_dynamics_gradient_inner) are FROZEN and
     placement-free: after the repoint, s_temp already points at the right pool, so
     passing it through is correct with no sub-inner change. The internal Minv/qdd
@@ -155,7 +155,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     func_def = func_def_start + func_def_end
     self.gen_add_func_doc("fd_du orchestration as a single inner-owns-placement device function",
                           ["Uses the fd/du = -Minv*id/du trick (Carpentier & Mansard 'Analytical Derivatives of Rigid Body Dynamics Algorithms')",
-                           "Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch and direct_minv's F-region)"],
+                           "Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch and minv's F-region)"],
                           func_params, None)
     self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
@@ -167,7 +167,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     if use_qdd_Minv_input:
         self.gen_add_code_line("(void)s_qdd_unused; (void)s_Minv_unused;")
     # Inner owns the pool placement; the repoint covers every consumer below
-    # (incl. the XImats helper's sincos scratch + direct_minv's F-region), so no
+    # (incl. the XImats helper's sincos scratch + minv's F-region), so no
     # caller-side repoint. The XImats helper call goes AFTER this repoint so its
     # sincos scratch follows the placement (avoids a null-s_temp sincos crash).
     self.gen_add_code_line("if constexpr(!SCRATCH_IN_SMEM){ s_temp = d_workspace; } else { (void)d_workspace; }")
@@ -208,7 +208,7 @@ def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_t
     if not use_qdd_Minv_input:
         extra_t_buffers[0] = ("s_q_qd_u", 3*n+self.robot.floating_base)
     shared_mem_size = 0 if use_global_temp else (
-        max(self.gen_direct_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
+        max(self.gen_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
