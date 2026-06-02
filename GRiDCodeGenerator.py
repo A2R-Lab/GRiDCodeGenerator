@@ -86,7 +86,8 @@ class GRiDCodeGenerator:
                             gen_id_bias_device, gen_id_bias_kernel, gen_id_bias_host, gen_id_bias, \
                             gen_centroidal_inner, gen_com_device, gen_ccrba_device, gen_energy_device, \
                             _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy, \
-                            gen_frame_jacobian_inner, gen_frame_jacobian_device, gen_frame_jacobian, \
+                            gen_frame_jacobian_inner, gen_frame_jacobian_device, \
+                            gen_frame_jacobian_kernel, gen_frame_jacobian_host, gen_frame_jacobian, \
                             gen_frame_jacobian_dot_device, gen_frame_jacobian_dot, \
                             gen_osc_inertia_device, gen_osc_inertia
 
@@ -1324,6 +1325,11 @@ class GRiDCodeGenerator:
                                  "    T *d_eePos;", \
                                  "    T *d_deePos;", \
                                  "    T *d_d2eePos;", \
+                                 # E2/S1: general-frame Jacobian outputs (frame_jacobian / frame_jacobian_dot:
+                                 # 6 x NUM_VEL each; osc_inertia: 6 x 6 task inertia Lambda)
+                                 "    T *d_frame_jacobian;       // frame_jacobian (6 x NUM_VEL)", \
+                                 "    T *d_frame_jacobian_dot;   // frame_jacobian_dot (6 x NUM_VEL)", \
+                                 "    T *d_osc_inertia;          // osc_inertia Lambda (6 x 6)", \
                                  "    unsigned char *d_workspace;", \
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *d_idsva_so;", \
@@ -1353,6 +1359,10 @@ class GRiDCodeGenerator:
                                  "    T *h_eePos;", \
                                  "    T *h_deePos;", \
                                  "    T *h_d2eePos;", \
+                                 # E2/S1: general-frame Jacobian host buffers
+                                 "    T *h_frame_jacobian;", \
+                                 "    T *h_frame_jacobian_dot;", \
+                                 "    T *h_osc_inertia;", \
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *h_idsva_so;", \
                                  # fdsva_so - d2a_dq2, d2a_dv2, d2a_dvdq, d2a_dtdq
@@ -1438,6 +1448,13 @@ class GRiDCodeGenerator:
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      # E2/S1: general-frame Jacobian outputs (J / Jdot: 6*NV each ; Lambda: 36)
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_frame_jacobian, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_frame_jacobian_dot, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_osc_inertia, 36*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_frame_jacobian = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_frame_jacobian_dot = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_osc_inertia = (T *)malloc(36*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "// G2 centroidal quick-wins outputs (com: 3+3*NV ; ccrba: 6*NV+6 ; energy: 3)", \
                       "if (needs_dynamics || needs_kinematics) {", \
@@ -1660,6 +1677,15 @@ class GRiDCodeGenerator:
             ("nonlinear_effects_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
+        # E2/S1 general-frame Jacobian family (opt-in; gated on membership in
+        # generated_algorithms via algo_short). Kernels carry the fixed-target
+        # signature (T *out, const T *q, const int stride_q, robotModel, int N).
+        ("frame_jacobian", "frame_jacobian", None, "FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("frame_jacobian_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("frame_jacobian_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
         ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
@@ -1795,6 +1821,9 @@ class GRiDCodeGenerator:
                                  "free(hd_data->h_c); free(hd_data->h_Minv); free(hd_data->h_qdd); free(hd_data->h_M);", \
                                  "free(hd_data->h_dc_du); free(hd_data->h_df_du);",\
                                  "free(hd_data->h_eePos); free(hd_data->h_deePos); free(hd_data->h_d2eePos);", \
+                                 # E2/S1: general-frame Jacobian outputs (frame_jacobian / frame_jacobian_dot / osc_inertia)
+                                 "gpuErrchk(cudaFree(hd_data->d_frame_jacobian)); gpuErrchk(cudaFree(hd_data->d_frame_jacobian_dot)); gpuErrchk(cudaFree(hd_data->d_osc_inertia));", \
+                                 "free(hd_data->h_frame_jacobian); free(hd_data->h_frame_jacobian_dot); free(hd_data->h_osc_inertia);", \
                                  "gpuErrchk(cudaFree(hd_data->d_x_kp1)); gpuErrchk(cudaFree(hd_data->d_dAB));", \
                                  "free(hd_data->h_x_kp1); free(hd_data->h_dAB);", \
                                  "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){gpuErrchk(cudaStreamDestroy(streams[i]));} free(streams);"])
@@ -2264,12 +2293,19 @@ class GRiDCodeGenerator:
             nv_fj = self.robot.get_num_vel()
             n_pos_fj = self.robot.get_num_pos()
             Xhom_size_fj, _, _ = self.gen_get_Xhom_size()
-            # arena = s_XmatsHom(Xhom_size) + inner_temp(16*NJ); s_J is a caller param.
-            fj_t_count = Xhom_size_fj + (16 * NJ_fj)
+            # Arena sized for the launchable KERNEL (the widest consumer): it adds
+            # s_q (NUM_POS) + s_frame_jacobian (6*NV) to the device arena
+            # (s_XmatsHom(Xhom_size) + inner_temp(16*NJ)). The *_device wrapper takes
+            # s_J as a caller param so it needs less, but over-allocating the shared
+            # arena for it is harmless; mirrors ee_t_count = n + 6*ees + inner + XHom.
+            fj_t_count = Xhom_size_fj + (16 * NJ_fj) + n_pos_fj + (6 * nv_fj)
             self.gen_add_code_line(
                 "template <typename T> __host__ __device__ inline size_t FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES() "
                 "{ return grid_shared_arena_bytes<T>(" + str(fj_t_count) +
                 ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+            # S1: surface-presence marker so host runners/bindings can detect the
+            # launchable frame_jacobian host surface (kernel + 3-mode host).
+            self.gen_add_code_line("#define GRID_HAS_FRAME_JACOBIAN 1")
             self.gen_frame_jacobian()
             # E2 CUDA parity (opt-in siblings). Jdot/Lambda reuse frame_jacobian_inner.
             if "frame_jacobian_dot" in algorithms:

@@ -902,14 +902,19 @@ def gen_grid_plant(self, algorithms):
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'end_effector_pose' and 'end_effector_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
 
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
-    # kinematics-domain device fns (grid::com_device / grid::ccrba_device),
-    # which are emitted when `end_effector_pose` is present and the robot is non-mimic.
-    centroidal_ok = ("end_effector_pose" in algorithms) and not self.robot_has_mimic_joints()
+    # kinematics-domain device fns (grid::com_device / grid::ccrba_device), which
+    # are emitted ONLY when their `com` / `ccrba` keys are selected (and the robot
+    # is non-mimic). Gating on `end_effector_pose` alone was wrong: a profile that
+    # pulls in ee_pose for some OTHER reason (e.g. the frame_jacobian family, whose
+    # normalization adds end_effector_pose) but does not request com/ccrba would
+    # emit com_cost/momentum_cost referencing undefined grid::com_device/ccrba_device.
+    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms
+                     and not self.robot_has_mimic_joints())
     if centroidal_ok:
         gen_com_cost(self)
         gen_momentum_cost(self)
     else:
-        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'end_effector_pose', non-mimic).")
+        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'com'+'ccrba', non-mimic).")
 
     # Binding layer (G1): emit the per-timestep kernels that wrap the device
     # functions above, so the grid_rbd Python/C-ABI surface can launch them.
