@@ -809,17 +809,17 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
                 )
             if not dab_in_smem:
                 self.gen_add_code_line(
-                    "T *s_dAB = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_DAB_OFFSET_BYTES<T>()]);"
+                    "T *s_dAB = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_GRADIENT_DAB_OFFSET_BYTES<T>()]);"
                 )
             if inner_level == 1:
                 self.gen_add_code_line(
-                    "d_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()]);"
+                    "d_temp_spill = reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_GRADIENT_INNER_OFFSET_BYTES<T>()]);"
                 )
 
         def _emit_device_call(slot_expr):
             # The FD-grad inner pool base (only consumed by the inner when
             # SCRATCH_IN_SMEM=false; nullptr otherwise).
-            pool_name = ("reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES<T>()])"
+            pool_name = ("reinterpret_cast<T *>(&d_workspace[" + slot_expr + " + GRID_INTEGRATOR_GRADIENT_INNER_OFFSET_BYTES<T>()])"
                          if inner_level == 2 else "nullptr")
             spill_name = "d_temp_spill" if inner_level == 1 else "nullptr"
             self.gen_integrator_gradient_device_function_call(
@@ -930,9 +930,9 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"" + base_name + "\", INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     workspace_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
                        else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
-    self.gen_add_code_line("if (GRID_INTEGRATOR_DU_USES_WORKSPACE) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    self.gen_add_code_line("if (GRID_INTEGRATOR_GRADIENT_USES_WORKSPACE) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_INTEGRATOR_DU_USES_WORKSPACE) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_INTEGRATOR_GRADIENT_USES_WORKSPACE) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         self.gen_add_code_lines([
             "// finally transfer the result back",

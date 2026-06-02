@@ -767,19 +767,19 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     if not use_workspace_temp:
         self.gen_add_code_line("(void)d_workspace;")
-    # Per-tier eegrad_temp byte offset. The shared GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES
-    # macro keys off the single-valued PERF-pick GRID_EE_GRAD_USES_WORKSPACE_DXHOM, so it
+    # Per-tier eegrad_temp byte offset. The shared GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_TEMP_OFFSET_BYTES
+    # macro keys off the single-valued PERF-pick GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_DXHOM, so it
     # would collide with the spilled dXhom region at tiers whose pick spills dXhom but whose
     # PERF pick does not (e.g. go2 ee_grad = (0,0,2)). Compute the offset locally from THIS
     # tier's use_workspace_dxhom so the temp arena always lands past the spilled dXhom region.
-    eegrad_temp_off = "GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()"
+    eegrad_temp_off = "GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES<T>()"
     if use_workspace_dxhom:
         eegrad_temp_off += " + sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT)"
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         self.gen_kernel_load_inputs("q",str(n),stride="stride_q")
         if use_workspace_dxhom:
-            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = &d_deePos[k*" + str(6*nv*num_ees) + "];")
             self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + eegrad_temp_off + "]);")
@@ -802,7 +802,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     else:
         self.gen_kernel_load_inputs("q",str(n))
         if use_workspace_dxhom:
-            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
+            self.gen_add_code_line("T *s_dXmatsHom = reinterpret_cast<T *>(&d_workspace[GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES<T>()]);")
         if use_workspace_temp:
             self.gen_add_code_line("T *s_deePos = d_deePos;")
             self.gen_add_code_line("T *s_eegrad_temp = reinterpret_cast<T *>(&d_workspace[" + eegrad_temp_off + "]);")
@@ -915,9 +915,9 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
     # Per-tier gate: arm L2 persistence if ANY tier routes the chain workspace
     # through d_workspace (runtime RESOURCE_TIER may differ from the PERF pick).
-    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
+    self.gen_add_code_line("if (GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
-    self.gen_add_code_line("if (GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_end_l2_persisting(0));}")
+    self.gen_add_code_line("if (GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP_ANY) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \

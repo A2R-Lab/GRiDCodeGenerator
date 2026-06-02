@@ -923,15 +923,15 @@ class GRiDCodeGenerator:
                                  "const int XHOM_T_COUNT = " + str(XHom_size) + ";", \
                                  "const int DXHOM_T_COUNT = " + str(dXhom_size) + ";", \
                                  "const int D2XHOM_T_COUNT = " + str(d2Xhom_size) + ";", \
-                                 "const int GRID_ID_DU_USES_GLOBAL_TEMP = " + str(int(self.id_du_use_global_temp)) + ";", \
-                                 "const int GRID_ID_DU_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.id_du_spill_tier_3way) else 0) + ";", \
-                                 "const int GRID_FD_DU_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
-                                 "const int GRID_FD_DU_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.fd_du_spill_tier_3way) else 0) + ";", \
-                                 "const int GRID_ID_DU_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
-                                 "const int GRID_FD_DU_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
+                                 "const int GRID_INVERSE_DYNAMICS_GRADIENT_USES_GLOBAL_TEMP = " + str(int(self.id_du_use_global_temp)) + ";", \
+                                 "const int GRID_INVERSE_DYNAMICS_GRADIENT_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.id_du_spill_tier_3way) else 0) + ";", \
+                                 "const int GRID_FORWARD_DYNAMICS_GRADIENT_USES_GLOBAL_TEMP = " + str(int(self.fd_du_use_global_temp)) + ";", \
+                                 "const int GRID_FORWARD_DYNAMICS_GRADIENT_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 1 for p in self.fd_du_spill_tier_3way) else 0) + ";", \
+                                 "const int GRID_INVERSE_DYNAMICS_GRADIENT_USES_DA_DF_SPILL = " + str(int(self.id_du_use_selective_spill)) + ";", \
+                                 "const int GRID_FORWARD_DYNAMICS_GRADIENT_USES_DA_DF_SPILL = " + str(int(self.fd_du_use_selective_spill)) + ";", \
                                  "const int GRID_INTEGRATOR_USES_WORKSPACE = " + str(int(any(p == 1 for p in self.integrator_spill_tier_3way))) + ";", \
-                                 "const int GRID_INTEGRATOR_DU_USES_WORKSPACE = " + str(int(any(p >= 1 for p in self.integrator_du_spill_tier_3way))) + ";", \
-                                 "const int GRID_INTEGRATOR_DU_USES_DA_DF_SPILL = " + str(int(self.integrator_du_uses_da_df_spill)) + ";", \
+                                 "const int GRID_INTEGRATOR_GRADIENT_USES_WORKSPACE = " + str(int(any(p >= 1 for p in self.integrator_du_spill_tier_3way))) + ";", \
+                                 "const int GRID_INTEGRATOR_GRADIENT_USES_DA_DF_SPILL = " + str(int(self.integrator_du_uses_da_df_spill)) + ";", \
                                  "const int GRID_GENERATES_IDSVA_SO_BODY_FRAME = " + str(int(getattr(self, "generate_idsva_so_body_frame", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
                                  "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_end_effector_pose_hessian", True))) + ";", \
@@ -944,22 +944,22 @@ class GRiDCodeGenerator:
                                  # spill_fd_grad_band, spill_df_du, spill_Minv, pool_global). The host
                                  # uses this to pin L2 persistence on d_workspace for the per-tier path.
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 2 for p in self.fdsva_so_spill_tier_3way) else 0) + ";", \
-                                 # GRID_D2EE_USES_WORKSPACE_TEMP: 1 if the PERF tier spills the d2ee output
+                                 # GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP: 1 if the PERF tier spills the d2ee output
                                  # (the only large buffer in the new FD-on-Jacobian path) to global memory.
                                  # When spilled, the inner writes directly into d_d2eePos (the persistent
                                  # output buffer) -- no extra per-timestep workspace slice is used. The old
                                  # d2xhom-spill bit is permanently 0 (the FD inner never touches d2Xhom).
-                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_output)) + ";", \
-                                 "const int GRID_D2EE_USES_WORKSPACE_D2XHOM = 0;", \
-                                 "const int GRID_D2EE_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.d2ee_spill_tier_3way) else 0) + ";", \
-                                 "const int GRID_D2EE_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
-                                 "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP = " + str(int(self.ee_grad_use_workspace_temp)) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_output)) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_D2XHOM = 0;", \
+                                 "const int GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.d2ee_spill_tier_3way) else 0) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_HESSIAN_SHARED_TIER_VALUE = " + str(self.d2ee_spill_tier) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP = " + str(int(self.ee_grad_use_workspace_temp)) + ";", \
                                  # Same per-tier gate for the EE_POSE_GRAD chain workspace.
-                                 "const int GRID_EE_GRAD_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.ee_grad_spill_tier_3way) else 0) + ";", \
-                                 "const int GRID_EE_GRAD_USES_WORKSPACE_DXHOM = " + str(int(self.ee_grad_use_workspace_dxhom)) + ";", \
-                                 "const int GRID_EE_GRAD_SHARED_TIER_VALUE = " + str(self.ee_grad_spill_tier) + ";", \
-                                 "const int GRID_ID_DU_SHARED_TIER_VALUE = " + str(self.id_du_spill_tier) + ";", \
-                                 "const int GRID_FD_DU_SHARED_TIER_VALUE = " + str(self.fd_du_spill_tier) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.ee_grad_spill_tier_3way) else 0) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_DXHOM = " + str(int(self.ee_grad_use_workspace_dxhom)) + ";", \
+                                 "const int GRID_END_EFFECTOR_POSE_GRADIENT_SHARED_TIER_VALUE = " + str(self.ee_grad_spill_tier) + ";", \
+                                 "const int GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.id_du_spill_tier) + ";", \
+                                 "const int GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.fd_du_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(id_du_temp_layout["spill_start"]) + ";", \
                                  "const int ID_DU_TEMP_SPILL_END = " + str(id_du_temp_layout["spill_end"]) + ";", \
                                  "const int ID_DU_TEMP_SPILL_COUNT = " + str(id_du_temp_layout["spill_count"]) + ";", \
@@ -1094,8 +1094,8 @@ class GRiDCodeGenerator:
                                  "template <int TIER> __host__ __device__ constexpr bool INTEGRATOR_DU_DAB_IN_SMEM() { return (TIER == TIER_SHARED) ? " + _b(self.integrator_du_dab_in_smem_per_tier[0]) + " : (TIER == TIER_LITE) ? " + _b(self.integrator_du_dab_in_smem_per_tier[1]) + " : " + _b(self.integrator_du_dab_in_smem_per_tier[2]) + "; }",
                                  "template <int TIER> __host__ __device__ constexpr int INTEGRATOR_DU_INNER_LEVEL() { return (TIER == TIER_SHARED) ? " + str(self.integrator_du_inner_level_per_tier[0]) + " : (TIER == TIER_LITE) ? " + str(self.integrator_du_inner_level_per_tier[1]) + " : " + str(self.integrator_du_inner_level_per_tier[2]) + "; }",
                                  # d_workspace sub-offsets (within the per-timestep slot): Dqdd at 0, then dAB, then the inner-spill region.
-                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_DU_DAB_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count) + "); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_DU_INNER_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count + self._integrator_du_dAB_count) + "); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_GRADIENT_DAB_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count) + "); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_INTEGRATOR_GRADIENT_INNER_OFFSET_BYTES() { return sizeof(T) * static_cast<size_t>(" + str(self._integrator_du_dqdd_count + self._integrator_du_dAB_count) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t MINV_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(minv_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t FORWARD_DYNAMICS_DEVICE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(fd_device_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
@@ -1242,8 +1242,8 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(3*nv*nv if any(p >= 4 for p in getattr(self, 'fdsva_so_spill_tier_3way', (0, 0, 0))) else 0) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_WORKSPACE_BYTES_PER_TIMESTEP() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP<T>(); }",
-                                 "template <typename T> __host__ __device__ inline gridSharedTier GRID_ID_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_ID_DU_SHARED_TIER_VALUE); }",
-                                 "template <typename T> __host__ __device__ inline gridSharedTier GRID_FD_DU_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FD_DU_SHARED_TIER_VALUE); }",
+                                 "template <typename T> __host__ __device__ inline gridSharedTier GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE); }",
+                                 "template <typename T> __host__ __device__ inline gridSharedTier GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
                                  # Phase 3a: Minv-F lives at offset 0 of the grad section when spilled.
                                  # Safe to overlap with id_du_spill region because Minv finishes before
@@ -1258,14 +1258,14 @@ class GRiDCodeGenerator:
                                  # s_d2eePos is written directly into d_d2eePos); these offset macros are
                                  # retained as 0 for backward compatibility with any inline-CUDA caller
                                  # pattern that still references them. New code should not use them.
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_TEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2XHOM_OFFSET_BYTES() { return static_cast<size_t>(0); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_D2EE_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_HESSIAN_WORKSPACE_TEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_HESSIAN_WORKSPACE_D2XHOM_OFFSET_BYTES() { return static_cast<size_t>(0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_HESSIAN_WORKSPACE_D2EETEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
                                  # Phase 3d: EE_POSE_GRAD reuses the SO section (the kernels don't
                                  # run concurrently — d_workspace bytes are safely repurposed). When
                                  # the MINIMAL tier spills dXmatsHom, it sits before the temp arena.
-                                 "template <typename T> __host__ __device__ inline size_t GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
-                                 "template <typename T> __host__ __device__ inline size_t GRID_EE_GRAD_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_EE_GRAD_WORKSPACE_DXHOM_OFFSET_BYTES<T>() + (GRID_EE_GRAD_USES_WORKSPACE_DXHOM ? sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT) : 0); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>(); }",
+                                 "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES<T>() + (GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_DXHOM ? sizeof(T) * static_cast<size_t>(DXHOM_T_COUNT) : 0); }",
                                  "template <typename T> __host__ __device__ inline bool grid_selected_shared_memory_fits() { return INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES && (!GRID_GENERATES_D2EE || END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_IDSVA_SO_BODY_FRAME || IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES) && (!GRID_GENERATES_FDSVA_SO || FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>() <= GRID_CUDA_TARGET_SHARED_MEM_BYTES); }",
                                  "// __forceinline__ used throughout the xhom helper chain so ptxas folds these into the",
                                  "// inner kernels at all opt levels. For fixed-base the body of grid_q_index_affects_joint is",
@@ -1460,7 +1460,7 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    if ((GRID_D2EE_USES_WORKSPACE_TEMP || GRID_EE_GRAD_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
+                      "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
