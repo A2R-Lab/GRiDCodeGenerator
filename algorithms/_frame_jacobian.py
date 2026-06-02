@@ -34,6 +34,8 @@ __all__ = [
     "gen_frame_jacobian_host",
     "gen_frame_jacobian",
     "gen_frame_jacobian_dot_device",
+    "gen_frame_jacobian_dot_kernel",
+    "gen_frame_jacobian_dot_host",
     "gen_frame_jacobian_dot",
     "gen_osc_inertia_device",
     "gen_osc_inertia",
@@ -465,8 +467,124 @@ def gen_frame_jacobian_dot_device(self):
     self.gen_add_end_function()
 
 
+def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
+    """Emit frame_jacobian_dot_kernel: batched launcher of the general-frame
+    Jacobian time-derivative Jdot. Reads q (NUM_POS) + qd (NUM_VEL) from the
+    packed d_q_qd_u buffer; target_jid + reference_frame baked as the leaf-EE /
+    LOCAL_WORLD_ALIGNED defaults (mirrors frame_jacobian_kernel). Output 6 x NV."""
+    n_vel = self.robot.get_num_vel()
+    n_pos = self.robot.get_num_pos()
+    fb = 1 if self.robot.floating_base else 0
+    default_tjid = self.robot.get_leaf_nodes()[0]
+    func_params = ["d_frame_jacobian_dot is the vector of 6 x NUM_VEL Jacobian time-derivatives (column-major, [linear; angular])",
+                   "d_q_qd is the packed [q (NUM_POS); qd (NUM_VEL)] input",
+                   "stride_q_qd is the stride between each (q, qd) tuple",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_def_start = "void frame_jacobian_dot_kernel(T *d_frame_jacobian_dot, const T *d_q_qd, const int stride_q_qd, "
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian", [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("const int target_jid = " + str(default_tjid) + ";")
+    self.gen_add_code_line("const int reference_frame = " + str(_REF_LWA) + ";")
+    # frame_jacobian_dot_device is a full auto-smem wrapper: it owns the ENTIRE
+    # dynamic-smem arena (s_XmatsHom + s_qpert + s_Jp + s_Jm + s_temp), sized by
+    # FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES, and reads s_q/s_qd + writes
+    # s_Jdot as caller params. So the kernel keeps its input/output buffers in
+    # STATIC __shared__ (NOT the dynamic arena) to avoid aliasing the wrapper's
+    # internal scratch (mirrors the cuda_frame_jacobian_smoke_runner static-shared
+    # pattern). The dynamic smem the launch reserves is consumed by the wrapper.
+    self.gen_add_code_line("__shared__ T s_q_qd[" + str(n_pos + n_vel) + "];")
+    self.gen_add_code_line("__shared__ T s_frame_jacobian_dot[" + str(6 * n_vel) + "];")
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n_pos) + "];")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q_qd", str(n_pos + n_vel), stride="stride_q_qd")
+        self.gen_add_code_line("// compute")
+        self.gen_add_code_line("frame_jacobian_dot_device<T>(s_frame_jacobian_dot, target_jid, reference_frame, s_q, s_qd, d_robotModel);")
+        self.gen_add_sync()
+        self.gen_kernel_save_result("frame_jacobian_dot", str(6 * n_vel), stride=str(6 * n_vel))
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q_qd", str(n_pos + n_vel))
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q_qd", str(n_pos + n_vel), feedback_from="frame_jacobian_dot")
+        self.gen_add_code_line("frame_jacobian_dot_device<T>(s_frame_jacobian_dot, target_jid, reference_frame, s_q, s_qd, d_robotModel);")
+        self.gen_anti_licm_output_write("frame_jacobian_dot")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("frame_jacobian_dot", str(6 * n_vel))
+    self.gen_add_end_function()
+
+
+def gen_frame_jacobian_dot_host(self, mode=0):
+    """Emit frame_jacobian_dot host launcher (3 modes). Always uses the full
+    q|qd|u memory (Jdot needs qd, which the compressed q-only layout lacks)."""
+    single_call_timing = True if mode == 1 else False
+    compute_only = True if mode == 2 else False
+    func_params = ["hd_data is the packaged input and output pointers",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+    func_def_start = "void frame_jacobian_dot(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian", [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian_dot requires all-data or kinematics gridData\");")
+    # Jdot needs qd; always source from the full q|qd|u buffer (stride 3*NUM_JOINTS),
+    # the kernel reads the leading [q; qd] slice.
+    func_call = ("frame_jacobian_dot_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+                 "(hd_data->d_frame_jacobian_dot,hd_data->d_q_qd_u,stride_q_qd,d_robotModel,num_timesteps);")
+    if single_call_timing:
+        func_call = func_call.replace("kernel<T>", "kernel_single_timing<T>")
+    if not compute_only:
+        self.gen_add_code_lines(["// start code with memory transfer",
+                                 "int stride_q_qd = 3*NUM_JOINTS;",
+                                 "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));",
+                                 "gpuErrchkKernel();"])
+    else:
+        self.gen_add_code_line("int stride_q_qd = 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call_code = [func_call, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"frame_jacobian_dot\", FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines(["// finally transfer the result back",
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_frame_jacobian_dot,hd_data->d_frame_jacobian_dot,6*NUM_VEL*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("frame_jacobian_dot"))
+    self.gen_add_end_function()
+
+
 def gen_frame_jacobian_dot(self):
     self.gen_frame_jacobian_dot_device()
+    self.gen_frame_jacobian_dot_kernel(single_call_timing=False)
+    self.gen_frame_jacobian_dot_kernel(single_call_timing=True)
+    self.gen_frame_jacobian_dot_host(mode=0)
+    self.gen_frame_jacobian_dot_host(mode=1)
+    self.gen_frame_jacobian_dot_host(mode=2)
 
 
 def gen_osc_inertia_device(self):

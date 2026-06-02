@@ -88,7 +88,8 @@ class GRiDCodeGenerator:
                             _gen_kin_centroidal_kernel, _gen_kin_centroidal_host, gen_com, gen_ccrba, gen_energy, \
                             gen_frame_jacobian_inner, gen_frame_jacobian_device, \
                             gen_frame_jacobian_kernel, gen_frame_jacobian_host, gen_frame_jacobian, \
-                            gen_frame_jacobian_dot_device, gen_frame_jacobian_dot, \
+                            gen_frame_jacobian_dot_device, gen_frame_jacobian_dot_kernel, \
+                            gen_frame_jacobian_dot_host, gen_frame_jacobian_dot, \
                             gen_osc_inertia_device, gen_osc_inertia
 
     # finally import the test code
@@ -1686,6 +1687,12 @@ class GRiDCodeGenerator:
             ("frame_jacobian_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
+        ("frame_jacobian_dot", "frame_jacobian_dot", None, "FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("frame_jacobian_dot_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("frame_jacobian_dot_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
         ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
@@ -2309,12 +2316,17 @@ class GRiDCodeGenerator:
             self.gen_frame_jacobian()
             # E2 CUDA parity (opt-in siblings). Jdot/Lambda reuse frame_jacobian_inner.
             if "frame_jacobian_dot" in algorithms:
-                # Jdot arena = s_XmatsHom + extras(s_qpert[n_pos] + s_Jp[6nv] + s_Jm[6nv]) + inner_temp(16*NJ).
+                # Jdot arena = s_XmatsHom + extras(s_qpert[n_pos] + s_Jp[6nv] + s_Jm[6nv])
+                # + inner_temp(16*NJ). The launchable kernel keeps its input (s_q_qd)
+                # and output (s_frame_jacobian_dot) in STATIC __shared__ — NOT this
+                # dynamic arena, which the frame_jacobian_dot_device wrapper owns
+                # entirely — so this size matches the wrapper exactly.
                 fjd_t_count = Xhom_size_fj + n_pos_fj + (2 * 6 * nv_fj) + (16 * NJ_fj)
                 self.gen_add_code_line(
                     "template <typename T> __host__ __device__ inline size_t FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES() "
                     "{ return grid_shared_arena_bytes<T>(" + str(fjd_t_count) +
                     ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_add_code_line("#define GRID_HAS_FRAME_JACOBIAN_DOT 1")
                 # Floating-base Jdot integrates q on the SE(3) group; emit the Lie
                 # helpers if no other kinematics path already did.
                 if self.robot.floating_base and not getattr(self, "_lie_helpers_emitted", False):
