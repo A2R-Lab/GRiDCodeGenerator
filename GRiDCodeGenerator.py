@@ -658,8 +658,14 @@ class GRiDCodeGenerator:
         # priority families use the full smem arena).
         NB = self.robot.get_num_bodies()
         # generalized_gravity (the larger of the two ID-bias kernels: + s_qd0):
-        #   s_q_qd(2n) + s_out(nv) + s_vaf(18n) + s_qd0(nv) + inner_temp(6n) + XI
-        self.id_bias_t_count = 2*n + nv + 18*n + nv + 6*n + XI_size
+        #   s_q_qd(2n) + s_out(nv) + s_vaf(18*nb_vaf) + s_qd0(nv) + inner_temp(6n) + XI
+        # s_vaf is body-indexed by RAW body id inside inverse_dynamics_inner; for mimic
+        # robots get_num_joints() (NB) > get_num_pos() (NV) so it MUST be 18*NB here to
+        # match the device wrapper's arena (_centroidal.py:68/96) — else the host arena
+        # macro under-budgets and the high-body f-writes overflow shared mem (h1_2:fixed
+        # NB=51>NV=39 crashed). Non-mimic (nb_vaf==n) is byte-identical to the old 18*n.
+        nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+        self.id_bias_t_count = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size
         # com/ccrba/energy share one arena sizing (use the largest input/output):
         #   s_in(<=2n) + s_out(<=6nv+6) + s_A(6nv) + s_com(3) + s_extra(4)
         #   + centroidal_inner_temp + XHom_size
