@@ -1582,9 +1582,9 @@ class GRiDCodeGenerator:
         ]),
         ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("fdsva_so_kernel<T>",
-             "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("fdsva_so_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, unsigned char *, T *, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
         ]),
         # Integrator kernels are templated on IntegratorType IT (a non-type param
         # that does not change the function signature). Each IT is a distinct

@@ -450,15 +450,15 @@ def gen_fdsva_so_kernel(self, single_call_timing = False):
     n = self.robot.get_num_vel()
     NUM_POS = self.robot.get_num_pos()
     func_params = ["d_df2 is the second derivatives of forward dynamics WRT q,qd,tau", \
+                    "d_workspace is the generated global spill workspace", \
                     "d_q_qd_u is the vector of joint positions, velocities, torques", \
                     "stride_q_qd_u is the stride between each q, qd, qdd", \
-                    "d_workspace is the generated global spill workspace", \
                     "d_idsva_so is the pointer to the idsva_so output tensor in global memory", \
                     "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                     "gravity is the gravity constant", \
                     "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = []
-    func_def_start = "void fdsva_so_kernel(T *d_df2, const T *d_q_qd_u, const int stride_q_qd_u, unsigned char *d_workspace, T *d_idsva_so, "
+    func_def_start = "void fdsva_so_kernel(T *d_df2, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, T *d_idsva_so, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -506,7 +506,7 @@ def gen_fdsva_so_host(self, mode = 0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fdsva_so requires all-data or dynamics gridData\");")
 
-    func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_workspace,hd_data->d_idsva_so,"
+    func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_idsva_so,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd_qdd = Q_QD_U_STRIDE;")
     if single_call_timing:
