@@ -143,8 +143,8 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     if (include_homogenous_transforms):
         Xmats_hom = self.robot.get_Xmats_hom_ordered_by_id(include_fixed_joints = self.include_fixed_kinematic_targets)
         generated_algorithms = getattr(self, "generated_algorithms", set())
-        include_hom_gradients = ("ee_pose_gradient" in generated_algorithms) or ("ee_pose_hessian" in generated_algorithms)
-        include_hom_hessians = "ee_pose_hessian" in generated_algorithms
+        include_hom_gradients = ("end_effector_pose_gradient" in generated_algorithms) or ("end_effector_pose_hessian" in generated_algorithms)
+        include_hom_hessians = "end_effector_pose_hessian" in generated_algorithms
         dXmats_hom, _ = _global_hom_derivative_matrices_by_q(self) if include_hom_gradients else ([], [])
         d2Xmats_hom, _ = _global_hom_second_derivative_matrices(self) if include_hom_hessians else ([], [])
         Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()

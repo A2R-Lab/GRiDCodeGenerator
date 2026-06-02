@@ -856,7 +856,7 @@ def gen_plant_kernels(self, algorithms):
         gen_plant_step_kernel(self)
         # Signal to the binding layer (wrapper_template.cu) that plant_step exists.
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP 1")
-    if ("ee_pose" in algorithms) and ("ee_pose_gradient" in algorithms):
+    if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         gen_ee_pos_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
 
@@ -896,7 +896,7 @@ def gen_grid_plant(self, algorithms):
         self.gen_add_code_line("// [grid_plant] plant_step_gradient[_and_value] skipped: requires 'integrator_gradient' (grid::integrator_gradient_device) — not generated.")
 
     # EE position cost needs both ee_pose and ee_pose_gradient.
-    if ("ee_pose" in algorithms) and ("ee_pose_gradient" in algorithms):
+    if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         self.gen_ee_pos_cost()
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'ee_pose' and 'ee_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
@@ -904,7 +904,7 @@ def gen_grid_plant(self, algorithms):
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
     # kinematics-domain device fns (grid::com_device / grid::ccrba_device),
     # which are emitted when `ee_pose` is present and the robot is non-mimic.
-    centroidal_ok = ("ee_pose" in algorithms) and not self.robot_has_mimic_joints()
+    centroidal_ok = ("end_effector_pose" in algorithms) and not self.robot_has_mimic_joints()
     if centroidal_ok:
         gen_com_cost(self)
         gen_momentum_cost(self)

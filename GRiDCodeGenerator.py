@@ -52,11 +52,11 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_device_temp_mem_size, gen_end_effector_pose_device, gen_end_effector_pose_kernel, \
                             gen_end_effector_pose_host, gen_end_effector_pose_gradient_inner_temp_mem_size, gen_end_effector_pose_gradient_inner_function_call, \
                             gen_end_effector_pose_gradient_inner, gen_end_effector_pose_gradient_device, gen_end_effector_pose_gradient_kernel, \
-                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_gradient_hessian_output_count, gen_end_effector_pose_gradient_hessian_inner_temp_mem_size, gen_end_effector_pose_gradient_hessian_inner_function_call, \
-                            gen_end_effector_pose_gradient_hessian_inner, gen_end_effector_pose_gradient_hessian_device, gen_end_effector_pose_gradient_hessian_kernel, gen_ee_pose_inner_thread, gen_ee_pose_inner_warp, \
+                            gen_end_effector_pose_gradient_host, gen_end_effector_pose_hessian_output_count, gen_end_effector_pose_hessian_inner_temp_mem_size, gen_end_effector_pose_hessian_inner_function_call, \
+                            gen_end_effector_pose_hessian_inner, gen_end_effector_pose_hessian_device, gen_end_effector_pose_hessian_kernel, gen_ee_pose_inner_thread, gen_ee_pose_inner_warp, \
                             gen_ee_pose_inner_xform_from_q_lines, gen_ee_pose_inner_parent_lookup, \
                             gen_ee_pose_fk_batched_kernel, gen_ee_pose_fk_batched_host, \
-                            gen_end_effector_pose_gradient_hessian_host, gen_eepose_and_derivatives, \
+                            gen_end_effector_pose_hessian_host, gen_eepose_and_derivatives, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, gen_aba_inner_cold_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
@@ -115,7 +115,7 @@ class GRiDCodeGenerator:
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
         all_algorithms = {
             "id", "minv", "fd", "id_du", "fd_du", "aba", "crba",
-            "idsva_so_body_frame", "fdsva_so", "ee_pose", "ee_pose_gradient", "ee_pose_hessian",
+            "idsva_so_body_frame", "fdsva_so", "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
             "f_ext_grad", "regressor", "fd_parameter_gradient",
         }
@@ -129,7 +129,7 @@ class GRiDCodeGenerator:
         opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia"}
         profile_algorithms = {
             "all": all_algorithms,
-            "frame-jacobian": {"ee_pose", "minv", "frame_jacobian",
+            "frame-jacobian": {"end_effector_pose", "minv", "frame_jacobian",
                                "frame_jacobian_dot", "osc_inertia"},
             "dynamics": {"id", "minv", "fd", "id_du", "fd_du", "aba", "crba", "idsva_so_body_frame", "fdsva_so",
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
@@ -138,8 +138,8 @@ class GRiDCodeGenerator:
             "regressor": {"id", "regressor"},
             "fd-param-gradient": {"id", "minv", "fd", "regressor", "fd_parameter_gradient"},
             "f-ext-gradient": {"id", "minv", "f_ext_grad"},
-            "kinematics": {"ee_pose"},
-            "kinematics-derivatives": {"ee_pose", "ee_pose_gradient", "ee_pose_hessian"},
+            "kinematics": {"end_effector_pose"},
+            "kinematics-derivatives": {"end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian"},
             "second-order": {"id", "minv", "fd", "id_du", "fd_du", "idsva_so_body_frame", "fdsva_so"},
             "integrators": {"id", "minv", "fd", "id_du", "fd_du", "integrator", "integrator_gradient",
                             "integrator_with_gradient"},
@@ -163,12 +163,12 @@ class GRiDCodeGenerator:
             "inverse-dynamics-regressor": "regressor",
             "idsva-so": "idsva_so_body_frame",
             "fdsva-so": "fdsva_so",
-            "ee-pose": "ee_pose",
-            "end-effector-pose": "ee_pose",
-            "ee-pose-gradient": "ee_pose_gradient",
-            "end-effector-pose-gradient": "ee_pose_gradient",
-            "ee-pose-hessian": "ee_pose_hessian",
-            "end-effector-pose-hessian": "ee_pose_hessian",
+            "ee-pose": "end_effector_pose",
+            "end-effector-pose": "end_effector_pose",
+            "ee-pose-gradient": "end_effector_pose_gradient",
+            "end-effector-pose-gradient": "end_effector_pose_gradient",
+            "ee-pose-hessian": "end_effector_pose_hessian",
+            "end-effector-pose-hessian": "end_effector_pose_hessian",
             "euler": "integrator",
             "integrator-euler": "integrator",
             "integrator-gradient": "integrator_gradient",
@@ -205,7 +205,7 @@ class GRiDCodeGenerator:
         if "frame_jacobian_dot" in algorithms or "osc_inertia" in algorithms:
             algorithms.add("frame_jacobian")
         if "frame_jacobian" in algorithms:
-            algorithms.update({"ee_pose", "minv"})
+            algorithms.update({"end_effector_pose", "minv"})
         if "fd_du" in algorithms:
             algorithms.update({"id", "minv", "fd", "id_du"})
         if "id_du" in algorithms:
@@ -633,15 +633,15 @@ class GRiDCodeGenerator:
         # large buffer that can move out of smem). dXhom/d2Xhom are no longer used
         # by the geometric-Jacobian gradient inner the d2ee inner runs internally.
         _d2ee_num_ees = self.robot.get_total_leaf_nodes()
-        d2ee_inner_temp_count = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
-        d2ee_output_count = self.gen_end_effector_pose_gradient_hessian_output_count()
+        d2ee_inner_temp_count = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
+        d2ee_output_count = self.gen_end_effector_pose_hessian_output_count()
         d2ee_grad_count = 6 * nv * _d2ee_num_ees
         # full smem: q + grad + d2ee_output + inner_temp + Xhom
         d2ee_full_t_count   = n + d2ee_grad_count + d2ee_output_count + d2ee_inner_temp_count + XHom_size
         # output spilled: drop d2ee_output from smem (still need q + grad + inner_temp + Xhom)
         d2ee_spill_t_count  = n + d2ee_grad_count                     + d2ee_inner_temp_count + XHom_size
         _d2ee_arenas = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_t_count)
-        if "ee_pose_hessian" in getattr(self, "generated_algorithms", set()):
+        if "end_effector_pose_hessian" in getattr(self, "generated_algorithms", set()):
             self.d2ee_spill_tier_3way = select_shared_tier_3way(*_d2ee_arenas)
         else:
             self.d2ee_spill_tier_3way = (0, 0, 0)
@@ -925,7 +925,7 @@ class GRiDCodeGenerator:
                                  "const int GRID_INTEGRATOR_DU_USES_DA_DF_SPILL = " + str(int(self.integrator_du_uses_da_df_spill)) + ";", \
                                  "const int GRID_GENERATES_IDSVA_SO_BODY_FRAME = " + str(int(getattr(self, "generate_idsva_so_body_frame", True))) + ";", \
                                  "const int GRID_GENERATES_FDSVA_SO = " + str(int(getattr(self, "generate_fdsva_so", True))) + ";", \
-                                 "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_ee_pose_hessian", True))) + ";", \
+                                 "const int GRID_GENERATES_D2EE = " + str(int(getattr(self, "generate_end_effector_pose_hessian", True))) + ";", \
                                  "const int GRID_IDSVA_SO_USES_GLOBAL_OUTPUT = " + str(int(self.idsva_so_body_frame_use_global_output)) + ";", \
                                  "const int GRID_FDSVA_SO_USES_GLOBAL_TENSORS = " + str(int(self.fdsva_so_use_global_tensors)) + ";", \
                                  # Single-bool kept for inline-CUDA back-compat (reflects PERF-pick only).
@@ -1196,7 +1196,7 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.ee_grad_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ee_grad_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ee_grad_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "// --- end_effector_pose_gradient_hessian_inner (large nv^2 d2eePos output) ---",
+                                 "// --- end_effector_pose_hessian_inner (large nv^2 d2eePos output) ---",
                                  "// Per-tier placement of the d2ee inner's OUTPUT s_d2eePos: true => smem, false => d_workspace (which the kernel sets to d_d2eePos directly).",
                                  "template <int TIER> __host__ __device__ constexpr bool D2EE_OUT_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.d2ee_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.d2ee_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.d2ee_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_SHARED the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing roughly " + str(fd_du_temp_count) + "*sizeof(T) bytes of smem.",
@@ -1206,7 +1206,7 @@ class GRiDCodeGenerator:
                                  "        : grid_shared_arena_bytes<T>(" + str(fd_du_device_t_count - fd_du_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FD_DU_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(fd_du_temp_count) + "); }",
-                                 "// Per-tier sizes for end_effector_pose_gradient_hessian_device (inline-CUDA users only). At TIER_SHARED the smem arena keeps only the FD scratch + s_Xhom; at TIER_LITE/MINIMAL the device contract is unchanged (smem arena is the same -- the caller-provided s_d2eePos is what shifts), and the inner writes its " + str(d2ee_output_count) + "*sizeof(T) output bytes to d_workspace instead.",
+                                 "// Per-tier sizes for end_effector_pose_hessian_device (inline-CUDA users only). At TIER_SHARED the smem arena keeps only the FD scratch + s_Xhom; at TIER_LITE/MINIMAL the device contract is unchanged (smem arena is the same -- the caller-provided s_d2eePos is what shifts), and the inner writes its " + str(d2ee_output_count) + "*sizeof(T) output bytes to d_workspace instead.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t D2EE_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count + XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
                                  "}",
@@ -1522,13 +1522,13 @@ class GRiDCodeGenerator:
             ("crba_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("end_effector_pose", "ee_pose", None, "EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("end_effector_pose", "end_effector_pose", None, "EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("end_effector_pose_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("end_effector_pose_gradient", "ee_pose_gradient", None, "DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("end_effector_pose_gradient", "end_effector_pose_gradient", None, "DEE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("end_effector_pose_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_gradient_kernel_single_timing<T>",
@@ -1639,11 +1639,11 @@ class GRiDCodeGenerator:
         # ee_pose_hessian is special: only emitted when its shared-mem fits the
         # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime
         # guard wraps the cudaFuncSetAttribute call.
-        ("end_effector_pose_gradient_hessian", "ee_pose_hessian", "generate_ee_pose_hessian",
+        ("end_effector_pose_hessian", "end_effector_pose_hessian", "generate_end_effector_pose_hessian",
          "D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
-            ("end_effector_pose_gradient_hessian_kernel<T>",
+            ("end_effector_pose_hessian_kernel<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-            ("end_effector_pose_gradient_hessian_kernel_single_timing<T>",
+            ("end_effector_pose_hessian_kernel_single_timing<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         # G2 centroidal quick-wins. gravity/nonlinear_effects gate on `id`
@@ -1662,19 +1662,19 @@ class GRiDCodeGenerator:
             ("nonlinear_effects_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
-        ("com", "ee_pose", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("com", "end_effector_pose", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("com_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("ccrba", "ee_pose", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("ccrba", "end_effector_pose", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("ccrba_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("ccrba_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
-        ("energy", "ee_pose", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ("energy", "end_effector_pose", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("energy_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("energy_kernel_single_timing<T>",
@@ -1857,12 +1857,12 @@ class GRiDCodeGenerator:
             emit_dynamics_combo("dynamics_only", "Run all generated non-second-order dynamics wrappers in sequence", calls)
 
         kinematics_calls = []
-        if "ee_pose" in algorithms:
+        if "end_effector_pose" in algorithms:
             kinematics_calls.append("end_effector_pose" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-        if "ee_pose_gradient" in algorithms:
+        if "end_effector_pose_gradient" in algorithms:
             kinematics_calls.append("end_effector_pose_gradient" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
-        if "ee_pose_hessian" in algorithms:
-            kinematics_calls.append("end_effector_pose_gradient_hessian" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
+        if "end_effector_pose_hessian" in algorithms:
+            kinematics_calls.append("end_effector_pose_hessian" + kinematics_suffix + "<T,false,KIND>(hd_data,d_robotModel,num_timesteps,block_dimms,thread_dimms,streams);")
         if kinematics_calls:
             emit_kinematics_combo("kinematics_only", "Run all generated kinematics wrappers in sequence", kinematics_calls)
 
@@ -1928,13 +1928,13 @@ class GRiDCodeGenerator:
             self.gen_add_code_line("// [centroidal] generalized_gravity/nonlinear_effects skipped: require 'id' (grid::inverse_dynamics_inner).")
         # R3/R2/energy: kinematics-domain centroidal families. Need homogeneous
         # transforms (always present when ee_pose is generated).
-        kin_ok = ("ee_pose" in algorithms) and not self.robot_has_mimic_joints()
+        kin_ok = ("end_effector_pose" in algorithms) and not self.robot_has_mimic_joints()
         if kin_ok:
             self.gen_centroidal_inner()
             self.gen_com()
             self.gen_ccrba()
             self.gen_energy()
-        elif "ee_pose" not in algorithms:
+        elif "end_effector_pose" not in algorithms:
             self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: require 'ee_pose' (homogeneous-transform world-frame machinery).")
         else:
             self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
@@ -2036,7 +2036,7 @@ class GRiDCodeGenerator:
                 )
         self.generate_id_du = "id_du" in algorithms
         self.generate_fd_du = "fd_du" in algorithms
-        self.generate_ee_pose_hessian = "ee_pose_hessian" in algorithms
+        self.generate_end_effector_pose_hessian = "end_effector_pose_hessian" in algorithms
         self.enable_floating_second_order = enable_floating_second_order
         allow_second_order = (not self.robot.floating_base) or enable_floating_second_order
         self.generate_idsva_so_body_frame = ("idsva_so_body_frame" in algorithms) and allow_second_order
@@ -2053,7 +2053,7 @@ class GRiDCodeGenerator:
                 "Either keep enable_idsva_so_world_frame at its default (None → "
                 "True for floating-base) or remove fdsva_so from algorithms."
             )
-        include_any_kinematics = any(name in algorithms for name in ("ee_pose", "ee_pose_gradient", "ee_pose_hessian"))
+        include_any_kinematics = any(name in algorithms for name in ("end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian"))
         include_homogenous_transforms = include_homogenous_transforms or include_any_kinematics
         # first generate the file info
         file_notes = [ "Interface is:", \
@@ -2108,10 +2108,10 @@ class GRiDCodeGenerator:
             "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_pose_gradient_hessian_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
-            "    __device__ end_effector_pose_gradient_hessian_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_pose_gradient_hessian_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
-            "    __host__   end_effector_pose_gradient_hessian<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
+            "    __device__ end_effector_pose_hessian_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_hessian_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_hessian_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __host__   end_effector_pose_hessian<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, T *s_XImats, T *s_mem, const T gravity)",\
             "    __global__ idsva_so_body_frame_kernel(T *d_idsva_so, const T *d_q_qd_u, const int stride_q_qd_u, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
@@ -2196,9 +2196,9 @@ class GRiDCodeGenerator:
         self.gen_load_update_XImats_helpers()
         if include_homogenous_transforms and include_any_kinematics:
             self.gen_load_update_XmatsHom_helpers(include_base_inertia)
-            if "ee_pose_gradient" in algorithms or "ee_pose_hessian" in algorithms:
+            if "end_effector_pose_gradient" in algorithms or "end_effector_pose_hessian" in algorithms:
                 self.gen_load_update_XmatsHom_helpers(include_base_inertia,include_gradients = True)
-            if "ee_pose_hessian" in algorithms:
+            if "end_effector_pose_hessian" in algorithms:
                 self.gen_load_update_XmatsHom_helpers(include_base_inertia,include_gradients = True, include_hessians = True)
         # then generate kinematic algorithms.
         # SE(3) Lie-group helpers (grid_integrate_floating_q, grid_so3_*, grid_quat_*)
@@ -2207,13 +2207,13 @@ class GRiDCodeGenerator:
         # the emission so gen_integrator skips its own emit (avoiding redefinitions).
         self._lie_helpers_emitted = False
         if include_any_kinematics:
-            if self.robot.floating_base and "ee_pose_hessian" in algorithms:
+            if self.robot.floating_base and "end_effector_pose_hessian" in algorithms:
                 self.gen_lie_group_helpers()
                 self._lie_helpers_emitted = True
             self.gen_eepose_and_derivatives(fixed_target_name = fixed_target_name,
-                                            include_pose = "ee_pose" in algorithms,
-                                            include_gradient = "ee_pose_gradient" in algorithms,
-                                            include_hessian = "ee_pose_hessian" in algorithms)
+                                            include_pose = "end_effector_pose" in algorithms,
+                                            include_gradient = "end_effector_pose_gradient" in algorithms,
+                                            include_hessian = "end_effector_pose_hessian" in algorithms)
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
@@ -2281,7 +2281,7 @@ class GRiDCodeGenerator:
         # ee_pose dependency itself is mimic-gated elsewhere (kin_ok), but the
         # frame_jacobian family only needs ee_pose's world-transform machinery, which
         # is emitted whenever the frame_jacobian key is selected.
-        if "frame_jacobian" in algorithms and "ee_pose" in algorithms:
+        if "frame_jacobian" in algorithms and "end_effector_pose" in algorithms:
             NJ_fj = self.robot.get_num_joints()
             nv_fj = self.robot.get_num_vel()
             n_pos_fj = self.robot.get_num_pos()
@@ -2342,7 +2342,7 @@ class GRiDCodeGenerator:
         # all (mimic Lambda IS emitted otherwise). Emitted ONLY for mimic robots
         # so non-mimic headers stay byte-identical; the runner gates its Lambda
         # machinery on #ifndef GRID_FRAME_JAC_MIMIC.
-        if ("frame_jacobian" in algorithms and "ee_pose" in algorithms
+        if ("frame_jacobian" in algorithms and "end_effector_pose" in algorithms
                 and self.robot_has_mimic_joints() and "osc_inertia" not in algorithms):
             self.gen_add_code_line("#define GRID_FRAME_JAC_MIMIC 1")
         self.gen_combination_functions(algorithms, fixed_target_name)

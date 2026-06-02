@@ -323,7 +323,7 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("ee_pose"))
+        self.gen_add_code_line(single_call_printf_line("end_effector_pose"))
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_inner_temp_mem_size(self, fixed_target_name = ""):
@@ -927,10 +927,10 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("ee_pose_gradient"))
+        self.gen_add_code_line(single_call_printf_line("end_effector_pose_gradient"))
     self.gen_add_end_function()
 
-def gen_end_effector_pose_gradient_hessian_output_count(self):
+def gen_end_effector_pose_hessian_output_count(self):
     """Number of T elements in the d2eePos output: 6 * nv * nv * num_ees.
 
     Output is now d^2(pose)/dv^2 (TANGENT, pinocchio convention). For fixed-base
@@ -942,7 +942,7 @@ def gen_end_effector_pose_gradient_hessian_output_count(self):
     num_ees = self.robot.get_total_leaf_nodes()
     return 6 * nv * nv * num_ees
 
-def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
+def gen_end_effector_pose_hessian_inner_temp_mem_size(self):
     """Size (in T elements) of the analytic d2ee inner's s_temp.
 
     The closed-form per-chain second-order Taylor algorithm (see
@@ -963,7 +963,7 @@ def gen_end_effector_pose_gradient_hessian_inner_temp_mem_size(self):
     num_ees = self.robot.get_total_leaf_nodes()
     return 16*n_joints + 16*nv*num_ees + 4*num_ees
 
-def gen_end_effector_pose_gradient_hessian_inner_function_call(self, updated_var_names = None,
+def gen_end_effector_pose_hessian_inner_function_call(self, updated_var_names = None,
                                                                out_in_smem_expr = "true"):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
@@ -979,7 +979,7 @@ def gen_end_effector_pose_gradient_hessian_inner_function_call(self, updated_var
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_gradient_hessian_inner<T, " + out_in_smem_expr + ">(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_hessian_inner<T, " + out_in_smem_expr + ">(" + var_names["s_d2eePos_name"] + ", " + var_names["s_deePos_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_robotModel_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
@@ -1052,7 +1052,7 @@ def _eepose_hessian_chain_metadata(self, all_ees):
     return chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee
 
 
-def gen_end_effector_pose_gradient_hessian_inner(self):
+def gen_end_effector_pose_hessian_inner(self):
     """Analytic d^2(pose)/dv^2 of the end-effector pose via per-chain second-
     order Taylor expansion (see docs/d2ee_analytic_derivation.md).
 
@@ -1119,7 +1119,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
         "s_deePos is a pointer to memory of size 6*NUM_VEL*NUM_EE (the d/dv tangent Jacobian at q)",
         "s_q is the vector of joint positions (size NUM_POS = " + str(nq) + "; kept for signature compatibility, unused by the analytic path)",
         "s_Xhom is the per-joint LOCAL homogeneous-transform buffer (read-only)",
-        "s_temp is helper shared memory of size " + str(self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()) +
+        "s_temp is helper shared memory of size " + str(self.gen_end_effector_pose_hessian_inner_temp_mem_size()) +
             " (s_Xworld | s_Sworld | s_E_sc; always kept in smem)",
         "d_workspace is the global spill arena s_d2eePos is repointed at when !OUT_IN_SMEM (else unused)",
         "d_robotModel is the model-specific helper struct (kept for signature compatibility, unused by the analytic path)",
@@ -1129,7 +1129,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
         "Closed-form analytic d2(pose)/dv2; matches RBDReference.end_effector_pose_hessian_analytic (which agrees with pinocchio getJointKinematicHessian(LOCAL_WORLD_ALIGNED) to the FD floor fleet-wide; CUDA confirmed on iiwa14-fixed + go2-floating).",
         "Inner-owns scratch placement: the large nv^2 output s_d2eePos moves to d_workspace when !OUT_IN_SMEM. The s_Xworld+s_Sworld+s_E_sc scratch in s_temp stays in smem at every tier.",
     ]
-    func_def_start = "void end_effector_pose_gradient_hessian_inner("
+    func_def_start = "void end_effector_pose_hessian_inner("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, unsigned char *s_linalg_smem) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
@@ -2108,12 +2108,12 @@ def _emit_d2M_mimic_vslot_pair_block(self, ee_idx, ee_jid, vi, vj, nv, num_ees,
     self.gen_add_code_line("s_d2eePos[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
 
 
-def gen_end_effector_pose_gradient_hessian_device(self):
+def gen_end_effector_pose_hessian_device(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes()
-    inner_temp_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
-    output_count = self.gen_end_effector_pose_gradient_hessian_output_count()
+    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
+    output_count = self.gen_end_effector_pose_hessian_output_count()
     # construct the boilerplate and function definition
     func_params = ["s_d2eePos is a pointer to shared memory of size 6*NUM_VEL*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees) + " (d^2/dv^2 tangent, pinocchio convention)", \
                    "s_deePos is a pointer to shared memory of size 6*NUM_VEL*NUM_EE (d/dv tangent Jacobian)", \
@@ -2121,7 +2121,7 @@ def gen_end_effector_pose_gradient_hessian_device(self):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "d_workspace is the global scratch buffer; size D2EE_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_SHARED, " + str(output_count) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the large s_d2eePos output (~" + str(output_count) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel"]
-    func_def_start = "void end_effector_pose_gradient_hessian_device("
+    func_def_start = "void end_effector_pose_hessian_device("
     func_def_middle = "T *s_d2eePos, T *s_deePos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
@@ -2145,7 +2145,7 @@ def gen_end_effector_pose_gradient_hessian_device(self):
     self.gen_load_update_XmatsHom_helpers_function_call(include_gradients = False, include_hessians = False)
     # Inner-owns placement: pass d_workspace + the per-tier flag. When the flag is
     # false the inner repoints s_d2eePos at d_workspace.
-    self.gen_end_effector_pose_gradient_hessian_inner_function_call(
+    self.gen_end_effector_pose_hessian_inner_function_call(
         updated_var_names = {"d_workspace_name": "d_workspace", "s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"},
         out_in_smem_expr = "D2EE_OUT_IN_SMEM<RESOURCE_TIER>()")
     self.gen_add_end_function()
@@ -2164,11 +2164,11 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
                                      single_call_timing):
     """Emit the d2ee kernel body specialized for one tier's spill flags.
     Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
-    Used by gen_end_effector_pose_gradient_hessian_kernel to emit either a
+    Used by gen_end_effector_pose_hessian_kernel to emit either a
     single body (collapsed picks) or three branched bodies (divergent picks)."""
     nv = self.robot.get_num_vel()
-    output_count = self.gen_end_effector_pose_gradient_hessian_output_count()
-    inner_temp_size = self.gen_end_effector_pose_gradient_hessian_inner_temp_mem_size()
+    output_count = self.gen_end_effector_pose_hessian_output_count()
+    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
     extra_t_buffers = [("s_q", n)] if use_workspace_output else [("s_q", n), ("s_d2eePos", output_count), ("s_deePos", 6*nv*num_ees)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_temp_size, include_gradients = False, include_hessians = False,
                                                       extra_t_buffers = extra_t_buffers,
@@ -2190,7 +2190,7 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         updated = {"s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"}
         if use_workspace_output:
             updated["d_workspace_name"] = "s_d2eePos_ws"
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(
+        self.gen_end_effector_pose_hessian_inner_function_call(
             updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
         self.gen_add_sync()
         if not use_workspace_output:
@@ -2215,7 +2215,7 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         updated = {"s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"}
         if use_workspace_output:
             updated["d_workspace_name"] = "s_d2eePos_ws"
-        self.gen_end_effector_pose_gradient_hessian_inner_function_call(
+        self.gen_end_effector_pose_hessian_inner_function_call(
             updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
         self.gen_anti_licm_output_write("d2eePos")
         self.gen_add_end_control_flow()
@@ -2226,7 +2226,7 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
             self.gen_kernel_save_result("deePos",str(6*nv*num_ees))
 
 
-def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = False):
+def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
     n = self.robot.get_num_pos()
     num_ees = self.robot.get_total_leaf_nodes()
     func_params = ["d_d2eePos is the vector of end effector pose Hessians (6 x nv x nv per ee)", \
@@ -2237,7 +2237,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = Fal
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = ["Output d^2(pose)/dv^2 is in tangent-space convention (d/dv), shape 6 x nv x nv per ee, C-order. Matches pinocchio."]
-    func_def_start = "void end_effector_pose_gradient_hessian_kernel(T *d_d2eePos, T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, "
+    func_def_start = "void end_effector_pose_hessian_kernel(T *d_d2eePos, T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -2259,7 +2259,7 @@ def gen_end_effector_pose_gradient_hessian_kernel(self, single_call_timing = Fal
     self.gen_tier_dispatch(picks, _emit_d2ee_body)
     self.gen_add_end_function()
 
-def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
+def gen_end_effector_pose_hessian_host(self, mode = 0):
     # default is to do the full kernel call -- options are for single timing or compute only kernel wrapper
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
@@ -2270,7 +2270,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_gradient_hessian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void end_effector_pose_hessian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -2285,8 +2285,8 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
-    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient_hessian requires all-data or kinematics gridData\");")
-    func_call_start = "end_effector_pose_gradient_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_workspace,hd_data->d_q,stride_q,"
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_hessian requires all-data or kinematics gridData\");")
+    func_call_start = "end_effector_pose_hessian_kernel<T><<<block_dimms,thread_dimms,D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_d2eePos,hd_data->d_deePos,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
@@ -2315,8 +2315,8 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_gradient_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("if (D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_hessian\", D2EE_POS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
     # No L2 persistence: at LITE/MINIMAL the d2eePos spill target IS the output
     # buffer (d_d2eePos), which is written once and read once -- no benefit from
     # L2 pinning.
@@ -2332,7 +2332,7 @@ def gen_end_effector_pose_gradient_hessian_host(self, mode = 0):
     # finally report out timing if requested
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
-        self.gen_add_code_line(single_call_printf_line("ee_pose_hessian"))
+        self.gen_add_code_line(single_call_printf_line("end_effector_pose_hessian"))
     self.gen_add_end_function()
 
 def gen_ee_pose_inner_xform_from_q_lines(self, lane_guarded = False):
@@ -2708,16 +2708,16 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
 
     if include_hessian:
         # then for the hessian first generate the inner helpers
-        self.gen_end_effector_pose_gradient_hessian_inner()
+        self.gen_end_effector_pose_hessian_inner()
         # then generate the device wrappers
-        self.gen_end_effector_pose_gradient_hessian_device()
+        self.gen_end_effector_pose_hessian_device()
         # then generate the kernels
-        self.gen_end_effector_pose_gradient_hessian_kernel(True)
-        self.gen_end_effector_pose_gradient_hessian_kernel(False)
+        self.gen_end_effector_pose_hessian_kernel(True)
+        self.gen_end_effector_pose_hessian_kernel(False)
         # then the host launch wrappers
-        self.gen_end_effector_pose_gradient_hessian_host(0)
-        self.gen_end_effector_pose_gradient_hessian_host(1)
-        self.gen_end_effector_pose_gradient_hessian_host(2)
+        self.gen_end_effector_pose_hessian_host(0)
+        self.gen_end_effector_pose_hessian_host(1)
+        self.gen_end_effector_pose_hessian_host(2)
 
     if include_pose or include_gradient or include_hessian:
         # standalone warp/thread FK inners + batched convenience path.

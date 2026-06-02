@@ -72,11 +72,9 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Integrators"),
 
     # Kinematics
-    AlgoEntry("ee_pose",              "EE_POSE",                           "Kinematics",
-              legacy_labels=("eepos",)),
-    AlgoEntry("ee_pose_gradient",     "EE_POSE_GRADIENT (Jacobian)",       "Kinematics",
-              legacy_labels=("deepos",)),
-    AlgoEntry("ee_pose_hessian",      "EE_POSE_HESSIAN (2nd-order EE Jacobian)", "Kinematics"),
+    AlgoEntry("end_effector_pose",              "END_EFFECTOR_POSE",                 "Kinematics"),
+    AlgoEntry("end_effector_pose_gradient",     "END_EFFECTOR_POSE_GRADIENT (Jacobian)", "Kinematics"),
+    AlgoEntry("end_effector_pose_hessian",      "END_EFFECTOR_POSE_HESSIAN (2nd-order EE Jacobian)", "Kinematics"),
     AlgoEntry("frame_jacobian",       "FRAME_JACOBIAN (general-frame J: LOCAL/WORLD/LWA)", "Kinematics"),
     AlgoEntry("frame_jacobian_dot",   "FRAME_JACOBIAN_DOT (time derivative Jdot of the general-frame J)", "Kinematics"),
     AlgoEntry("osc_inertia",          "OSC_INERTIA (operational-space inertia Lambda = (J Minv J^T)^-1)", "Kinematics"),
