@@ -432,8 +432,13 @@ def gen_com_cost(self):
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
-    self.gen_add_parallel_loop("i", str(nv))
-    self.gen_add_code_line("s_grad[" + str(nq) + " + i] = static_cast<T>(0);")
+    # Zero the entire non-q-gradient tail [nv, nx): the meaningful gradient occupies the
+    # first nv slots [0, nv), everything after must be zero (matches the GN hessian
+    # convention below, nonzero only on [0,nv)x[0,nv)). Zeroing [nq, nq+nv) left [nv, nq)
+    # UNINITIALIZED for floating-base robots (nq>nv) -> stale shared mem (go2 nq=19,nv=18
+    # left s_grad[18] stale). For fixed-base (nq==nv) this is byte-identical to the old loop.
+    self.gen_add_parallel_loop("i", str(nq))
+    self.gen_add_code_line("s_grad[" + str(nv) + " + i] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
