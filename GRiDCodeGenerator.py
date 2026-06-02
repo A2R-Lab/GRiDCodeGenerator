@@ -971,13 +971,6 @@ class GRiDCodeGenerator:
                                  f"const int IDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(idsva_so_body_frame_t_count)};", \
                                  f"const int FDSVA_SO_DYNAMIC_SHARED_MEM_COUNT = {legacy_arena_count(fdsva_so_t_count)};", \
                                  "const int MAX_PERF_LEVEL_THREADS = " + str(self.max_perf_level_threads) + ";", \
-                                 "// Deprecated alias: SUGGESTED_THREADS was renamed to MAX_PERF_LEVEL_THREADS",
-                                 "// (the PERF-tier launch-bounds cap / autotune ceiling). Kept so external",
-                                 "// callsites still holding an older generated header (e.g. GATO merit.cuh,",
-                                 "// PDDP cg_v4_iiwaplant.cuh, this repo's printGRiD.cu) keep compiling after a",
-                                 "// regen. Prefer MAX_PERF_LEVEL_THREADS in new code; this alias may be removed",
-                                 "// in a future major version (see docs/open-tasks/f2_audit_findings.md §C).",
-                                 "const int SUGGESTED_THREADS = MAX_PERF_LEVEL_THREADS;", \
                                  "",
                                  "// Resource-tier API (v2.0): each emitted kernel/_device/_inner takes a",
                                  "// `RESOURCE_TIER` template parameter that picks the (launch_bounds, smem,",
