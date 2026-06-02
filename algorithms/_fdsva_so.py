@@ -83,7 +83,17 @@ def gen_fdsva_so_contract(self):
     self.gen_add_code_line('// Compute relevant inner subterms in parallel')
     self.gen_add_parallel_loop("ind",str(3*n**3))
     self.gen_add_code_line(f'int i = ind / {n*n} % {n}; int j = ind / {n} % {n}; int k = ind % {n};')
-    self.gen_add_code_line(f'if (ind < {n**3}) inner_dq[ind] += rot_dq[ind] + d2tau_dqdq[ind]; // Started with dM_dq*da_dq')
+    # inner_dq is assembled in natural [i,j,k] layout but the final -Minv reduction
+    # reads it jk-transposed (inner_dq[j + k*n], i.e. [L,k,j]); the dM_dq*da_dq
+    # (inner_dq + rot_dq) part is jk-symmetric so the swap is a no-op there, but
+    # d2tau_dqdq is NOT jk-symmetric for the 6-DoF FLOATING ROOT (its q-q columns
+    # 3..5 carry a genuine asymmetry that the world-frame inner stores un-symmetrized).
+    # So on floating base the d2tau_dqdq term must be added jk-transposed to land in
+    # the layout the final reduction consumes. Fixed-base d2tau_dqdq is jk-symmetric
+    # (1-DoF joints), so the natural index is kept there -> byte-identical fixed output.
+    d2tau_dqdq_term = (f'd2tau_dqdq[i*{n*n} + k*{n} + j]' if self.robot.floating_base
+                       else 'd2tau_dqdq[ind]')
+    self.gen_add_code_line(f'if (ind < {n**3}) inner_dq[ind] += rot_dq[ind] + {d2tau_dqdq_term}; // Started with dM_dq*da_dq')
     self.gen_add_code_line(f'else if (ind < {2*n**3}) inner_cross[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_df_dqd[{n}*j]) + d2tau_dvdq[i*{n*n} + j*{n} + k];')
     self.gen_add_code_line(f'else inner_tau[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_Minv[{n}*j]);')
     self.gen_add_end_control_flow()
