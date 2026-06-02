@@ -1680,19 +1680,20 @@ class GRiDCodeGenerator:
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         # E2/S1 general-frame Jacobian family (opt-in; gated on membership in
-        # generated_algorithms via algo_short). Kernels carry the fixed-target
-        # signature (T *out, const T *q, const int stride_q, robotModel, int N).
+        # generated_algorithms via algo_short). The kernels take the target frame
+        # at RUNTIME: (T *out, const T *q, const int stride_q, const int target_jid,
+        # const int reference_frame, robotModel, int N).
         ("frame_jacobian", "frame_jacobian", None, "FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("frame_jacobian_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
             ("frame_jacobian_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
         ]),
         ("frame_jacobian_dot", "frame_jacobian_dot", None, "FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("frame_jacobian_dot_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
             ("frame_jacobian_dot_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
         ]),
         ("osc_inertia", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("osc_inertia_kernel<T>",
