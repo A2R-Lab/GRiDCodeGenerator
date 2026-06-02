@@ -1058,8 +1058,13 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
 
     Replaces the previous FD-on-d/dv-Jacobian implementation (2*nv + 1 gradient
     calls) with a single closed-form pass. Mirrors
-    `RBDReference.end_effector_pose_hessian_analytic` (validated to ~1e-9 vs
-    the FD oracle on iiwa14-fixed / floating + go2-floating).
+    `RBDReference.end_effector_pose_hessian_analytic`, which agrees with
+    pinocchio's analytic `getJointKinematicHessian(LOCAL_WORLD_ALIGNED)` to the
+    FD-noise floor (~1e-5 rel) across the full manifest fleet (iiwa14/go2/g1/
+    h1_2/fr3/rizon4/gen3/fetch/baxter, fixed + floating). The CUDA path is
+    confirmed vs the pinocchio oracle on iiwa14-fixed + go2-floating (the
+    floating orientation-hessian block was the old B1 bug; the chain-composition
+    d^2/dv^2 derivation is correct fleet-wide on both surfaces).
 
     Output convention: d^2(pose)/dv^2 (TANGENT, pinocchio convention), shape
     (num_ees, 6, nv, nv) in row-major (C-order): linear index
@@ -1121,7 +1126,7 @@ def gen_end_effector_pose_gradient_hessian_inner(self):
         "s_linalg_smem is optional byte-addressed shared memory (reserved; unused by this inner)",
     ]
     func_notes = [
-        "Closed-form analytic d2(pose)/dv2; matches RBDReference.end_effector_pose_hessian_analytic (validated ~1e-9 vs the FD oracle on iiwa14 fixed/floating + go2 floating).",
+        "Closed-form analytic d2(pose)/dv2; matches RBDReference.end_effector_pose_hessian_analytic (which agrees with pinocchio getJointKinematicHessian(LOCAL_WORLD_ALIGNED) to the FD floor fleet-wide; CUDA confirmed on iiwa14-fixed + go2-floating).",
         "Inner-owns scratch placement: the large nv^2 output s_d2eePos moves to d_workspace when !OUT_IN_SMEM. The s_Xworld+s_Sworld+s_E_sc scratch in s_temp stays in smem at every tier.",
     ]
     func_def_start = "void end_effector_pose_gradient_hessian_inner("
