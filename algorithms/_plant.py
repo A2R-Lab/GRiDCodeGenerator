@@ -899,17 +899,17 @@ def gen_grid_plant(self, algorithms):
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         self.gen_ee_pos_cost()
     else:
-        self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'ee_pose' and 'ee_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
+        self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'end_effector_pose' and 'end_effector_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
 
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
     # kinematics-domain device fns (grid::com_device / grid::ccrba_device),
-    # which are emitted when `ee_pose` is present and the robot is non-mimic.
+    # which are emitted when `end_effector_pose` is present and the robot is non-mimic.
     centroidal_ok = ("end_effector_pose" in algorithms) and not self.robot_has_mimic_joints()
     if centroidal_ok:
         gen_com_cost(self)
         gen_momentum_cost(self)
     else:
-        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'ee_pose', non-mimic).")
+        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'end_effector_pose', non-mimic).")
 
     # Binding layer (G1): emit the per-timestep kernels that wrap the device
     # functions above, so the grid_rbd Python/C-ABI surface can launch them.
