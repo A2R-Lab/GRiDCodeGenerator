@@ -2256,8 +2256,8 @@ class GRiDCodeGenerator:
             if "idsva_so_body_frame" in algorithms:
                 self.gen_idsva_so_body_frame()
                 # Optional: emit the world-frame single-pass alternative path alongside
-                # the existing emission. Co-exists with `idsva_so_body_frame_kernel`/`idsva_so_body_frame_host`;
-                # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame_host`.
+                # the existing emission. Co-exists with `idsva_so_body_frame_kernel`/`idsva_so_body_frame` (host);
+                # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame` (host).
                 if enable_idsva_so_world_frame:
                     self.gen_idsva_so_world_frame()
                 # Emit the dispatching `idsva_so` host wrapper. For floating-base
