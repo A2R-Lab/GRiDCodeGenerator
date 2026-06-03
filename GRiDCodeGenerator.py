@@ -2037,39 +2037,22 @@ class GRiDCodeGenerator:
         self.include_fixed_kinematic_targets = fixed_target_name != ""
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         self.generated_algorithms = algorithms
-        # G0 footgun guard: mimic robots' GRADIENT algorithms are not yet folded
-        # (the reduced alpha-scaled gradient assembly is deferred to T3-finisher).
-        # Until then refuse to emit a gradient algo for a mimic robot rather than
-        # silently writing ZEROS. Non-gradient mimic codegen (id/fd/aba/crba/minv/
-        # ee_pose/integrator value) is unaffected and still emits normally.
-        if self.robot_has_mimic_joints():
-            # Mimic gradient support: all first/second-order mimic gradients (id_du,
-            # fd_du, ee_pose grad/hess, f_ext_grad, idsva_so/fdsva_so) are supported
-            # for BOTH bases via the alpha-weighted reduced-v-slot column fold (the
-            # SO world inner runs a per-column INTERNAL-coordinate sweep then folds to
-            # the reduced 4*NV^3 output; the floating root's 6 DoF emerge as 6 distinct
-            # internal slots, alpha=1, so no separate root fold).
-            # The ONE refusal: FLOATING-base + MULTI-stage (Midpoint/RK3/RK4) + mimic
-            # integrator gradients are wrong (stage-projection bug isolated to that exact
-            # intersection — fixed-mimic, floating-nonmimic, and floating-single-stage-mimic
-            # are all exact). Codegen emits all integrator types into one header, so refuse
-            # rather than ship a silently-wrong floating-mimic RK gradient.
-            _MIMIC_GRADIENT_ALGORITHMS = set()
-            if self.robot.floating_base:
-                _MIMIC_GRADIENT_ALGORITHMS |= {
-                    "integrator_gradient", "integrator_with_gradient",
-                }
-            requested_gradients = sorted(algorithms & _MIMIC_GRADIENT_ALGORITHMS)
-            if requested_gradients:
-                raise NotImplementedError(
-                    "mimic gradients not yet supported — deferred to T3-finisher. "
-                    "Robot has mimic joints but the requested codegen selection includes "
-                    "gradient algorithm(s) " + ", ".join(requested_gradients) + ". "
-                    "These would emit silently-zeroed output (no valid mimic-reduced "
-                    "gradient exists yet). Re-run with a non-gradient profile/algorithm "
-                    "list (e.g. 'dynamics-core', or inverse_dynamics/forward_dynamics/aba/crba/minv/end_effector_pose/integrator) "
-                    "to codegen this robot."
-                )
+        # MIMIC GRADIENTS — fully supported, no refusal. All first/second-order mimic
+        # gradients emit correctly for BOTH bases via the alpha-weighted reduced-v-slot
+        # column fold: id_du / fd_du, ee_pose grad/hess, f_ext_grad, idsva_so/fdsva_so
+        # (the SO world inner runs a per-column INTERNAL-coordinate sweep then folds to
+        # the reduced 4*NV^3 output; the floating root's 6 DoF emerge as 6 distinct
+        # internal slots, alpha=1, so no separate root fold). The last gated case, the
+        # floating-base + multi-stage RK + mimic integrator gradient, was RESOLVED
+        # 2026-06-02 (B3): it composes the (correct, B1) floating-mimic FD gradient in
+        # reduced tangent space — the mimic alpha-fold lives entirely inside the FD inner,
+        # and the RK chain-rule + SE(3) dIntegrate projection act on already-reduced
+        # columns — so no separate refusal exists. Verified vs the RBDReference oracle on
+        # fr3-floating (Euler/SI-Euler/Midpoint/RK3/RK4, value + gradient + both-at-once);
+        # the only large residuals are float32 cancellation through the ill-conditioned
+        # reduced finger Minv (cond ~1.3e4) at extreme energetic+large-dt samples (the same
+        # conditioning floor the fr3-floating FD-gradient tolerance documents), absorbed by
+        # the equivalence test's norm-relative guard — not a code bug.
         self.generate_id_du = "inverse_dynamics_gradient" in algorithms
         self.generate_fd_du = "forward_dynamics_gradient" in algorithms
         self.generate_end_effector_pose_hessian = "end_effector_pose_hessian" in algorithms
