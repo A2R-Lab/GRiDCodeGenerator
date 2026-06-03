@@ -620,16 +620,16 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     # d_workspace below). Sizing the slot via a per-tier constexpr keeps a single
     # arena declaration (all pointers stay in this scope) while shrinking the
     # smem footprint exactly to match FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
-    self.gen_add_code_line("constexpr bool FPG_Y_IN_SMEM = FD_PARAMETER_GRADIENT_Y_IN_SMEM<RESOURCE_TIER>();")
-    self.gen_add_code_line("constexpr int FPG_Y_SLOT = FPG_Y_IN_SMEM ? " + str(out_size) + " : 0;")
+    self.gen_add_code_line("constexpr bool REGRESSOR_Y_OUTPUT_IN_SMEM = FD_PARAMETER_GRADIENT_Y_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int REGRESSOR_Y_OUTPUT_SLOT = REGRESSOR_Y_OUTPUT_IN_SMEM ? " + str(out_size) + " : 0;")
     extra_t_buffers = [
         ("s_q_qd_u", in_size), ("s_dqdd_dpi", out_size), ("s_Minv", nv * nv),
-        ("s_qdd", nv), ("s_vaf", 18 * NUM_POS), ("s_c", nv), ("s_Y", "FPG_Y_SLOT"),
+        ("s_qdd", nv), ("s_vaf", 18 * NUM_POS), ("s_c", nv), ("s_Y", "REGRESSOR_Y_OUTPUT_SLOT"),
     ]
     shared_mem_size = self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
-    self.gen_add_code_line("if constexpr (FPG_Y_IN_SMEM) { (void)d_workspace; }")
+    self.gen_add_code_line("if constexpr (REGRESSOR_Y_OUTPUT_IN_SMEM) { (void)d_workspace; }")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) +
                            "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + nv) + "];")
 
@@ -637,7 +637,7 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
         # When spilled, repoint s_Y at the L2-pinned d_workspace SO section
         # (per-timestep slot; reused safely -- fd_param never runs concurrently with
         # the SO kernels). Emitted where `k` is in scope for the batched path.
-        self.gen_add_code_line("if constexpr (!FPG_Y_IN_SMEM) {", True)
+        self.gen_add_code_line("if constexpr (!REGRESSOR_Y_OUTPUT_IN_SMEM) {", True)
         if in_timestep_loop:
             self.gen_add_code_line("s_Y = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         else:

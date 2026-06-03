@@ -603,7 +603,7 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         extra_byte_regions = []
     topology_count = self.gen_topology_helpers_size() if include_topology_helpers else 0
     # A t_buffer count may be a C++ constexpr expression string (e.g. a per-tier
-    # slot size like "FPG_Y_SLOT") rather than a Python int; such slots are
+    # slot size like "REGRESSOR_Y_OUTPUT_SLOT") rather than a Python int; such slots are
     # tier-routed and excluded from the (debug-only) Python fixed-size accounting.
     def _int_or_zero(v):
         try:

@@ -623,19 +623,19 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
     # at spilled tiers (then routed to d_workspace below). Single arena declaration
     # keeps every pointer in this scope; the smem footprint shrinks to match
     # F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
-    self.gen_add_code_line("constexpr bool FEG_DQDD_IN_SMEM = F_EXT_GRADIENT_DQDD_IN_SMEM<RESOURCE_TIER>();")
-    self.gen_add_code_line("constexpr int FEG_DQDD_SLOT = FEG_DQDD_IN_SMEM ? " + str(out_each) + " : 0;")
+    self.gen_add_code_line("constexpr bool DQDD_DFEXT_OUTPUT_IN_SMEM = F_EXT_GRADIENT_DQDD_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int DQDD_DFEXT_OUTPUT_SLOT = DQDD_DFEXT_OUTPUT_IN_SMEM ? " + str(out_each) + " : 0;")
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_extra, extra_t_buffers=[("s_q", n_pos), ("s_dtau_dfext", out_each),
-                                       ("s_dqdd_dfext", "FEG_DQDD_SLOT")],
+                                       ("s_dqdd_dfext", "DQDD_DFEXT_OUTPUT_SLOT")],
         include_linalg_scratch=True)
-    self.gen_add_code_line("if constexpr (FEG_DQDD_IN_SMEM) { (void)d_workspace; }")
+    self.gen_add_code_line("if constexpr (DQDD_DFEXT_OUTPUT_IN_SMEM) { (void)d_workspace; }")
 
     def _repoint_spilled_output(in_timestep_loop):
         # When spilled, repoint s_dqdd_dfext at the L2-pinned d_workspace SO section
         # (per-timestep slot; reused safely -- f_ext_gradient never runs concurrently
         # with the SO kernels). Emitted inside the per-timestep loop so `k` is in scope.
-        self.gen_add_code_line("if constexpr (!FEG_DQDD_IN_SMEM) {", True)
+        self.gen_add_code_line("if constexpr (!DQDD_DFEXT_OUTPUT_IN_SMEM) {", True)
         if in_timestep_loop:
             self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         else:
