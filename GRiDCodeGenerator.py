@@ -148,7 +148,14 @@ class GRiDCodeGenerator:
         # E2 CUDA parity (additive, opt-in only): frame_jacobian_dot (Jdot) and
         # osc_inertia (Lambda) join frame_jacobian as recognized-but-not-default
         # keys so the default `all` header stays byte-identical.
-        opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia"}
+        # idsva_so_world_frame is a first-class, recognized algorithm_list key
+        # (mirrors idsva_so_body_frame), but it is NOT in the default `all`
+        # profile: on fixed-base the default emits only body_frame, and on
+        # floating-base world_frame is already pulled in by the
+        # enable_idsva_so_world_frame default (True). Keeping it opt-in (not in
+        # `all`) preserves the default-profile header byte-for-byte.
+        opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia",
+                             "idsva_so_world_frame"}
         profile_algorithms = {
             "all": all_algorithms,
             "frame-jacobian": {"end_effector_pose", "minv", "frame_jacobian",
@@ -228,6 +235,12 @@ class GRiDCodeGenerator:
         # main reconcile (shared GCG.py edit; unblocks floating-mimic fdsva_so).
         if "minv" in algorithms and self.robot_has_mimic_joints():
             algorithms.add("crba")
+        # idsva_so_world_frame is emitted alongside idsva_so_body_frame (it
+        # reuses the body-frame inner scaffolding + dispatcher); requesting it
+        # pulls in body_frame so the world-frame emit block (gated under
+        # body_frame) actually runs.
+        if "idsva_so_world_frame" in algorithms:
+            algorithms.add("idsva_so_body_frame")
         if "idsva_so_body_frame" in algorithms:
             algorithms.add("inverse_dynamics")
             if self.robot.floating_base:
@@ -2034,8 +2047,14 @@ class GRiDCodeGenerator:
         # specific variant (the bench harness exercises both for comparison).
         if enable_idsva_so_world_frame is None:
             enable_idsva_so_world_frame = self.robot.floating_base
-        self.include_fixed_kinematic_targets = fixed_target_name != ""
+        # idsva_so_world_frame is also a first-class algorithm_list key: an
+        # explicit request enables the world-frame emit even on fixed-base
+        # (where the kwarg default is False). Resolve the algorithm set up front
+        # so the request can be OR'd into enable_idsva_so_world_frame below.
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
+        if "idsva_so_world_frame" in algorithms:
+            enable_idsva_so_world_frame = True
+        self.include_fixed_kinematic_targets = fixed_target_name != ""
         self.generated_algorithms = algorithms
         # MIMIC GRADIENTS — fully supported, no refusal. All first/second-order mimic
         # gradients emit correctly for BOTH bases via the alpha-weighted reduced-v-slot
