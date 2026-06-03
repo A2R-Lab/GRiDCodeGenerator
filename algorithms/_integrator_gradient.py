@@ -567,7 +567,7 @@ def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
                                                      use_da_df_spill_expr="false",
                                                      d_workspace_pool_name="nullptr",
                                                      d_temp_spill_name="nullptr"):
-    """Emit the call to `integrator_gradient[_with_x_kp1]_device`. Arg order MUST
+    """Emit the call to `integrator_gradient_device` / `integrator_with_gradient_device`. Arg order MUST
     match the def in gen_integrator_gradient_device. The FD-grad inner POOL
     placement region (d_workspace) and the id_du da_df band spill region
     (d_temp_spill) default to nullptr (unused under the matching if-constexpr); the
@@ -588,7 +588,7 @@ def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
 
 
 def gen_integrator_gradient_device(self, compute_x_kp1=False):
-    """Emit `integrator_gradient[_with_x_kp1]_device` — the whole integrator
+    """Emit `integrator_gradient_device` (compute_x_kp1=False) / `integrator_with_gradient_device` (compute_x_kp1=True) — the whole integrator
     gradient orchestration as ONE inner that OWNS its FD-grad scratch (s_temp) pool
     placement (inner-owns-placement; mirrors gen_inverse_dynamics_gradient_device /
     gen_fdsva_so_device). It wraps, in order:
