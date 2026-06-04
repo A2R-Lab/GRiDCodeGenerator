@@ -512,8 +512,21 @@ class GRiDCodeGenerator:
         _integrator_du_D_qdd_count = _max_stages * nv * 3 * nv
         _integrator_du_dAB_count = 2 * nv * 3 * nv
         _integrator_du_inner_full = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
-        _integrator_du_inner_selective = max(self.gen_minv_inner_temp_mem_size(),
-                                             self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
+        # The FD-grad inner's da_df-band SELECTIVE spill only exists on the SPARSE
+        # (non-mimic) inverse_dynamics_gradient layout. The MIMIC inner is a DENSE
+        # serial fold that ignores USE_DA_DF_SPILL and always writes its full pool,
+        # so it cannot shrink — size the "selective" rung to the FULL inner there.
+        # (Otherwise rung 2 claims a false shrink: the arena is sized for the sparse
+        # selective_shared_count but the dense inner writes its full pool -> smem OOB.
+        # This is the design_principles §7 "arena sized for one rung, inner flag for
+        # another" trap.) Mimic robots therefore only ever use rung 0 (full smem) or
+        # rung 3 (whole pool -> d_workspace); the selective rungs 1/2 collapse onto
+        # the full-inner size so the picker never lands a mimic robot on a rung that
+        # under-sizes the dense pool.
+        _integrator_du_inner_selective = (
+            _integrator_du_inner_full if self.robot_has_mimic_joints()
+            else max(self.gen_minv_inner_temp_mem_size(),
+                     self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]))
         _integrator_du_full = max(integrator_du_t_count, integrator_du_with_x_kp1_t_count)
         _integrator_du_arenas = (
             _integrator_du_full,                                                                                  # 0 full
@@ -529,13 +542,25 @@ class GRiDCodeGenerator:
         self.integrator_du_dqdd_in_smem_per_tier  = tuple(p < 1 for p in _picks)  # spilled at rungs >=1
         self.integrator_du_dab_in_smem_per_tier    = tuple(p < 2 for p in _picks)  # spilled at rungs >=2
         # FD-grad inner level per tier: 0 full smem, 1 selective (da_df band), 2 global_temp (whole inner).
-        self.integrator_du_inner_level_per_tier = tuple((0 if p < 2 else (1 if p == 2 else 2)) for p in _picks)
+        # The selective level (1) only exists for the SPARSE (non-mimic) inner; the
+        # MIMIC dense inner ignores USE_DA_DF_SPILL, so it must never be emitted at
+        # level 1 (that would set USE_DA_DF_SPILL=true against a dense pool that does
+        # not honour it). For mimic, rung 2 collapses to level 0 (full smem; its arena
+        # equals rung-1's-minus-dAB because the inner can't shrink) and only rung 3
+        # routes the whole pool to global (level 2).
+        if self.robot_has_mimic_joints():
+            self.integrator_du_inner_level_per_tier = tuple((0 if p < 3 else 2) for p in _picks)
+        else:
+            self.integrator_du_inner_level_per_tier = tuple((0 if p < 2 else (1 if p == 2 else 2)) for p in _picks)
         # d_workspace floats the gradient needs when ANY tier spills: Dqdd + dAB +
         # the whole inner (rung-3 worst case; the rungs reuse the same regions).
         self.integrator_du_workspace_count = (
             (_integrator_du_D_qdd_count + _integrator_du_dAB_count + _integrator_du_inner_full)
             if any(p >= 1 for p in _picks) else 0)
-        self.integrator_du_uses_da_df_spill = any(p == 2 for p in _picks)
+        # da_df selective spill is a sparse-inner-only mechanism (level 1); mimic
+        # never uses it (it has no selective level).
+        self.integrator_du_uses_da_df_spill = (
+            (not self.robot_has_mimic_joints()) and any(p == 2 for p in _picks))
         self._integrator_du_dqdd_count = _integrator_du_D_qdd_count
         self._integrator_du_dAB_count = _integrator_du_dAB_count
         id_du_temp_layout = self.gen_inverse_dynamics_gradient_temp_layout()

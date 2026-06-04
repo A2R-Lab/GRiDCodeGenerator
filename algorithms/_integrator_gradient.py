@@ -725,8 +725,16 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     self.gen_add_code_line("__launch_bounds__(MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line(func_def, True)
     inner_temp_full = self.gen_integrator_gradient_inner_temp_mem_size()
-    inner_temp_selective = max(self.gen_minv_inner_temp_mem_size(),
-                               self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
+    # The da_df-band SELECTIVE inner level only exists for the SPARSE (non-mimic)
+    # inverse_dynamics_gradient inner. The MIMIC inner is a dense serial fold that
+    # ignores USE_DA_DF_SPILL and always writes its full pool, so it cannot shrink:
+    # size the "selective" pool to the full inner there (matches GCG.py's
+    # _integrator_du_inner_selective). Mimic never emits inner_level 1 (see GCG's
+    # mimic-aware integrator_du_inner_level_per_tier), so this only guards against a
+    # mis-sized pool if that invariant ever changes.
+    inner_temp_selective = (inner_temp_full if self.robot_has_mimic_joints()
+                            else max(self.gen_minv_inner_temp_mem_size(),
+                                     self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]))
     fb = self.robot.floating_base
     max_stages = _max_stages_in_use()
     d_qdd_count = max_stages * n * 3 * n
