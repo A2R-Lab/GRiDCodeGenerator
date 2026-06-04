@@ -1,8 +1,8 @@
 def gen_forward_dynamics_gradient_inner_temp_mem_size(self, use_qdd_Minv_input = False):
     n = self.robot.get_num_vel()
     minv_temp = self.gen_minv_inner_temp_mem_size()
-    id_du_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-    return max(minv_temp,id_du_temp) if not use_qdd_Minv_input else id_du_temp
+    inverse_dynamics_gradient_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    return max(minv_temp,inverse_dynamics_gradient_temp) if not use_qdd_Minv_input else inverse_dynamics_gradient_temp
 
 def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
                                                s_df_du_name = "s_df_du",
@@ -18,7 +18,7 @@ def gen_forward_dynamics_gradient_inner_python(self, use_qdd_Minv_input = False,
         self.gen_add_code_line("//TODO: there is a slightly faster way as s_v does not change -- thus no recompute needed")
         # Inner-controlled placement: minv_inner slices its own F-region
         # from the tail of s_temp (FD_DU keeps Minv-F in smem; its surgical spill
-        # is the id_du da_df band, handled separately). After Minv returns, the
+        # is the inverse_dynamics_gradient da_df band, handled separately). After Minv returns, the
         # c+vaf/ID code reuses these bytes (the steps run sequentially).
         self.gen_minv_inner_function_call(f_in_smem_expr = "true")
         # updated_var_names = dict(s_c_name = "s_temp", s_vaf_name = "&s_temp[" + str(n) + "]", s_temp_name = "&s_temp[" + str(19*n) + "]")
@@ -90,13 +90,13 @@ def gen_forward_dynamics_gradient_device_function_call(self,
     self.gen_add_code_line(start + middle + end)
 
 def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
-    """Emit `forward_dynamics_gradient_device` — the whole fd_du orchestration
+    """Emit `forward_dynamics_gradient_device` — the whole forward_dynamics_gradient orchestration
     as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
     mirrors gen_inverse_dynamics_gradient_device / gen_fdsva_so_device). It
     wraps, in order:
       [repoint s_temp] -> load_update_XImats -> minv_inner (f_in_smem=true)
       -> inverse_dynamics_inner (c+vaf) -> forward_dynamics_finish -> id_inner (vaf)
-      -> inverse_dynamics_gradient_inner (the id_du BAND sub-inner) -> df/du = -Minv*dc/du.
+      -> inverse_dynamics_gradient_inner (the inverse_dynamics_gradient BAND sub-inner) -> df/du = -Minv*dc/du.
     Because the s_temp repoint happens at the very top, EVERY consumer below —
     including the XImats helper's sincos scratch and minv's own F-region —
     follows the placement, so the kernel never repoints s_temp from the outside.
@@ -105,7 +105,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
       SCRATCH_IN_SMEM  : the shared s_temp pool lives in smem (true) or routes the
                          WHOLE pool to d_workspace (false; the rung-2 global-temp
                          path).
-      USE_DA_DF_SPILL  : the id_du band selectively spills its da_dq..fxvi band to
+      USE_DA_DF_SPILL  : the inverse_dynamics_gradient band selectively spills its da_dq..fxvi band to
                          d_temp_spill (rung 1). Threaded through to the BAND
                          sub-inner's grid_id_du_temp_ptr<T, USE_DA_DF_SPILL> helper.
     The 3-rung menu (see _FD_DU_PICK_FLAGS): pick0=(SMEM=true, SPILL=false) full;
@@ -132,12 +132,12 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
         func_params.append("s_u is the vector of input torques")
     func_params += [
         "s_vaf is the id intermediate band (caller places); size 18*NUM_JOINTS = " + str(18*n),
-        "s_dc_du is the id_du output band (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
+        "s_dc_du is the inverse_dynamics_gradient output band (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
         "s_qdd is the joint-accel scratch (caller places); size NUM_JOINTS = " + str(n),
         "s_Minv is the mass-matrix scratch (caller places); size NUM_JOINTS*NUM_JOINTS = " + str(n*n),
         "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
         "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
-        "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_temp_spill is the inverse_dynamics_gradient da_df band spill region (used when USE_DA_DF_SPILL)",
         "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
         "d_robotModel holds XImats/topology; gravity is the gravity constant",
     ]
@@ -153,7 +153,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
                     "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity) {")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_def = func_def_start + func_def_end
-    self.gen_add_func_doc("fd_du orchestration as a single inner-owns-placement device function",
+    self.gen_add_func_doc("forward_dynamics_gradient orchestration as a single inner-owns-placement device function",
                           ["Uses the fd/du = -Minv*id/du trick (Carpentier & Mansard 'Analytical Derivatives of Rigid Body Dynamics Algorithms')",
                            "Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch and minv's F-region)"],
                           func_params, None)
@@ -161,7 +161,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc a separate __device__ wrapper keeps its callees as distinct
     # functions whose regcount must fit the kernel's launch_bounds budget -> ptxas
-    # regcount error. Inlining folds them into the kernel. Mirrors id_du / fdsva_so.
+    # regcount error. Inlining folds them into the kernel. Mirrors inverse_dynamics_gradient / fdsva_so.
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     if use_qdd_Minv_input:
@@ -193,9 +193,9 @@ _FD_DU_PICK_FLAGS = [
     (False, True),    # pick 2: global temp
 ]
 
-def _emit_fd_du_kernel_body_for_flags(self, n, use_selective_spill, use_global_temp,
+def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective_spill, use_global_temp,
                                       use_qdd_Minv_input, single_call_timing):
-    """Emit fd_du kernel body for one tier's spill flags."""
+    """Emit forward_dynamics_gradient kernel body for one tier's spill flags."""
     # s_vaf is body-indexed (NB bodies, stride 6). For a MIMIC robot (fixed base)
     # NB > nv, so size 18*NB to keep the ID inner's writes from overflowing into
     # s_qdd/s_Minv. Non-mimic keeps 18*n (byte-identical; floating nv > NB).
@@ -304,11 +304,11 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    picks = getattr(self, "fd_du_spill_tier_3way", (0, 0, 0))
-    def _emit_fd_du_body(pick):
+    picks = getattr(self, "forward_dynamics_gradient_spill_tier_3way", (0, 0, 0))
+    def _emit_forward_dynamics_gradient_body(pick):
         uss, ugt = _FD_DU_PICK_FLAGS[pick]
-        _emit_fd_du_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
-    self.gen_tier_dispatch(picks, _emit_fd_du_body)
+        _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
+    self.gen_tier_dispatch(picks, _emit_forward_dynamics_gradient_body)
     self.gen_add_end_function()
 
 def gen_forward_dynamics_gradient_host(self, mode = 0):
@@ -384,7 +384,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
 
 def gen_forward_dynamics_gradient(self):
     # the canonical _device (orchestrator: owns s_temp placement; wraps XImats +
-    # minv/id/finish/id + id_du band sub-inner + (-Minv*dc/du); called from kernel
+    # minv/id/finish/id + inverse_dynamics_gradient band sub-inner + (-Minv*dc/du); called from kernel
     # and integrator_gradient). Both qdd-Minv-input variants.
     self.gen_forward_dynamics_gradient_device(False)
     self.gen_forward_dynamics_gradient_device(True)

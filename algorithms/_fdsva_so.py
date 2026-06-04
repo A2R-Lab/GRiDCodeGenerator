@@ -135,7 +135,7 @@ def gen_fdsva_so_fd_gradient_inline_temp_mem_size(self):
 
 
 def gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled(self):
-    """MEM1 variant: shared-mem footprint when id_du_gradient_inner uses spill.
+    """MEM1 variant: shared-mem footprint when inverse_dynamics_gradient_gradient_inner uses spill.
 
     Same prefix layout (s_fd_vaf + s_fd_dc_du) but s_fd_temp is sized for
     `selective_shared_count` (= full minus the spilled da_dq..fxvi band)
@@ -152,10 +152,10 @@ def gen_fdsva_so_fd_gradient_inline(self, use_spill = False, spill_ptr_expr = "n
     """Emit the inline FD-gradient computation.
 
     MEM1 (use_spill=True path): when the kernel is shared-mem-pressured (big
-    floating-base robots like g1), have the inner id_du_gradient_inner spill
+    floating-base robots like g1), have the inner inverse_dynamics_gradient_gradient_inner spill
     its da_dq..fxvi block to ``spill_ptr_expr`` (typically a slice of
     d_workspace). This matches the well-tested spill pattern used by
-    id_du_kernel — the WHOLE temp is NOT pushed to global; only the
+    inverse_dynamics_gradient_kernel — the WHOLE temp is NOT pushed to global; only the
     overflow band. s_fd_vaf/s_fd_dc_du/s_fd_temp still live in shared
     `s_temp`, but s_fd_temp is sized for ``selective_shared_count``, not
     ``full_count``. Saves the bulk of fd_grad_inline's ~40k-float footprint

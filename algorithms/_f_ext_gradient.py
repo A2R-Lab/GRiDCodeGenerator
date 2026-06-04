@@ -5,7 +5,7 @@ f_ext enters RNEA additively & linearly so the Jacobian carries no f_ext value):
 
   dtau/dfext      = -J(q)^T          (section A.1)  stacked body-Jacobian transpose
   dqdd/dfext      =  M^{-1} J^T      (section A.2)  operational-space inverse-inertia
-  d(id_du)/dfext  = -dJ^T/dq         (section A.3)  q-derivative of the body Jacobian
+  d(inverse_dynamics_gradient)/dfext  = -dJ^T/dq         (section A.3)  q-derivative of the body Jacobian
 
 J^T is the stacked SPATIAL body-Jacobian transpose in each link's LOCAL frame:
 
@@ -30,7 +30,7 @@ the q-dot block is identically zero (J^T is q-only) and is not stored.
 """
 
 
-def _f_ext_grad_chain_jobs(self):
+def _f_ext_gradient_chain_jobs(self):
     """Bake the per-(body i, chain-joint j, S-column) fill jobs for -J^T.
 
     Returns (NB, nv, jobs) where each job is a dict:
@@ -128,7 +128,7 @@ def gen_f_ext_gradient_jacobianT_inner(self):
     """
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
-    _, _, jobs = _f_ext_grad_chain_jobs(self)
+    _, _, jobs = _f_ext_gradient_chain_jobs(self)
     HAS_MIMIC = self.robot_has_mimic_joints()
 
     func_params = [
@@ -401,7 +401,7 @@ def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
 
 def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
     """Emit f_ext_gradient_dq_kernel: the mixed second-order block
-    d(id_du)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv.
+    d(inverse_dynamics_gradient)/dfext = -dJ^T/dq  (section A.3), size nv x (6*NB) x nv.
 
     Central finite-difference of the analytic A.1 -J^T over each generalized
     coordinate (the same FD-on-Jacobian approach the d2ee GPU path uses for the
@@ -429,7 +429,7 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("(", "_single_timing(")
-    self.gen_add_func_doc("Compute -dJ^T/dq = d(id_du)/dfext (section A.3, fixed base, batched kernel)",
+    self.gen_add_func_doc("Compute -dJ^T/dq = d(inverse_dynamics_gradient)/dfext (section A.3, fixed base, batched kernel)",
                           [], func_params, None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
@@ -473,7 +473,7 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
     if compute_only:
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
-    self.gen_add_func_doc("Compute -dJ^T/dq = d(id_du)/dfext (host wrapper, fixed base)", [], func_params, None)
+    self.gen_add_func_doc("Compute -dJ^T/dq = d(inverse_dynamics_gradient)/dfext (host wrapper, fixed base)", [], func_params, None)
     self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
@@ -519,7 +519,7 @@ def gen_f_ext_gradient_device(self):
     """Emit f_ext_gradient_device: computes dtau/dfext = -J^T and
     dqdd/dfext = M^{-1} J^T into caller-provided shared buffers.
 
-    Reuses minv_inner for s_Minv (the same inverse-inertia buffer fd_du
+    Reuses minv_inner for s_Minv (the same inverse-inertia buffer forward_dynamics_gradient
     consumes) and the f_ext_gradient_jacobianT_inner for -J^T, then one
     nv x nv * nv x 6NB GEMM (dqdd = -Minv @ dtau). Both outputs are q-only and
     f_ext-VALUE independent (so this device takes q, not f_ext)."""
@@ -788,8 +788,8 @@ def gen_f_ext_gradient(self):
     self.gen_f_ext_gradient_host(mode=2)
     # A.3 (-dJ^T/dq): own kernel + host (both base modes); separate output buffer
     # d_did_du_dfext so the first-order kernel/host stay byte-identical. The
-    # _f_ext_grad_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration.
-    self._f_ext_grad_dq_emitted = True
+    # _f_ext_gradient_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration.
+    self._f_ext_gradient_dq_emitted = True
     self.gen_f_ext_gradient_dq_kernel(single_call_timing=False)
     self.gen_f_ext_gradient_dq_kernel(single_call_timing=True)
     self.gen_f_ext_gradient_dq_host(mode=0)

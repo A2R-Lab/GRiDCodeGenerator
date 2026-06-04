@@ -38,7 +38,7 @@ def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
             # + Iv) rather than the sparse-compressed band, so it needs its own
             # (larger) scratch. Big-NB humanoids route this whole pool to
             # d_workspace at the global-temp tier (SCRATCH_IN_SMEM=false).
-            return _id_du_mimic_temp_count(self)
+            return _inverse_dynamics_gradient_mimic_temp_count(self)
         return self.gen_inverse_dynamics_gradient_temp_layout()["full_count"]
 
 def gen_inverse_dynamics_gradient_temp_layout(self):
@@ -82,7 +82,7 @@ def gen_inverse_dynamics_gradient_temp_layout(self):
         "selective_shared_count": full_count - spill_count,
     }
 
-def _rewrite_id_du_temp_accesses_for_spill(code):
+def _rewrite_inverse_dynamics_gradient_temp_accesses_for_spill(code):
     def replace_accesses(text, address_of):
         token = "&s_temp[" if address_of else "s_temp["
         out = []
@@ -125,11 +125,11 @@ def gen_inverse_dynamics_gradient_inner_function_call(self, updated_var_names = 
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    id_du_code_start = "inverse_dynamics_gradient_inner<T, " + var_names["temp_spill_flag_name"] + ">(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
-    id_du_code_middle = var_names["s_vaf_name"] + ", " + self.gen_insert_helpers_function_call()
-    id_du_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
-    id_du_code = id_du_code_start + id_du_code_middle + id_du_code_end
-    self.gen_add_code_line(id_du_code)
+    inverse_dynamics_gradient_code_start = "inverse_dynamics_gradient_inner<T, " + var_names["temp_spill_flag_name"] + ">(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
+    inverse_dynamics_gradient_code_middle = var_names["s_vaf_name"] + ", " + self.gen_insert_helpers_function_call()
+    inverse_dynamics_gradient_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
+    inverse_dynamics_gradient_code = inverse_dynamics_gradient_code_start + inverse_dynamics_gradient_code_middle + inverse_dynamics_gradient_code_end
+    self.gen_add_code_line(inverse_dynamics_gradient_code)
 
 def gen_inverse_dynamics_gradient_inner(self):
     function_start = len(self.code_str)
@@ -150,7 +150,7 @@ def gen_inverse_dynamics_gradient_inner(self):
     func_def_end = "T *s_temp, T *d_temp_spill, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
-                  "This is the id_du band sub-inner (the stable surface composed by fd_du / integrator_gradient). It does NOT own s_temp placement; the USE_DA_DF_SPILL band selectively spills its da_dq..fxvi band to d_temp_spill via grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>. The whole-pool placement is owned by the wrapping inverse_dynamics_gradient_device."]
+                  "This is the inverse_dynamics_gradient band sub-inner (the stable surface composed by forward_dynamics_gradient / integrator_gradient). It does NOT own s_temp placement; the USE_DA_DF_SPILL band selectively spills its da_dq..fxvi band to d_temp_spill via grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>. The whole-pool placement is owned by the wrapping inverse_dynamics_gradient_device."]
     func_def = func_def_start + func_def_end
     # then generate the code
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
@@ -168,7 +168,7 @@ def gen_inverse_dynamics_gradient_inner(self):
         # the goal here (mimic robots are the gripper/hand class). The large
         # dense per-body buffers spill to d_temp_spill / d_workspace via the
         # inner's mimic temp-size; see gen_inverse_dynamics_gradient_inner_temp_mem_size.
-        _gen_id_du_mimic_inner(self, n, NJ)
+        _gen_inverse_dynamics_gradient_mimic_inner(self, n, NJ)
         self.gen_add_end_function()
         return
 
@@ -993,7 +993,7 @@ def gen_inverse_dynamics_gradient_inner(self):
 
     self.gen_add_end_function()
     function_code = self.code_str[function_start:]
-    self.code_str = self.code_str[:function_start] + _rewrite_id_du_temp_accesses_for_spill(function_code)
+    self.code_str = self.code_str[:function_start] + _rewrite_inverse_dynamics_gradient_temp_accesses_for_spill(function_code)
 
 def gen_inverse_dynamics_gradient_device_function_call(self,
                                                            use_qdd_input = False,
@@ -1017,11 +1017,11 @@ def gen_inverse_dynamics_gradient_device_function_call(self,
     self.gen_add_code_line(start + middle + end)
 
 def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
-    """Emit `inverse_dynamics_gradient_device` — the whole id_du orchestration
+    """Emit `inverse_dynamics_gradient_device` — the whole inverse_dynamics_gradient orchestration
     as ONE inner that OWNS its scratch (s_temp) placement (inner-owns-placement;
     mirrors gen_fdsva_so_device). It wraps, in order:
       [repoint s_temp] -> load_update_XImats -> inverse_dynamics_inner (vaf) ->
-      inverse_dynamics_gradient_inner (the id_du band sub-inner).
+      inverse_dynamics_gradient_inner (the inverse_dynamics_gradient band sub-inner).
     Because the s_temp repoint happens at the very top, EVERY consumer below —
     including the XImats helper's sincos scratch — follows the placement, so the
     kernel never repoints s_temp from the outside.
@@ -1030,10 +1030,10 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
       SCRATCH_IN_SMEM  : the shared s_temp pool lives in smem (true) or routes the
                          WHOLE pool to d_workspace (false; the rung-2 global-temp
                          path). Dominant lever on big floating humanoids.
-      USE_DA_DF_SPILL  : the id_du band selectively spills its da_dq..fxvi band to
+      USE_DA_DF_SPILL  : the inverse_dynamics_gradient band selectively spills its da_dq..fxvi band to
                          d_temp_spill (rung 1). Threaded through to the band
                          sub-inner's grid_id_du_temp_ptr<T, USE_DA_DF_SPILL> helper.
-    The 3-rung menu (see _ID_DU_PICK_FLAGS): pick0=(SMEM=true, SPILL=false) full;
+    The 3-rung menu (see _INVERSE_DYNAMICS_GRADIENT_PICK_FLAGS): pick0=(SMEM=true, SPILL=false) full;
     pick1=(true, true) selective band; pick2=(false, false) whole-pool global.
 
     Pointer params are caller-supplied (the kernel decides where the OUTPUT s_dc_du
@@ -1049,7 +1049,7 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
         "s_vaf is the id intermediate band (caller places); size 18*NUM_JOINTS = " + str(18*n),
         "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
         "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
-        "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_temp_spill is the inverse_dynamics_gradient da_df band spill region (used when USE_DA_DF_SPILL)",
         "d_robotModel holds XImats/topology; gravity is the gravity constant",
     ]
     fname = "inverse_dynamics_gradient_device_qdd" if use_qdd_input else "inverse_dynamics_gradient_device"
@@ -1063,7 +1063,7 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
         func_params.insert(4, "s_qdd is the vector of joint accelerations")
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_def = func_def_start + func_def_end
-    self.gen_add_func_doc("id_du orchestration as a single inner-owns-placement device function",
+    self.gen_add_func_doc("inverse_dynamics_gradient orchestration as a single inner-owns-placement device function",
                           ["Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch)"],
                           func_params, None)
     self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
@@ -1093,16 +1093,16 @@ def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
     temp_mem_size = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
-_ID_DU_PICK_FLAGS = [
+_INVERSE_DYNAMICS_GRADIENT_PICK_FLAGS = [
     # (use_selective_spill, use_global_temp)
     (False, False),   # pick 0: full smem
     (True,  False),   # pick 1: selective spill (da_df band to workspace)
     (False, True),    # pick 2: global temp (entire s_temp to workspace)
 ]
 
-def _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
+def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
                                       use_qdd_input, single_call_timing):
-    """Emit the id_du kernel body for one tier's spill flags."""
+    """Emit the inverse_dynamics_gradient kernel body for one tier's spill flags."""
     # s_vaf is body-indexed (the ID inner writes NB bodies, stride 6). For a
     # MIMIC robot (fixed base) NB > nv, so size it 18*NB to avoid overflowing
     # into the adjacent arena buffers. Non-mimic keeps 18*n (byte-identical;
@@ -1200,11 +1200,11 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
     self.gen_add_code_line(func_def, True)
     # Tier dispatch: collapsed picks → single body (current behavior);
     # divergent picks → 3 if-constexpr branches.
-    picks = getattr(self, "id_du_spill_tier_3way", (0, 0, 0))
-    def _emit_id_du_body(pick):
-        uss, ugt = _ID_DU_PICK_FLAGS[pick]
-        _emit_id_du_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
-    self.gen_tier_dispatch(picks, _emit_id_du_body)
+    picks = getattr(self, "inverse_dynamics_gradient_spill_tier_3way", (0, 0, 0))
+    def _emit_inverse_dynamics_gradient_body(pick):
+        uss, ugt = _INVERSE_DYNAMICS_GRADIENT_PICK_FLAGS[pick]
+        _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
+    self.gen_tier_dispatch(picks, _emit_inverse_dynamics_gradient_body)
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_host(self, mode = 0):
@@ -1288,11 +1288,11 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient(self):
-    # first the id_du band sub-inner (internal helper composed by the orchestration
-    # _device; also called by fd_du / integrator_gradient orchestrators).
+    # first the inverse_dynamics_gradient band sub-inner (internal helper composed by the orchestration
+    # _device; also called by forward_dynamics_gradient / integrator_gradient orchestrators).
     self.gen_inverse_dynamics_gradient_inner()
     # then the canonical _device (orchestrator: owns s_temp placement; wraps XImats
-    # + id-inner + id_du band sub-inner; called from kernel and fd_du / integrator).
+    # + id-inner + inverse_dynamics_gradient band sub-inner; called from kernel and forward_dynamics_gradient / integrator).
     # Both qdd variants (qdd-input vs qdd=0 specialization).
     self.gen_inverse_dynamics_gradient_device(True)
     self.gen_inverse_dynamics_gradient_device(False)
@@ -1307,7 +1307,7 @@ def gen_inverse_dynamics_gradient(self):
     self.gen_inverse_dynamics_gradient_host(2)
 
 
-def _gen_id_du_mimic_inner(self, nv, NB):
+def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
     """Dense serial mimic ID-gradient (T3-finisher P3 fixed-base; B1 floating).
 
     Mirrors RBDReference.rnea_grad exactly, in REDUCED v-space:
@@ -1549,7 +1549,7 @@ def _gen_id_du_mimic_inner(self, nv, NB):
             else:
                 # fixed-base root: the base's accel is PURE gravity (NOT the body's
                 # own a, which also carries S*qdd when use_qdd_input — that would
-                # corrupt fd_du). X*gravity is column 5 of X scaled by `gravity`:
+                # corrupt forward_dynamics_gradient). X*gravity is column 5 of X scaled by `gravity`:
                 #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity (col5=+30).
                 self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = -s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
                 self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
@@ -1675,7 +1675,7 @@ def _gen_id_du_mimic_inner(self, nv, NB):
     self.gen_add_sync()
 
 
-def _id_du_mimic_temp_count(self):
+def _inverse_dynamics_gradient_mimic_temp_count(self):
     """Dense mimic ID-gradient scratch size: 6 buffers of 6*nv*NB + Iv(6*NB)."""
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_joints()

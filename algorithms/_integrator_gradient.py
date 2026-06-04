@@ -569,7 +569,7 @@ def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
                                                      d_temp_spill_name="nullptr"):
     """Emit the call to `integrator_gradient_device` / `integrator_with_gradient_device`. Arg order MUST
     match the def in gen_integrator_gradient_device. The FD-grad inner POOL
-    placement region (d_workspace) and the id_du da_df band spill region
+    placement region (d_workspace) and the inverse_dynamics_gradient da_df band spill region
     (d_temp_spill) default to nullptr (unused under the matching if-constexpr); the
     kernel passes real pointers per tier. s_D_qdd_stage / s_dAB remain SEPARATE
     caller-placed pointers — they are threaded through unchanged."""
@@ -605,10 +605,10 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
                         routes the WHOLE pool to d_workspace (false; the rung-2
                         whole-pool global-temp path, formerly the kernel's line-744
                         repoint). Dominant lever on big floating humanoids.
-      USE_DA_DF_SPILL : the FD-grad inner's id_du band selectively spills its
+      USE_DA_DF_SPILL : the FD-grad inner's inverse_dynamics_gradient band selectively spills its
                         da_dq..fxvi band to d_temp_spill (rung 1). Threaded through
                         the stable gen_forward_dynamics_gradient_inner_python
-                        composition surface to the id_du band sub-inner.
+                        composition surface to the inverse_dynamics_gradient band sub-inner.
 
     Pointer params are caller-supplied (the kernel decides where the OUTPUT s_dAB
     and the multi-band scratch s_D_qdd_stage live — smem or de-aliased workspace
@@ -633,7 +633,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
         "s_dInt_q_6x6 / s_dInt_v_6x6 are the floating-base SE(3) dIntegrate blocks (unused fixed-base)",
         "s_temp is the FD-grad inner scratch pool (used when SCRATCH_IN_SMEM)",
         "d_workspace is the global scratch pool the FD-grad inner s_temp routes to (used when !SCRATCH_IN_SMEM)",
-        "d_temp_spill is the id_du da_df band spill region (used when USE_DA_DF_SPILL)",
+        "d_temp_spill is the inverse_dynamics_gradient da_df band spill region (used when USE_DA_DF_SPILL)",
         "d_robotModel holds XImats/topology; gravity is the gravity constant; dt is the timestep",
     ]
     func_def_start = "void " + fname + "(T *s_dAB, "
@@ -729,8 +729,8 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     # inverse_dynamics_gradient inner. The MIMIC inner is a dense serial fold that
     # ignores USE_DA_DF_SPILL and always writes its full pool, so it cannot shrink:
     # size the "selective" pool to the full inner there (matches GCG.py's
-    # _integrator_du_inner_selective). Mimic never emits inner_level 1 (see GCG's
-    # mimic-aware integrator_du_inner_level_per_tier), so this only guards against a
+    # _integrator_gradient_inner_selective). Mimic never emits inner_level 1 (see GCG's
+    # mimic-aware integrator_gradient_inner_level_per_tier), so this only guards against a
     # mis-sized pool if that invariant ever changes.
     inner_temp_selective = (inner_temp_full if self.robot_has_mimic_joints()
                             else max(self.gen_minv_inner_temp_mem_size(),
@@ -742,14 +742,14 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     def _emit_body(dqdd_in_smem, dab_in_smem, inner_level):
         # Surgical per-tier body. The 3 distinct buffers spill independently to
         # SEPARATE non-aliasing d_workspace sub-offsets (the integrator gradient
-        # never runs concurrently with id_du/fd_du/fdsva_so, so it reuses those
+        # never runs concurrently with inverse_dynamics_gradient/forward_dynamics_gradient/fdsva_so, so it reuses those
         # sections) — the de-aliased multi-band layout is preserved, NOT collapsed:
         #   - s_D_qdd_stage (max_stages*nv*3nv) -> Dqdd region (offset 0) when !dqdd_in_smem  [caller-placed]
         #   - s_dAB output (2nv*3nv)            -> dAB region              when !dab_in_smem  [caller-placed]
         #   - the FD-grad inner s_temp POOL (the integrator_gradient_device OWNS
         #     this placement via its SCRATCH_IN_SMEM template flag):
         #       inner_level 0: full smem (SCRATCH_IN_SMEM=true);
-        #       1: da_df-band SELECTIVE spill (s_temp shrinks, only the id_du band
+        #       1: da_df-band SELECTIVE spill (s_temp shrinks, only the inverse_dynamics_gradient band
         #          leaves smem to d_temp_spill; SCRATCH_IN_SMEM=true, USE_DA_DF_SPILL=true);
         #       2: whole inner POOL -> inner region (SCRATCH_IN_SMEM=false; the inner
         #          repoints s_temp=d_workspace at its top).
@@ -760,7 +760,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         # s_vaf is body-indexed (NB bodies, stride 6). For a MIMIC robot (fixed
         # base) NB > nv, so the composed FD-grad inner's ID sub-inner writes
         # 18*NB entries — size it 18*NB to keep those writes from overflowing
-        # into the adjacent s_Minv/s_qdd buffers (mirrors fd_du's kernel sizing
+        # into the adjacent s_Minv/s_qdd buffers (mirrors forward_dynamics_gradient's kernel sizing
         # in _forward_dynamics_gradient.py). Non-mimic keeps 18*n (byte-identical;
         # floating nv > NB).
         vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
@@ -801,7 +801,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         # Per-rung flags are passed as 'true'/'false' literals.
         scratch_in_smem_expr = "false" if inner_level == 2 else "true"
         spill_flag = "true" if inner_level == 1 else "false"
-        # d_temp_spill is the id_du da_df band region (rung 1); always declared so the
+        # d_temp_spill is the inverse_dynamics_gradient da_df band region (rung 1); always declared so the
         # device call can reference it (nullptr unless inner_level==1).
         self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
 
@@ -872,10 +872,10 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     # (dqdd_smem / dab_smem / inner_lvl) by tier position — not by the pick value
     # — so the helper's value-based emit_body_fn(pick) contract doesn't fit.
     # Kept bespoke (the plan explicitly allows this for the irregular sites).
-    picks = getattr(self, "integrator_du_spill_tier_3way", (0, 0, 0))
-    dqdd_smem = getattr(self, "integrator_du_dqdd_in_smem_per_tier", (True, True, True))
-    dab_smem = getattr(self, "integrator_du_dab_in_smem_per_tier", (True, True, True))
-    inner_lvl = getattr(self, "integrator_du_inner_level_per_tier", (0, 0, 0))
+    picks = getattr(self, "integrator_gradient_spill_tier_3way", (0, 0, 0))
+    dqdd_smem = getattr(self, "integrator_gradient_dqdd_in_smem_per_tier", (True, True, True))
+    dab_smem = getattr(self, "integrator_gradient_dab_in_smem_per_tier", (True, True, True))
+    inner_lvl = getattr(self, "integrator_gradient_inner_level_per_tier", (0, 0, 0))
     if picks[0] == picks[1] == picks[2]:
         _emit_body(dqdd_smem[0], dab_smem[0], inner_lvl[0])
     else:

@@ -539,7 +539,7 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     # block-parallel fill (byte-identical to the legacy path for non-mimic, where
     # every group is a singleton with alpha == 1); multi-job groups (mimic) are
     # emitted as a serial alpha-accumulate fold so the shared column sums all
-    # contributions. Mirrors the id_du / crba mimic v-slot accumulate.
+    # contributions. Mirrors the inverse_dynamics_gradient / crba mimic v-slot accumulate.
     HAS_MIMIC = self.robot_has_mimic_joints()
     _groups = {}
     for entry in flat_jobs:
@@ -770,7 +770,7 @@ def _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name,
     # Per-tier eegrad_temp byte offset. The shared GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_TEMP_OFFSET_BYTES
     # macro keys off the single-valued PERF-pick GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_DXHOM, so it
     # would collide with the spilled dXhom region at tiers whose pick spills dXhom but whose
-    # PERF pick does not (e.g. go2 ee_grad = (0,0,2)). Compute the offset locally from THIS
+    # PERF pick does not (e.g. go2 end_effector_pose_gradient = (0,0,2)). Compute the offset locally from THIS
     # tier's use_workspace_dxhom so the temp arena always lands past the spilled dXhom region.
     eegrad_temp_off = "GRID_END_EFFECTOR_POSE_GRADIENT_WORKSPACE_DXHOM_OFFSET_BYTES<T>()"
     if use_workspace_dxhom:
@@ -848,11 +848,11 @@ def gen_end_effector_pose_gradient_kernel(self, single_call_timing = False, fixe
     # diverge, emit three if-constexpr branches — each specialized for that
     # tier's spill flags. END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, TIER>() is
     # tier-aware.
-    picks = getattr(self, "ee_grad_spill_tier_3way", (0, 0, 0))
-    def _emit_ee_grad_body(pick):
+    picks = getattr(self, "end_effector_pose_gradient_spill_tier_3way", (0, 0, 0))
+    def _emit_end_effector_pose_gradient_body(pick):
         uwt, uwd = _EE_GRAD_PICK_FLAGS[pick]
         _emit_eepose_grad_kernel_body_for_flags(self, n, num_ees, fixed_target_name, uwt, uwd, single_call_timing)
-    self.gen_tier_dispatch(picks, _emit_ee_grad_body)
+    self.gen_tier_dispatch(picks, _emit_end_effector_pose_gradient_body)
     self.gen_add_end_function()
 
 def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
@@ -1201,7 +1201,7 @@ def gen_end_effector_pose_hessian_inner(self):
     # each contributing joint's generator (the mimic body moves alpha*target_rate).
     # Every downstream step (d2M products, J_w/J_v readout, rpy chain rule) reads only
     # s_Sworld[vi] / s_deePos[vi], so folding the generator here is sufficient. The
-    # signed S column is baked into `ax`, so (unlike the unit-axis id_du path) the only
+    # signed S column is baked into `ax`, so (unlike the unit-axis inverse_dynamics_gradient path) the only
     # scalar fold is alpha — no separate s_sign. Non-mimic: each (ee,vi) slot written
     # once with alpha==1.0 => byte-identical to the legacy "=" assignment.
     #

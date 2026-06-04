@@ -139,7 +139,7 @@ def gen_forward_dynamics_inner(self):
 def gen_forward_dynamics_device(self):
     n = self.robot.get_num_vel()
     # Inline-CUDA device path. Tier-aware via tier_workspace_expr (mirrors
-    # idsva_so_device / d2ee_device / id_du_device): at TIER_SHARED the whole
+    # idsva_so_device / d2ee_device / inverse_dynamics_gradient_device): at TIER_SHARED the whole
     # FD inner s_temp arena lives in shared memory (with MINV_F at its tail);
     # at TIER_LITE/TIER_MINIMAL the WHOLE arena is routed to L2-pinned
     # d_workspace, freeing smem for the caller's outer kernel. The inner is
