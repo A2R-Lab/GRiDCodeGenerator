@@ -259,7 +259,7 @@ def gen_quadratic_input_cost(self):
 def gen_ee_pos_cost(self):
     """ee_pos_cost family. p(q) = grid::end_effector_pose (rows 0..2 of the 6-pose);
     J_p = rows 0..2 of grid::end_effector_pose_gradient (layout
-    s_deePos[6*NV*ee + 6*vi + row]). Templated on `int EE = 0`.
+    s_end_effector_pose_gradient[6*NV*ee + 6*vi + row]). Templated on `int EE = 0`.
 
         r       = p(q) - p_des                              (3-vector)
         value   = 1/2 * sum_{r} W[r] * r[r]^2
@@ -283,24 +283,24 @@ def gen_ee_pos_cost(self):
         "ee_pos_cost: value = 1/2 * sum_r W[r] * (p_r(q) - p_des_r)^2 over the 3 position axes",
         ["Calls grid::end_effector_pose_device for p(q) (auto-allocating; owns its scratch).",
          "EE selects which end-effector (0.." + str(num_ees - 1) + ").",
-         "s_eePos must hold 6*NUM_EE; s_scratch unused here but kept for signature uniformity."],
+         "s_end_effector_pose must hold 6*NUM_EE; s_scratch unused here but kept for signature uniformity."],
         ["s_out is the scalar cost output (s_out[0])",
          "s_q is the joint position vector (size NUM_POS)",
          "s_p_des is the desired EE position (3-vector)",
          "s_W is the per-axis position weight (3-vector)",
-         "s_eePos is scratch for the 6*NUM_EE pose (the position is rows 0..2 of EE block)",
+         "s_end_effector_pose is scratch for the 6*NUM_EE pose (the position is rows 0..2 of EE block)",
          "d_robotModel is the GPU model helpers"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_eePos, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_eePos, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_eePos[6*EE + r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_end_effector_pose[6*EE + r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
     self.gen_add_code_line("s_out[0] = acc;")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -309,27 +309,27 @@ def gen_ee_pos_cost(self):
     self.gen_add_func_doc(
         "ee_pos_cost_gradient: grad_x = [J_p^T W (p - p_des) ; 0], over x = [q; qd]",
         ["Calls grid::end_effector_pose_device (for p) and grid::end_effector_pose_gradient_device (for J_p).",
-         "J_p = rows 0..2 of s_deePos, layout s_deePos[6*NUM_VEL*ee + 6*vi + row].",
+         "J_p = rows 0..2 of s_end_effector_pose_gradient, layout s_end_effector_pose_gradient[6*NUM_VEL*ee + 6*vi + row].",
          "The qd-block of the gradient (entries NUM_VEL.." + str(nx - 1) + ") is set to exactly zero.",
          "ACCUMULATE=false overwrites s_grad; true adds (for fusing with a state-cost gradient)."],
         ["s_grad is the gradient over x (size NUM_POS + NUM_VEL = " + str(nx) + ")",
          "s_q / s_p_des / s_W / d_robotModel as above",
-         "s_eePos is 6*NUM_EE pose scratch; s_deePos is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_eePos, T *s_deePos, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_eePos, s_q, d_robotModel);")
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_deePos, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
+    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
     self.gen_add_sync()
     # grad_q[i] = sum_r J_p[r,i] * W[r] * (p_r - p_des_r)
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
     self.gen_add_code_line("for (int r = 0; r < 3; ++r) {")
-    self.gen_add_code_line("    T Jri = s_deePos[6*" + str(nv) + "*EE + 6*i + r];")
-    self.gen_add_code_line("    T e   = s_eePos[6*EE + r] - s_p_des[r];")
+    self.gen_add_code_line("    T Jri = s_end_effector_pose_gradient[6*" + str(nv) + "*EE + 6*i + r];")
+    self.gen_add_code_line("    T e   = s_end_effector_pose[6*EE + r] - s_p_des[r];")
     self.gen_add_code_line("    g += Jri * s_W[r] * e;")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
@@ -349,13 +349,13 @@ def gen_ee_pos_cost(self):
          "Dense column-major NX x NX (NX = NUM_POS + NUM_VEL = " + str(nx) + "); only the top-left NUM_VEL x NUM_VEL q-block is non-zero.",
          "ACCUMULATE=false overwrites the whole NX x NX block; true adds the q-block into an existing hessian."],
         ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
-         "s_q / s_W / d_robotModel as above; s_deePos is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
-                           "T *s_deePos, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_deePos, s_q, d_robotModel);")
+                           "T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
     self.gen_add_sync()
     # H[i,j] = sum_r J_p[r,i] * W[r] * J_p[r,j], column-major over the full NX x NX
     # block (zero outside the NUM_VEL x NUM_VEL q-block).
@@ -366,8 +366,8 @@ def gen_ee_pos_cost(self):
     self.gen_add_code_line("if (row < " + str(nv) + " && col < " + str(nv) + ") {")
     self.gen_add_code_line("    #pragma unroll")
     self.gen_add_code_line("    for (int r = 0; r < 3; ++r) {")
-    self.gen_add_code_line("        T Jri = s_deePos[6*" + str(nv) + "*EE + 6*row + r];")
-    self.gen_add_code_line("        T Jrj = s_deePos[6*" + str(nv) + "*EE + 6*col + r];")
+    self.gen_add_code_line("        T Jri = s_end_effector_pose_gradient[6*" + str(nv) + "*EE + 6*row + r];")
+    self.gen_add_code_line("        T Jrj = s_end_effector_pose_gradient[6*" + str(nv) + "*EE + 6*col + r];")
     self.gen_add_code_line("        h += Jri * s_W[r] * Jrj;")
     self.gen_add_code_line("    }")
     self.gen_add_code_line("}")
@@ -953,21 +953,21 @@ def gen_ee_pos_cost_kernel(self):
                                "d_q joint positions (NUM_POS per timestep)",
                                "d_p_des desired EE position (3 per timestep)",
                                "d_W per-axis weight (3 per timestep)",
-                               "d_eePos / d_deePos global scratch (6*NUM_EES / 6*NUM_VEL*NUM_EES per timestep)",
+                               "d_end_effector_pose / d_end_effector_pose_gradient global scratch (6*NUM_EES / 6*NUM_VEL*NUM_EES per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     self.gen_add_code_line("template <typename T, int EE = 0>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
-                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_eePos, T *d_deePos, "
+                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_end_effector_pose, T *d_end_effector_pose_gradient, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
-    self.gen_add_code_line("T *s_eePos = &d_eePos[k*" + str(6*num_ees) + "]; T *s_deePos = &d_deePos[k*" + str(6*nv*num_ees) + "];")
-    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], s_q, s_p_des, s_W, s_eePos, d_robotModel);")
+    self.gen_add_code_line("T *s_end_effector_pose = &d_end_effector_pose[k*" + str(6*num_ees) + "]; T *s_end_effector_pose_gradient = &d_end_effector_pose_gradient[k*" + str(6*nv*num_ees) + "];")
+    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], s_q, s_p_des, s_W, s_end_effector_pose, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_gradient<T, EE>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_eePos, s_deePos, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_gradient<T, EE>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_hessian<T, EE>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_deePos, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_hessian<T, EE>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_end_effector_pose_gradient, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()

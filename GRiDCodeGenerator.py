@@ -662,10 +662,10 @@ class GRiDCodeGenerator:
         )
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         # Phase 3d (EE_POSE_GRAD): three-tier spill, mirrors D2EE.
-        # Level 0 = full smem (inner_temp + s_deePos + dXmatsHom). Level 1 =
-        # inner_temp + s_deePos -> workspace/global. Level 2 = also
+        # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient + dXmatsHom). Level 1 =
+        # inner_temp + s_end_effector_pose_gradient -> workspace/global. Level 2 = also
         # dXmatsHom -> workspace. inner_temp is recursion-hot but L2-pinned at
-        # the host wrapper for spill tiers; s_deePos is write-once output.
+        # the host wrapper for spill tiers; s_end_effector_pose_gradient is write-once output.
         _end_effector_pose_gradient_num_ees = self.robot.get_total_leaf_nodes()
         _end_effector_pose_gradient_inner_temp_count = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
         _end_effector_pose_gradient_full_t_count        = n + 6*n*_end_effector_pose_gradient_num_ees + _end_effector_pose_gradient_inner_temp_count + XHom_size + dXhom_size
@@ -916,7 +916,7 @@ class GRiDCodeGenerator:
                                            self.integrator_gradient_workspace_count)
         # D2EE needs no d_workspace: under the FD-on-Jacobian inner the only large
         # buffer is the nv^2 output, and when spilled the inner writes directly into
-        # d_d2eePos (the persistent output) -- not a per-timestep workspace slice.
+        # d_end_effector_pose_hessian (the persistent output) -- not a per-timestep workspace slice.
         d2ee_workspace_t_count = 0
         # Phase 3d: max workspace required by EE_POSE_GRAD across any tier (PERF
         # may pick 0, but the workspace allocation must cover what LITE/MINIMAL
@@ -984,7 +984,7 @@ class GRiDCodeGenerator:
                                  "const int GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER = " + str(1 if any(p >= 2 for p in self.fdsva_so_spill_tier_3way) else 0) + ";", \
                                  # GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP: 1 if the PERF tier spills the d2ee output
                                  # (the only large buffer in the new FD-on-Jacobian path) to global memory.
-                                 # When spilled, the inner writes directly into d_d2eePos (the persistent
+                                 # When spilled, the inner writes directly into d_end_effector_pose_hessian (the persistent
                                  # output buffer) -- no extra per-timestep workspace slice is used. The old
                                  # d2xhom-spill bit is permanently 0 (the FD inner never touches d2Xhom).
                                  "const int GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP = " + str(int(self.d2ee_use_workspace_output)) + ";", \
@@ -1243,8 +1243,8 @@ class GRiDCodeGenerator:
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
                                  "template <int TIER> __host__ __device__ constexpr bool EE_GRAD_TEMP_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.end_effector_pose_gradient_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.end_effector_pose_gradient_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.end_effector_pose_gradient_spill_tier_3way[2] == 0 else "false") + "; }",
-                                 "// --- end_effector_pose_hessian_inner (large nv^2 d2eePos output) ---",
-                                 "// Per-tier placement of the d2ee inner's OUTPUT s_d2eePos: true => smem, false => d_workspace (which the kernel sets to d_d2eePos directly).",
+                                 "// --- end_effector_pose_hessian_inner (large nv^2 end_effector_pose_hessian output) ---",
+                                 "// Per-tier placement of the d2ee inner's OUTPUT s_end_effector_pose_hessian: true => smem, false => d_workspace (which the kernel sets to d_end_effector_pose_hessian directly).",
                                  "template <int TIER> __host__ __device__ constexpr bool D2EE_OUT_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.d2ee_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.d2ee_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.d2ee_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// Per-tier sizes for forward_dynamics_gradient_device (inline-CUDA users only). At TIER_SHARED the temp scratch arena lives in s_temp; at TIER_LITE/MINIMAL it moves to d_workspace, freeing roughly " + str(forward_dynamics_gradient_temp_count) + "*sizeof(T) bytes of smem.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FORWARD_DYNAMICS_GRADIENT_DEVICE_INLINE_SMEM_BYTES() {",
@@ -1253,7 +1253,7 @@ class GRiDCodeGenerator:
                                  "        : grid_shared_arena_bytes<T>(" + str(forward_dynamics_gradient_device_t_count - forward_dynamics_gradient_temp_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>());",
                                  "}",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t FORWARD_DYNAMICS_GRADIENT_DEVICE_INLINE_WORKSPACE_BYTES() { return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(forward_dynamics_gradient_temp_count) + "); }",
-                                 "// Per-tier sizes for end_effector_pose_hessian_device (inline-CUDA users only). At TIER_SHARED the smem arena keeps only the FD scratch + s_Xhom; at TIER_LITE/MINIMAL the device contract is unchanged (smem arena is the same -- the caller-provided s_d2eePos is what shifts), and the inner writes its " + str(d2ee_output_count) + "*sizeof(T) output bytes to d_workspace instead.",
+                                 "// Per-tier sizes for end_effector_pose_hessian_device (inline-CUDA users only). At TIER_SHARED the smem arena keeps only the FD scratch + s_Xhom; at TIER_LITE/MINIMAL the device contract is unchanged (smem arena is the same -- the caller-provided s_end_effector_pose_hessian is what shifts), and the inner writes its " + str(d2ee_output_count) + "*sizeof(T) output bytes to d_workspace instead.",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t END_EFFECTOR_POSE_HESSIAN_DEVICE_INLINE_SMEM_BYTES() {",
                                  "    return grid_shared_arena_bytes<T>(" + str(d2ee_inner_temp_count + XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>());",
                                  "}",
@@ -1293,7 +1293,7 @@ class GRiDCodeGenerator:
                                  # offset 0 without growing GRID_WORKSPACE_BYTES_PER_TIMESTEP.
                                  "template <typename T> __host__ __device__ inline size_t GRID_ABA_COLD_OFFSET_BYTES() { return static_cast<size_t>(0); }",
                                  # D2EE no longer uses a per-timestep d_workspace slice (the spilled
-                                 # s_d2eePos is written directly into d_d2eePos); these offset macros are
+                                 # s_end_effector_pose_hessian is written directly into d_end_effector_pose_hessian); these offset macros are
                                  # retained as 0 for backward compatibility with any inline-CUDA caller
                                  # pattern that still references them. New code should not use them.
                                  "template <typename T> __host__ __device__ inline size_t GRID_END_EFFECTOR_POSE_HESSIAN_WORKSPACE_TEMP_OFFSET_BYTES() { return static_cast<size_t>(0); }",
@@ -1371,14 +1371,14 @@ class GRiDCodeGenerator:
                                  # dqdd/dfext = M^-1 J^T; each nv x (6*NB), body-major.
                                  "    T *d_dtau_dfext;",
                                  "    T *d_dqdd_dfext;",
-                                 "    T *d_did_du_dfext;  // -dJ^T/dq = d(id_du)/dfext, nv*6NB*nv (both base modes)",
+                                 "    T *d_f_ext_gradient_dq;  // -dJ^T/dq = d(inverse_dynamics_gradient)/dfext, nv*6NB*nv (both base modes)",
                                  # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
                                  "    T *d_Y;          // inverse_dynamics_regressor (tau = Y . pi), nv*10NB",
                                  "    T *d_dqdd_dpi;   // forward_dynamics_parameter_gradient (-Minv . Y), nv*10NB"]
                                  + [
-                                 "    T *d_eePos;", \
-                                 "    T *d_deePos;", \
-                                 "    T *d_d2eePos;", \
+                                 "    T *d_end_effector_pose;", \
+                                 "    T *d_end_effector_pose_gradient;", \
+                                 "    T *d_end_effector_pose_hessian;", \
                                  # E2/S1: general-frame Jacobian outputs (frame_jacobian / frame_jacobian_dot:
                                  # 6 x NUM_VEL each; osc_inertia: 6 x 6 task inertia Lambda)
                                  "    T *d_frame_jacobian;       // frame_jacobian (6 x NUM_VEL)", \
@@ -1405,14 +1405,14 @@ class GRiDCodeGenerator:
                                  "    T *h_df_du;", \
                                  "    T *h_dtau_dfext;",
                                  "    T *h_dqdd_dfext;",
-                                 "    T *h_did_du_dfext;  // -dJ^T/dq, nv*6NB*nv (both base modes)",
+                                 "    T *h_f_ext_gradient_dq;  // -dJ^T/dq, nv*6NB*nv (both base modes)",
                                  # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
                                  "    T *h_Y;",
                                  "    T *h_dqdd_dpi;"]
                                  + [
-                                 "    T *h_eePos;", \
-                                 "    T *h_deePos;", \
-                                 "    T *h_d2eePos;", \
+                                 "    T *h_end_effector_pose;", \
+                                 "    T *h_end_effector_pose_gradient;", \
+                                 "    T *h_end_effector_pose_hessian;", \
                                  # E2/S1: general-frame Jacobian host buffers
                                  "    T *h_frame_jacobian;", \
                                  "    T *h_frame_jacobian_dot;", \
@@ -1465,8 +1465,8 @@ class GRiDCodeGenerator:
                       "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
                       "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
                       "    // f_ext A.3: -dJ^T/dq = d(inverse_dynamics_gradient)/dfext, nv*6NB*nv (both base modes)",
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_did_du_dfext, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
-                      "    hd_data->h_did_du_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_f_ext_gradient_dq, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
+                      "    hd_data->h_f_ext_gradient_dq = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));",
                       "    // R2: regressor Y and FD param-gradient dqdd/dpi (each nv x 10*NUM_BODIES)",
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_Y, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dpi, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
@@ -1495,13 +1495,13 @@ class GRiDCodeGenerator:
                       "}", \
                       "// kinematics outputs", \
                       "if (needs_kinematics) {", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePos, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_deePos, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_d2eePos, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_gradient, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_hessian, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
-                      "    hd_data->h_eePos = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_deePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_d2eePos = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_end_effector_pose = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_end_effector_pose_gradient = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_end_effector_pose_hessian = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       # E2/S1: general-frame Jacobian outputs (J / Jdot: 6*NV each ; Lambda: 36)
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_frame_jacobian, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_frame_jacobian_dot, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
@@ -1870,12 +1870,12 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_dc_du)); gpuErrchk(cudaFree(hd_data->d_df_du));", \
                                  "gpuErrchk(cudaFree(hd_data->d_dtau_dfext)); gpuErrchk(cudaFree(hd_data->d_dqdd_dfext));",
                                  "free(hd_data->h_dtau_dfext); free(hd_data->h_dqdd_dfext);",
-                                 "gpuErrchk(cudaFree(hd_data->d_did_du_dfext)); free(hd_data->h_did_du_dfext);",
+                                 "gpuErrchk(cudaFree(hd_data->d_f_ext_gradient_dq)); free(hd_data->h_f_ext_gradient_dq);",
                                  # R2: regressor Y + FD param-gradient dqdd/dpi outputs
                                  "gpuErrchk(cudaFree(hd_data->d_Y)); gpuErrchk(cudaFree(hd_data->d_dqdd_dpi));",
                                  "free(hd_data->h_Y); free(hd_data->h_dqdd_dpi);"]
                                  + [
-                                 "gpuErrchk(cudaFree(hd_data->d_eePos)); gpuErrchk(cudaFree(hd_data->d_deePos)); gpuErrchk(cudaFree(hd_data->d_d2eePos));", \
+                                 "gpuErrchk(cudaFree(hd_data->d_end_effector_pose)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_gradient)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_hessian));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
                                  "gpuErrchk(grid_end_l2_persisting(0));", \
                                  "gpuErrchk(cudaFree(hd_data->d_workspace));", \
@@ -1887,7 +1887,7 @@ class GRiDCodeGenerator:
                                  "free(hd_data->h_q_qd_u); free(hd_data->h_q_qd); free(hd_data->h_q);", \
                                  "free(hd_data->h_c); free(hd_data->h_Minv); free(hd_data->h_qdd); free(hd_data->h_M);", \
                                  "free(hd_data->h_dc_du); free(hd_data->h_df_du);",\
-                                 "free(hd_data->h_eePos); free(hd_data->h_deePos); free(hd_data->h_d2eePos);", \
+                                 "free(hd_data->h_end_effector_pose); free(hd_data->h_end_effector_pose_gradient); free(hd_data->h_end_effector_pose_hessian);", \
                                  # E2/S1: general-frame Jacobian outputs (frame_jacobian / frame_jacobian_dot / osc_inertia)
                                  "gpuErrchk(cudaFree(hd_data->d_frame_jacobian)); gpuErrchk(cudaFree(hd_data->d_frame_jacobian_dot)); gpuErrchk(cudaFree(hd_data->d_osc_inertia));", \
                                  "free(hd_data->h_frame_jacobian); free(hd_data->h_frame_jacobian_dot); free(hd_data->h_osc_inertia);", \
@@ -2161,19 +2161,19 @@ class GRiDCodeGenerator:
             "    __global__ forward_dynamics_gradient_kernel<T>(T *d_df_du, const T *d_q_qd, const T *d_qdd, const T *d_Minv, const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS)", \
             "    __host__   forward_dynamics_gradient<T,USE_QDD_MINV_FLAG=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_pose_inner<T,TEMP_IN_SMEM=true>(T *s_eePos, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp, T *d_workspace, unsigned char *s_linalg_smem)", \
-            "    __device__ end_effector_pose_device<T>(T *s_eePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_pose_kernel<T>(T *d_eePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __device__ end_effector_pose_inner<T,TEMP_IN_SMEM=true>(T *s_end_effector_pose, const T *s_q, const T *s_Xhom, int *s_topology_helpers, T *s_temp, T *d_workspace, unsigned char *s_linalg_smem)", \
+            "    __device__ end_effector_pose_device<T>(T *s_end_effector_pose, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_kernel<T>(T *d_end_effector_pose, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_pose_gradient_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
-            "    __device__ end_effector_pose_gradient_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_pose_gradient_kernel<T>(T *d_deePos, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __device__ end_effector_pose_gradient_inner<T>(T *s_end_effector_pose_gradient, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_gradient_device<T>(T *s_end_effector_pose_gradient, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_gradient_kernel<T>(T *d_end_effector_pose_gradient, unsigned char *d_workspace, const T *d_q, const int stride_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_gradient<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
-            "    __device__ end_effector_pose_hessian_inner<T>(T *s_deePos, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
-            "    __device__ end_effector_pose_hessian_device<T>(T *s_deePos, const T *s_q, const robotModel<T> *d_robotModel)", \
-            "    __global__ end_effector_pose_hessian_kernel<T>(T *d_deePos, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
+            "    __device__ end_effector_pose_hessian_inner<T>(T *s_end_effector_pose_gradient, const T *s_q, const T *s_Xhom, const T *s_dXhom, int *s_topology_helpers, T *s_temp)", \
+            "    __device__ end_effector_pose_hessian_device<T>(T *s_end_effector_pose_gradient, const T *s_q, const robotModel<T> *d_robotModel)", \
+            "    __global__ end_effector_pose_hessian_kernel<T>(T *d_end_effector_pose_gradient, const T *d_q, const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS)", \
             "    __host__   end_effector_pose_hessian<T,USE_COMPRESSED_MEM=false>(gridData<T> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps, const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams)", \
             "",\
             "    __device__ idsva_so_body_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, T *s_XImats, T *s_mem, const T gravity)",\

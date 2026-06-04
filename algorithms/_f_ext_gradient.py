@@ -357,7 +357,7 @@ def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
     fb = self.robot.floating_base
     out6 = 6 * NB
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
-    self.gen_add_code_line("T *s_did_du_dfext = " + out_ptr_expr + ";")
+    self.gen_add_code_line("T *s_f_ext_gradient_dq = " + out_ptr_expr + ";")
     self.gen_add_code_line("const T fd_h = static_cast<T>(1e-3);")
     self.gen_add_code_line("T *s_qpert = s_temp;")
     dv_extra = nv if fb else 0
@@ -389,7 +389,7 @@ def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
     # s_JTp/s_JTm already hold -J^T (the inner emits -J^T), so this is -dJ^T/dq.
     # output layout: [ (row v_j) + nv*(6NB col) + nv*6NB*qi ]
     self.gen_add_parallel_loop("ind", str(nv * out6))
-    self.gen_add_code_line("s_did_du_dfext[ind + " + str(nv * out6) + "*qi] = "
+    self.gen_add_code_line("s_f_ext_gradient_dq[ind + " + str(nv * out6) + "*qi] = "
                            "(s_JTp[ind] - s_JTm[ind]) / (static_cast<T>(2)*fd_h);")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
@@ -418,12 +418,12 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
     out_each = nv * out6 * nv
 
     func_params = [
-        "d_did_du_dfext is the output -dJ^T/dq, size NV*(6*NB)*NV = " + str(out_each) + " per timestep",
+        "d_f_ext_gradient_dq is the output -dJ^T/dq, size NV*(6*NB)*NV = " + str(out_each) + " per timestep",
         "d_q is the joint positions, stride_q the per-timestep stride",
         "d_robotModel is the initialized model helpers on the GPU",
         "NUM_TIMESTEPS is the trajectory length (or timing reps)",
     ]
-    func_def_start = ("void f_ext_gradient_dq_kernel(T *d_did_du_dfext, "
+    func_def_start = ("void f_ext_gradient_dq_kernel(T *d_f_ext_gradient_dq, "
                       "const T *d_q, const int stride_q, ")
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
@@ -442,14 +442,14 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
         self.gen_add_code_line("// compute")
-        _emit_f_ext_gradient_dq_body(self, "&d_did_du_dfext[k*" + str(out_each) + "]")
+        _emit_f_ext_gradient_dq_body(self, "&d_f_ext_gradient_dq[k*" + str(out_each) + "]")
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q", str(n_pos))
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="did_du_dfext")
-        _emit_f_ext_gradient_dq_body(self, "d_did_du_dfext")
+        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="f_ext_gradient_dq")
+        _emit_f_ext_gradient_dq_body(self, "d_f_ext_gradient_dq")
         self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -481,7 +481,7 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"f_ext_gradient_dq requires all-data or dynamics gridData\");")
     out_each = "NUM_VEL*6*NUM_BODIES*NUM_VEL"
     func_call_start = ("f_ext_gradient_dq_kernel<T><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
-                       "hd_data->d_did_du_dfext,hd_data->d_q,stride_q,")
+                       "hd_data->d_f_ext_gradient_dq,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
@@ -507,7 +507,7 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
     if not compute_only:
         self.gen_add_code_lines([
             "// finally transfer the result back",
-            "gpuErrchk(cudaMemcpy(hd_data->h_did_du_dfext,hd_data->d_did_du_dfext," + out_each + "*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+            "gpuErrchk(cudaMemcpy(hd_data->h_f_ext_gradient_dq,hd_data->d_f_ext_gradient_dq," + out_each + "*" + ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
             "gpuErrchkKernel();"])
     if single_call_timing:
         from ..algo_registry import single_call_printf_line
@@ -780,14 +780,14 @@ def gen_f_ext_gradient(self):
     self.gen_f_ext_gradient_device()
     # A.3 (-dJ^T/dq) GPU device emit: the mixed second-order block, now emitted for
     # both base modes. The kernel/host wire it as the third output
-    # (s_did_du_dfext, size nv*6NB*nv); the first-order kernel/host are unchanged.
+    # (s_f_ext_gradient_dq, size nv*6NB*nv); the first-order kernel/host are unchanged.
     self.gen_f_ext_gradient_kernel(single_call_timing=False)
     self.gen_f_ext_gradient_kernel(single_call_timing=True)
     self.gen_f_ext_gradient_host(mode=0)
     self.gen_f_ext_gradient_host(mode=1)
     self.gen_f_ext_gradient_host(mode=2)
     # A.3 (-dJ^T/dq): own kernel + host (both base modes); separate output buffer
-    # d_did_du_dfext so the first-order kernel/host stay byte-identical. The
+    # d_f_ext_gradient_dq so the first-order kernel/host stay byte-identical. The
     # _f_ext_gradient_dq_emitted gate keys the KERNEL_ATTR_MANIFEST registration.
     self._f_ext_gradient_dq_emitted = True
     self.gen_f_ext_gradient_dq_kernel(single_call_timing=False)
