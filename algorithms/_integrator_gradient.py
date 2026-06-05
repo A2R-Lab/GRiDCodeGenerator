@@ -961,6 +961,129 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     self.gen_add_end_function()
 
 
+def gen_integrator_hessian_device_function_call(self,
+                                                scratch_in_smem_expr="true",
+                                                fd_grad_use_spill_expr="false",
+                                                contract_in_smem_expr="true",
+                                                d_workspace_pool_name="nullptr",
+                                                d_fd_grad_spill_name="nullptr",
+                                                s_fdsva_temp_name="nullptr"):
+    """Emit the call to `integrator_hessian_device`. Arg order MUST match the def
+    in gen_integrator_hessian_device. The fdsva_so spill/pool regions default to
+    nullptr (unused under the SHARED tier's all-smem placement)."""
+    tmpl = ("<T, IT, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr
+            + ", " + contract_in_smem_expr + ">")
+    start = ("integrator_hessian_device" + tmpl
+             + "(s_d2AB, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, ")
+    middle = self.gen_insert_helpers_function_call()
+    end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
+           + s_fdsva_temp_name + ", d_robotModel, gravity, dt);")
+    self.gen_add_code_line(start + middle + end)
+
+
+def gen_integrator_hessian_device(self):
+    """Emit `integrator_hessian_device` — the second-order sensitivity of the
+    integrator step x_{k+1} = [q; v] as ONE inner that composes
+    `fdsva_so_device` (producing the four 2nd-order forward-dynamics blocks in
+    s_df2) and assembles the s_d2AB surface (the plant_step_hessian output).
+
+    Output s_d2AB has shape (2*NUM_VEL, 3*NUM_VEL, 3*NUM_VEL) in row-major
+    (C-order) flat layout: H[o*nz*nz + a*nz + b] = d^2 x_{k+1}[o] / dz[a] dz[b],
+    z = [dq(nv); dqd(nv); du(nv)], output rows = [position-tangent(nv); velocity(nv)].
+
+    Assembly (mirrors RBDReference._PlantMixin._d2qdd_tangent + plant_step_hessian):
+    the full forward-dynamics Hessian D2[i,a,b] = d^2 qdd[i]/dz[a]dz[b] is built
+    from the fdsva_so blocks in s_df2 = [d2a_dqdq | d2a_dvdq | d2a_dvdv | d2a_dtdq]
+    (each nv^3, laid out [i*nv*nv + j*nv + k]) with the z-block structure
+        [q,q]=d2a_dqdq; [qd,qd]=d2a_dvdv; [qd,q]=d2a_dvdq, [q,qd]=d2a_dvdq^T(jk);
+        [u,q]=d2a_dtdq, [q,u]=d2a_dtdq^T(jk); all u-u / u-qd / qd-u blocks = 0.
+    Velocity rows (bottom nv) = dt*D2 (both Euler and SI-Euler). Position rows
+    (top nv) = 0 (Euler) or dt*dt*D2 (SI-Euler, q_{k+1}=q+dt*v_{k+1}).
+
+    Scope: EULER + SEMI_IMPLICIT_EULER, fixed-base. Multi-stage RK (the 2nd-order
+    chain rule) and floating-base (the SE(3) retract Hessian) static_assert out
+    (clean-break: no silently-wrong tensor). SCRATCH_IN_SMEM=true is the SHARED
+    (full-smem PERF) tier; the fdsva_so spill flags are threaded through for
+    later tier work but default to the all-smem placement."""
+    n = self.robot.get_num_vel()
+    nz = 3 * n
+    func_params = [
+        "s_d2AB is the output Hessian (2*NUM_VEL x 3*NUM_VEL x 3*NUM_VEL, row-major); size " + str(2 * n * nz * nz),
+        "s_df2/s_idsva_so/s_Minv/s_df_du/s_qdd are fdsva_so in/out scratch (caller places)",
+        "s_q/s_qd/s_u are the joint positions, velocities, and input torques",
+        "s_temp is the fdsva_so shared scratch pool (used when SCRATCH_IN_SMEM)",
+        "d_workspace/d_fd_grad_spill/s_fdsva_temp are fdsva_so spill regions (SHARED tier: nullptr)",
+        "d_robotModel holds XImats/topology; gravity is the gravity constant; dt is the timestep",
+    ]
+    func_def_start = "void integrator_hessian_device(T *s_d2AB, "
+    func_def_middle = ("T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, "
+                       "const T *s_q, const T *s_qd, const T *s_u, ")
+    func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
+                    "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("integrator hessian (plant_step_hessian s_d2AB surface): composes fdsva_so + dt-scaled assembly",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, "
+                           "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line(func_def, True)
+    # Clean-break deferrals: only single-stage Euler / SI-Euler on a fixed base.
+    self.gen_add_code_line("static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER,")
+    self.gen_add_code_line("    \"integrator_hessian_device: only EULER / SEMI_IMPLICIT_EULER are supported \"")
+    self.gen_add_code_line("    \"(multi-stage RK 2nd-order chain rule is deferred; see f1_plant_step_hessian_plan.md).\");")
+    if self.robot.floating_base:
+        self.gen_add_code_line("static_assert(sizeof(T) == 0,")
+        self.gen_add_code_line("    \"integrator_hessian_device: floating-base is deferred (the position q-q block needs \"")
+        self.gen_add_code_line("    \"the SE(3) retract connection term; see f1_plant_step_hessian_plan.md).\");")
+        self.gen_add_end_function()
+        return
+    # The four 2nd-order forward-dynamics blocks (fdsva_so output), each nv^3.
+    self.gen_fdsva_so_device_function_call(
+        scratch_in_smem_expr="SCRATCH_IN_SMEM",
+        fd_grad_use_spill_expr="FD_GRAD_USE_SPILL",
+        contract_in_smem_expr="CONTRACT_IN_SMEM",
+        d_workspace_pool_name="d_workspace",
+        d_fd_grad_spill_name="d_fd_grad_spill",
+        s_fdsva_temp_name="s_fdsva_temp")
+    self.gen_add_sync()
+    self.gen_add_code_line("T *d2a_dqdq = s_df2;")
+    self.gen_add_code_line("T *d2a_dvdq = &s_df2[" + str(n * n * n) + "];")
+    self.gen_add_code_line("T *d2a_dvdv = &s_df2[" + str(2 * n * n * n) + "];")
+    self.gen_add_code_line("T *d2a_dtdq = &s_df2[" + str(3 * n * n * n) + "];")
+    # SI-Euler also carries the dt^2*D2 position rows (top nv); Euler leaves them 0.
+    self.gen_add_code_line("const bool si = (IT == IntegratorType::SEMI_IMPLICIT_EULER);")
+    self.gen_add_code_line("const T dt2 = dt * dt;")
+    # Assemble + dt-scale in one fully-parallel sweep over the 2*nv*nz*nz output
+    # cells (max in-block parallelism; each cell is an independent scatter). For
+    # output cell (o, a, b): o<nv selects a position row (SI-Euler dt^2, Euler 0),
+    # o>=nv a velocity row (dt). The (a,b) z-block picks which fdsva_so block (and
+    # its i,j,k -> [i*nv*nv + j*nv + k] index) contributes, else 0.
+    self.gen_add_parallel_loop("ind", str(2 * n * nz * nz))
+    self.gen_add_code_line("int o = ind / " + str(nz * nz) + ";")
+    self.gen_add_code_line("int a = (ind / " + str(nz) + ") % " + str(nz) + ";")
+    self.gen_add_code_line("int b = ind % " + str(nz) + ";")
+    self.gen_add_code_line("int i = o % " + str(n) + ";  // qdd component index for this output row")
+    self.gen_add_code_line("T d2 = static_cast<T>(0);")
+    # z-block lookup: a,b in {q:[0,nv), qd:[nv,2nv), u:[2nv,3nv)}. The fdsva_so
+    # blocks store [d/(velocity|torque), d/q] (j-index first), so the transposed
+    # off-diagonal blocks swap which of (a,b) supplies j vs k.
+    self.gen_add_code_line("int ablk = a / " + str(n) + "; int bblk = b / " + str(n) + ";")
+    self.gen_add_code_line("int aj = a % " + str(n) + "; int bk = b % " + str(n) + ";")
+    self.gen_add_code_line("if (ablk == 0 && bblk == 0)      d2 = d2a_dqdq[i*" + str(n * n) + " + aj*" + str(n) + " + bk];  // [q,q]")
+    self.gen_add_code_line("else if (ablk == 1 && bblk == 1) d2 = d2a_dvdv[i*" + str(n * n) + " + aj*" + str(n) + " + bk];  // [qd,qd]")
+    self.gen_add_code_line("else if (ablk == 1 && bblk == 0) d2 = d2a_dvdq[i*" + str(n * n) + " + aj*" + str(n) + " + bk];  // [qd,q]")
+    self.gen_add_code_line("else if (ablk == 0 && bblk == 1) d2 = d2a_dvdq[i*" + str(n * n) + " + bk*" + str(n) + " + aj];  // [q,qd] = [qd,q]^T(jk)")
+    self.gen_add_code_line("else if (ablk == 2 && bblk == 0) d2 = d2a_dtdq[i*" + str(n * n) + " + aj*" + str(n) + " + bk];  // [u,q]")
+    self.gen_add_code_line("else if (ablk == 0 && bblk == 2) d2 = d2a_dtdq[i*" + str(n * n) + " + bk*" + str(n) + " + aj];  // [q,u] = [u,q]^T(jk)")
+    self.gen_add_code_line("// all u-u / u-qd / qd-u blocks are identically zero (qdd linear in u).")
+    self.gen_add_code_line("T scale = (o < " + str(n) + ") ? (si ? dt2 : static_cast<T>(0)) : dt;")
+    self.gen_add_code_line("s_d2AB[ind] = scale * d2;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
 def gen_integrator_gradient(self):
     # Canonical _device (orchestrator: owns s_temp placement; called from kernel).
     # One per output kind (gradient-only vs gradient + x_kp1).

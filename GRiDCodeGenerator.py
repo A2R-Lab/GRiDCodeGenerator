@@ -80,7 +80,8 @@ class GRiDCodeGenerator:
                             gen_integrator_gradient_inner_python, gen_integrator_gradient_multistage, \
                             gen_integrator_gradient_device, gen_integrator_gradient_device_function_call, \
                             gen_integrator_gradient_kernel, gen_integrator_gradient_host, gen_integrator_gradient, \
-                            gen_plant_step, gen_plant_step_gradient, gen_quadratic_state_cost, gen_quadratic_input_cost, \
+                            gen_integrator_hessian_device, gen_integrator_hessian_device_function_call, \
+                            gen_plant_step, gen_plant_step_gradient, gen_plant_step_hessian, gen_plant_step_hessian_kernel, gen_quadratic_state_cost, gen_quadratic_input_cost, \
                             gen_ee_pos_cost, gen_plant_barriers, gen_grid_plant, \
                             gen_plant_step_kernel, gen_quadratic_cost_kernel, gen_ee_pos_cost_kernel, gen_plant_kernels, \
                             gen_id_bias_device, gen_id_bias_kernel, gen_id_bias_host, gen_id_bias, \
@@ -154,8 +155,14 @@ class GRiDCodeGenerator:
         # floating-base world_frame is already pulled in by the
         # enable_idsva_so_world_frame default (True). Keeping it opt-in (not in
         # `all`) preserves the default-profile header byte-for-byte.
+        # F1: integrator_hessian (the plant_step_hessian s_d2AB surface) is a
+        # recognized opt-in key. It is NOT in the default `all` profile (keeping
+        # the default header byte-identical for non-fdsva_so callers is moot since
+        # `all` already pulls fdsva_so, but the hessian device fn + plant wrapper
+        # are gated on fdsva_so membership, which `all` satisfies). Requesting it
+        # explicitly pulls in fdsva_so + integrator below.
         opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia",
-                             "idsva_so_world_frame"}
+                             "idsva_so_world_frame", "integrator_hessian"}
         profile_algorithms = {
             "all": all_algorithms,
             "frame-jacobian": {"end_effector_pose", "minv", "frame_jacobian",
@@ -225,6 +232,12 @@ class GRiDCodeGenerator:
             algorithms.update({"inverse_dynamics", "minv"})
         if "aba" in algorithms and self.robot.floating_base:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
+        # F1: integrator_hessian (plant_step_hessian) composes fdsva_so_device for
+        # the four 2nd-order FD blocks; gravity/integrator value share the same RBD
+        # chain. Pull in fdsva_so (which expands to the full 2nd-order dep set below)
+        # plus integrator.
+        if "integrator_hessian" in algorithms:
+            algorithms.update({"fdsva_so", "integrator"})
         if "fdsva_so" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame"})
         # Mimic Minv routes through crba_inner (see _minv.py: the reduced-space
@@ -2324,6 +2337,12 @@ class GRiDCodeGenerator:
                     self.gen_idsva_so_dispatcher()
             if "fdsva_so" in algorithms:
                 self.gen_fdsva_so()
+                # F1: integrator_hessian device (the plant_step_hessian s_d2AB
+                # surface) composes fdsva_so_device, so emit it alongside fdsva_so.
+                # Additive — only the (fixed-base, Euler/SI-Euler) device fn; floating
+                # and RK static_assert out. Gated to keep non-fdsva_so headers
+                # byte-identical.
+                self.gen_integrator_hessian_device()
         # G2 centroidal quick-wins (R1-R3): additive families gated on their
         # grid:: deps. generalized_gravity / nonlinear_effects are RNEA bias
         # wrappers (need `id`); com / ccrba / energy live in the kinematics

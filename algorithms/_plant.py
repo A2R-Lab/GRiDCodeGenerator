@@ -139,6 +139,52 @@ def gen_plant_step_gradient(self, with_value=False):
     self.gen_add_end_function()
 
 
+def gen_plant_step_hessian(self):
+    """`plant_step_hessian` — thin wrapper over `grid::integrator_hessian_device`
+    (the s_d2AB surface: the true 2nd-order sensitivity of the integrator step).
+
+    H has shape (2*NUM_VEL, 3*NUM_VEL, 3*NUM_VEL), row-major flat:
+        H[o*nz*nz + a*nz + b] = d^2 x_{k+1}[o] / dz[a] dz[b],
+    z = [dq(nv); dqd(nv); du(nv)], output rows = [position-tangent(nv); velocity(nv)].
+    The emitted s_d2AB IS grid::integrator_hessian_device's output (this is what
+    the equivalence test asserts vs the RBDReference oracle). Scope: EULER /
+    SI-EULER on a FIXED base; floating-base + multi-stage RK static_assert out in
+    the composed device fn (clean-break). See f1_plant_step_hessian_plan.md.
+
+    The caller supplies the fdsva_so scratch buffers (s_df2/s_idsva_so/s_Minv/
+    s_df_du/s_qdd) the inner needs (it is an inner-owns-placement orchestrator);
+    we forward them straight through, splitting s_x into s_q / s_qd.
+    """
+    func_params = [
+        "s_d2AB is the Hessian output (2*NUM_VEL x 3*NUM_VEL x 3*NUM_VEL, row-major)",
+        "s_x is the current state [q; qd]",
+        "s_u is the control torque vector (size NUM_VEL)",
+        "s_df2 / s_idsva_so / s_Minv / s_df_du / s_qdd are fdsva_so in/out scratch (caller-placed)",
+        "s_temp / d_workspace / d_fd_grad_spill / s_fdsva_temp are the fdsva_so scratch arenas (caller-placed)",
+        "d_robotModel / gravity / dt as for plant_step",
+    ]
+    nq = self.robot.get_num_pos()
+    self.gen_add_func_doc("Plant step hessian s_d2AB (thin wrapper over grid::integrator_hessian_device — pass-through)",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                           "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    self.gen_add_code_line("__device__")
+    sig = "void plant_step_hessian(T *s_d2AB, "
+    sig_middle = ("const T *s_x, const T *s_u, T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, ")
+    sig_middle, func_params = self.gen_insert_helpers_func_def_params(sig_middle, func_params, -1)
+    sig_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
+               "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+    self.gen_add_code_line(sig + sig_middle + sig_end, True)
+    self.gen_add_code_line("const T *s_q  = s_x;")
+    self.gen_add_code_line("const T *s_qd = &s_x[" + str(nq) + "];")
+    inner = ("grid::integrator_hessian_device<T, IT, SCRATCH_IN_SMEM, FD_GRAD_USE_SPILL, CONTRACT_IN_SMEM>"
+             "(s_d2AB, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, ")
+    inner_helpers = self.gen_insert_helpers_function_call()
+    inner_end = ("s_temp, d_workspace, d_fd_grad_spill, s_fdsva_temp, d_robotModel, gravity, dt);")
+    self.gen_add_code_line(inner + inner_helpers + inner_end)
+    self.gen_add_end_function()
+
+
 # ---------------------------------------------------------------------------
 # Quadratic state / input cost (value, gradient, GN-diag hessian, fused).
 # ---------------------------------------------------------------------------
@@ -823,6 +869,79 @@ def gen_plant_step_gradient_kernel(self):
     self.gen_add_end_function()
 
 
+def gen_plant_step_hessian_kernel(self):
+    """`plant_step_hessian_kernel` — one block/timestep, s_d2AB -> d_d2AB.
+
+    Mirrors gen_plant_step_gradient_kernel's PERF/full-smem (SHARED tier) body:
+    the whole fdsva_so scratch arena lives in shared memory (SCRATCH_IN_SMEM=true,
+    no workspace/spill), then calls grid_plant::plant_step_hessian (the thin
+    pass-through over grid::integrator_hessian_device). Inputs/outputs are global.
+
+    Scope: EULER / SI-EULER on a FIXED base (floating + RK static_assert out in
+    the composed device fn). x = [q (NUM_POS); qd (NUM_VEL)]; u = control torque
+    (NUM_VEL). d_d2AB is the (2*NUM_VEL x 3*NUM_VEL x 3*NUM_VEL) row-major output."""
+    n = self.robot.get_num_vel()
+    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
+    nz = 3 * n
+    d2ab_count = 2 * n * nz * nz
+    # SHARED-tier fdsva_so inner pool: max(idsva_so inner, 4*nv^3 contract,
+    # fd_grad inline) -- the same sizing GCG.py's _temp_full uses for fdsva_so.
+    inner_idsva = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+    inner_temp_full = max(inner_idsva,
+                          self.gen_fdsva_so_contract_temp_mem_size(),
+                          self.gen_fdsva_so_fd_gradient_inline_temp_mem_size())
+    # s_vaf inside the fd-grad inline is body-indexed (stride 6 over NB); size by
+    # NB for mimic robots (NB>nv) so the 18*NB writes don't overflow neighbors.
+    self.gen_add_func_doc("plant_step_hessian kernel: s_d2AB = d^2 integrator([q;qd], u, dt) per timestep "
+                          "(full-smem SHARED-tier scratch; pass-through to grid::integrator_hessian_device)",
+                          [],
+                          ["d_d2AB is the Hessian output (2*NUM_VEL*3*NUM_VEL*3*NUM_VEL per timestep, row-major)",
+                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
+                           "d_u is the packed control torque (NUM_VEL per timestep)",
+                           "stride_x / stride_u are the per-timestep strides",
+                           "d_robotModel / gravity / dt as for plant_step",
+                           "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
+    self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, const T *d_x, const T *d_u, "
+                           "const int stride_x, const int stride_u, "
+                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_code_line("using namespace grid;")
+    extra_t_buffers = [
+        ("s_x", nx),
+        ("s_u", n),
+        ("s_d2AB", d2ab_count),
+        ("s_df2", 4 * n * n * n),
+        ("s_idsva_so", 4 * n * n * n),
+        ("s_Minv", n * n),
+        ("s_df_du", 2 * n * n),
+        ("s_qdd", n),
+    ]
+    self.gen_XImats_helpers_temp_shared_memory_code(
+        inner_temp_full, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+    self.gen_add_parallel_loop("ind", str(nx))
+    self.gen_add_code_line("s_x[ind] = d_x[k*stride_x + ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_parallel_loop("ind", str(n))
+    self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # SHARED tier: all scratch in smem (SCRATCH_IN_SMEM=true, no spill).
+    self.gen_add_code_line("plant_step_hessian<T, IT, true, false, true>("
+                           "s_d2AB, s_x, s_u, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, "
+                           + self.gen_insert_helpers_function_call()
+                           + "s_temp, nullptr, nullptr, nullptr, d_robotModel, gravity, dt);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", str(d2ab_count))
+    self.gen_add_code_line("d_d2AB[k*" + str(d2ab_count) + " + ind] = s_d2AB[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
 def gen_com_cost_kernel(self):
     """`com_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
@@ -1030,6 +1149,12 @@ def gen_plant_kernels(self, algorithms):
     if ("integrator_gradient" in algorithms) or ("integrator_with_gradient" in algorithms):
         gen_plant_step_gradient_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_GRADIENT 1")
+    # F1: plant_step_hessian composes grid::integrator_hessian_device, emitted
+    # alongside fdsva_so (the device fn is gated on the same key). Fixed-base only
+    # (the device fn static_asserts floating + RK out).
+    if ("fdsva_so" in algorithms) and not self.robot.floating_base:
+        gen_plant_step_hessian_kernel(self)
+        self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_HESSIAN 1")
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         gen_ee_pos_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
@@ -1078,6 +1203,13 @@ def gen_grid_plant(self, algorithms):
         self.gen_plant_step_gradient(with_value=True)
     else:
         self.gen_add_code_line("// [grid_plant] plant_step_gradient[_and_value] skipped: requires 'integrator_gradient' (grid::integrator_gradient_device) — not generated.")
+
+    # Plant step hessian (s_d2AB) needs grid::integrator_hessian_device, which is
+    # emitted alongside fdsva_so. Fixed-base only (floating + RK static_assert out).
+    if ("fdsva_so" in algorithms) and not self.robot.floating_base:
+        self.gen_plant_step_hessian()
+    else:
+        self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device), fixed-base — not generated.")
 
     # EE position cost needs both ee_pose and ee_pose_gradient.
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):

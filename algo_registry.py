@@ -70,6 +70,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("integrator_with_gradient",
               "Integrator_With_Gradient (x_{k+1} + ∂x_{k+1}/∂x,u)",
               "Integrators"),
+    AlgoEntry("integrator_hessian", "Integrator_Hessian (∂²x_{k+1}/∂z², z=[q,qd,u]; plant_step_hessian s_d2AB)",
+              "Integrators"),
 
     # Kinematics
     AlgoEntry("end_effector_pose",              "END_EFFECTOR_POSE",                 "Kinematics"),
