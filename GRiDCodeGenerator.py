@@ -909,6 +909,23 @@ class GRiDCodeGenerator:
          self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv,
          self.fdsva_so_use_workspace_idsva_temp) = _chosen
         self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
+
+        # ----- F1: plant_step_hessian shared-mem tier selection (fixed-base only) -----
+        # The hessian kernel composes fdsva_so_device and stages its 18*nv^3 output
+        # band s_d2AB. Two tiers (mirrors _PLANT_HESSIAN_PICK_FLAGS in _plant.py):
+        #   tier 0 (full smem): base + s_d2AB(18nv^3) + s_df2+s_idsva_so(8nv^3) + pool
+        #   tier 1 (deep spill): base only in smem; d2AB + fdsva tensors + pool -> global
+        # PERF picks the lowest tier whose arena fits cuda_target_shared_mem; LITE
+        # clamps >= PERF; MINIMAL is always the deep-spill tier. Only meaningful on a
+        # fixed base (floating + RK static_assert out in the device fn), but compute
+        # it unconditionally — the kernel/macros are only emitted on fixed-base anyway.
+        _psh_d2ab = 2 * nv * (3 * nv) * (3 * nv)
+        _psh_base = (nv + nv) + nv + nv*nv + 2*nv*nv + nv + XI_size  # s_x(nx==2nv fixed) + s_u + s_qdd + Minv + df_du
+        _psh_pool = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _psh_t_full  = _psh_base + _psh_d2ab + 8*nv**3 + _psh_pool
+        _psh_t_spill = _psh_base
+        self.plant_step_hessian_spill_tier_3way = select_shared_tier_3way(_psh_t_full, _psh_t_spill)
+
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before inverse_dynamics_gradient / forward_dynamics_gradient in any kernel that
         # composes both — they sequentially reuse the same workspace bytes).

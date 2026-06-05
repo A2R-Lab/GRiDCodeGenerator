@@ -869,57 +869,60 @@ def gen_plant_step_gradient_kernel(self):
     self.gen_add_end_function()
 
 
-def gen_plant_step_hessian_kernel(self):
-    """`plant_step_hessian_kernel` — one block/timestep, s_d2AB -> d_d2AB.
+# Per-tier spill flags for plant_step_hessian_kernel, ordered least-spill first.
+# (spill_d2AB, spill_tensors, spill_fdsva_pool):
+#   spill_d2AB     : the 18*nv^3 COLD output band s_d2AB -> the kernel's global
+#                    d_workspace hessian section (the device fn just scatters into
+#                    the pointer it is handed — global is fine).
+#   spill_tensors  : s_df2 + s_idsva_so (4*nv^3 each, fdsva_so outputs) -> global
+#                    workspace bands. These are write-once-consumed-once.
+#   spill_fdsva_pool: route the WHOLE fdsva_so s_temp pool + 4*nv^3 contraction
+#                    scratch to d_workspace (SCRATCH_IN_SMEM=false in the composed
+#                    device fn). This is the dominant smem consumer on big robots.
+# Tier 0 keeps everything in smem (SHARED/PERF, byte-identical to the pre-spill
+# kernel for robots that fit). Tier 1 is the deep all-large-bands-to-global spill
+# that lets g1/h1_2 fit the ~99 KB cap (smem then holds only the small base:
+# inputs + s_Minv + s_df_du + s_qdd + XI). Surgical-spill rule: the small hot
+# df_du/Minv/qdd stay in smem; only the cold/large d2AB + fdsva outputs + pool spill.
+_PLANT_HESSIAN_PICK_FLAGS = [
+    (False, False, False),   # tier 0: full smem (SHARED/PERF)
+    (True,  True,  True),    # tier 1: deep spill (d2AB + fdsva tensors + pool -> global)
+]
 
-    Mirrors gen_plant_step_gradient_kernel's PERF/full-smem (SHARED tier) body:
-    the whole fdsva_so scratch arena lives in shared memory (SCRATCH_IN_SMEM=true,
-    no workspace/spill), then calls grid_plant::plant_step_hessian (the thin
-    pass-through over grid::integrator_hessian_device). Inputs/outputs are global.
 
-    Scope: EULER / SI-EULER on a FIXED base (floating + RK static_assert out in
-    the composed device fn). x = [q (NUM_POS); qd (NUM_VEL)]; u = control torque
-    (NUM_VEL). d_d2AB is the (2*NUM_VEL x 3*NUM_VEL x 3*NUM_VEL) row-major output."""
-    n = self.robot.get_num_vel()
-    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
-    nz = 3 * n
-    d2ab_count = 2 * n * nz * nz
+def _emit_plant_step_hessian_kernel_body_for_flags(self, n, nx, nz, d2ab_count,
+                                                   spill_d2AB, spill_tensors, spill_fdsva_pool):
+    """Emit the plant_step_hessian_kernel body for one tier's spill flags.
+
+    Mirrors _emit_fdsva_so_kernel_body_for_flags: declare the shared arena (only
+    the buffers that stay in smem for this tier), then declare the workspace bands
+    for the spilled buffers, then call grid_plant::plant_step_hessian with the
+    matching SCRATCH_IN_SMEM/CONTRACT_IN_SMEM flags, then (if d2AB is in smem)
+    scatter it to the global output."""
     # SHARED-tier fdsva_so inner pool: max(idsva_so inner, 4*nv^3 contract,
     # fd_grad inline) -- the same sizing GCG.py's _temp_full uses for fdsva_so.
     inner_idsva = self.gen_idsva_so_body_frame_inner_temp_mem_size()
     inner_temp_full = max(inner_idsva,
                           self.gen_fdsva_so_contract_temp_mem_size(),
                           self.gen_fdsva_so_fd_gradient_inline_temp_mem_size())
-    # s_vaf inside the fd-grad inline is body-indexed (stride 6 over NB); size by
-    # NB for mimic robots (NB>nv) so the 18*NB writes don't overflow neighbors.
-    self.gen_add_func_doc("plant_step_hessian kernel: s_d2AB = d^2 integrator([q;qd], u, dt) per timestep "
-                          "(full-smem SHARED-tier scratch; pass-through to grid::integrator_hessian_device)",
-                          [],
-                          ["d_d2AB is the Hessian output (2*NUM_VEL*3*NUM_VEL*3*NUM_VEL per timestep, row-major)",
-                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
-                           "d_u is the packed control torque (NUM_VEL per timestep)",
-                           "stride_x / stride_u are the per-timestep strides",
-                           "d_robotModel / gravity / dt as for plant_step",
-                           "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
-    self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, const T *d_x, const T *d_u, "
-                           "const int stride_x, const int stride_u, "
-                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
-    self.gen_add_code_line("using namespace grid;")
-    extra_t_buffers = [
-        ("s_x", nx),
-        ("s_u", n),
-        ("s_d2AB", d2ab_count),
-        ("s_df2", 4 * n * n * n),
-        ("s_idsva_so", 4 * n * n * n),
-        ("s_Minv", n * n),
-        ("s_df_du", 2 * n * n),
-        ("s_qdd", n),
-    ]
+    # When the pool spills, the smem s_temp slot is unused (size 0); the whole
+    # pool (incl. the contraction scratch) routes to d_workspace.
+    shared_temp_size = 0 if spill_fdsva_pool else inner_temp_full
+    extra_t_buffers = [("s_x", nx), ("s_u", n)]
+    if not spill_d2AB:
+        extra_t_buffers.append(("s_d2AB", d2ab_count))
+    if not spill_tensors:
+        extra_t_buffers.append(("s_df2", 4 * n * n * n))
+        extra_t_buffers.append(("s_idsva_so", 4 * n * n * n))
+    # df_du / Minv / qdd are small + hot — always smem (surgical-spill rule).
+    extra_t_buffers.append(("s_Minv", n * n))
+    extra_t_buffers.append(("s_df_du", 2 * n * n))
+    extra_t_buffers.append(("s_qdd", n))
     self.gen_XImats_helpers_temp_shared_memory_code(
-        inner_temp_full, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+        shared_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    needs_workspace = spill_d2AB or spill_tensors or spill_fdsva_pool
+    if not needs_workspace:
+        self.gen_add_code_line("(void)d_workspace;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_parallel_loop("ind", str(nx))
     self.gen_add_code_line("s_x[ind] = d_x[k*stride_x + ind];")
@@ -928,32 +931,141 @@ def gen_plant_step_hessian_kernel(self):
     self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    # SHARED tier: all scratch in smem (SCRATCH_IN_SMEM=true, no spill).
-    self.gen_add_code_line("plant_step_hessian<T, IT, true, false, true>("
+    # Per-timestep workspace bands (carved past the fdsva_so sections so they never
+    # collide with the fdsva pool/contraction spill). Layout (per timestep slot):
+    #   [0 .. d2AB)        : s_d2AB output band (18*nv^3) when spill_d2AB
+    #   [d2AB .. +4nv^3)   : s_df2     when spill_tensors
+    #   [.. +4nv^3)        : s_idsva_so when spill_tensors
+    #   [.. + pool)        : s_fdsva_temp (the fdsva pool/contraction) when spill_fdsva_pool
+    if needs_workspace:
+        self.gen_add_code_line("T *d_ws = reinterpret_cast<T *>(&d_workspace[k*PLANT_HESSIAN_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        self.gen_add_code_line("size_t ws_off = 0;")
+    if spill_d2AB:
+        self.gen_add_code_line("T *s_d2AB = &d_ws[ws_off]; ws_off += " + str(d2ab_count) + ";")
+    if spill_tensors:
+        self.gen_add_code_line("T *s_df2 = &d_ws[ws_off]; ws_off += " + str(4 * n * n * n) + ";")
+        self.gen_add_code_line("T *s_idsva_so = &d_ws[ws_off]; ws_off += " + str(4 * n * n * n) + ";")
+    if spill_fdsva_pool:
+        self.gen_add_code_line("T *s_fdsva_pool = &d_ws[ws_off]; ws_off += " + str(inner_temp_full) + ";")
+        self.gen_add_code_line("(void)ws_off;")
+    # Compose flags: SCRATCH_IN_SMEM=false routes the fdsva pool to d_workspace
+    # (the device fn hands it to the body-frame idsva inner + contraction).
+    scratch_in_smem = "false" if spill_fdsva_pool else "true"
+    contract_in_smem = "false" if spill_fdsva_pool else "true"
+    pool_arg = "s_fdsva_pool" if spill_fdsva_pool else "nullptr"
+    self.gen_add_code_line("plant_step_hessian<T, IT, " + scratch_in_smem + ", false, " + contract_in_smem + ">("
                            "s_d2AB, s_x, s_u, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, "
                            + self.gen_insert_helpers_function_call()
-                           + "s_temp, nullptr, nullptr, nullptr, d_robotModel, gravity, dt);")
+                           + "s_temp, " + pool_arg + ", nullptr, " + pool_arg + ", d_robotModel, gravity, dt);")
     self.gen_add_sync()
+    # Scatter s_d2AB to the global output. When d2AB is already in workspace (spill)
+    # the device fn wrote straight into the global band, but the public d_d2AB output
+    # is a separate contiguous array, so copy in BOTH cases (the workspace slot is a
+    # scratch slice, not the user's output array).
+    src = "s_d2AB"
     self.gen_add_parallel_loop("ind", str(d2ab_count))
-    self.gen_add_code_line("d_d2AB[k*" + str(d2ab_count) + " + ind] = s_d2AB[ind];")
+    self.gen_add_code_line("d_d2AB[k*" + str(d2ab_count) + " + ind] = " + src + "[ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
     self.gen_add_end_control_flow()
-    self.gen_add_end_function()
-    # Launch shared-mem byte count for plant_step_hessian_kernel. The kernel's
-    # SHARED-tier arena (s_d2AB 18*nv^3 output + the fdsva_so scratch) exceeds the
-    # 48 KB static default, so the binding launch MUST size the dynamic smem with
-    # this macro AND raise the per-kernel max via cudaFuncSetAttribute. The
-    # t_count mirrors the kernel's arena exactly: the extra_t_buffers above +
-    # s_XImats (XI_size) + s_temp (inner_temp_full); topology/linalg match the
-    # arena's TOPOLOGY_HELPERS_COUNT / GRID_LINALG_NVIDIA_MAX_HELPER_BYTES regions.
+
+
+def gen_plant_step_hessian_kernel(self):
+    """`plant_step_hessian_kernel` — one block/timestep, s_d2AB -> d_d2AB.
+
+    Tier-aware (mirrors fdsva_so_kernel): TIER_SHARED keeps the whole fdsva_so
+    scratch arena + the 18*nv^3 s_d2AB output band in shared memory; TIER_LITE /
+    TIER_MINIMAL spill the cold/large bands (s_d2AB output, the fdsva_so output
+    tensors s_df2/s_idsva_so, and the fdsva_so s_temp pool + contraction scratch)
+    to the L2-pinned d_workspace so big fixed-base robots (g1/h1_2, nv>=35) fit
+    the ~99 KB dynamic-smem cap. The small hot buffers (s_Minv/s_df_du/s_qdd) stay
+    in smem (surgical-spill rule). Calls grid_plant::plant_step_hessian (the thin
+    pass-through over grid::integrator_hessian_device) with the matching
+    SCRATCH_IN_SMEM / CONTRACT_IN_SMEM flags. Inputs/outputs are global.
+
+    Scope: EULER / SI-EULER on a FIXED base (floating + RK static_assert out in
+    the composed device fn). x = [q (NUM_POS); qd (NUM_VEL)]; u = control torque
+    (NUM_VEL). d_d2AB is the (2*NUM_VEL x 3*NUM_VEL x 3*NUM_VEL) row-major output;
+    d_workspace is the generated global spill workspace (nullptr at TIER_SHARED)."""
+    n = self.robot.get_num_vel()
+    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
+    nz = 3 * n
+    d2ab_count = 2 * n * nz * nz
     xi_size = self.gen_get_XI_size()
-    t_count = (nx + n + d2ab_count + 4 * n * n * n + 4 * n * n * n
-               + n * n + 2 * n * n + n + xi_size + inner_temp_full)
+    inner_idsva = self.gen_idsva_so_body_frame_inner_temp_mem_size()
+    inner_temp_full = max(inner_idsva,
+                          self.gen_fdsva_so_contract_temp_mem_size(),
+                          self.gen_fdsva_so_fd_gradient_inline_temp_mem_size())
+    # Per-timestep workspace band for the spilled tiers: s_d2AB (18*nv^3) +
+    # s_df2 + s_idsva_so (8*nv^3) + the fdsva_so pool/contraction scratch. Sized
+    # for the MAX a tier might spill, so the allocation always covers any tier the
+    # kernel template is instantiated with. Dedicated to the hessian kernel (its
+    # own d_workspace arg), so it does NOT perturb the shared gridData
+    # GRID_WORKSPACE_BYTES_PER_TIMESTEP used by every other algorithm. Emitted
+    # BEFORE the kernel template so the kernel body can reference it.
+    ws_t_count = d2ab_count + 8 * n * n * n + inner_temp_full
     self.gen_add_code_line(
         "template <typename T> __host__ __device__ inline size_t "
-        "INTEGRATOR_HESSIAN_DYNAMIC_SHARED_MEM_BYTES() { return grid::grid_shared_arena_bytes<T>("
-        + str(t_count) + ", grid::TOPOLOGY_HELPERS_COUNT, grid::GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }")
+        "PLANT_HESSIAN_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>("
+        + str(ws_t_count) + "); }")
+    self.gen_add_func_doc("plant_step_hessian kernel: s_d2AB = d^2 integrator([q;qd], u, dt) per timestep "
+                          "(tier-aware scratch; pass-through to grid::integrator_hessian_device)",
+                          [],
+                          ["d_d2AB is the Hessian output (2*NUM_VEL*3*NUM_VEL*3*NUM_VEL per timestep, row-major)",
+                           "d_workspace is the generated global spill workspace (nullptr at TIER_SHARED)",
+                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
+                           "d_u is the packed control torque (NUM_VEL per timestep)",
+                           "stride_x / stride_u are the per-timestep strides",
+                           "d_robotModel / gravity / dt as for plant_step",
+                           "NUM_TIMESTEPS is the batch size"], None)
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                           "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(grid::tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, unsigned char *d_workspace, const T *d_x, const T *d_u, "
+                           "const int stride_x, const int stride_u, "
+                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
+    self.gen_add_code_line("using namespace grid;")
+    picks = getattr(self, "plant_step_hessian_spill_tier_3way", (0, 0, 0))
+
+    def _emit_body(pick):
+        spill_d2AB, spill_tensors, spill_fdsva_pool = _PLANT_HESSIAN_PICK_FLAGS[pick]
+        _emit_plant_step_hessian_kernel_body_for_flags(
+            self, n, nx, nz, d2ab_count, spill_d2AB, spill_tensors, spill_fdsva_pool)
+
+    self.gen_tier_dispatch(picks, _emit_body)
+    self.gen_add_end_function()
+    # Per-tier launch shared-mem byte count for plant_step_hessian_kernel. The
+    # binding launch MUST size the dynamic smem with this macro AND raise the
+    # per-kernel max via cudaFuncSetAttribute. The t_count mirrors each tier's
+    # arena exactly (the in-smem extra_t_buffers + s_XImats + s_temp pool).
+    base_t = nx + n + n * n + 2 * n * n + n + xi_size
+
+    def _tier_t_count(pick):
+        spill_d2AB, spill_tensors, spill_fdsva_pool = _PLANT_HESSIAN_PICK_FLAGS[pick]
+        t = base_t
+        if not spill_d2AB:
+            t += d2ab_count
+        if not spill_tensors:
+            t += 8 * n * n * n
+        if not spill_fdsva_pool:
+            t += inner_temp_full
+        return t
+
+    t0 = _tier_t_count(picks[0])
+    t1 = _tier_t_count(picks[1])
+    t2 = _tier_t_count(picks[2])
+    self.gen_add_code_line(
+        "template <typename T, int TIER = grid::GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t "
+        "INTEGRATOR_HESSIAN_DYNAMIC_SHARED_MEM_BYTES() { "
+        "if constexpr (TIER == grid::TIER_SHARED)    return grid::grid_shared_arena_bytes<T>(" + str(t0) + ", grid::TOPOLOGY_HELPERS_COUNT, grid::GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+        "else if constexpr (TIER == grid::TIER_LITE) return grid::grid_shared_arena_bytes<T>(" + str(t1) + ", grid::TOPOLOGY_HELPERS_COUNT, grid::GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+        "else                                        return grid::grid_shared_arena_bytes<T>(" + str(t2) + ", grid::TOPOLOGY_HELPERS_COUNT, grid::GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+        "}")
+    # 1 when any tier spills (so the launcher knows it must allocate d_workspace).
+    spills_any = 1 if any(p >= 1 for p in picks) else 0
+    self.gen_add_code_line(
+        "static const int GRID_PLANT_HESSIAN_USES_WORKSPACE_ANY_TIER = " + str(spills_any) + ";")
 
 
 def gen_com_cost_kernel(self):
