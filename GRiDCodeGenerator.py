@@ -2356,9 +2356,9 @@ class GRiDCodeGenerator:
                 self.gen_fdsva_so()
                 # F1: integrator_hessian device (the plant_step_hessian s_d2AB
                 # surface) composes fdsva_so_device, so emit it alongside fdsva_so.
-                # Additive — only the (fixed-base, Euler/SI-Euler) device fn; floating
-                # and RK static_assert out. Gated to keep non-fdsva_so headers
-                # byte-identical.
+                # Fixed-base (dt-scaled assembly) and floating-base (the SE(3) retract
+                # Hessian) both emit; only multi-stage RK static_asserts out. Gated on
+                # fdsva_so membership to keep non-fdsva_so headers byte-identical.
                 self.gen_integrator_hessian_device()
         # G2 centroidal quick-wins (R1-R3): additive families gated on their
         # grid:: deps. generalized_gravity / nonlinear_effects are RNEA bias

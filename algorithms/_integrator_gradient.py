@@ -961,6 +961,153 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     self.gen_add_end_function()
 
 
+# Floating-base SE(3) scratch the hessian inner carves from the (post-fdsva_so)
+# s_temp pool: w[6] + dInt_v[36] + d2Int_qv[216] + d2Int_vv[216].
+FLOATING_HESSIAN_SE3_SCRATCH = 6 + 36 + 216 + 216
+
+
+def gen_integrator_hessian_device_floating(self):
+    """Emit the FLOATING-BASE body of integrator_hessian_device (after the
+    EULER/SI-EULER static_assert). Composes fdsva_so_device (the four 2nd-order
+    forward-dynamics blocks D2qdd in s_df2, plus the first-order s_df_du / s_Minv
+    / s_qdd) with the SE(3) retract second derivatives, exactly mirroring
+    RBDReference._PlantMixin.plant_step_hessian (floating branch):
+
+      velocity rows : H[nv+i, a, b] = dt * D2qdd[i, b, a]   (a/b TRANSPOSED vs
+                      the fixed sweep: perturb in a, gradient-column in b).
+      position rows, EULER (nonzero only when a is in the qd block, a=nv+a'):
+            H[i, nv+a', b in q ] = dt   * d2Int_qv[i, b , a']
+            H[i, nv+a', b in qd] = dt^2 * d2Int_vv[i, b', a']  (b=nv+b')
+        everything else 0; NOT symmetrized (the FD-of-pinocchio ground truth is
+        asymmetric -- only the qd perturbation axis carries the cross term).
+      position rows, SI-EULER (Vgrad = dv_{k+1}/dz = [dt*fd_dq | I+dt*fd_dqd | dt*Minv]):
+            t1 (b in q): dt  * sum_c d2Int_qv[i,b,c] * Vgrad[c,a]
+            t2:          dt^2* sum_{m,c} d2Int_vv[i,m,c] * Vgrad[c,a] * Vgrad[m,b]
+            t3:          dt^2* sum_m dInt_v[i,m] * D2qdd[m,a,b]
+        where the SE(3) blocks (dInt_v, d2Int_qv, d2Int_vv) are nonzero ONLY in
+        the free-flyer 6x6(x6) corner; revolute rows/cols of dInt_v are identity
+        (so t3's m-sum picks up the i-th D2qdd block directly for i>=6).
+
+    All d2Int / dInt SE(3) blocks are finite-differenced in DOUBLE (see
+    grid_d2Integrate_block) then stored as T, so a float32 kernel matches the
+    float64 oracle. The blocks are computed ONCE block-cooperatively into the
+    post-fdsva_so s_temp pool, then a single fully-parallel sweep over the
+    2*nv*3*nv*3*nv output cells reads them (each thread owns one output cell)."""
+    n = self.robot.get_num_vel()
+    nz = 3 * n
+    nn = n * n
+    nnn = n * n * n
+    # fdsva_so (D2qdd blocks in s_df2; first-order s_df_du=[fd_dq|fd_dqd], s_Minv,
+    # s_qdd). Same composition + flags as the fixed-base path.
+    self.gen_fdsva_so_device_function_call(
+        scratch_in_smem_expr="SCRATCH_IN_SMEM",
+        fd_grad_use_spill_expr="FD_GRAD_USE_SPILL",
+        contract_in_smem_expr="CONTRACT_IN_SMEM",
+        d_workspace_pool_name="d_workspace",
+        d_fd_grad_spill_name="d_fd_grad_spill",
+        s_fdsva_temp_name="s_fdsva_temp")
+    self.gen_add_sync()
+    self.gen_add_code_line("T *d2a_dqdq = s_df2;")
+    self.gen_add_code_line("T *d2a_dvdq = &s_df2[" + str(nnn) + "];")
+    self.gen_add_code_line("T *d2a_dvdv = &s_df2[" + str(2 * nnn) + "];")
+    self.gen_add_code_line("T *d2a_dtdq = &s_df2[" + str(3 * nnn) + "];")
+    self.gen_add_code_line("const bool si = (IT == IntegratorType::SEMI_IMPLICIT_EULER);")
+    self.gen_add_code_line("const T dt2 = dt * dt;")
+    # The fdsva_so pool (s_temp; routed to d_workspace when !SCRATCH_IN_SMEM) is
+    # free after the call returns -- carve the tiny SE(3) scratch from its front.
+    self.gen_add_code_line("// SE(3) retract scratch (block-shared, carved from the freed fdsva_so pool).")
+    self.gen_add_code_line("T *s_se3 = (SCRATCH_IN_SMEM) ? s_temp : d_workspace;")
+    self.gen_add_code_line("T *s_w       = &s_se3[0];")
+    self.gen_add_code_line("T *s_dInt_v  = &s_se3[6];          // 6x6 first-order dIntegrate_v")
+    self.gen_add_code_line("T *s_d2Int_qv = &s_se3[6 + 36];    // 6x6x6 [o*36 + j*6 + k]")
+    self.gen_add_code_line("T *s_d2Int_vv = &s_se3[6 + 36 + 216];")
+    # w = the q-update increment (free-flyer 6): Euler dt*qd; SI-Euler dt*(qd+dt*qdd).
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("for (int m = 0; m < 6; ++m) s_w[m] = si ? (dt * (s_qd[m] + dt * s_qdd[m])) : (dt * s_qd[m]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # Compute the SE(3) blocks once, block-cooperatively. dInt_v (6x6) is one
+    # thread; the two 6x6x6 d2Int tensors are FD'd in double (each thread owns
+    # the full direction-k stencil over the 6 free-flyer directions).
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("double w_d[6]; for (int m = 0; m < 6; ++m) w_d[m] = static_cast<double>(s_w[m]);")
+    self.gen_add_code_line("double dIv_d[36]; grid_dIntegrate_v_block<double>(w_d, dIv_d);")
+    self.gen_add_code_line("for (int m = 0; m < 36; ++m) s_dInt_v[m] = static_cast<T>(dIv_d[m]);")
+    self.gen_add_code_line("grid_d2Integrate_block<T, true >(s_w, s_d2Int_qv);")
+    self.gen_add_code_line("grid_d2Integrate_block<T, false>(s_w, s_d2Int_vv);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # ---- one fully-parallel sweep over the 2*nv*nz*nz output cells ----
+    # D2qdd[m,p,q] (z-block lookup, same structure as the fixed-base assembly).
+    # Defined as a device lambda so the velocity-row transpose and the SI-Euler
+    # t3 contraction both read it without recompute.
+    self.gen_add_code_line("auto D2qdd = [&](int m, int p, int q) -> T {")
+    self.gen_add_code_line("    int pblk = p / " + str(n) + ", qblk = q / " + str(n) + ";")
+    self.gen_add_code_line("    int pj = p % " + str(n) + ", qk = q % " + str(n) + ";")
+    self.gen_add_code_line("    if (pblk == 0 && qblk == 0) return d2a_dqdq[m*" + str(nn) + " + pj*" + str(n) + " + qk];")
+    self.gen_add_code_line("    if (pblk == 1 && qblk == 1) return d2a_dvdv[m*" + str(nn) + " + pj*" + str(n) + " + qk];")
+    self.gen_add_code_line("    if (pblk == 1 && qblk == 0) return d2a_dvdq[m*" + str(nn) + " + pj*" + str(n) + " + qk];")
+    self.gen_add_code_line("    if (pblk == 0 && qblk == 1) return d2a_dvdq[m*" + str(nn) + " + qk*" + str(n) + " + pj];")
+    self.gen_add_code_line("    if (pblk == 2 && qblk == 0) return d2a_dtdq[m*" + str(nn) + " + pj*" + str(n) + " + qk];")
+    self.gen_add_code_line("    if (pblk == 0 && qblk == 2) return d2a_dtdq[m*" + str(nn) + " + qk*" + str(n) + " + pj];")
+    self.gen_add_code_line("    return static_cast<T>(0);")
+    self.gen_add_code_line("};")
+    # Vgrad[c, axis] = dv_{k+1}/dz: a in q -> dt*fd_dq[c,a]; a in qd -> (c==a')+dt*fd_dqd[c,a'];
+    #                 a in u -> dt*Minv[c,a']. fd_dq/fd_dqd are column-major (s_df_du[col*n+row]);
+    #                 Minv is SYMMETRIC_UPPER. Only used by SI-Euler.
+    self.gen_add_code_line("auto Vgrad = [&](int c, int axis) -> T {")
+    self.gen_add_code_line("    int blk = axis / " + str(n) + ", a2 = axis % " + str(n) + ";")
+    self.gen_add_code_line("    if (blk == 0) return dt * s_df_du[a2*" + str(n) + " + c];")
+    self.gen_add_code_line("    if (blk == 1) return ((c == a2) ? static_cast<T>(1) : static_cast<T>(0)) + dt * s_df_du[" + str(nn) + " + a2*" + str(n) + " + c];")
+    self.gen_add_code_line("    int midx = (c <= a2) * (a2*" + str(n) + " + c) + (c > a2) * (c*" + str(n) + " + a2);")
+    self.gen_add_code_line("    return dt * s_Minv[midx];")
+    self.gen_add_code_line("};")
+    # dInt_v[i,m]: free-flyer 6x6 corner from s_dInt_v; identity on the revolute block.
+    self.gen_add_code_line("auto dIntv = [&](int i, int m) -> T {")
+    self.gen_add_code_line("    if (i < 6 && m < 6) return s_dInt_v[i*6 + m];")
+    self.gen_add_code_line("    return (i == m) ? static_cast<T>(1) : static_cast<T>(0);")
+    self.gen_add_code_line("};")
+    self.gen_add_parallel_loop("ind", str(2 * n * nz * nz))
+    self.gen_add_code_line("int o = ind / " + str(nz * nz) + ";")
+    self.gen_add_code_line("int a = (ind / " + str(nz) + ") % " + str(nz) + ";")
+    self.gen_add_code_line("int b = ind % " + str(nz) + ";")
+    self.gen_add_code_line("T val = static_cast<T>(0);")
+    self.gen_add_code_line("if (o >= " + str(n) + ") {", True)
+    self.gen_add_code_line("// velocity rows: dt * D2qdd[i, b, a]  (a/b transposed vs the fixed sweep).")
+    self.gen_add_code_line("int i = o - " + str(n) + ";")
+    self.gen_add_code_line("val = dt * D2qdd(i, b, a);")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else if (!si) {", True)
+    self.gen_add_code_line("// position rows, EULER: nonzero only when a is in the qd block.")
+    self.gen_add_code_line("int i = o;")
+    self.gen_add_code_line("if (a >= " + str(n) + " && a < " + str(2 * n) + " && i < 6) {", True)
+    self.gen_add_code_line("int aL = a - " + str(n) + ";")
+    self.gen_add_code_line("if (b < " + str(n) + ") { if (b < 6 && aL < 6) val = dt * s_d2Int_qv[i*36 + b*6 + aL]; }")
+    self.gen_add_code_line("else if (b < " + str(2 * n) + ") { int bL = b - " + str(n) + "; if (bL < 6 && aL < 6) val = dt2 * s_d2Int_vv[i*36 + bL*6 + aL]; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("// position rows, SI-EULER: t1 + t2 + t3.")
+    self.gen_add_code_line("int i = o;")
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("if (i < 6) {", True)
+    self.gen_add_code_line("// t1 (b in q only): dt * sum_c d2Int_qv[i,b,c] * Vgrad[c,a].")
+    self.gen_add_code_line("if (b < " + str(n) + " && b < 6) { for (int c = 0; c < 6; ++c) acc += dt * s_d2Int_qv[i*36 + b*6 + c] * Vgrad(c, a); }")
+    self.gen_add_code_line("// t2: dt^2 * sum_{m,c} d2Int_vv[i,m,c] * Vgrad[c,a] * Vgrad[m,b].")
+    self.gen_add_code_line("for (int m = 0; m < 6; ++m) { T vmb = Vgrad(m, b); if (vmb != static_cast<T>(0)) for (int c = 0; c < 6; ++c) acc += dt2 * s_d2Int_vv[i*36 + m*6 + c] * Vgrad(c, a) * vmb; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// t3: dt^2 * sum_m dInt_v[i,m] * D2qdd[m,a,b]. dInt_v is block-diagonal")
+    self.gen_add_code_line("//     (6x6 free-flyer corner + identity revolute), so the m-sum is the 6")
+    self.gen_add_code_line("//     free-flyer rows plus the single identity term m==i for i>=6.")
+    self.gen_add_code_line("if (i < 6) { for (int m = 0; m < 6; ++m) acc += dt2 * dIntv(i, m) * D2qdd(m, a, b); }")
+    self.gen_add_code_line("else { acc += dt2 * D2qdd(i, a, b); }")
+    self.gen_add_code_line("val = acc;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("s_d2AB[ind] = val;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_integrator_hessian_device_function_call(self,
                                                 scratch_in_smem_expr="true",
                                                 fd_grad_use_spill_expr="false",
@@ -1033,9 +1180,7 @@ def gen_integrator_hessian_device(self):
     self.gen_add_code_line("    \"integrator_hessian_device: only EULER / SEMI_IMPLICIT_EULER are supported \"")
     self.gen_add_code_line("    \"(multi-stage RK 2nd-order chain rule is deferred; see f1_plant_step_hessian_plan.md).\");")
     if self.robot.floating_base:
-        self.gen_add_code_line("static_assert(sizeof(T) == 0,")
-        self.gen_add_code_line("    \"integrator_hessian_device: floating-base is deferred (the position q-q block needs \"")
-        self.gen_add_code_line("    \"the SE(3) retract connection term; see f1_plant_step_hessian_plan.md).\");")
+        gen_integrator_hessian_device_floating(self)
         self.gen_add_end_function()
         return
     # The four 2nd-order forward-dynamics blocks (fdsva_so output), each nv^3.

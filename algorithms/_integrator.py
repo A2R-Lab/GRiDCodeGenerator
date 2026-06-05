@@ -282,6 +282,40 @@ def gen_lie_group_helpers(self):
         "    }",
         "}",
         "",
+        # ---- second-order dIntegrate: d2Int[o,j,k] = d(dInt_block[o,j])/d(w[k]) ----
+        # 4th-order central finite difference of the 6x6 SE(3) dIntegrate blocks over
+        # the 6 free-flyer increment directions k. Done in DOUBLE regardless of the
+        # caller's T (the blocks are tiny and double keeps a float32 kernel matching
+        # the float64 oracle; a float32 FD here would be too noisy). h matches the
+        # RBDReference.d2Integrate stencil (1e-3, near the 4th-order roundoff sweet
+        # spot, clear of dIntegrate's small-angle cliff). Output tensor [o*36 + j*6 + k].
+        "template <typename T, bool IS_Q> __device__ inline void grid_d2Integrate_block(const T *w, T J2[216]) {",
+        "    const double h = 1e-3;",
+        "    double wd[6]; for (int m = 0; m < 6; ++m) wd[m] = static_cast<double>(w[m]);",
+        "    for (int k = 0; k < 6; ++k) {",
+        "        double Jp1[36], Jm1[36], Jp2[36], Jm2[36];",
+        "        double wp[6];",
+        "        #pragma unroll",
+        "        for (int m = 0; m < 6; ++m) wp[m] = wd[m]; wp[k] = wd[k] + h;",
+        "        if constexpr (IS_Q) grid_dIntegrate_q_block<double>(wp, Jp1); else grid_dIntegrate_v_block<double>(wp, Jp1);",
+        "        #pragma unroll",
+        "        for (int m = 0; m < 6; ++m) wp[m] = wd[m]; wp[k] = wd[k] - h;",
+        "        if constexpr (IS_Q) grid_dIntegrate_q_block<double>(wp, Jm1); else grid_dIntegrate_v_block<double>(wp, Jm1);",
+        "        #pragma unroll",
+        "        for (int m = 0; m < 6; ++m) wp[m] = wd[m]; wp[k] = wd[k] + 2.0*h;",
+        "        if constexpr (IS_Q) grid_dIntegrate_q_block<double>(wp, Jp2); else grid_dIntegrate_v_block<double>(wp, Jp2);",
+        "        #pragma unroll",
+        "        for (int m = 0; m < 6; ++m) wp[m] = wd[m]; wp[k] = wd[k] - 2.0*h;",
+        "        if constexpr (IS_Q) grid_dIntegrate_q_block<double>(wp, Jm2); else grid_dIntegrate_v_block<double>(wp, Jm2);",
+        "        #pragma unroll",
+        "        for (int oj = 0; oj < 36; ++oj) {",
+        "            int o = oj / 6, j = oj % 6;",
+        "            double d = (8.0*(Jp1[oj] - Jm1[oj]) - (Jp2[oj] - Jm2[oj])) / (12.0*h);",
+        "            J2[o*36 + j*6 + k] = static_cast<T>(d);",
+        "        }",
+        "    }",
+        "}",
+        "",
     ])
 
 

@@ -905,6 +905,9 @@ def _emit_plant_step_hessian_kernel_body_for_flags(self, n, nx, nz, d2ab_count,
     inner_temp_full = max(inner_idsva,
                           self.gen_fdsva_so_contract_temp_mem_size(),
                           self.gen_fdsva_so_fd_gradient_inline_temp_mem_size())
+    if self.robot.floating_base:
+        from ._integrator_gradient import FLOATING_HESSIAN_SE3_SCRATCH
+        inner_temp_full = max(inner_temp_full, FLOATING_HESSIAN_SE3_SCRATCH)
     # When the pool spills, the smem s_temp slot is unused (size 0); the whole
     # pool (incl. the contraction scratch) routes to d_workspace.
     shared_temp_size = 0 if spill_fdsva_pool else inner_temp_full
@@ -996,6 +999,9 @@ def gen_plant_step_hessian_kernel(self):
     inner_temp_full = max(inner_idsva,
                           self.gen_fdsva_so_contract_temp_mem_size(),
                           self.gen_fdsva_so_fd_gradient_inline_temp_mem_size())
+    if self.robot.floating_base:
+        from ._integrator_gradient import FLOATING_HESSIAN_SE3_SCRATCH
+        inner_temp_full = max(inner_temp_full, FLOATING_HESSIAN_SE3_SCRATCH)
     # Per-timestep workspace band for the spilled tiers: s_d2AB (18*nv^3) +
     # s_df2 + s_idsva_so (8*nv^3) + the fdsva_so pool/contraction scratch. Sized
     # for the MAX a tier might spill, so the allocation always covers any tier the
@@ -1276,9 +1282,9 @@ def gen_plant_kernels(self, algorithms):
         gen_plant_step_gradient_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_GRADIENT 1")
     # F1: plant_step_hessian composes grid::integrator_hessian_device, emitted
-    # alongside fdsva_so (the device fn is gated on the same key). Fixed-base only
-    # (the device fn static_asserts floating + RK out).
-    if ("fdsva_so" in algorithms) and not self.robot.floating_base:
+    # alongside fdsva_so (the device fn is gated on the same key). Fixed-base
+    # (dt-scaled fdsva_so assembly) and floating-base (the SE(3) retract Hessian).
+    if ("fdsva_so" in algorithms):
         gen_plant_step_hessian_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_HESSIAN 1")
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
@@ -1331,11 +1337,12 @@ def gen_grid_plant(self, algorithms):
         self.gen_add_code_line("// [grid_plant] plant_step_gradient[_and_value] skipped: requires 'integrator_gradient' (grid::integrator_gradient_device) — not generated.")
 
     # Plant step hessian (s_d2AB) needs grid::integrator_hessian_device, which is
-    # emitted alongside fdsva_so. Fixed-base only (floating + RK static_assert out).
-    if ("fdsva_so" in algorithms) and not self.robot.floating_base:
+    # emitted alongside fdsva_so. Fixed-base (dt-scaled assembly) and floating-base
+    # (SE(3) retract Hessian); RK static_asserts out in the composed device fn.
+    if ("fdsva_so" in algorithms):
         self.gen_plant_step_hessian()
     else:
-        self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device), fixed-base — not generated.")
+        self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device) — not generated.")
 
     # EE position cost needs both ee_pose and ee_pose_gradient.
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
