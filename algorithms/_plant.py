@@ -940,6 +940,20 @@ def gen_plant_step_hessian_kernel(self):
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
+    # Launch shared-mem byte count for plant_step_hessian_kernel. The kernel's
+    # SHARED-tier arena (s_d2AB 18*nv^3 output + the fdsva_so scratch) exceeds the
+    # 48 KB static default, so the binding launch MUST size the dynamic smem with
+    # this macro AND raise the per-kernel max via cudaFuncSetAttribute. The
+    # t_count mirrors the kernel's arena exactly: the extra_t_buffers above +
+    # s_XImats (XI_size) + s_temp (inner_temp_full); topology/linalg match the
+    # arena's TOPOLOGY_HELPERS_COUNT / GRID_LINALG_NVIDIA_MAX_HELPER_BYTES regions.
+    xi_size = self.gen_get_XI_size()
+    t_count = (nx + n + d2ab_count + 4 * n * n * n + 4 * n * n * n
+               + n * n + 2 * n * n + n + xi_size + inner_temp_full)
+    self.gen_add_code_line(
+        "template <typename T> __host__ __device__ inline size_t "
+        "INTEGRATOR_HESSIAN_DYNAMIC_SHARED_MEM_BYTES() { return grid::grid_shared_arena_bytes<T>("
+        + str(t_count) + ", grid::TOPOLOGY_HELPERS_COUNT, grid::GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }")
 
 
 def gen_com_cost_kernel(self):
