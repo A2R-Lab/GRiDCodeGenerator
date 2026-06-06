@@ -1178,6 +1178,13 @@ def gen_idsva_so_body_frame_floating_reference_inner(self, use_qdd_input = False
     """
     Emits a floating-base diagnostic IDSVA-SO path with explicit body/velocity
     split memory. Fixed-base keeps the optimized generator path below.
+
+    DOCUMENTED NON-EMITTED REFERENCE FALLBACK (not dead-by-accident): in
+    production the dispatcher routes ALL floating-base second-order to the
+    world_frame path, so this body-frame floating branch is never generated /
+    benchmarked. It is intentionally retained as a reference (see the header
+    block above + docs/open-tasks/so_audit_plan.md); the SO audit decides
+    keep-vs-retire. Do NOT remove it as unused.
     """
     NV = self.robot.get_num_vel()
     num_bodies = self.robot.get_num_bodies()

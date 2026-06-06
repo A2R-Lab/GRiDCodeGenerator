@@ -2240,16 +2240,31 @@ class GRiDCodeGenerator:
             self.gen_centroidal_inner()
             if want_com:
                 self.gen_com()
+                # Signal to the binding layer that grid::com is emitted. The
+                # centroidal value wrappers (com/ccrba/energy) are NOT emitted for
+                # mimic robots, so the grid_rbd C-ABI gates each on its own define.
+                self.gen_add_code_line("#define GRID_HAS_COM 1")
             if want_ccrba:
                 self.gen_ccrba()
+                self.gen_add_code_line("#define GRID_HAS_CCRBA 1")
             if want_energy:
                 self.gen_energy()
+                self.gen_add_code_line("#define GRID_HAS_ENERGY 1")
             # PS5 dCCRBA: emit the qd-contraction Adot first (lighter), then the
             # full 6*nv*nv tensor (with per-tier output spill).
             if want_cmm:
                 self.gen_cmm_time_variation()
             if want_dccrba:
                 self.gen_dccrba()
+            # Signal to the binding layer (wrapper_template.cu) that the centroidal
+            # tensor host wrappers (dccrba / cmm_time_variation) were emitted. They
+            # are NOT emitted for mimic robots (the per-body Jacobian fold isn't
+            # mimic-reduced), so the grid_rbd C-ABI gates its dccrba /
+            # cmm_time_variation symbols on this define and returns rc=3 otherwise.
+            if want_dccrba:
+                self.gen_add_code_line("#define GRID_HAS_DCCRBA 1")
+            if want_cmm:
+                self.gen_add_code_line("#define GRID_HAS_CMM_TIME_VARIATION 1")
         else:
             self.gen_add_code_line("// [centroidal] com/ccrba/energy/dccrba/cmm_time_variation skipped: not requested.")
         # PS5 full Coriolis matrix C(q,qd): closed-form world-frame spatial recursion.
