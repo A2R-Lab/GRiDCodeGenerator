@@ -62,6 +62,10 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Gradients"),
     AlgoEntry("forward_dynamics_parameter_gradient", "Forward Dynamics Parameter Gradient (∂q̈/∂π = -M⁻¹·Y)",
               "Gradients"),
+    AlgoEntry("kinetic_energy_regressor", "Kinetic Energy Regressor (KE = y_KE·π, length 10·NB)",
+              "Gradients"),
+    AlgoEntry("potential_energy_regressor", "Potential Energy Regressor (PE = y_PE·π, length 10·NB)",
+              "Gradients"),
 
     # Integrators
     AlgoEntry("integrator",           "Integrator (x_{k+1})",              "Integrators"),

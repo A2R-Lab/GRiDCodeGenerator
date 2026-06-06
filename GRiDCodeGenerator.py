@@ -26,6 +26,12 @@ class GRiDCodeGenerator:
                             gen_inverse_dynamics_regressor_inner, gen_inverse_dynamics_regressor_device_temp_mem_size, \
                             gen_inverse_dynamics_regressor_device, gen_inverse_dynamics_regressor_kernel, \
                             gen_inverse_dynamics_regressor_host, gen_inverse_dynamics_regressor, \
+                            gen_kinetic_energy_regressor_inner_temp_mem_size, gen_kinetic_energy_regressor_inner_function_call, \
+                            gen_kinetic_energy_regressor_inner, gen_kinetic_energy_regressor_device, gen_kinetic_energy_regressor_kernel, \
+                            gen_kinetic_energy_regressor_host, gen_kinetic_energy_regressor, \
+                            gen_potential_energy_regressor_inner_function_call, gen_potential_energy_regressor_inner, \
+                            gen_potential_energy_regressor_device, gen_potential_energy_regressor_kernel, \
+                            gen_potential_energy_regressor_host, gen_potential_energy_regressor, \
                             gen_forward_dynamics_parameter_gradient_inner_temp_mem_size, gen_forward_dynamics_parameter_gradient_inner_function_call, \
                             gen_forward_dynamics_parameter_gradient_inner, gen_forward_dynamics_parameter_gradient_device_temp_mem_size, \
                             gen_forward_dynamics_parameter_gradient_device, gen_forward_dynamics_parameter_gradient_kernel, \
@@ -136,6 +142,7 @@ class GRiDCodeGenerator:
             "idsva_so_body_frame", "fdsva_so", "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
             "integrator", "integrator_gradient", "integrator_with_gradient",
             "f_ext_gradient", "inverse_dynamics_regressor", "forward_dynamics_parameter_gradient",
+            "kinetic_energy_regressor", "potential_energy_regressor",
             # G2 centroidal quick-wins: each is its OWN first-class key (R6). They
             # expand to their real deps below (com/ccrba/energy -> ee_pose kin
             # machinery; generalized_gravity/nonlinear_effects -> id RNEA-bias), but
@@ -171,7 +178,10 @@ class GRiDCodeGenerator:
                          "integrator", "integrator_gradient", "integrator_with_gradient"},
             "dynamics-core": {"inverse_dynamics", "minv", "forward_dynamics"},
             "dynamics-gradients": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "f_ext_gradient"},
-            "regressor": {"inverse_dynamics", "inverse_dynamics_regressor"},
+            "regressor": {"inverse_dynamics", "inverse_dynamics_regressor",
+                          "kinetic_energy_regressor", "potential_energy_regressor"},
+            "energy-regressor": {"inverse_dynamics", "end_effector_pose",
+                                 "kinetic_energy_regressor", "potential_energy_regressor"},
             "fd-param-gradient": {"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_regressor", "forward_dynamics_parameter_gradient"},
             "f-ext-gradient": {"inverse_dynamics", "minv", "f_ext_gradient"},
             "kinematics": {"end_effector_pose"},
@@ -279,6 +289,12 @@ class GRiDCodeGenerator:
             algorithms.add("end_effector_pose")
         if algorithms & {"generalized_gravity", "nonlinear_effects"}:
             algorithms.add("inverse_dynamics")
+        # Energy regressors (PS5): KE reuses the RNEA forward sweep (inverse_dynamics
+        # inner); PE reuses the ee_pose world-transform homogeneous machinery.
+        if "kinetic_energy_regressor" in algorithms:
+            algorithms.add("inverse_dynamics")
+        if "potential_energy_regressor" in algorithms:
+            algorithms.add("end_effector_pose")
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -372,6 +388,15 @@ class GRiDCodeGenerator:
         regressor_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() + 18*n \
             + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size
         self.regressor_t_count = regressor_t_count
+        # PS5 energy regressors. Both outputs are 10*NUM_BODIES (no DoF sweep).
+        # KE (spatial / XImats domain): s_q_qd(n+nv) + s_y_ke(10NB) + s_vaf(18n)
+        #   + RNEA forward scratch + XI_size.
+        self.kinetic_energy_regressor_t_count = (n + nv) + 10*self.robot.get_num_bodies() + 18*n \
+            + self.gen_kinetic_energy_regressor_inner_temp_mem_size() + XI_size
+        # PE (kinematics / XmatsHom domain): s_q(n) + s_y_pe(10NB)
+        #   + world-transform BFS scratch (16*NUM_JOINTS) + XHom_size.
+        self.potential_energy_regressor_t_count = n + 10*self.robot.get_num_bodies() \
+            + 16*self.robot.get_num_joints() + XHom_size
         # FD param gradient: kernel smem = XI + s_q_qd_u(NUM_POS+2nv) + s_dqdd_dpi
         # + s_Minv(nv*nv) + s_Y(nv x 10*NB) + s_qdd(nv) + s_vaf(18*NUM_POS) + s_c(nv)
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
@@ -1094,6 +1119,8 @@ class GRiDCodeGenerator:
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 # PS5 energy regressors (each output 10*NUM_BODIES, fits every tier -> no spill).
+                                 "template <typename T> __host__ __device__ inline size_t KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.kinetic_energy_regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  # g1-spill: tier-aware. At a spilled tier the s_Y regressor
                                  # scratch moves to d_workspace, shrinking the smem arena. Default
                                  # TIER = TIER_SHARED keeps every existing single-arg call site working.
@@ -1190,6 +1217,8 @@ class GRiDCodeGenerator:
                                  "else                                 return grid_shared_arena_bytes<T>(" + str(self.crba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
                                  "}",
                                  "template <typename T> __host__ __device__ constexpr size_t GRID_EE_LINALG_SHARED_BYTES() { return static_cast<size_t>(0); }",
+                                 # PS5 potential-energy regressor (kinematics / XmatsHom domain; uses the ee linalg helper bytes).
+                                 "template <typename T> __host__ __device__ inline size_t POTENTIAL_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.potential_energy_regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(ee_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  # Phase 3d: tier-aware. PERF/LITE/MINIMAL each report the smem
                                  # bytes their picked spill level needs. Collapsed picks (small
@@ -1404,7 +1433,10 @@ class GRiDCodeGenerator:
                                  "    T *d_f_ext_gradient_dq;  // -dJ^T/dq = d(inverse_dynamics_gradient)/dfext, nv*6NB*nv (both base modes)",
                                  # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
                                  "    T *d_Y;          // inverse_dynamics_regressor (tau = Y . pi), nv*10NB",
-                                 "    T *d_dqdd_dpi;   // forward_dynamics_parameter_gradient (-Minv . Y), nv*10NB"]
+                                 "    T *d_dqdd_dpi;   // forward_dynamics_parameter_gradient (-Minv . Y), nv*10NB",
+                                 # PS5 energy regressors (each 10*NUM_BODIES; KE=y_KE.pi, PE=y_PE.pi)
+                                 "    T *d_ke_regressor;   // kinetic_energy_regressor (KE = y_KE . pi), 10NB",
+                                 "    T *d_pe_regressor;   // potential_energy_regressor (PE = y_PE . pi), 10NB"]
                                  + [
                                  "    T *d_end_effector_pose;", \
                                  "    T *d_end_effector_pose_gradient;", \
@@ -1438,7 +1470,10 @@ class GRiDCodeGenerator:
                                  "    T *h_f_ext_gradient_dq;  // -dJ^T/dq, nv*6NB*nv (both base modes)",
                                  # R2: regressor + FD param-gradient outputs (each nv x 10*NUM_BODIES)
                                  "    T *h_Y;",
-                                 "    T *h_dqdd_dpi;"]
+                                 "    T *h_dqdd_dpi;",
+                                 # PS5 energy regressors
+                                 "    T *h_ke_regressor;",
+                                 "    T *h_pe_regressor;"]
                                  + [
                                  "    T *h_end_effector_pose;", \
                                  "    T *h_end_effector_pose_gradient;", \
@@ -1548,6 +1583,11 @@ class GRiDCodeGenerator:
                       "    hd_data->h_com = (T *)malloc((3+3*NUM_VEL)*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_ccrba = (T *)malloc((6*NUM_VEL+6)*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_energy = (T *)malloc(3*NUM_TIMESTEPS*sizeof(T));", \
+                      "    // PS5 energy regressors (each 10*NUM_BODIES): KE (dynamics) + PE (kinematics)", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_ke_regressor, 10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_pe_regressor, 10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_ke_regressor = (T *)malloc(10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_pe_regressor = (T *)malloc(10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "return hd_data;"])
         # generate as templated or not function
@@ -1678,6 +1718,20 @@ class GRiDCodeGenerator:
             ("inverse_dynamics_regressor_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_regressor_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        # PS5 energy regressors (each output 10*NUM_BODIES; opt-in like the joint-torque
+        # regressor so big-robot launches set the dynamic-smem attr).
+        ("kinetic_energy_regressor", "kinetic_energy_regressor", None, "KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("kinetic_energy_regressor_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("kinetic_energy_regressor_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
+        ("potential_energy_regressor", "potential_energy_regressor", None, "POTENTIAL_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("potential_energy_regressor_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("potential_energy_regressor_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         # FD param gradient dqdd/dpi = -Minv . Y: output is nv x 10*NUM_BODIES (same
@@ -1903,7 +1957,10 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_f_ext_gradient_dq)); free(hd_data->h_f_ext_gradient_dq);",
                                  # R2: regressor Y + FD param-gradient dqdd/dpi outputs
                                  "gpuErrchk(cudaFree(hd_data->d_Y)); gpuErrchk(cudaFree(hd_data->d_dqdd_dpi));",
-                                 "free(hd_data->h_Y); free(hd_data->h_dqdd_dpi);"]
+                                 "free(hd_data->h_Y); free(hd_data->h_dqdd_dpi);",
+                                 # PS5 energy regressors
+                                 "gpuErrchk(cudaFree(hd_data->d_ke_regressor)); gpuErrchk(cudaFree(hd_data->d_pe_regressor));",
+                                 "free(hd_data->h_ke_regressor); free(hd_data->h_pe_regressor);"]
                                  + [
                                  "gpuErrchk(cudaFree(hd_data->d_end_effector_pose)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_gradient)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_hessian));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
@@ -2316,6 +2373,13 @@ class GRiDCodeGenerator:
         # forward sweep emitted by gen_inverse_dynamics (requires "inverse_dynamics").
         if "inverse_dynamics_regressor" in algorithms:
             self.gen_inverse_dynamics_regressor()
+        # PS5 energy regressors. KE reuses the RNEA forward sweep (requires
+        # "inverse_dynamics"); PE reuses the ee_pose world-transform machinery
+        # (requires "end_effector_pose", emitted above in the kinematics block).
+        if "kinetic_energy_regressor" in algorithms:
+            self.gen_kinetic_energy_regressor()
+        if "potential_energy_regressor" in algorithms:
+            self.gen_potential_energy_regressor()
         if "minv" in algorithms:
             self.gen_minv()
         if "forward_dynamics" in algorithms:
