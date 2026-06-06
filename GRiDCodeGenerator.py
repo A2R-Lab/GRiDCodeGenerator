@@ -99,6 +99,12 @@ class GRiDCodeGenerator:
                             gen_frame_jacobian_dot_host, gen_frame_jacobian_dot, \
                             gen_osc_inertia_device, gen_osc_inertia_kernel, \
                             gen_osc_inertia_host, gen_osc_inertia, \
+                            gen_end_effector_pose_runtime_inner, gen_end_effector_pose_runtime_device, \
+                            gen_end_effector_pose_runtime_kernel, gen_end_effector_pose_runtime_host, \
+                            gen_end_effector_pose_runtime, \
+                            gen_end_effector_pose_gradient_runtime_inner, gen_end_effector_pose_gradient_runtime_device, \
+                            gen_end_effector_pose_gradient_runtime_kernel, gen_end_effector_pose_gradient_runtime_host, \
+                            gen_end_effector_pose_gradient_runtime, _gen_runtime_host, \
                             gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
                             gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
                             gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix
@@ -177,6 +183,7 @@ class GRiDCodeGenerator:
         # are gated on fdsva_so membership, which `all` satisfies). Requesting it
         # explicitly pulls in fdsva_so + integrator below.
         opt_in_algorithms = {"frame_jacobian", "frame_jacobian_dot", "osc_inertia",
+                             "end_effector_pose_runtime", "end_effector_pose_gradient_runtime",
                              "idsva_so_world_frame", "integrator_hessian"}
         profile_algorithms = {
             "all": all_algorithms,
@@ -240,6 +247,12 @@ class GRiDCodeGenerator:
             algorithms.add("frame_jacobian")
         if "frame_jacobian" in algorithms:
             algorithms.update({"end_effector_pose", "minv"})
+        # Runtime-target pose / pose-gradient (additive, opt-in): need ee_pose's
+        # world-transform (s_XmatsHom) machinery only -- same dep as frame_jacobian
+        # but WITHOUT minv (no OSC composition).
+        if ("end_effector_pose_runtime" in algorithms
+                or "end_effector_pose_gradient_runtime" in algorithms):
+            algorithms.add("end_effector_pose")
         if "forward_dynamics_gradient" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient"})
         if "inverse_dynamics_gradient" in algorithms:
@@ -1510,6 +1523,11 @@ class GRiDCodeGenerator:
                                  "    T *d_frame_jacobian;       // frame_jacobian (6 x NUM_VEL)", \
                                  "    T *d_frame_jacobian_dot;   // frame_jacobian_dot (6 x NUM_VEL)", \
                                  "    T *d_osc_inertia;          // osc_inertia Lambda (6 x 6)", \
+                                 # runtime-target pose/pose-gradient (additive, opt-in). The 3-vector
+                                 # runtime offset is a single device buffer, host-init to {0,0,0}.
+                                 "    T *d_eePose;               // end_effector_pose_runtime (6 = [xyz;rpy])", \
+                                 "    T *d_eePoseGrad;           // end_effector_pose_gradient_runtime (6 x NUM_VEL)", \
+                                 "    T *d_eepose_runtime_offset; // runtime 3-vector point offset (target frame)", \
                                  "    unsigned char *d_workspace;", \
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *d_idsva_so;", \
@@ -1551,6 +1569,8 @@ class GRiDCodeGenerator:
                                  "    T *h_frame_jacobian;", \
                                  "    T *h_frame_jacobian_dot;", \
                                  "    T *h_osc_inertia;", \
+                                 "    T *h_eePose;", \
+                                 "    T *h_eePoseGrad;", \
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *h_idsva_so;", \
                                  # fdsva_so - d2a_dq2, d2a_dv2, d2a_dvdq, d2a_dtdq
@@ -1643,6 +1663,15 @@ class GRiDCodeGenerator:
                       "    hd_data->h_frame_jacobian = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_frame_jacobian_dot = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_osc_inertia = (T *)malloc(36*NUM_TIMESTEPS*sizeof(T));", \
+                      # runtime-target pose / pose-gradient (additive, opt-in). The runtime
+                      # 3-vector offset is a single device buffer init to {0,0,0} (frame origin);
+                      # a binding overwrites it before the call to request a nonzero offset.
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePose, 6*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eePoseGrad, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eepose_runtime_offset, 3*sizeof(T)));", \
+                      "    gpuErrchk(cudaMemset(hd_data->d_eepose_runtime_offset, 0, 3*sizeof(T)));", \
+                      "    hd_data->h_eePose = (T *)malloc(6*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_eePoseGrad = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "// G2 centroidal quick-wins outputs (com: 3+3*NV ; ccrba: 6*NV+6 ; energy: 3)", \
                       "if (needs_dynamics || needs_kinematics) {", \
@@ -1938,6 +1967,23 @@ class GRiDCodeGenerator:
             ("osc_inertia_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
+        # Runtime-target pose / pose-gradient (opt-in). Kernels take target_jid +
+        # the runtime offset pointer: (T *out, const T *q, const int stride_q,
+        # const int target_jid, const T *offset, robotModel, int N).
+        ("end_effector_pose_runtime", "end_effector_pose_runtime", None,
+         "END_EFFECTOR_POSE_RUNTIME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("end_effector_pose_runtime_kernel<T>",
+             "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
+            ("end_effector_pose_runtime_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
+        ]),
+        ("end_effector_pose_gradient_runtime", "end_effector_pose_gradient_runtime", None,
+         "END_EFFECTOR_POSE_GRADIENT_RUNTIME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("end_effector_pose_gradient_runtime_kernel<T>",
+             "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
+            ("end_effector_pose_gradient_runtime_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
+        ]),
         ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
@@ -2084,6 +2130,8 @@ class GRiDCodeGenerator:
                                  # E2/S1: general-frame Jacobian outputs (frame_jacobian / frame_jacobian_dot / osc_inertia)
                                  "gpuErrchk(cudaFree(hd_data->d_frame_jacobian)); gpuErrchk(cudaFree(hd_data->d_frame_jacobian_dot)); gpuErrchk(cudaFree(hd_data->d_osc_inertia));", \
                                  "free(hd_data->h_frame_jacobian); free(hd_data->h_frame_jacobian_dot); free(hd_data->h_osc_inertia);", \
+                                 "gpuErrchk(cudaFree(hd_data->d_eePose)); gpuErrchk(cudaFree(hd_data->d_eePoseGrad)); gpuErrchk(cudaFree(hd_data->d_eepose_runtime_offset));", \
+                                 "free(hd_data->h_eePose); free(hd_data->h_eePoseGrad);", \
                                  "gpuErrchk(cudaFree(hd_data->d_x_kp1)); gpuErrchk(cudaFree(hd_data->d_dAB));", \
                                  "free(hd_data->h_x_kp1); free(hd_data->h_dAB);", \
                                  "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){gpuErrchk(cudaStreamDestroy(streams[i]));} free(streams);"])
@@ -2659,6 +2707,35 @@ class GRiDCodeGenerator:
         if ("frame_jacobian" in algorithms and "end_effector_pose" in algorithms
                 and self.robot_has_mimic_joints() and "osc_inertia" not in algorithms):
             self.gen_add_code_line("#define GRID_FRAME_JAC_MIMIC 1")
+        # Runtime-target pose / pose-gradient (additive, opt-in). Emitted only when
+        # their key is selected, so every existing profile's header is byte-identical.
+        # Both need ee_pose's world-transform machinery (pulled in above). The arena
+        # mirrors frame_jacobian: s_XmatsHom(Xhom) + inner_temp(16*NJ) + s_q(NUM_POS)
+        # + the output band (6 for pose, 6*NV for gradient). The runtime offset[3]
+        # lives in STATIC __shared__ inside the kernel, not this dynamic arena.
+        if (("end_effector_pose_runtime" in algorithms
+                or "end_effector_pose_gradient_runtime" in algorithms)
+                and "end_effector_pose" in algorithms):
+            NJ_rt = self.robot.get_num_joints()
+            nv_rt = self.robot.get_num_vel()
+            n_pos_rt = self.robot.get_num_pos()
+            Xhom_size_rt, _, _ = self.gen_get_Xhom_size()
+            if "end_effector_pose_runtime" in algorithms:
+                eprt_t_count = Xhom_size_rt + (16 * NJ_rt) + n_pos_rt + 6
+                self.gen_add_code_line(
+                    "template <typename T> __host__ __device__ inline size_t END_EFFECTOR_POSE_RUNTIME_DYNAMIC_SHARED_MEM_BYTES() "
+                    "{ return grid_shared_arena_bytes<T>(" + str(eprt_t_count) +
+                    ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_add_code_line("#define GRID_HAS_END_EFFECTOR_POSE_RUNTIME 1")
+                self.gen_end_effector_pose_runtime()
+            if "end_effector_pose_gradient_runtime" in algorithms:
+                epgrt_t_count = Xhom_size_rt + (16 * NJ_rt) + n_pos_rt + (6 * nv_rt)
+                self.gen_add_code_line(
+                    "template <typename T> __host__ __device__ inline size_t END_EFFECTOR_POSE_GRADIENT_RUNTIME_DYNAMIC_SHARED_MEM_BYTES() "
+                    "{ return grid_shared_arena_bytes<T>(" + str(epgrt_t_count) +
+                    ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_add_code_line("#define GRID_HAS_END_EFFECTOR_POSE_GRADIENT_RUNTIME 1")
+                self.gen_end_effector_pose_gradient_runtime()
         self.gen_combination_functions(algorithms, fixed_target_name)
         # then finally the master init and close the namespace
         self.gen_init_close_grid()

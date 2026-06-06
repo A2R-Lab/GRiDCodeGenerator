@@ -19,3 +19,4 @@ from ._plant import *
 from ._centroidal import *
 from ._coriolis import *
 from ._frame_jacobian import *
+from ._eepose_runtime import *
