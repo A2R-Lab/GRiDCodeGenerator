@@ -2044,11 +2044,6 @@ class GRiDCodeGenerator:
                 continue
             if gate_attr is None and generated_set is not None and algo_short not in generated_set:
                 continue
-            # G2 centroidal kinematics-domain families are not emitted for mimic
-            # robots (their per-body Jacobian fold isn't mimic-reduced yet), so
-            # skip registering their (nonexistent) kernels there.
-            if algo_label in ("com", "ccrba", "energy", "dccrba", "cmm_time_variation") and self.robot_has_mimic_joints():
-                continue
             # Wrap EVERY kernel's attribute registration in a compile-time-
             # resolvable size guard so init_grid never hard-aborts when a kernel
             # literally can't fit a device even with cudaFuncSetAttribute (e.g.
@@ -2273,8 +2268,9 @@ class GRiDCodeGenerator:
             self.gen_add_code_line("// [centroidal] generalized_gravity/nonlinear_effects skipped: not requested (request 'generalized_gravity'/'nonlinear_effects').")
         # R3/R2/energy: kinematics-domain centroidal families. R6: each emits on
         # its OWN key (com/ccrba/energy); the ee_pose homogeneous-transform world-
-        # frame machinery is auto-expanded as their dep. Mimic robots skip them
-        # (per-body Jacobian fold isn't mimic-reduced yet).
+        # frame machinery is auto-expanded as their dep. Mimic robots are SUPPORTED
+        # (centroidal_inner's per-body Jacobian + the dccrba per-unit phi are
+        # alpha-folded, mirroring the mimic-aware RBDReference oracle).
         want_com = "com" in algorithms
         want_ccrba = "ccrba" in algorithms
         want_energy = "energy" in algorithms
@@ -2282,15 +2278,12 @@ class GRiDCodeGenerator:
         want_dccrba = "dccrba" in algorithms
         want_cmm = "cmm_time_variation" in algorithms
         want_centroidal = want_com or want_ccrba or want_energy or want_dccrba or want_cmm
-        if want_centroidal and self.robot_has_mimic_joints():
-            self.gen_add_code_line("// [centroidal] com/ccrba/energy/dccrba/cmm_time_variation skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
-        elif want_centroidal:
+        if want_centroidal:
             self.gen_centroidal_inner()
             if want_com:
                 self.gen_com()
-                # Signal to the binding layer that grid::com is emitted. The
-                # centroidal value wrappers (com/ccrba/energy) are NOT emitted for
-                # mimic robots, so the grid_rbd C-ABI gates each on its own define.
+                # Signal to the binding layer that grid::com is emitted (the
+                # grid_rbd C-ABI gates each centroidal wrapper on its own define).
                 self.gen_add_code_line("#define GRID_HAS_COM 1")
             if want_ccrba:
                 self.gen_ccrba()
@@ -2305,10 +2298,9 @@ class GRiDCodeGenerator:
             if want_dccrba:
                 self.gen_dccrba()
             # Signal to the binding layer (wrapper_template.cu) that the centroidal
-            # tensor host wrappers (dccrba / cmm_time_variation) were emitted. They
-            # are NOT emitted for mimic robots (the per-body Jacobian fold isn't
-            # mimic-reduced), so the grid_rbd C-ABI gates its dccrba /
-            # cmm_time_variation symbols on this define and returns rc=3 otherwise.
+            # tensor host wrappers (dccrba / cmm_time_variation) were emitted; the
+            # grid_rbd C-ABI gates its dccrba / cmm_time_variation symbols on these
+            # defines and returns rc=3 otherwise.
             if want_dccrba:
                 self.gen_add_code_line("#define GRID_HAS_DCCRBA 1")
             if want_cmm:

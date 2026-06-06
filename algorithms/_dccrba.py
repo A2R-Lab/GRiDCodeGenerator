@@ -40,10 +40,11 @@ PARALLELISM: the NV output columns m of dA/dq are INDEPENDENT -> P2 fan over m
 centroidal_inner. cmm_time_variation contracts each column with qd[m] on the fly
 (NO full-tensor materialization).
 
-MIMIC: GATED OFF initially (centroidal_inner's Jw is not yet mimic-alpha-folded;
-the per-unit phi here is alpha=1). The mimic skip mirrors com/ccrba/energy. The
-numpy oracle IS mimic-aware; flipping the gate is a follow-up once the alpha-fold
-is threaded through centroidal_inner + the units here.
+MIMIC: SUPPORTED. centroidal_inner's Jw is mimic-alpha-folded (s_J columns carry
+the multiplier), and the per-unit phi here is likewise alpha-scaled (dc_unit_alpha,
+mirroring the RBDReference _dccrba_world_sweep oracle). The downstream tensor math
+is bilinear in phi so no further change is needed. Non-mimic emit stays byte-
+identical (the alpha table + multiply live entirely inside HAS_MIMIC branches).
 
 SPILL: dccrba's output s_dccrba (6*NV*NV) is the cold/large write-once output ->
 repointed to the L2-pinned d_workspace SO band when DCCRBA_OUTPUT_IN_SMEM<TIER>()
@@ -76,6 +77,7 @@ def _dccrba_metadata(self):
     robot = self.robot
     NB = robot.get_num_bodies()
     nv = robot.get_num_vel()
+    HAS_MIMIC = self.robot_has_mimic_joints()
 
     def ancestors(i):
         res = set()
@@ -88,7 +90,7 @@ def _dccrba_metadata(self):
     anc = [ancestors(i) for i in range(NB)]
     anc_self = [anc[i] | {i} for i in range(NB)]
 
-    unit_body, unit_vi, unit_ax, unit_lin = [], [], [], []
+    unit_body, unit_vi, unit_ax, unit_lin, unit_alpha = [], [], [], [], []
     for j in range(NB):
         S = np.asarray(robot.get_S_by_id(j), dtype=np.float64)
         if S.ndim == 1:
@@ -97,10 +99,15 @@ def _dccrba_metadata(self):
         if not isinstance(vinds, (list, tuple, np.ndarray)):
             vinds = [vinds]
         vinds = [int(v) for v in np.asarray(vinds).reshape(-1)]
+        # MIMIC: the per-unit world motion column phi is alpha-scaled exactly as
+        # the RBDReference oracle (_dccrba_world_sweep / _body_spatial_jacobian_world)
+        # and centroidal_inner's s_J. Non-mimic alpha == 1.0 (unused, gated off).
+        alpha = self._alpha_for_jid(j) if HAS_MIMIC else 1.0
         for c in range(S.shape[1]):
             vi = vinds[c] if c < len(vinds) else vinds[-1]
             unit_body.append(j)
             unit_vi.append(vi)
+            unit_alpha.append(alpha)
             unit_ax += [float(S[0, c]), float(S[1, c]), float(S[2, c])]
             unit_lin += [float(S[3, c]), float(S[4, c]), float(S[5, c])]
     n_int = len(unit_body)
@@ -125,8 +132,8 @@ def _dccrba_metadata(self):
             unit_anc_strict.append(1 if jb in anc[jj] else 0)
 
     return {
-        "NB": NB, "nv": nv, "n_int": n_int,
-        "unit_body": unit_body, "unit_vi": unit_vi,
+        "NB": NB, "nv": nv, "n_int": n_int, "HAS_MIMIC": HAS_MIMIC,
+        "unit_body": unit_body, "unit_vi": unit_vi, "unit_alpha": unit_alpha,
         "unit_ax": unit_ax, "unit_lin": unit_lin,
         "is_root_v": is_root_v,
         "unit_anc_self": unit_anc_self, "unit_anc_strict": unit_anc_strict,
@@ -159,6 +166,7 @@ def _emit_dccrba_assembly(self, out_name, contract_qd):
     NB = md["NB"]
     nv = md["nv"]
     n_int = md["n_int"]
+    HAS_MIMIC = md["HAS_MIMIC"]
     NJ = self.robot.get_num_joints()
 
     # scratch pointers carved from s_temp AFTER centroidal_inner's pool.
@@ -188,6 +196,12 @@ def _emit_dccrba_assembly(self, out_name, contract_qd):
         f"static const int dc_unit_anc_self[] = {{ {_dccrba_int_array(md['unit_anc_self'])} }};",
         f"static const int dc_unit_anc_strict[] = {{ {_dccrba_int_array(md['unit_anc_strict'])} }};",
     ])
+    if HAS_MIMIC:
+        # MIMIC: per-unit mimic multiplier; folds into phi (the alpha-scaled world
+        # motion column), mirroring the RBDReference _dccrba_world_sweep oracle.
+        self.gen_add_code_line(
+            "static const T dc_unit_alpha[] = { " + ", ".join(
+                "static_cast<T>({:.17g})".format(v) for v in md["unit_alpha"]) + " };")
 
     # ---- Step A: per-unit world motion column phi (angular-first), EXACTLY as
     #      centroidal_inner builds Jw columns: aw = R_j*ang ; lw = R_j*lin ;
@@ -204,10 +218,21 @@ def _emit_dccrba_assembly(self, out_name, contract_qd):
     self.gen_add_code_line("T lw1 = Xj[1]*l0 + Xj[5]*l1 + Xj[9]*l2;")
     self.gen_add_code_line("T lw2 = Xj[2]*l0 + Xj[6]*l1 + Xj[10]*l2;")
     self.gen_add_code_line("T pjx = Xj[12], pjy = Xj[13], pjz = Xj[14];")
-    self.gen_add_code_line("s_phi[6*u+0] = aw0; s_phi[6*u+1] = aw1; s_phi[6*u+2] = aw2;")
-    self.gen_add_code_line("s_phi[6*u+3] = lw0 + (pjy*aw2 - pjz*aw1);")
-    self.gen_add_code_line("s_phi[6*u+4] = lw1 + (pjz*aw0 - pjx*aw2);")
-    self.gen_add_code_line("s_phi[6*u+5] = lw2 + (pjx*aw1 - pjy*aw0);")
+    # MIMIC: scale the world motion column by the unit's mimic multiplier alpha
+    # (phi[:3]=alpha*aw; phi[3:]=alpha*(lw + p x aw)); non-mimic alpha==1.0 and the
+    # multiply is gated off so non-mimic emit is byte-identical. Downstream tensor
+    # math (crm/crf/dot_matrix) is bilinear in phi -> no other change needed.
+    if HAS_MIMIC:
+        self.gen_add_code_line("T al = dc_unit_alpha[u];")
+        self.gen_add_code_line("s_phi[6*u+0] = al*aw0; s_phi[6*u+1] = al*aw1; s_phi[6*u+2] = al*aw2;")
+        self.gen_add_code_line("s_phi[6*u+3] = al*(lw0 + (pjy*aw2 - pjz*aw1));")
+        self.gen_add_code_line("s_phi[6*u+4] = al*(lw1 + (pjz*aw0 - pjx*aw2));")
+        self.gen_add_code_line("s_phi[6*u+5] = al*(lw2 + (pjx*aw1 - pjy*aw0));")
+    else:
+        self.gen_add_code_line("s_phi[6*u+0] = aw0; s_phi[6*u+1] = aw1; s_phi[6*u+2] = aw2;")
+        self.gen_add_code_line("s_phi[6*u+3] = lw0 + (pjy*aw2 - pjz*aw1);")
+        self.gen_add_code_line("s_phi[6*u+4] = lw1 + (pjz*aw0 - pjx*aw2);")
+        self.gen_add_code_line("s_phi[6*u+5] = lw2 + (pjx*aw1 - pjy*aw0);")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 

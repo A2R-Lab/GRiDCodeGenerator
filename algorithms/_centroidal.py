@@ -374,7 +374,17 @@ def gen_centroidal_inner(self):
     # Build column fills: for each (body jid, ancestor-or-self jj, S-col c) the
     # world contribution to J[:, vi] is the screw of joint jj at the world origin.
     # We bake the per-body chain jobs at codegen time.
-    jobs = []  # (jid, jj, c, vi, ang_local[3], lin_local[3])
+    # MIMIC fold: a mimic joint and its target share ONE velocity coordinate
+    # (get_joint_index_v(mimic) == get_joint_index_v(target)), so several chain
+    # joints accumulate into the same J column. The mimic body's generalized
+    # velocity is alpha * v_target, so its contribution to s_J is alpha-weighted
+    # (mirrors RBDReference._body_spatial_jacobian_world's `scale=_mimic_multiplier(j)`
+    # and the frame_jacobian Step-3 fold). The serial accumulate already sums the
+    # shared-vi columns; the only missing piece is the per-job alpha. For a
+    # NON-mimic robot every alpha == 1.0, so the alpha array/multiply is gated on
+    # HAS_MIMIC to keep non-mimic emit byte-identical.
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    jobs = []  # (jid, jj, vi, ang_local[3], lin_local[3], alpha)
     for jid in range(NB):
         chain = sorted(self.robot.get_ancestors_by_id(jid)) + [jid]
         for jj in chain:
@@ -386,11 +396,12 @@ def gen_centroidal_inner(self):
                 vinds = [vinds]
             else:
                 vinds = list(vinds)
+            alpha = self._alpha_for_jid(jj) if HAS_MIMIC else 1.0
             for c in range(S.shape[1]):
                 vi = vinds[c] if c < len(vinds) else vinds[-1]
                 ang = [float(S[0, c]), float(S[1, c]), float(S[2, c])]
                 lin = [float(S[3, c]), float(S[4, c]), float(S[5, c])]
-                jobs.append((jid, jj, vi, ang, lin))
+                jobs.append((jid, jj, vi, ang, lin, alpha))
     njobs = len(jobs)
     if njobs > 0:
         jid_arr = ", ".join(str(j[0]) for j in jobs)
@@ -403,6 +414,9 @@ def gen_centroidal_inner(self):
         self.gen_add_code_line("const int cj_vi[" + str(njobs) + "] = {" + vi_arr + "};")
         self.gen_add_code_line("const T cj_ang[" + str(3 * njobs) + "] = {" + ax_arr + "};")
         self.gen_add_code_line("const T cj_lin[" + str(3 * njobs) + "] = {" + lx_arr + "};")
+        if HAS_MIMIC:
+            al_arr = ", ".join("static_cast<T>({:.17g})".format(j[5]) for j in jobs)
+            self.gen_add_code_line("const T cj_alpha[" + str(njobs) + "] = {" + al_arr + "};")
         # Serial accumulation (columns within one body can repeat vi across bodies;
         # different bodies write disjoint J slabs, but to keep it simple & correct
         # we accumulate serially). Correctness-first.
@@ -426,8 +440,15 @@ def gen_centroidal_inner(self):
         self.gen_add_code_line("T linw1 = lw1 + (pjz*aw0 - pjx*aw2);")
         self.gen_add_code_line("T linw2 = lw2 + (pjx*aw1 - pjy*aw0);")
         # accumulate into J[:, vi] for body jid (angular-first): base = 6*nv*jid + 6*vi
+        # MIMIC: scale this chain joint's column contribution by its multiplier
+        # alpha (the mimic body moves alpha * v_target; non-mimic alpha == 1.0,
+        # and the alpha term is omitted entirely so non-mimic emit is unchanged).
         self.gen_add_code_line("T *Jc = &s_J[" + str(6 * nv) + "*jid + 6*vi];")
-        self.gen_add_code_line("Jc[0]+=aw0; Jc[1]+=aw1; Jc[2]+=aw2; Jc[3]+=linw0; Jc[4]+=linw1; Jc[5]+=linw2;")
+        if HAS_MIMIC:
+            self.gen_add_code_line("T al = cj_alpha[t];")
+            self.gen_add_code_line("Jc[0]+=al*aw0; Jc[1]+=al*aw1; Jc[2]+=al*aw2; Jc[3]+=al*linw0; Jc[4]+=al*linw1; Jc[5]+=al*linw2;")
+        else:
+            self.gen_add_code_line("Jc[0]+=aw0; Jc[1]+=aw1; Jc[2]+=aw2; Jc[3]+=linw0; Jc[4]+=linw1; Jc[5]+=linw2;")
         self.gen_add_end_control_flow()
         self.gen_add_end_control_flow()  # serial
         self.gen_add_sync()
