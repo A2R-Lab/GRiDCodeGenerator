@@ -1456,7 +1456,23 @@ def gen_end_effector_pose_hessian_inner(self):
     # SINGLE closure (one thread owns the cell and sums its block-pairs serially),
     # so the reduction is never split across threads.
     HAS_MIMIC = self.robot_has_mimic_joints()
-    cell_emitters = []   # list of (comment_str, emit_callable) — one per output cell
+    # Cross-joint cells (the overwhelming majority for big robots: every (vi, vj)
+    # pair whose proximal/distal joints are DISTINCT chain joints) all run the
+    # SAME per-cell scalar arithmetic, differing ONLY in six integer offsets
+    # (prox/dist/si/sj s_Sworld bases, the ee world-transform base, and the output
+    # base). The legacy emit inlined that arithmetic once per cell behind an
+    # `if (d2m_cell == k)` ladder -> O(n_cross) copies of a ~90-line body, which is
+    # the nvcc compile-time / code-size blow-up on h1_2/big-floating. We instead
+    # BAKE the six offsets into a per-cell `int` table and emit the cross body
+    # ONCE, reading its offsets from the table indexed by `d2m_cell`. Output is
+    # byte-identical (same scalar ops, just offsets sourced from a table row).
+    #
+    # The few same-joint (intra-multi-DoF, floating-base only) and mimic
+    # block-pair cells keep their explicit per-cell bodies (their arithmetic SHAPE
+    # differs per cell: rev/prism axis literals, variable-length alpha sums), but
+    # they are a small minority, so the `if==k` ladder over THEM stays cheap.
+    cross_table = []     # list of (prox_base, dist_base, si_base, sj_base, pee_base, out_base)
+    cell_emitters = []   # list of (comment_str, emit_callable) — one per NON-cross cell
     for ee_idx in range(num_ees):
         ee_jid = anchors[ee_idx]
         chain_dofs = per_ee_dof_info[ee_idx]
@@ -1550,12 +1566,15 @@ def gen_end_effector_pose_hessian_inner(self):
                                                            jid, sib, sjb))
                 else:
                     # Different chain joints: proximal = smaller chain_pos.
+                    # This is the data-driven cross-joint path: bake the six
+                    # offsets into cross_table and let the single shared body read
+                    # them by `d2m_cell`. (Same final values as the inlined body.)
                     prox_base = si_base if a < b else sj_base
                     dist_base = sj_base if a < b else si_base
-                    emit = (lambda pb=prox_base, db=dist_base, ee_idx=ee_idx, vi=vi, vj=vj,
-                                   sib=si_base, sjb=sj_base:
-                                _emit_d2M_cross_joint_block(self, pb, db,
-                                                            ee_idx, vi, vj, nv, num_ees, sib, sjb))
+                    out_base = ee_idx * 6 * nv * nv + (vi * nv + vj)
+                    cross_table.append((prox_base, dist_base, si_base, sj_base,
+                                        16 * ee_jid, out_base))
+                    continue
                 def _emit_nonmimic_cell(ee_jid=ee_jid, _emit=emit):
                     # Read X_ee column 3 (p_ee); helpers consume pex/pey/pez.
                     self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
@@ -1565,11 +1584,33 @@ def gen_end_effector_pose_hessian_inner(self):
                 cell_emitters.append((comment, _emit_nonmimic_cell))
 
     # Dispatch all cells one-thread-per-cell via a single block-parallel loop.
-    n_cells = len(cell_emitters)
+    # Flat cell index layout: [0, n_cross) cross-joint cells (one shared
+    # table-driven body), then [n_cross, n_cells) the explicit non-cross bodies
+    # (same-joint + mimic) behind the residual `if==k` ladder. Same total cell
+    # count and launch geometry as before; the cross bulk is now a single body.
+    n_cross = len(cross_table)
+    n_noncross = len(cell_emitters)
+    n_cells = n_cross + n_noncross
     self.gen_add_parallel_loop("d2m_cell", str(n_cells))
+    if n_cross > 0:
+        # Baked offset table for the cross-joint cells. Row layout (6 ints):
+        #   [0]=prox_base [1]=dist_base [2]=si_base [3]=sj_base
+        #   [4]=pee_base (s_Xworld base of the ee transform; +12/13/14 = p_ee)
+        #   [5]=out_base (ee*6*nv*nv + vi*nv + vj; +c*nv*nv selects the 6 rows)
+        # Flattened row-major so a single static array drives every cross cell.
+        flat = []
+        for row in cross_table:
+            flat.extend(int(x) for x in row)
+        table_literal = ", ".join(str(x) for x in flat)
+        self.gen_add_code_line("// Cross-joint cells (vast majority): one shared body driven by a baked")
+        self.gen_add_code_line("// per-cell offset table; collapses the old O(n_cross) if==k ladder.")
+        self.gen_add_code_line("static const int s_d2ee_cross_tab[" + str(len(flat)) + "] = {" + table_literal + "};")
+        self.gen_add_code_line("if (d2m_cell < " + str(n_cross) + ") {", True)
+        _emit_d2M_cross_joint_table_body(self, nv)
+        self.gen_add_end_control_flow()
     for k, (comment, emit) in enumerate(cell_emitters):
         self.gen_add_code_line(comment)
-        self.gen_add_code_line("if (d2m_cell == " + str(k) + ") {", True)
+        self.gen_add_code_line("if (d2m_cell == " + str(n_cross + k) + ") {", True)
         emit()
         self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
@@ -1767,6 +1808,79 @@ def _emit_d2M_cross_joint_block(self, prox_base, dist_base,
     self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
     self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
     self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
+
+
+def _emit_d2M_cross_joint_table_body(self, nv):
+    """Data-driven cross-joint d2M body shared by EVERY cross-joint cell.
+
+    Numerically identical to `_emit_d2M_cross_joint_block` (same scalar ops, same
+    float association), except the six per-cell offsets are read at runtime from
+    the baked `s_d2ee_cross_tab` table indexed by the loop counter `d2m_cell`,
+    instead of being inlined as compile-time constants. This replaces the
+    O(n_cross) `if==k` ladder of inlined bodies with ONE body -> the nvcc
+    compile-time + code-size win at identical Hessian values.
+
+    Table row (6 ints, see emitter): prox_base, dist_base, si_base, sj_base,
+    pee_base, out_base. s_Sworld is column-major 4x4 per DOF (S[r + 4*c]); the ee
+    world transform's p_ee is s_Xworld[pee_base + 12/13/14]; the output cell base
+    is out_base with row stride nv*nv (rows 0..2 = H_xyz, rows 3..5 = H_w temp).
+    """
+    nn = nv * nv
+    # Load the six per-cell offsets for this thread's cross cell.
+    self.gen_add_code_line("const int *row = &s_d2ee_cross_tab[6 * d2m_cell];")
+    self.gen_add_code_line("int prox_base = row[0]; int dist_base = row[1];")
+    self.gen_add_code_line("int si_base = row[2]; int sj_base = row[3];")
+    self.gen_add_code_line("int pee_base = row[4]; int out_base = row[5];")
+    # p_ee from the ee world transform (column 3).
+    self.gen_add_code_line("T pex = s_Xworld[pee_base + 12];")
+    self.gen_add_code_line("T pey = s_Xworld[pee_base + 13];")
+    self.gen_add_code_line("T pez = s_Xworld[pee_base + 14];")
+    # Read S_prox / S_dist top 3 rows (column-major). Bottom row of S is zero.
+    self.gen_add_code_line("// Read S_prox (chain proximal) rows 0..2")
+    for c in range(4):
+        for r in range(3):
+            self.gen_add_code_line("T P" + str(r) + str(c) + " = s_Sworld[prox_base + " + str(r + 4*c) + "];")
+    self.gen_add_code_line("// Read S_dist (chain distal) rows 0..2")
+    for c in range(4):
+        for r in range(3):
+            self.gen_add_code_line("T D" + str(r) + str(c) + " = s_Sworld[dist_base + " + str(r + 4*c) + "];")
+    # M = S_prox * S_dist (top 3 rows, all 4 cols).
+    self.gen_add_code_line("// M = S_prox * S_dist (top 3 rows, all 4 cols)")
+    for r in range(3):
+        for c in range(4):
+            self.gen_add_code_line(
+                "T M" + str(r) + str(c) + " = P" + str(r) + "0*D0" + str(c) +
+                " + P" + str(r) + "1*D1" + str(c) +
+                " + P" + str(r) + "2*D2" + str(c) + ";")
+    self.gen_add_code_line("// H_xyz[:, vi, vj] = (S_prox*S_dist*X_ee)[:3, 3] = M[:3,:3] * p_ee + M[:3, 3]")
+    self.gen_add_code_line("T Hxyz_x = M00*pex + M01*pey + M02*pez + M03;")
+    self.gen_add_code_line("T Hxyz_y = M10*pex + M11*pey + M12*pez + M13;")
+    self.gen_add_code_line("T Hxyz_z = M20*pex + M21*pey + M22*pez + M23;")
+    self.gen_add_code_line("// Read [Jw_i]_x (S_i_world top-left)")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[si_base + " + str(r + 4*c) + "];")
+    self.gen_add_code_line("// Read [Jw_j]_x (S_j_world top-left)")
+    for c in range(3):
+        for r in range(3):
+            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[sj_base + " + str(r + 4*c) + "];")
+    self.gen_add_code_line("// SiSj = [Jw_i]_x @ [Jw_j]_x")
+    for r in range(3):
+        for c in range(3):
+            self.gen_add_code_line(
+                "T SiSj" + str(r) + str(c) + " = Si" + str(r) + "0*Sj0" + str(c) +
+                " + Si" + str(r) + "1*Sj1" + str(c) +
+                " + Si" + str(r) + "2*Sj2" + str(c) + ";")
+    self.gen_add_code_line("// H_w[:, vi, vj] = skew_inv(M[:3,:3] - SiSj)")
+    self.gen_add_code_line("T HW_x = static_cast<T>(0.5) * ((M21 - SiSj21) - (M12 - SiSj12));")
+    self.gen_add_code_line("T HW_y = static_cast<T>(0.5) * ((M02 - SiSj02) - (M20 - SiSj20));")
+    self.gen_add_code_line("T HW_z = static_cast<T>(0.5) * ((M10 - SiSj10) - (M01 - SiSj01));")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 0 * " + str(nn) + "] = Hxyz_x;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 1 * " + str(nn) + "] = Hxyz_y;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 2 * " + str(nn) + "] = Hxyz_z;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 3 * " + str(nn) + "] = HW_x;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 4 * " + str(nn) + "] = HW_y;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 5 * " + str(nn) + "] = HW_z;")
 
 
 def _emit_d2M_same_joint_block(self, di, dj, ee_idx, ee_jid, vi, vj, nv, num_ees,
