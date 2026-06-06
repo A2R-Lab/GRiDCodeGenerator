@@ -1,0 +1,663 @@
+"""dCCRBA CUDA emit (PS5 oracle 1 — the hardest PS5 item).
+
+Two analytic centroidal-derivative surfaces sharing ONE world-frame sweep:
+
+  cmm_time_variation  Adot = dA(q(t))/dt = sum_m (dA/dq_m) qd_m   (6 x NV, no spill)
+  dccrba              dA_dq[:, k, m] = d A[:, k]/d q_m            (6 x NV x NV, spill)
+
+Both are direct transcriptions of the verified numpy oracle
+`RBDReference._CentroidalMixin._dccrba_analytic` / `cmm_time_variation`
+(validated vs pin.dccrba / computeCentroidalDynamicsDerivatives ~1e-12), so the
+TIGHT value-tolerance bucket applies (NOT the FD bucket).
+
+The shared world sweep is `centroidal_inner` (already byte-checked vs this oracle):
+it leaves, in the caller's s_temp,
+  s_Xworld (16*NJ), s_J = Jw (6*NV per body, angular-first), s_Iw (36 per body),
+  s_A0 (6*NV world-ORIGIN momentum map [ang;lin]), plus s_com / s_extra[0]=mass.
+On top of that we build the analytic tensor with the spatial cross operators
+crm/crf (the Coriolis `_emit_crm_cm`/`_emit_crf_cm` builders;
+dot_matrix(I,phi) = crf(phi)@I - I@crm(phi)).
+
+Derivation (world-ORIGIN [ang;lin], then CoM-shifted + reordered):
+  A0 = sum_i Iw_i Jw_i.  d/dq_m :
+    * BASE dof m (floating root): dA0/dq_m = crf(phi_m) @ A0
+    * JOINT dof m: for each body i,
+        if owner(m) is ancestor-or-self of i:  dIw_i = dot_matrix(Iw_i, phi_m)
+            contributes dIw_i @ Jw_i
+        dJw_i col c += crm(phi_m) @ phi_c   for units c whose owner is STRICTLY
+            below owner(m) in i's chain (owner(m) a strict ancestor of owner(c)),
+            contributing Iw_i @ dJw_i.
+  Then CoM dual-shift Xstar[:3,3:] = -skew(com); its q-derivative adds the
+  CoM-motion term dXstar[:3,3:] = -skew(Jcom[:,m]) (Jcom = A0[lin]/mass); finally
+  reorder rows [ang;lin] -> [lin;ang].
+
+Per-(body,DOF) world "motion units" phi: baked owner body + local S axis; phi is
+the world screw of that DOF at the world origin, recomputed here from s_Xworld
+EXACTLY as centroidal_inner builds its Jw columns (so phi sums to Jw).
+
+PARALLELISM: the NV output columns m of dA/dq are INDEPENDENT -> P2 fan over m
+(each thread-group owns one m). The single world sweep is computed once by
+centroidal_inner. cmm_time_variation contracts each column with qd[m] on the fly
+(NO full-tensor materialization).
+
+MIMIC: GATED OFF initially (centroidal_inner's Jw is not yet mimic-alpha-folded;
+the per-unit phi here is alpha=1). The mimic skip mirrors com/ccrba/energy. The
+numpy oracle IS mimic-aware; flipping the gate is a follow-up once the alpha-fold
+is threaded through centroidal_inner + the units here.
+
+SPILL: dccrba's output s_dccrba (6*NV*NV) is the cold/large write-once output ->
+repointed to the L2-pinned d_workspace SO band when DCCRBA_OUTPUT_IN_SMEM<TIER>()
+is false (mirrors the regressor s_Y spill). cmm_time_variation (6*NV) never spills.
+"""
+
+import numpy as np
+
+from ._coriolis import _emit_crm_cm, _emit_crf_cm
+from ._centroidal import _centroidal_inner_temp_mem_size
+
+
+def _dccrba_int_array(values):
+    return ", ".join(map(str, values)) if values else "0"
+
+
+def _dccrba_metadata(self):
+    """Per-(body,local-DOF) world motion-unit tables + per-column job topology.
+
+    One UNIT per S-column (n_int). For NON-mimic robots n_int == nv and vi is a
+    bijection; the mimic gate keeps us here. Tables (all int, baked static const):
+      unit_body[u]   owning body id (for the world (R,p) and the chain tests)
+      unit_vi[u]     reduced v-slot the unit writes
+      unit_ax[3u..]  local angular S axis (3 floats) — usually a unit axis
+      unit_lin[3u..] local linear  S axis (3 floats)
+      is_root_v[m]   1 if reduced slot m is a floating-base root slot
+      unit_anc_self[u*NB + i]  1 if owner(u) is ancestor-or-self of body i
+      unit_anc_strict[u*NB+ j] 1 if owner(u) is a STRICT ancestor of body j
+    """
+    robot = self.robot
+    NB = robot.get_num_bodies()
+    nv = robot.get_num_vel()
+
+    def ancestors(i):
+        res = set()
+        j = robot.get_parent_id(i)
+        while j != -1:
+            res.add(j)
+            j = robot.get_parent_id(j)
+        return res
+
+    anc = [ancestors(i) for i in range(NB)]
+    anc_self = [anc[i] | {i} for i in range(NB)]
+
+    unit_body, unit_vi, unit_ax, unit_lin = [], [], [], []
+    for j in range(NB):
+        S = np.asarray(robot.get_S_by_id(j), dtype=np.float64)
+        if S.ndim == 1:
+            S = S.reshape(-1, 1)
+        vinds = robot.get_joint_index_v(j)
+        if not isinstance(vinds, (list, tuple, np.ndarray)):
+            vinds = [vinds]
+        vinds = [int(v) for v in np.asarray(vinds).reshape(-1)]
+        for c in range(S.shape[1]):
+            vi = vinds[c] if c < len(vinds) else vinds[-1]
+            unit_body.append(j)
+            unit_vi.append(vi)
+            unit_ax += [float(S[0, c]), float(S[1, c]), float(S[2, c])]
+            unit_lin += [float(S[3, c]), float(S[4, c]), float(S[5, c])]
+    n_int = len(unit_body)
+
+    # floating-base root reduced slots (the 6 root columns)
+    root_v = set()
+    if robot.floating_base:
+        rv = robot.get_joint_index_v(0)
+        if not isinstance(rv, (list, tuple, np.ndarray)):
+            rv = [rv]
+        root_v = {int(v) for v in np.asarray(rv).reshape(-1)}
+    is_root_v = [1 if m in root_v else 0 for m in range(nv)]
+
+    # per-unit ancestor membership flags (flattened u*NB + body)
+    unit_anc_self = []
+    unit_anc_strict = []
+    for u in range(n_int):
+        jb = unit_body[u]
+        for i in range(NB):
+            unit_anc_self.append(1 if jb in anc_self[i] else 0)
+        for jj in range(NB):
+            unit_anc_strict.append(1 if jb in anc[jj] else 0)
+
+    return {
+        "NB": NB, "nv": nv, "n_int": n_int,
+        "unit_body": unit_body, "unit_vi": unit_vi,
+        "unit_ax": unit_ax, "unit_lin": unit_lin,
+        "is_root_v": is_root_v,
+        "unit_anc_self": unit_anc_self, "unit_anc_strict": unit_anc_strict,
+    }
+
+
+# ===========================================================================
+# Shared inner: build per-unit world motion columns phi (s_phi), then assemble
+# the dA0/dq tensor column-by-column. Parameterized on whether we materialize the
+# full 6*NV*NV tensor (dccrba) or contract on the fly with qd into 6*NV (Adot).
+# ===========================================================================
+
+def _dccrba_inner_temp_mem_size(self):
+    # centroidal_inner pool (holds s_Xworld/s_J/s_Iw/s_A0 we read post-call)
+    # + s_phi (6*n_int world motion columns) + s_dA0col (6*nv per active m, but we
+    #   process columns in a parallel loop so it is a per-thread-group register/
+    #   small band -> we stage one 6*nv accumulator per m in a shared band sized
+    #   6*nv (single reused column) is NOT safe across the parallel m-fan, so we
+    #   size the assembly scratch at 6*nv*nv? No -- each m thread writes directly to
+    #   the output. The only shared inner scratch beyond centroidal is s_phi.)
+    md = _dccrba_metadata(self)
+    return _centroidal_inner_temp_mem_size(self) + 6 * md["n_int"]
+
+
+def _emit_dccrba_assembly(self, out_name, contract_qd):
+    """Emit the per-column assembly. `out_name` is the output buffer name.
+    If contract_qd: out is 6*nv (Adot), each m-column scaled by qd[m] and atomic-
+    added. Else: out is 6*nv*nv, column m written at out[row + 6*k + 6*nv*m]."""
+    md = _dccrba_metadata(self)
+    NB = md["NB"]
+    nv = md["nv"]
+    n_int = md["n_int"]
+    NJ = self.robot.get_num_joints()
+
+    # scratch pointers carved from s_temp AFTER centroidal_inner's pool.
+    off_phi = _centroidal_inner_temp_mem_size(self)
+    off_J = 16 * NJ
+    off_Iw = off_J + 6 * nv * NB
+    off_A0 = off_Iw + 36 * NB
+
+    self.gen_add_code_lines([
+        "// dccrba scratch: centroidal_inner left s_Xworld(0)/s_J/s_Iw/s_A0 in s_temp.",
+        f"T *dc_Xworld = &s_temp[0];",
+        f"T *dc_J  = &s_temp[{off_J}];   // Jw, 6*NV per body (angular-first)",
+        f"T *dc_Iw = &s_temp[{off_Iw}];  // 36 per body world inertia",
+        f"T *dc_A0 = &s_temp[{off_A0}];  // 6*NV world-origin momentum map [ang;lin]",
+        f"T *s_phi = &s_temp[{off_phi}]; // 6*n_int per-unit world motion columns",
+    ])
+
+    # baked topology tables
+    self.gen_add_code_lines([
+        f"static const int dc_unit_body[] = {{ {_dccrba_int_array(md['unit_body'])} }};",
+        f"static const int dc_unit_vi[] = {{ {_dccrba_int_array(md['unit_vi'])} }};",
+        "static const T dc_unit_ax[] = { " + ", ".join(
+            "static_cast<T>({:.17g})".format(v) for v in md["unit_ax"]) + " };",
+        "static const T dc_unit_lin[] = { " + ", ".join(
+            "static_cast<T>({:.17g})".format(v) for v in md["unit_lin"]) + " };",
+        f"static const int dc_is_root_v[] = {{ {_dccrba_int_array(md['is_root_v'])} }};",
+        f"static const int dc_unit_anc_self[] = {{ {_dccrba_int_array(md['unit_anc_self'])} }};",
+        f"static const int dc_unit_anc_strict[] = {{ {_dccrba_int_array(md['unit_anc_strict'])} }};",
+    ])
+
+    # ---- Step A: per-unit world motion column phi (angular-first), EXACTLY as
+    #      centroidal_inner builds Jw columns: aw = R_j*ang ; lw = R_j*lin ;
+    #      phi = [aw ; lw + p_j x aw].  P2 fan over units. ----
+    self.gen_add_code_line("// per-unit world motion column phi (angular-first)")
+    self.gen_add_parallel_loop("u", str(n_int))
+    self.gen_add_code_line("int jb = dc_unit_body[u]; const T *Xj = &dc_Xworld[16*jb];")
+    self.gen_add_code_line("T a0=dc_unit_ax[3*u], a1=dc_unit_ax[3*u+1], a2=dc_unit_ax[3*u+2];")
+    self.gen_add_code_line("T l0=dc_unit_lin[3*u], l1=dc_unit_lin[3*u+1], l2=dc_unit_lin[3*u+2];")
+    self.gen_add_code_line("T aw0 = Xj[0]*a0 + Xj[4]*a1 + Xj[8]*a2;")
+    self.gen_add_code_line("T aw1 = Xj[1]*a0 + Xj[5]*a1 + Xj[9]*a2;")
+    self.gen_add_code_line("T aw2 = Xj[2]*a0 + Xj[6]*a1 + Xj[10]*a2;")
+    self.gen_add_code_line("T lw0 = Xj[0]*l0 + Xj[4]*l1 + Xj[8]*l2;")
+    self.gen_add_code_line("T lw1 = Xj[1]*l0 + Xj[5]*l1 + Xj[9]*l2;")
+    self.gen_add_code_line("T lw2 = Xj[2]*l0 + Xj[6]*l1 + Xj[10]*l2;")
+    self.gen_add_code_line("T pjx = Xj[12], pjy = Xj[13], pjz = Xj[14];")
+    self.gen_add_code_line("s_phi[6*u+0] = aw0; s_phi[6*u+1] = aw1; s_phi[6*u+2] = aw2;")
+    self.gen_add_code_line("s_phi[6*u+3] = lw0 + (pjy*aw2 - pjz*aw1);")
+    self.gen_add_code_line("s_phi[6*u+4] = lw1 + (pjz*aw0 - pjx*aw2);")
+    self.gen_add_code_line("s_phi[6*u+5] = lw2 + (pjx*aw1 - pjy*aw0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # ---- com + Jcom (Jcom[:,m] = dc_A0[lin row, m]/mass) ----
+    self.gen_add_code_line("T dc_cx = s_com[0], dc_cy = s_com[1], dc_cz = s_com[2];")
+    self.gen_add_code_line("T dc_inv_m = static_cast<T>(1)/s_extra[0];")
+
+    if contract_qd:
+        # zero the Adot output (6*nv) once
+        self.gen_add_code_line("// zero Adot output")
+        self.gen_add_parallel_loop("ind", str(6 * nv))
+        self.gen_add_code_line(out_name + "[ind] = static_cast<T>(0);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+    # ---- Step B: P2 fan over columns m. Each thread owns ONE m, builds the full
+    #      6*nv column dA[:, :, m] into a per-thread accumulator? 6*nv can be large
+    #      (g1: 216). Per-thread stack arrays of that size blow registers. Instead
+    #      each (m) thread loops k over nv and writes directly: for the on-the-fly
+    #      Adot we accumulate the contracted column; for the full tensor we write
+    #      each (row,k) cell. To keep per-thread memory bounded we recompute the
+    #      6-vector dA0[:,k,m] per (m,k) cell.
+    #
+    #      dA0[:,k,m] (world-origin [ang;lin], 6-vector) =
+    #        base m:  (crf(phi_m) @ A0)[:,k]
+    #        joint m: sum_i [ (owner(m) anc-self i) * dot_matrix(Iw_i, phi_m) @ Jw_i[:,k] ]
+    #                 + sum_i Iw_i @ ( sum_{units c: c anc-self i & owner(m) strict-anc owner(c) & vi(c)==k} crm(phi_m) @ phi_c )
+    #      We fold over the units owning slot m (mimic gated -> exactly one unit). ----
+    #
+    # Fan over (m, k) cells = nv*nv threads. Each computes the 6-vector dA0col then
+    # applies CoM-shift + reorder, then writes (contract or full).
+    self.gen_add_code_line("// P2 fan: one thread per (m, k) output cell")
+    self.gen_add_parallel_loop("cell", str(nv * nv))
+    self.gen_add_code_line(f"int m = cell / {nv}; int k = cell % {nv};")
+    self.gen_add_code_line("T dA0col[6]; for (int r=0;r<6;++r) dA0col[r] = static_cast<T>(0);")
+
+    # find the unit(s) owning slot m. Non-mimic: exactly one. We loop all units and
+    # branch on vi==m to stay mimic-structurally-correct (gate keeps it 1-unit).
+    self.gen_add_code_line("bool m_is_root = dc_is_root_v[m] != 0;")
+    self.gen_add_code_line(f"for (int um = 0; um < {n_int}; ++um) {{", True)
+    self.gen_add_code_line("if (dc_unit_vi[um] != m) continue;")
+    self.gen_add_code_line("const T *phim = &s_phi[6*um]; int jm = dc_unit_body[um];")
+    # crm(phi_m), crf(phi_m) as 6x6 col-major register builds
+    _emit_crm_cm(self, "CrmM", "phim")
+    _emit_crf_cm(self, "CrfM", "phim")
+    self.gen_add_code_line("if (m_is_root) {", True)
+    # base: dA0col = (crf(phi_m) @ A0)[:, k] = CrfM @ A0[:,k]
+    self.gen_add_code_line("const T *A0k = &dc_A0[6*k];")
+    self.gen_add_code_line("for (int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += CrfM[r+6*c]*A0k[c]; dA0col[r] += s; }")
+    self.gen_add_code_line("continue;")
+    self.gen_add_end_control_flow()
+    # joint m: loop bodies i
+    self.gen_add_code_line(f"for (int i = 0; i < {NB}; ++i) {{", True)
+    self.gen_add_code_line(f"const T *Iw_i = &dc_Iw[36*i];")
+    self.gen_add_code_line(f"const T *Jw_i = &dc_J[{6*nv}*i];")
+    # term1: if owner(m) anc-self i -> dot_matrix(Iw_i, phi_m) @ Jw_i[:,k]
+    #   dot_matrix(I,phi) = crf(phi)@I - I@crm(phi). Apply to vector Jw_i[:,k]:
+    #   (crf(phi)@I - I@crm(phi)) @ x  with x = Jw_i[:,k]
+    self.gen_add_code_line(f"if (dc_unit_anc_self[um*{NB} + i]) {{", True)
+    self.gen_add_code_line("const T *xk = &Jw_i[6*k];")
+    # tmp1 = I @ x ; t1 = crf(phi) @ tmp1
+    self.gen_add_code_line("T Ix[6]; for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += Iw_i[r+6*c]*xk[c]; Ix[r]=s; }")
+    self.gen_add_code_line("T cmx[6]; for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += CrmM[r+6*c]*xk[c]; cmx[r]=s; }")
+    self.gen_add_code_line("T Icmx[6]; for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += Iw_i[r+6*c]*cmx[c]; Icmx[r]=s; }")
+    self.gen_add_code_line("for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += CrfM[r+6*c]*Ix[c]; dA0col[r] += s - Icmx[r]; }")
+    self.gen_add_end_control_flow()
+    # term2: Iw_i @ dJi[:,k] where dJi[:,k] = sum_{units c: c anc-self i, owner(m) strict-anc owner(c), vi(c)==k} crm(phi_m) @ phi_c
+    self.gen_add_code_line("T dJk[6]; for(int r=0;r<6;++r) dJk[r] = static_cast<T>(0);")
+    self.gen_add_code_line(f"for (int uc = 0; uc < {n_int}; ++uc) {{", True)
+    self.gen_add_code_line("if (dc_unit_vi[uc] != k) continue;")
+    self.gen_add_code_line(f"if (!dc_unit_anc_self[uc*{NB} + i]) continue;")
+    self.gen_add_code_line(f"if (!dc_unit_anc_strict[um*{NB} + dc_unit_body[uc]]) continue;")
+    self.gen_add_code_line("const T *phic = &s_phi[6*uc];")
+    self.gen_add_code_line("for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += CrmM[r+6*c]*phic[c]; dJk[r] += s; }")
+    self.gen_add_end_control_flow()
+    # dA0col += Iw_i @ dJk
+    self.gen_add_code_line("for(int r=0;r<6;++r){ T s=0; for(int c=0;c<6;++c) s += Iw_i[r+6*c]*dJk[c]; dA0col[r] += s; }")
+    self.gen_add_end_control_flow()  # body i loop
+    self.gen_add_end_control_flow()  # unit um loop
+
+    # ---- CoM-shift + reorder for cell (k is the CMM column index) ----
+    # dA_fs = dXstar @ A0[:,k] + Xstar @ dA0col, where
+    #   Xstar[:3,3:] = -skew(com); dXstar[:3,3:] = -skew(Jcom[:,m]); Jcom[:,m]=A0[lin,m]/mass.
+    # Xstar @ x : ang' = x_ang - com x x_lin ; lin' = x_lin
+    # dXstar @ A0[:,k] : ang' += -Jcom[:,m] x A0_lin[:,k] ; lin' += 0
+    self.gen_add_code_line("// CoM-shift (Xstar) + CoM-motion (dXstar) + [ang;lin]->[lin;ang] reorder")
+    self.gen_add_code_line("const T *A0k2 = &dc_A0[6*k];")
+    self.gen_add_code_line("T jcx = dc_A0[3 + 6*m]*dc_inv_m, jcy = dc_A0[4 + 6*m]*dc_inv_m, jcz = dc_A0[5 + 6*m]*dc_inv_m;")
+    # ang_out (Featherstone angular rows 0..2)
+    self.gen_add_code_line("T fa0 = A0k2[3], fa1 = A0k2[4], fa2 = A0k2[5];")  # A0 linear part of column k
+    self.gen_add_code_line("T xa0 = dA0col[0] - (dc_cy*dA0col[5] - dc_cz*dA0col[4]);")
+    self.gen_add_code_line("T xa1 = dA0col[1] - (dc_cz*dA0col[3] - dc_cx*dA0col[5]);")
+    self.gen_add_code_line("T xa2 = dA0col[2] - (dc_cx*dA0col[4] - dc_cy*dA0col[3]);")
+    # add dXstar term: -Jcom[:,m] x A0_lin[:,k]
+    self.gen_add_code_line("xa0 += -(jcy*fa2 - jcz*fa1);")
+    self.gen_add_code_line("xa1 += -(jcz*fa0 - jcx*fa2);")
+    self.gen_add_code_line("xa2 += -(jcx*fa1 - jcy*fa0);")
+    # lin_out = dA0col linear part (unchanged by Xstar/dXstar)
+    self.gen_add_code_line("T xl0 = dA0col[3], xl1 = dA0col[4], xl2 = dA0col[5];")
+    # reorder [ang;lin] -> [lin;ang]: out rows [0..2]=lin, [3..5]=ang
+    if contract_qd:
+        self.gen_add_code_line("T qm = s_qd[m];")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[0 + 6*k], xl0*qm);")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[1 + 6*k], xl1*qm);")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[2 + 6*k], xl2*qm);")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[3 + 6*k], xa0*qm);")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[4 + 6*k], xa1*qm);")
+        self.gen_add_code_line("atomicAdd(&" + out_name + "[5 + 6*k], xa2*qm);")
+    else:
+        # full tensor: out[row + 6*k + 6*nv*m]
+        base = f"{out_name}[6*k + {6*nv}*m"
+        self.gen_add_code_line(base + " + 0] = xl0;")
+        self.gen_add_code_line(base + " + 1] = xl1;")
+        self.gen_add_code_line(base + " + 2] = xl2;")
+        self.gen_add_code_line(base + " + 3] = xa0;")
+        self.gen_add_code_line(base + " + 4] = xa1;")
+        self.gen_add_code_line(base + " + 5] = xa2;")
+    self.gen_add_end_control_flow()  # cell loop
+    self.gen_add_sync()
+
+
+# ===========================================================================
+# cmm_time_variation (Adot, 6*NV, NO spill)
+# ===========================================================================
+
+def _cmm_time_variation_inner(self):
+    nv = self.robot.get_num_vel()
+    func_params = [
+        "s_adot is the output Adot = dA/dt, 6 x NUM_VEL (column-major, [linear;angular] @ CoM) = " + str(6 * nv),
+        "s_q is the joint positions (unused; q is baked into s_Xhom)",
+        "s_qd is the joint velocities (contracted: Adot = sum_m (dA/dq_m) qd_m)",
+        "s_Xhom is the per-joint LOCAL homogeneous transforms",
+        "d_robotModel is the GPU model helpers (constant body inertias)",
+        "s_temp is scratch of size " + str(_dccrba_inner_temp_mem_size(self)),
+        "s_linalg_smem is reserved (unused)",
+    ]
+    func_def = ("void cmm_time_variation_inner(T *s_adot, T *s_A, T *s_com, T *s_extra, const T *s_q, const T *s_qd, const T *s_Xhom, "
+                "const robotModel<T> *d_robotModel, T *s_temp, unsigned char *s_linalg_smem) {")
+    self.gen_add_func_doc("Compute Adot = dA(q(t))/dt = sum_m (dA/dq_m) qd_m (analytic dCCRBA contraction)",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("(void)s_q;")
+    # centroidal_inner writes s_A/s_com/s_extra; we only need s_com/s_extra + the
+    # scratch bands it leaves. Carve s_A/s_com/s_extra from the END of s_temp pool
+    # is what com/ccrba do via extra_t_buffers; here centroidal_inner is called with
+    # explicit s_A/s_com/s_extra buffers the device/kernel provide.
+    self.gen_add_code_line("centroidal_inner<T>(s_A, s_com, s_extra, s_q, s_Xhom, d_robotModel, s_temp, s_linalg_smem);")
+    self.gen_add_sync()
+    _emit_dccrba_assembly(self, "s_adot", contract_qd=True)
+    self.gen_add_end_function()
+
+
+def _dccrba_full_inner(self):
+    nv = self.robot.get_num_vel()
+    func_params = [
+        "s_dccrba is the output tensor dA_dq[:,k,m], 6*NUM_VEL*NUM_VEL = " + str(6 * nv * nv) +
+        " (layout dA[row + 6*k + 6*NV*m], [linear;angular] @ CoM)",
+        "s_q is the joint positions (unused; baked into s_Xhom)",
+        "s_Xhom is the per-joint LOCAL homogeneous transforms",
+        "d_robotModel is the GPU model helpers (constant body inertias)",
+        "s_temp is scratch of size " + str(_dccrba_inner_temp_mem_size(self)),
+        "s_linalg_smem is reserved (unused)",
+    ]
+    func_def = ("void dccrba_inner(T *s_dccrba, T *s_A, T *s_com, T *s_extra, const T *s_q, const T *s_Xhom, "
+                "const robotModel<T> *d_robotModel, T *s_temp, unsigned char *s_linalg_smem) {")
+    self.gen_add_func_doc("Compute the analytic dCCRBA tensor dA_dq[:,k,m] (6 x NV x NV)",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("(void)s_q;")
+    self.gen_add_code_line("centroidal_inner<T>(s_A, s_com, s_extra, s_q, s_Xhom, d_robotModel, s_temp, s_linalg_smem);")
+    self.gen_add_sync()
+    _emit_dccrba_assembly(self, "s_dccrba", contract_qd=False)
+    self.gen_add_end_function()
+
+
+# ----- device wrappers (kinematics / XmatsHom domain, like com/ccrba) -----
+
+def _centroidal_out_extra(self):
+    nv = self.robot.get_num_vel()
+    return [("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
+
+
+def gen_cmm_time_variation_device(self):
+    nv = self.robot.get_num_vel()
+    func_def = ("void cmm_time_variation_device(T *s_adot, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel) {")
+    func_params = ["s_adot holds Adot (6 x NUM_VEL, column-major [linear;angular] @ CoM)",
+                   "s_q / s_qd are joint position / velocity", "d_robotModel is the GPU model helpers"]
+    self.gen_add_func_doc("Compute Adot = dA/dt (analytic dCCRBA contraction)", [], func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    extra = [("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _dccrba_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True,
+        linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_add_code_line("cmm_time_variation_inner<T>(s_adot, s_A, s_com, s_extra, s_q, s_qd, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
+def gen_dccrba_device(self):
+    nv = self.robot.get_num_vel()
+    func_def = ("void dccrba_device(T *s_dccrba, const T *s_q, const robotModel<T> *d_robotModel) {")
+    func_params = ["s_dccrba holds the tensor dA_dq[:,k,m] (6*NV*NV, dA[row + 6*k + 6*NV*m])",
+                   "s_q is joint position", "d_robotModel is the GPU model helpers"]
+    self.gen_add_func_doc("Compute the analytic dCCRBA tensor dA_dq[:,k,m]", [], func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    extra = [("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _dccrba_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True,
+        linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_add_code_line("dccrba_inner<T>(s_dccrba, s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+
+# ----- cmm_time_variation kernel/host (no spill; reuse the generic kin helper) -----
+
+def gen_cmm_time_variation_kernel(self, single_call_timing=False):
+    n = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = 6 * nv
+    in_size = 2 * n
+    func_def = ("void cmm_time_variation_kernel(T *d_out, const T *d_q_qd, const int stride_q_qd, "
+                "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {")
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Compute cmm_time_variation (Adot) per timestep", [], [], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    extra = [("s_q_qd", in_size), ("s_out", out_size), ("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _dccrba_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True,
+        linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
+
+    def _compute():
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_add_code_line("cmm_time_variation_inner<T>(s_out, s_A, s_com, s_extra, s_q, s_qd, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+        self.gen_add_sync()
+
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q_qd", str(in_size), stride="stride_q_qd")
+        self.gen_add_code_line("// compute")
+        _compute()
+        self.gen_kernel_save_result("out", str(out_size), stride=str(out_size))
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q_qd", str(in_size))
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q_qd", str(in_size), feedback_from="out")
+        _compute()
+        self.gen_anti_licm_output_write("out")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("out", str(out_size))
+    self.gen_add_end_function()
+
+
+def gen_cmm_time_variation_host(self, mode=0):
+    n = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = 6 * nv
+    macro = "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    single_call_timing = (mode == 1)
+    compute_only = (mode == 2)
+    func_def_start = ("void cmm_time_variation(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, "
+                      "const int num_timesteps,")
+    func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute cmm_time_variation (Adot)", [], [], None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"cmm_time_variation requires all-data or kinematics gridData\");")
+    kname = "cmm_time_variation_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+    func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_cmm_time_variation,hd_data->d_q_qd,stride_q_qd,d_robotModel,num_timesteps);")
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// start code with memory transfer", "int stride_q_qd;",
+            "if (USE_COMPRESSED_MEM) {stride_q_qd = 2*NUM_JOINTS; gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd,hd_data->h_q_qd,stride_q_qd*" +
+            ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+            "else {stride_q_qd = 3*NUM_JOINTS; gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" +
+            ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}"])
+    else:
+        self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? 2*NUM_JOINTS : 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call_mem = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem2 = "else                    {" + func_call.replace("hd_data->d_q_qd", "hd_data->d_q_qd_u") + "}"
+    func_call_code = [func_call_mem, func_call_mem2, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"cmm_time_variation\", " + macro + "));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// finally transfer the result back",
+            "gpuErrchk(cudaMemcpy(hd_data->h_cmm_time_variation,hd_data->d_cmm_time_variation," + str(out_size) + "*" +
+            ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+            "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("cmm_time_variation"))
+    self.gen_add_end_function()
+
+
+# ----- dccrba kernel/host (WITH spill: s_dccrba -> d_workspace SO band) -----
+
+def gen_dccrba_kernel(self, single_call_timing=False):
+    n = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = 6 * nv * nv
+    in_size = n
+    func_def = ("void dccrba_kernel(T *d_dccrba, unsigned char *d_workspace, const T *d_q, const int stride_q, "
+                "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {")
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Compute the dCCRBA tensor dA_dq[:,k,m] per timestep", [], [], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    # spill: s_dccrba is the last t_buffer; sized out_size in smem at TIER_SHARED,
+    # 0 at spilled tiers (then repointed to the d_workspace SO band).
+    self.gen_add_code_line("constexpr bool DCCRBA_OUT_IN_SMEM = DCCRBA_OUTPUT_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int DCCRBA_OUT_SLOT = DCCRBA_OUT_IN_SMEM ? " + str(out_size) + " : 0;")
+    extra = [("s_q", in_size), ("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4), ("s_dccrba", "DCCRBA_OUT_SLOT")]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _dccrba_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True,
+        linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    self.gen_add_code_line("if constexpr (DCCRBA_OUT_IN_SMEM) { (void)d_workspace; }")
+
+    def _repoint(in_loop):
+        self.gen_add_code_line("if constexpr (!DCCRBA_OUT_IN_SMEM) {", True)
+        if in_loop:
+            self.gen_add_code_line("s_dccrba = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("s_dccrba = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_end_control_flow()
+
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q", str(in_size), stride="stride_q")
+        _repoint(in_loop=True)
+        self.gen_add_code_line("// compute")
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_add_code_line("dccrba_inner<T>(s_dccrba, s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+        self.gen_add_sync()
+        self.gen_kernel_save_result("dccrba", str(out_size), stride=str(out_size))
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q", str(in_size))
+        _repoint(in_loop=False)
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_add_code_line("dccrba_inner<T>(s_dccrba, s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+        self.gen_add_sync()
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("dccrba", str(out_size))
+    self.gen_add_end_function()
+
+
+def gen_dccrba_host(self, mode=0):
+    n = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = 6 * nv * nv
+    macro = "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    single_call_timing = (mode == 1)
+    compute_only = (mode == 2)
+    func_def_start = ("void dccrba(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, "
+                      "const int num_timesteps,")
+    func_def_end = "                      const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute the dCCRBA tensor dA_dq[:,k,m]", [], [], None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"dccrba requires all-data or kinematics gridData\");")
+    kname = "dccrba_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+    func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_dccrba,hd_data->d_workspace,hd_data->d_q,stride_q,d_robotModel,num_timesteps);")
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// start code with memory transfer", "int stride_q = NUM_JOINTS;",
+            "gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" +
+            ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));"])
+    else:
+        self.gen_add_code_line("int stride_q = NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    # L2-pin d_workspace when the default tier spills s_dccrba into it.
+    ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!DCCRBA_OUTPUT_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
+    func_call_code = [func_call, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"dccrba\", " + macro + "));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines([
+            "// finally transfer the result back",
+            "gpuErrchk(cudaMemcpy(hd_data->h_dccrba,hd_data->d_dccrba," + str(out_size) + "*" +
+            ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+            "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("dccrba"))
+    self.gen_add_end_function()
+
+
+# ----- top-level emit -----
+
+def gen_cmm_time_variation(self):
+    _cmm_time_variation_inner(self)
+    gen_cmm_time_variation_device(self)
+    gen_cmm_time_variation_kernel(self, single_call_timing=True)
+    gen_cmm_time_variation_kernel(self, single_call_timing=False)
+    gen_cmm_time_variation_host(self, 0)
+    gen_cmm_time_variation_host(self, 1)
+    gen_cmm_time_variation_host(self, 2)
+
+
+def gen_dccrba(self):
+    _dccrba_full_inner(self)
+    gen_dccrba_device(self)
+    gen_dccrba_kernel(self, single_call_timing=True)
+    gen_dccrba_kernel(self, single_call_timing=False)
+    gen_dccrba_host(self, 0)
+    gen_dccrba_host(self, 1)
+    gen_dccrba_host(self, 2)

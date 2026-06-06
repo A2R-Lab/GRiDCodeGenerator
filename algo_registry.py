@@ -108,6 +108,10 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Centroidal"),
     AlgoEntry("coriolis_matrix",     "Coriolis Matrix C(q,q̇)",
               "Centroidal"),
+    AlgoEntry("dccrba",              "dCCRBA (∂A/∂q tensor, 6×NV×NV)",
+              "Centroidal"),
+    AlgoEntry("cmm_time_variation",  "CMM Time Variation (Ȧ, 6×NV)",
+              "Centroidal"),
 
     # Plant (T6): cost / constraint / plant-step primitives emitted in the
     # sibling `grid_plant` namespace. No standalone benchmarked kernel — this

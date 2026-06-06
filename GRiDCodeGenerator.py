@@ -102,6 +102,7 @@ class GRiDCodeGenerator:
                             gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
                             gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
                             gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix
+    from .algorithms._dccrba import _dccrba_inner_temp_mem_size, gen_cmm_time_variation, gen_dccrba
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -153,6 +154,8 @@ class GRiDCodeGenerator:
             "com", "ccrba", "energy", "generalized_gravity", "nonlinear_effects",
             # PS5: full Coriolis matrix C(q,qd) (closed-form spatial recursion; C qd+g=nle).
             "coriolis_matrix",
+            # PS5: analytic dCCRBA (∂A/∂q tensor, 6×NV×NV) + its qd-contraction Adot.
+            "dccrba", "cmm_time_variation",
         }
         # E2 (additive, opt-in only): frame_jacobian is NOT part of the default
         # `all` profile so the default-profile header stays byte-identical. It is
@@ -306,6 +309,11 @@ class GRiDCodeGenerator:
         # but pulling inverse_dynamics guarantees the spatial-algebra helper emit.
         if "coriolis_matrix" in algorithms:
             algorithms.add("inverse_dynamics")
+        # PS5 dCCRBA: both surfaces reuse the centroidal kinematics world-sweep
+        # (centroidal_inner), so they pull the ee_pose homogeneous-transform machinery
+        # exactly like com/ccrba.
+        if algorithms & {"dccrba", "cmm_time_variation"}:
+            algorithms.add("end_effector_pose")
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -413,6 +421,25 @@ class GRiDCodeGenerator:
         # The nv*nv output fits smem at FULL for every shipped robot -> no tier spill.
         self.coriolis_matrix_t_count = (n + nv) + nv*nv \
             + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size
+        # PS5 dCCRBA (kinematics / XmatsHom domain). The shared inner pool is the
+        # centroidal_inner pool + 6*n_int per-unit phi band (== _dccrba_inner_temp_mem_size).
+        _dccrba_inner_temp = self._dccrba_inner_temp_mem_size()
+        # cmm_time_variation (Adot, 6*nv output, NO spill):
+        #   s_q_qd(2n) + s_out(6nv) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
+        self.cmm_time_variation_t_count = 2*n + 6*nv + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
+        # dccrba (full 6*nv*nv tensor, WITH spill). Per-tier surgical ladder:
+        #   level 0 keeps the s_dccrba output (6*nv*nv) in smem; level 1 spills it to
+        #   the L2-pinned d_workspace SO band (the cold write-once output). Base arena:
+        #   s_q(n) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
+        _dccrba_out = 6 * nv * nv
+        _dccrba_base = n + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
+        _dccrba_t_count_full     = _dccrba_base + _dccrba_out
+        _dccrba_t_count_surgical = _dccrba_base
+        self.dccrba_spill_tier_3way = select_shared_tier_3way(_dccrba_t_count_full, _dccrba_t_count_surgical)
+        self.dccrba_t_count_per_tier = tuple(
+            (_dccrba_t_count_full, _dccrba_t_count_surgical)[i] for i in self.dccrba_spill_tier_3way
+        )
+        self.dccrba_spill_out_ws_count = _dccrba_out
         # FD param gradient: kernel smem = XI + s_q_qd_u(NUM_POS+2nv) + s_dqdd_dpi
         # + s_Minv(nv*nv) + s_Y(nv x 10*NB) + s_qdd(nv) + s_vaf(18*NUM_POS) + s_c(nv)
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
@@ -1007,7 +1034,10 @@ class GRiDCodeGenerator:
         # the max so the per-timestep workspace always covers them.
         _fpg_spill_ws = self.forward_dynamics_parameter_gradient_spill_Y_ws_count if any(p >= 1 for p in self.forward_dynamics_parameter_gradient_spill_tier_3way) else 0
         _feg_spill_ws = self.f_ext_gradient_spill_out_ws_count if any(p >= 1 for p in self.f_ext_gradient_spill_tier_3way) else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws)
+        # PS5 dccrba: its 6*nv*nv output surgically spills into this same SO band when
+        # any tier picks level >= 1. Never runs concurrently with the SO kernels.
+        _dccrba_spill_ws = self.dccrba_spill_out_ws_count if any(p >= 1 for p in self.dccrba_spill_tier_3way) else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws, _dccrba_spill_ws)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -1260,6 +1290,17 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t COM_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.com_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t CCRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
                                  "template <typename T> __host__ __device__ inline size_t ENERGY_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.energy_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 # PS5 dCCRBA (kinematics domain, uses the EE linalg scratch like ccrba):
+                                 # cmm_time_variation (Adot, 6*nv; no spill) + dccrba (6*nv*nv; per-tier
+                                 # surgical spill of the output to the d_workspace SO band).
+                                 "template <typename T> __host__ __device__ inline size_t CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.cmm_time_variation_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t DCCRBA_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.dccrba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.dccrba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.dccrba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "}",
+                                 # per-tier placement of the s_dccrba output -- true => smem, false => d_workspace.
+                                 "template <int TIER> __host__ __device__ constexpr bool DCCRBA_OUTPUT_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.dccrba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.dccrba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.dccrba_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
@@ -1456,7 +1497,10 @@ class GRiDCodeGenerator:
                                  "    T *d_ke_regressor;   // kinetic_energy_regressor (KE = y_KE . pi), 10NB",
                                  "    T *d_pe_regressor;   // potential_energy_regressor (PE = y_PE . pi), 10NB",
                                  # PS5 Coriolis matrix C(q,qd), row-major nv x nv (C qd+g = nonlinear_effects)
-                                 "    T *d_coriolis;       // coriolis_matrix C(q,qd), nv*nv"]
+                                 "    T *d_coriolis;       // coriolis_matrix C(q,qd), nv*nv",
+                                 # PS5 dCCRBA: dccrba tensor (6*nv*nv) + cmm_time_variation Adot (6*nv)
+                                 "    T *d_dccrba;             // dccrba dA_dq[:,k,m], 6*nv*nv",
+                                 "    T *d_cmm_time_variation; // cmm_time_variation Adot, 6*nv"]
                                  + [
                                  "    T *d_end_effector_pose;", \
                                  "    T *d_end_effector_pose_gradient;", \
@@ -1495,7 +1539,10 @@ class GRiDCodeGenerator:
                                  "    T *h_ke_regressor;",
                                  "    T *h_pe_regressor;",
                                  # PS5 Coriolis matrix C(q,qd)
-                                 "    T *h_coriolis;"]
+                                 "    T *h_coriolis;",
+                                 # PS5 dCCRBA host buffers
+                                 "    T *h_dccrba;",
+                                 "    T *h_cmm_time_variation;"]
                                  + [
                                  "    T *h_end_effector_pose;", \
                                  "    T *h_end_effector_pose_gradient;", \
@@ -1613,6 +1660,11 @@ class GRiDCodeGenerator:
                       "    // PS5 Coriolis matrix C(q,qd) (nv x nv)", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_coriolis, NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_coriolis = (T *)malloc(NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    // PS5 dCCRBA: dccrba tensor (6*nv*nv) + cmm_time_variation Adot (6*nv)", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dccrba, 6*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_cmm_time_variation, 6*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_dccrba = (T *)malloc(6*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_cmm_time_variation = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "return hd_data;"])
         # generate as templated or not function
@@ -1849,6 +1901,21 @@ class GRiDCodeGenerator:
             ("coriolis_matrix_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
+        # PS5 dCCRBA: cmm_time_variation (Adot 6*nv; no spill, no d_workspace arg) and
+        # dccrba (6*nv*nv tensor; spill -> d_workspace as the 2nd arg). REQUIRED so
+        # init_grid runs cudaFuncSetAttribute (the 6*nv*nv output blows the 48 KB cap).
+        ("cmm_time_variation", "cmm_time_variation", None, "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("cmm_time_variation_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("cmm_time_variation_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
+        ("dccrba", "dccrba", None, "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("dccrba_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
+            ("dccrba_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
+        ]),
         # E2/S1 general-frame Jacobian family (opt-in; gated on membership in
         # generated_algorithms via algo_short). The kernels take the target frame
         # at RUNTIME: (T *out, const T *q, const int stride_q, const int target_jid,
@@ -1934,7 +2001,7 @@ class GRiDCodeGenerator:
             # G2 centroidal kinematics-domain families are not emitted for mimic
             # robots (their per-body Jacobian fold isn't mimic-reduced yet), so
             # skip registering their (nonexistent) kernels there.
-            if algo_label in ("com", "ccrba", "energy") and self.robot_has_mimic_joints():
+            if algo_label in ("com", "ccrba", "energy", "dccrba", "cmm_time_variation") and self.robot_has_mimic_joints():
                 continue
             # Wrap EVERY kernel's attribute registration in a compile-time-
             # resolvable size guard so init_grid never hard-aborts when a kernel
@@ -1996,7 +2063,10 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_ke_regressor)); gpuErrchk(cudaFree(hd_data->d_pe_regressor));",
                                  "free(hd_data->h_ke_regressor); free(hd_data->h_pe_regressor);",
                                  # PS5 Coriolis matrix
-                                 "gpuErrchk(cudaFree(hd_data->d_coriolis)); free(hd_data->h_coriolis);"]
+                                 "gpuErrchk(cudaFree(hd_data->d_coriolis)); free(hd_data->h_coriolis);",
+                                 # PS5 dCCRBA
+                                 "gpuErrchk(cudaFree(hd_data->d_dccrba)); gpuErrchk(cudaFree(hd_data->d_cmm_time_variation));",
+                                 "free(hd_data->h_dccrba); free(hd_data->h_cmm_time_variation);"]
                                  + [
                                  "gpuErrchk(cudaFree(hd_data->d_end_effector_pose)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_gradient)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_hessian));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
@@ -2160,9 +2230,13 @@ class GRiDCodeGenerator:
         want_com = "com" in algorithms
         want_ccrba = "ccrba" in algorithms
         want_energy = "energy" in algorithms
-        if (want_com or want_ccrba or want_energy) and self.robot_has_mimic_joints():
-            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
-        elif want_com or want_ccrba or want_energy:
+        # PS5 dCCRBA surfaces also reuse centroidal_inner (the shared world sweep).
+        want_dccrba = "dccrba" in algorithms
+        want_cmm = "cmm_time_variation" in algorithms
+        want_centroidal = want_com or want_ccrba or want_energy or want_dccrba or want_cmm
+        if want_centroidal and self.robot_has_mimic_joints():
+            self.gen_add_code_line("// [centroidal] com/ccrba/energy/dccrba/cmm_time_variation skipped: mimic robots' per-body Jacobian fold is not yet mimic-reduced.")
+        elif want_centroidal:
             self.gen_centroidal_inner()
             if want_com:
                 self.gen_com()
@@ -2170,8 +2244,14 @@ class GRiDCodeGenerator:
                 self.gen_ccrba()
             if want_energy:
                 self.gen_energy()
+            # PS5 dCCRBA: emit the qd-contraction Adot first (lighter), then the
+            # full 6*nv*nv tensor (with per-tier output spill).
+            if want_cmm:
+                self.gen_cmm_time_variation()
+            if want_dccrba:
+                self.gen_dccrba()
         else:
-            self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: not requested (request 'com'/'ccrba'/'energy').")
+            self.gen_add_code_line("// [centroidal] com/ccrba/energy/dccrba/cmm_time_variation skipped: not requested.")
         # PS5 full Coriolis matrix C(q,qd): closed-form world-frame spatial recursion.
         # Self-contained (reuses only the XImats spatial-transform load + cross/icrf
         # helpers); emits on its OWN key. Mimic-safe (alpha-folded column assembly).
