@@ -106,6 +106,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
               "Centroidal"),
     AlgoEntry("ccrba",               "CCRBA (A, h)",
               "Centroidal"),
+    AlgoEntry("coriolis_matrix",     "Coriolis Matrix C(q,q̇)",
+              "Centroidal"),
 
     # Plant (T6): cost / constraint / plant-step primitives emitted in the
     # sibling `grid_plant` namespace. No standalone benchmarked kernel — this

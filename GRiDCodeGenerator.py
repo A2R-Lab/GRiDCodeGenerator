@@ -98,7 +98,10 @@ class GRiDCodeGenerator:
                             gen_frame_jacobian_dot_device, gen_frame_jacobian_dot_kernel, \
                             gen_frame_jacobian_dot_host, gen_frame_jacobian_dot, \
                             gen_osc_inertia_device, gen_osc_inertia_kernel, \
-                            gen_osc_inertia_host, gen_osc_inertia
+                            gen_osc_inertia_host, gen_osc_inertia, \
+                            gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
+                            gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
+                            gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -148,6 +151,8 @@ class GRiDCodeGenerator:
             # machinery; generalized_gravity/nonlinear_effects -> id RNEA-bias), but
             # requesting a SIBLING dep no longer silently emits them.
             "com", "ccrba", "energy", "generalized_gravity", "nonlinear_effects",
+            # PS5: full Coriolis matrix C(q,qd) (closed-form spatial recursion; C qd+g=nle).
+            "coriolis_matrix",
         }
         # E2 (additive, opt-in only): frame_jacobian is NOT part of the default
         # `all` profile so the default-profile header stays byte-identical. It is
@@ -295,6 +300,12 @@ class GRiDCodeGenerator:
             algorithms.add("inverse_dynamics")
         if "potential_energy_regressor" in algorithms:
             algorithms.add("end_effector_pose")
+        # PS5 Coriolis matrix: closed-form world-frame spatial recursion. Reuses the
+        # XImats spatial-transform load + the cross/icrf spatial helpers (the same dep
+        # set as nonlinear_effects -> inverse_dynamics). It does NOT call the RNEA inner,
+        # but pulling inverse_dynamics guarantees the spatial-algebra helper emit.
+        if "coriolis_matrix" in algorithms:
+            algorithms.add("inverse_dynamics")
         return algorithms
     
     # add generic code needs and helpers (includes, memory initialization, constants, kernel settings etc.)
@@ -397,6 +408,11 @@ class GRiDCodeGenerator:
         #   + world-transform BFS scratch (16*NUM_JOINTS) + XHom_size.
         self.potential_energy_regressor_t_count = n + 10*self.robot.get_num_bodies() \
             + 16*self.robot.get_num_joints() + XHom_size
+        # PS5 Coriolis matrix C(q,qd): kernel smem = XI + s_q_qd(NUM_POS+nv) + s_coriolis(nv*nv)
+        #   + the inner spatial-recursion scratch (per-body NB bands + per-column n_int bands).
+        # The nv*nv output fits smem at FULL for every shipped robot -> no tier spill.
+        self.coriolis_matrix_t_count = (n + nv) + nv*nv \
+            + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size
         # FD param gradient: kernel smem = XI + s_q_qd_u(NUM_POS+2nv) + s_dqdd_dpi
         # + s_Minv(nv*nv) + s_Y(nv x 10*NB) + s_qdd(nv) + s_vaf(18*NUM_POS) + s_c(nv)
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
@@ -1121,6 +1137,8 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  # PS5 energy regressors (each output 10*NUM_BODIES, fits every tier -> no spill).
                                  "template <typename T> __host__ __device__ inline size_t KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.kinetic_energy_regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 # PS5 Coriolis matrix C(q,qd) (nv x nv; fits smem at FULL -> no spill).
+                                 "template <typename T> __host__ __device__ inline size_t CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.coriolis_matrix_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  # g1-spill: tier-aware. At a spilled tier the s_Y regressor
                                  # scratch moves to d_workspace, shrinking the smem arena. Default
                                  # TIER = TIER_SHARED keeps every existing single-arg call site working.
@@ -1436,7 +1454,9 @@ class GRiDCodeGenerator:
                                  "    T *d_dqdd_dpi;   // forward_dynamics_parameter_gradient (-Minv . Y), nv*10NB",
                                  # PS5 energy regressors (each 10*NUM_BODIES; KE=y_KE.pi, PE=y_PE.pi)
                                  "    T *d_ke_regressor;   // kinetic_energy_regressor (KE = y_KE . pi), 10NB",
-                                 "    T *d_pe_regressor;   // potential_energy_regressor (PE = y_PE . pi), 10NB"]
+                                 "    T *d_pe_regressor;   // potential_energy_regressor (PE = y_PE . pi), 10NB",
+                                 # PS5 Coriolis matrix C(q,qd), row-major nv x nv (C qd+g = nonlinear_effects)
+                                 "    T *d_coriolis;       // coriolis_matrix C(q,qd), nv*nv"]
                                  + [
                                  "    T *d_end_effector_pose;", \
                                  "    T *d_end_effector_pose_gradient;", \
@@ -1473,7 +1493,9 @@ class GRiDCodeGenerator:
                                  "    T *h_dqdd_dpi;",
                                  # PS5 energy regressors
                                  "    T *h_ke_regressor;",
-                                 "    T *h_pe_regressor;"]
+                                 "    T *h_pe_regressor;",
+                                 # PS5 Coriolis matrix C(q,qd)
+                                 "    T *h_coriolis;"]
                                  + [
                                  "    T *h_end_effector_pose;", \
                                  "    T *h_end_effector_pose_gradient;", \
@@ -1588,6 +1610,9 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_pe_regressor, 10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_ke_regressor = (T *)malloc(10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_pe_regressor = (T *)malloc(10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));", \
+                      "    // PS5 Coriolis matrix C(q,qd) (nv x nv)", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_coriolis, NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    hd_data->h_coriolis = (T *)malloc(NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "}", \
                       "return hd_data;"])
         # generate as templated or not function
@@ -1815,6 +1840,15 @@ class GRiDCodeGenerator:
             ("nonlinear_effects_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
+        # PS5 Coriolis matrix C(q,qd): nv x nv output can exceed the 48 KB default
+        # dynamic-smem cap on big robots, so it MUST opt in. Kernel takes d_workspace
+        # as its 2nd arg (reserved for a future big-robot spill; unused at FULL).
+        ("coriolis_matrix", "coriolis_matrix", None, "CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+            ("coriolis_matrix_kernel<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+            ("coriolis_matrix_kernel_single_timing<T>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
+        ]),
         # E2/S1 general-frame Jacobian family (opt-in; gated on membership in
         # generated_algorithms via algo_short). The kernels take the target frame
         # at RUNTIME: (T *out, const T *q, const int stride_q, const int target_jid,
@@ -1960,7 +1994,9 @@ class GRiDCodeGenerator:
                                  "free(hd_data->h_Y); free(hd_data->h_dqdd_dpi);",
                                  # PS5 energy regressors
                                  "gpuErrchk(cudaFree(hd_data->d_ke_regressor)); gpuErrchk(cudaFree(hd_data->d_pe_regressor));",
-                                 "free(hd_data->h_ke_regressor); free(hd_data->h_pe_regressor);"]
+                                 "free(hd_data->h_ke_regressor); free(hd_data->h_pe_regressor);",
+                                 # PS5 Coriolis matrix
+                                 "gpuErrchk(cudaFree(hd_data->d_coriolis)); free(hd_data->h_coriolis);"]
                                  + [
                                  "gpuErrchk(cudaFree(hd_data->d_end_effector_pose)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_gradient)); gpuErrchk(cudaFree(hd_data->d_end_effector_pose_hessian));", \
                                  # Phase 3a/b/c/e: end the L2 persisting window opened at init.
@@ -2136,6 +2172,13 @@ class GRiDCodeGenerator:
                 self.gen_energy()
         else:
             self.gen_add_code_line("// [centroidal] com/ccrba/energy skipped: not requested (request 'com'/'ccrba'/'energy').")
+        # PS5 full Coriolis matrix C(q,qd): closed-form world-frame spatial recursion.
+        # Self-contained (reuses only the XImats spatial-transform load + cross/icrf
+        # helpers); emits on its OWN key. Mimic-safe (alpha-folded column assembly).
+        if "coriolis_matrix" in algorithms:
+            self.gen_coriolis_matrix()
+        else:
+            self.gen_add_code_line("// [coriolis] coriolis_matrix skipped: not requested (request 'coriolis_matrix').")
 
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
