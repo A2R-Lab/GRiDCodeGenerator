@@ -1281,10 +1281,12 @@ def gen_plant_kernels(self, algorithms):
     if ("integrator_gradient" in algorithms) or ("integrator_with_gradient" in algorithms):
         gen_plant_step_gradient_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_GRADIENT 1")
-    # F1: plant_step_hessian composes grid::integrator_hessian_device, emitted
-    # alongside fdsva_so (the device fn is gated on the same key). Fixed-base
-    # (dt-scaled fdsva_so assembly) and floating-base (the SE(3) retract Hessian).
-    if ("fdsva_so" in algorithms):
+    # F1: plant_step_hessian composes grid::integrator_hessian_device (needs
+    # `fdsva_so`) AND is templated on `grid::IntegratorType` (emitted only by
+    # `integrator`), so it requires BOTH. Gating on fdsva_so alone breaks any
+    # profile that has fdsva_so without integrator (e.g. the benchmark's per-algo
+    # fdsva_so TU): the kernel emits but `grid::IntegratorType` is undefined.
+    if ("fdsva_so" in algorithms) and ("integrator" in algorithms):
         gen_plant_step_hessian_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_STEP_HESSIAN 1")
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
@@ -1336,10 +1338,10 @@ def gen_grid_plant(self, algorithms):
     else:
         self.gen_add_code_line("// [grid_plant] plant_step_gradient[_and_value] skipped: requires 'integrator_gradient' (grid::integrator_gradient_device) — not generated.")
 
-    # Plant step hessian (s_d2AB) needs grid::integrator_hessian_device, which is
-    # emitted alongside fdsva_so. Fixed-base (dt-scaled assembly) and floating-base
-    # (SE(3) retract Hessian); RK static_asserts out in the composed device fn.
-    if ("fdsva_so" in algorithms):
+    # Plant step hessian (s_d2AB) needs grid::integrator_hessian_device (`fdsva_so`)
+    # AND `grid::IntegratorType` (`integrator`); requires BOTH (see the kernel gate
+    # above — fdsva_so-without-integrator profiles otherwise emit an undefined-type ref).
+    if ("fdsva_so" in algorithms) and ("integrator" in algorithms):
         self.gen_plant_step_hessian()
     else:
         self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device) — not generated.")
