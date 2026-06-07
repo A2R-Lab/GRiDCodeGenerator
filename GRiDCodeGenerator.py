@@ -108,7 +108,7 @@ class GRiDCodeGenerator:
                             gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
                             gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
                             gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix
-    from .algorithms._dccrba import _dccrba_inner_temp_mem_size, gen_cmm_time_variation, gen_dccrba
+    from .algorithms._dccrba import _dccrba_inner_temp_mem_size, _dccrba_sweep_J_count, gen_cmm_time_variation, gen_dccrba
 
     # finally import the test code
     from ._test import test_rnea_fpass, test_rnea_bpass, test_rnea, test_minv_bpass, test_minv_fpass, test_densify_Minv, test_minv, test_rnea_grad_inner, \
@@ -435,24 +435,41 @@ class GRiDCodeGenerator:
         self.coriolis_matrix_t_count = (n + nv) + nv*nv \
             + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size
         # PS5 dCCRBA (kinematics / XmatsHom domain). The shared inner pool is the
-        # centroidal_inner pool + 6*n_int per-unit phi band (== _dccrba_inner_temp_mem_size).
+        # SHRUNK (no-J) centroidal_inner pool + 6*n_int per-unit phi band
+        # (== _dccrba_inner_temp_mem_size). The Jw sweep band (6*nv*NB) is carved as a
+        # SEPARATE tier-routed buffer s_J (in-smem at L0/L1, d_workspace at the
+        # J-spilled tier) -- DE-GATE #2: this is the cold/large quadratic buffer whose
+        # spill de-gates big floating robots (g1/h1_2-floating).
         _dccrba_inner_temp = self._dccrba_inner_temp_mem_size()
-        # cmm_time_variation (Adot, 6*nv output, NO spill):
-        #   s_q_qd(2n) + s_out(6nv) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
-        self.cmm_time_variation_t_count = 2*n + 6*nv + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        # dccrba (full 6*nv*nv tensor, WITH spill). Per-tier surgical ladder:
-        #   level 0 keeps the s_dccrba output (6*nv*nv) in smem; level 1 spills it to
-        #   the L2-pinned d_workspace SO band (the cold write-once output). Base arena:
-        #   s_q(n) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
+        _dccrba_sJ = self._dccrba_sweep_J_count()   # 6*nv*NB
+        # cmm_time_variation (Adot, 6*nv output). 2-rung ladder (the only lever is the
+        # Jw band; its tiny 6*nv output never spills): L0 keeps s_J in smem, L1 spills
+        # it to the d_workspace SO band.
+        #   base = s_q_qd(2n) + s_out(6nv) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
+        _cmm_base = 2*n + 6*nv + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
+        _cmm_t_count_full = _cmm_base + _dccrba_sJ   # L0: s_J in smem
+        _cmm_t_count_Jspill = _cmm_base              # L1: s_J -> d_workspace
+        self.cmm_time_variation_spill_tier_3way = select_shared_tier_3way(_cmm_t_count_full, _cmm_t_count_Jspill)
+        self.cmm_time_variation_t_count_per_tier = tuple(
+            (_cmm_t_count_full, _cmm_t_count_Jspill)[i] for i in self.cmm_time_variation_spill_tier_3way
+        )
+        self.cmm_time_variation_spill_J_ws_count = _dccrba_sJ
+        # dccrba (full 6*nv*nv tensor). 3-rung ladder: L0 keeps the s_dccrba output
+        # (6*nv*nv) AND s_J in smem; L1 spills the output to d_workspace but keeps s_J
+        # in smem (today's surgical rung on robots that fit it); L2 (NEW) spills BOTH
+        # output and s_J -> d_workspace at distinct SO sub-offsets (the de-gating rung).
+        #   base = s_q(n) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom (no out, no s_J).
         _dccrba_out = 6 * nv * nv
         _dccrba_base = n + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        _dccrba_t_count_full     = _dccrba_base + _dccrba_out
-        _dccrba_t_count_surgical = _dccrba_base
-        self.dccrba_spill_tier_3way = select_shared_tier_3way(_dccrba_t_count_full, _dccrba_t_count_surgical)
+        _dccrba_L0 = _dccrba_base + _dccrba_out + _dccrba_sJ   # nothing spilled
+        _dccrba_L1 = _dccrba_base + _dccrba_sJ                 # output -> ws, s_J in smem
+        _dccrba_L2 = _dccrba_base                              # output + s_J -> ws
+        self.dccrba_spill_tier_3way = select_shared_tier_3way(_dccrba_L0, _dccrba_L1, _dccrba_L2)
         self.dccrba_t_count_per_tier = tuple(
-            (_dccrba_t_count_full, _dccrba_t_count_surgical)[i] for i in self.dccrba_spill_tier_3way
+            (_dccrba_L0, _dccrba_L1, _dccrba_L2)[i] for i in self.dccrba_spill_tier_3way
         )
         self.dccrba_spill_out_ws_count = _dccrba_out
+        self.dccrba_spill_J_ws_count = _dccrba_sJ
         # FD param gradient: kernel smem = XI + s_q_qd_u(NUM_POS+2nv) + s_dqdd_dpi
         # + s_Minv(nv*nv) + s_Y(nv x 10*NB) + s_qdd(nv) + s_vaf(18*NUM_POS) + s_c(nv)
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
@@ -1047,10 +1064,22 @@ class GRiDCodeGenerator:
         # the max so the per-timestep workspace always covers them.
         _fpg_spill_ws = self.forward_dynamics_parameter_gradient_spill_Y_ws_count if any(p >= 1 for p in self.forward_dynamics_parameter_gradient_spill_tier_3way) else 0
         _feg_spill_ws = self.f_ext_gradient_spill_out_ws_count if any(p >= 1 for p in self.f_ext_gradient_spill_tier_3way) else 0
-        # PS5 dccrba: its 6*nv*nv output surgically spills into this same SO band when
-        # any tier picks level >= 1. Never runs concurrently with the SO kernels.
-        _dccrba_spill_ws = self.dccrba_spill_out_ws_count if any(p >= 1 for p in self.dccrba_spill_tier_3way) else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws, _dccrba_spill_ws)
+        # PS5 dccrba: its 6*nv*nv output (L1+) and the Jw sweep band (L2, DE-GATE #2)
+        # surgically spill into this same SO band at DISTINCT sub-offsets, so at L2 the
+        # band must hold BOTH simultaneously (out at the base, s_J at base+6*nv*nv).
+        # cmm spills only s_J (L1). Never runs concurrently with the SO kernels, so the
+        # max-fold is free (8*nv^3 dwarfs out+s_J on the big robots this de-gates).
+        _dccrba_spill_ws = 0
+        if any(p >= 2 for p in self.dccrba_spill_tier_3way):
+            _dccrba_spill_ws = self.dccrba_spill_out_ws_count + self.dccrba_spill_J_ws_count
+        elif any(p >= 1 for p in self.dccrba_spill_tier_3way):
+            _dccrba_spill_ws = self.dccrba_spill_out_ws_count
+        # cmm places its Jw band at GRID_DCCRBA_J_OFFSET_BYTES = SO_TEMP_OFFSET +
+        # 6*nv*nv*sizeof(T) (shared with dccrba's J sub-offset), so the band must span
+        # that offset region (6*nv*nv) plus the Jw band itself, even though cmm never
+        # writes the output region.
+        _cmm_spill_ws = (6 * nv * nv + self.cmm_time_variation_spill_J_ws_count) if any(p >= 1 for p in self.cmm_time_variation_spill_tier_3way) else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws, _dccrba_spill_ws, _cmm_spill_ws)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -1110,6 +1139,9 @@ class GRiDCodeGenerator:
                                  "const int GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP_ANY = " + str(1 if any(p >= 1 for p in self.end_effector_pose_gradient_spill_tier_3way) else 0) + ";", \
                                  "const int GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_DXHOM = " + str(int(self.end_effector_pose_gradient_use_workspace_dxhom)) + ";", \
                                  "const int GRID_END_EFFECTOR_POSE_GRADIENT_SHARED_TIER_VALUE = " + str(self.end_effector_pose_gradient_spill_tier) + ";", \
+                                 # DE-GATE #2: 1 if the DEFAULT tier spills the dccrba output or Jw band / cmm Jw band
+                                 # into d_workspace (so init_gridData must allocate d_workspace in the kinematics path).
+                                 "const int GRID_DCCRBA_USES_WORKSPACE_TEMP = " + str(1 if (self.dccrba_spill_tier_3way[0] >= 1 or self.cmm_time_variation_spill_tier_3way[0] >= 1) else 0) + ";", \
                                  "const int GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.inverse_dynamics_gradient_spill_tier) + ";", \
                                  "const int GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.forward_dynamics_gradient_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(inverse_dynamics_gradient_temp_layout["spill_start"]) + ";", \
@@ -1306,7 +1338,13 @@ class GRiDCodeGenerator:
                                  # PS5 dCCRBA (kinematics domain, uses the EE linalg scratch like ccrba):
                                  # cmm_time_variation (Adot, 6*nv; no spill) + dccrba (6*nv*nv; per-tier
                                  # surgical spill of the output to the d_workspace SO band).
-                                 "template <typename T> __host__ __device__ inline size_t CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.cmm_time_variation_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.cmm_time_variation_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.cmm_time_variation_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.cmm_time_variation_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "}",
+                                 # DE-GATE #2: per-tier placement of the cmm Jw sweep band -- true => smem, false => d_workspace.
+                                 "template <int TIER> __host__ __device__ constexpr bool CMM_J_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.cmm_time_variation_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.cmm_time_variation_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.cmm_time_variation_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t DCCRBA_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.dccrba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.dccrba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
@@ -1314,6 +1352,8 @@ class GRiDCodeGenerator:
                                  "}",
                                  # per-tier placement of the s_dccrba output -- true => smem, false => d_workspace.
                                  "template <int TIER> __host__ __device__ constexpr bool DCCRBA_OUTPUT_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.dccrba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.dccrba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.dccrba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 # DE-GATE #2: per-tier placement of the dccrba Jw sweep band -- in smem at L0/L1 (pick<=1), spilled at L2.
+                                 "template <int TIER> __host__ __device__ constexpr bool DCCRBA_J_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.dccrba_spill_tier_3way[0] <= 1 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.dccrba_spill_tier_3way[1] <= 1 else "false") + " : " + ("true" if self.dccrba_spill_tier_3way[2] <= 1 else "false") + "; }",
                                  "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES() { "
                                  "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT); "
                                  "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.idsva_so_body_frame_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT); "
@@ -1414,6 +1454,11 @@ class GRiDCodeGenerator:
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
+                                 # DE-GATE #2: the dccrba Jw sweep band (and the cmm Jw band) spill to the SO
+                                 # band at a DISTINCT sub-offset so they never alias the dccrba output (which
+                                 # sits at GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES, size 6*nv*nv*sizeof(T)). For cmm
+                                 # the output region is unused so the overlap is harmless.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_DCCRBA_J_OFFSET_BYTES() { return GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>() + sizeof(T) * static_cast<size_t>(" + str(6 * nv * nv) + "); }",
                                  # Phase 3a: Minv-F lives at offset 0 of the grad section when spilled.
                                  # Safe to overlap with inverse_dynamics_gradient spill region because Minv finishes before
                                  # inverse_dynamics_gradient starts in any kernel that composes both.
@@ -1652,7 +1697,7 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_gradient, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_hessian, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
+                      "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP || GRID_DCCRBA_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_end_effector_pose = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_end_effector_pose_gradient = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_end_effector_pose_hessian = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
@@ -1935,9 +1980,9 @@ class GRiDCodeGenerator:
         # init_grid runs cudaFuncSetAttribute (the 6*nv*nv output blows the 48 KB cap).
         ("cmm_time_variation", "cmm_time_variation", None, "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("cmm_time_variation_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("cmm_time_variation_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("dccrba", "dccrba", None, "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("dccrba_kernel<T>",

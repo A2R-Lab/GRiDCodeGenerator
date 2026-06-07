@@ -231,11 +231,15 @@ def gen_id_bias(self, gravity_only):
 # Body inertias are CONSTANT — read from d_robotModel->d_XImats[36*NB + 36*jid].
 # ===========================================================================
 
-def _centroidal_inner_temp_mem_size(self):
+def _centroidal_inner_temp_mem_size(self, j_in_smem=True):
+    """centroidal_inner s_temp pool size. When j_in_smem is False the s_J band
+    (6*nv*NB) is repointed to the caller's s_J_ext (d_workspace) and the pool
+    shrinks by that much (offsets after s_J rebase to drop the hole)."""
     NJ = self.robot.get_num_joints()
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
-    return 16 * NJ + 6 * nv * NB + 36 * NB + 6 * nv + 36
+    sJ = (6 * nv * NB) if j_in_smem else 0
+    return 16 * NJ + sJ + 36 * NB + 6 * nv + 36
 
 
 def gen_centroidal_inner(self):
@@ -256,25 +260,50 @@ def gen_centroidal_inner(self):
         "s_Xhom is the per-joint LOCAL homogeneous transforms",
         "d_robotModel is the GPU model helpers (for the constant body inertias)",
         "s_temp is scratch of size " + str(_centroidal_inner_temp_mem_size(self)),
+        "s_J_ext is the spilled-J band (used only when !J_IN_SMEM; pass nullptr when J_IN_SMEM)",
         "s_linalg_smem is reserved (unused)"]
     func_def_middle = "T *s_A, T *s_com, T *s_extra, const T *s_q, const T *s_Xhom, const robotModel<T> *d_robotModel, "
-    func_def = "void centroidal_inner(" + func_def_middle + "T *s_temp, unsigned char *s_linalg_smem) {"
+    func_def = "void centroidal_inner(" + func_def_middle + "T *s_temp, T *s_J_ext, unsigned char *s_linalg_smem) {"
     self.gen_add_func_doc("Compute the world momentum map, composite inertia, CoM and CMM", [], func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    # J_IN_SMEM=true (default) keeps s_J in the s_temp pool (byte-identical to the
+    # original com/ccrba/energy emit). When false (DE-GATE #2: dccrba/cmm at the
+    # J-spilled tier) the cold/large s_J band (6*nv*NB) is repointed to s_J_ext
+    # (the L2-pinned d_workspace SO band) and the s_temp pool shrinks by that much
+    # (the offsets after s_J rebase to drop the hole). Pure pointer move; the math,
+    # buffer layout (6*nv stride, body-indexed) and mimic alpha-fold are unchanged.
+    self.gen_add_code_line("template <typename T, bool J_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    self.gen_add_code_line("(void)s_q; (void)s_linalg_smem;")
+    self.gen_add_code_line("(void)s_q; (void)s_linalg_smem; (void)s_J_ext;")
 
-    off_Xw = 0
-    off_J = off_Xw + 16 * NJ
+    # Pointer band layout. When J_IN_SMEM (default; com/ccrba/energy + dccrba/cmm
+    # L0/L1) the s_J band lives in s_temp and the trailing offsets are the original
+    # baked literals -> BYTE-IDENTICAL emit. When !J_IN_SMEM (dccrba/cmm J-spilled
+    # tier) s_J points at s_J_ext (d_workspace) and s_Iw/s_A0/s_IW shift down by
+    # 6*nv*NB so the in-smem pool genuinely shrinks. if constexpr keeps the spill
+    # branch entirely out of the J_IN_SMEM=true instantiation.
+    off_J = 16 * NJ
     off_Iw = off_J + 6 * nv * NB
     off_A0 = off_Iw + 36 * NB
     off_IW = off_A0 + 6 * nv
-    self.gen_add_code_line("T *s_Xworld = &s_temp[" + str(off_Xw) + "];")
-    self.gen_add_code_line("T *s_J      = &s_temp[" + str(off_J) + "];   // 6 x NV per body (angular-first)")
-    self.gen_add_code_line("T *s_Iw     = &s_temp[" + str(off_Iw) + "];  // 36 per body world inertia")
-    self.gen_add_code_line("T *s_A0     = &s_temp[" + str(off_A0) + "];  // 6 x NV world momentum map")
-    self.gen_add_code_line("T *s_IW     = &s_temp[" + str(off_IW) + "];  // 36 world composite inertia")
+    # No-J layout: s_Iw sits right after s_Xworld (the s_J band lives in s_J_ext).
+    off_Iw_noJ = off_J                       # == 16*NJ (no 6*nv*NB s_J hole)
+    off_A0_noJ = off_Iw_noJ + 36 * NB
+    off_IW_noJ = off_A0_noJ + 6 * nv
+    self.gen_add_code_line("T *s_Xworld = &s_temp[0];")
+    self.gen_add_code_line("T *s_J; T *s_Iw; T *s_A0; T *s_IW;")
+    self.gen_add_code_line("if constexpr (J_IN_SMEM) {", True)
+    self.gen_add_code_line("s_J  = &s_temp[" + str(off_J) + "];   // 6 x NV per body (angular-first)")
+    self.gen_add_code_line("s_Iw = &s_temp[" + str(off_Iw) + "];  // 36 per body world inertia")
+    self.gen_add_code_line("s_A0 = &s_temp[" + str(off_A0) + "];  // 6 x NV world momentum map")
+    self.gen_add_code_line("s_IW = &s_temp[" + str(off_IW) + "];  // 36 world composite inertia")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
+    self.gen_add_code_line("s_J  = s_J_ext;   // spilled to d_workspace SO band (6*nv*NB)")
+    self.gen_add_code_line("s_Iw = &s_temp[" + str(off_Iw_noJ) + "];  // pool shrinks by 6*nv*NB")
+    self.gen_add_code_line("s_A0 = &s_temp[" + str(off_A0_noJ) + "];")
+    self.gen_add_code_line("s_IW = &s_temp[" + str(off_IW_noJ) + "];")
+    self.gen_add_end_control_flow()
 
     # ---- Step 1: world homogeneous transforms by BFS level (chain-up) ----
     self.gen_add_code_line("// Step 1: world homogeneous transforms (chain-up of local s_Xhom)")
@@ -503,7 +532,8 @@ def _centroidal_device_extra(self):
 
 
 def _gen_centroidal_call(self):
-    self.gen_add_code_line("centroidal_inner<T>(s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_linalg_smem);")
+    # com/ccrba/energy keep s_J in smem (J_IN_SMEM=true) -> s_J_ext is nullptr.
+    self.gen_add_code_line("centroidal_inner<T, true>(s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, nullptr, s_linalg_smem);")
 
 
 # ----- com (p_com + J_com) device/kernel/host -----
