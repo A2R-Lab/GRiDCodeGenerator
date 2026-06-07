@@ -2520,7 +2520,12 @@ def gen_ee_pose_inner_thread(self, fixed_target_name = ""):
                 if self.custom_is_constant(val):
                     continue
                 str_val = sp.ccode(val)
+                # sin/cos(theta) -> the precomputed s/c locals; a PRISMATIC joint
+                # also leaves a BARE theta (its translation cell, e.g. an axial
+                # origin offset emits `theta + 0.1`) -> the raw q-slot. Order
+                # matters: consume sin/cos(theta) BEFORE the bare-theta replace.
                 str_val = str_val.replace("sin(theta)", "s").replace("cos(theta)", "c")
+                str_val = str_val.replace("theta", "s_q[" + str(qslot) + "]")
                 cell = self.gen_static_array_ind_3d(jid, col, row, ind_stride=16, col_stride=4)
                 self.gen_add_code_line("s_XmatsHom[16*" + str(jid) + " + " + str(cell - 16*jid) +
                                        "] = static_cast<T>(" + str_val + ");")
@@ -2620,7 +2625,10 @@ def gen_ee_pose_inner_warp(self, fixed_target_name = ""):
                 if self.custom_is_constant(val):
                     continue
                 str_val = sp.ccode(val)
+                # see the thread variant above: sin/cos(theta) -> s/c, then the
+                # bare theta (prismatic translation cell) -> the raw q-slot.
                 str_val = str_val.replace("sin(theta)", "s").replace("cos(theta)", "c")
+                str_val = str_val.replace("theta", "s_q[" + str(qslot) + "]")
                 cell = self.gen_static_array_ind_3d(jid, col, row, ind_stride=16, col_stride=4)
                 self.gen_add_code_line("s_XmatsHom[16*" + str(jid) + " + " + str(cell - 16*jid) +
                                        "] = static_cast<T>(" + str_val + ");")
