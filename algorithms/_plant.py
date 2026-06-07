@@ -1294,9 +1294,12 @@ def gen_plant_kernels(self, algorithms):
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
     # CoM / centroidal-momentum cost kernels emit whenever their device fns do
     # (gated identically to gen_com_cost/gen_momentum_cost in gen_grid_plant:
-    # require grid::com_device + grid::ccrba_device, non-mimic).
-    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms
-                     and not self.robot_has_mimic_joints())
+    # require grid::com_device + grid::ccrba_device). MIMIC-OK (de-gate #3): the
+    # cost emit consumes only the NV-sized com/ccrba output (J_com 3xNV, A 6xNV),
+    # which is already mimic-correct (alpha-fold lives inside the centroidal inner,
+    # de-gate #1); no body-indexed (NB-stride) scratch lives here, so no NB-vs-NV
+    # sizing is needed at the cost layer.
+    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms)
     if centroidal_ok:
         gen_com_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_COM_COST 1")
@@ -1354,18 +1357,24 @@ def gen_grid_plant(self, algorithms):
 
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
     # kinematics-domain device fns (grid::com_device / grid::ccrba_device), which
-    # are emitted ONLY when their `com` / `ccrba` keys are selected (and the robot
-    # is non-mimic). Gating on `end_effector_pose` alone was wrong: a profile that
-    # pulls in ee_pose for some OTHER reason (e.g. the frame_jacobian family, whose
-    # normalization adds end_effector_pose) but does not request com/ccrba would
-    # emit com_cost/momentum_cost referencing undefined grid::com_device/ccrba_device.
-    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms
-                     and not self.robot_has_mimic_joints())
+    # are emitted ONLY when their `com` / `ccrba` keys are selected. Gating on
+    # `end_effector_pose` alone was wrong: a profile that pulls in ee_pose for some
+    # OTHER reason (e.g. the frame_jacobian family, whose normalization adds
+    # end_effector_pose) but does not request com/ccrba would emit
+    # com_cost/momentum_cost referencing undefined grid::com_device/ccrba_device.
+    # MIMIC-OK (de-gate #3): com_cost/momentum_cost consume only the NV-sized
+    # com/ccrba output (J_com 3xNV, A 6xNV, h 6); the mimic alpha-fold is already
+    # baked into that output by the centroidal inner (de-gate #1). The cost emit
+    # carries NO body-indexed (NB-stride) scratch — every loop is over NV columns
+    # of A/J_com or the NX state dims — so it needs no NB-vs-NV sizing and rides
+    # the mimic-correct centroidal output directly (matches the RBDReference oracle,
+    # which uses the same NV-sized self.com/jacobian_com/ccrba).
+    centroidal_ok = ("com" in algorithms and "ccrba" in algorithms)
     if centroidal_ok:
         gen_com_cost(self)
         gen_momentum_cost(self)
     else:
-        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'com'+'ccrba', non-mimic).")
+        self.gen_add_code_line("// [grid_plant] com_cost/momentum_cost skipped: require grid::com_device/ccrba_device (need 'com'+'ccrba').")
 
     # Binding layer (G1): emit the per-timestep kernels that wrap the device
     # functions above, so the grid_rbd Python/C-ABI surface can launch them.
