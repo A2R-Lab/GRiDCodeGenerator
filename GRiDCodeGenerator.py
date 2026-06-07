@@ -117,7 +117,7 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float"):
         self.robot = robotObj
         # USE_JOINT_DYNAMICS: when True, the RNEA/FD value path emits the
         # joint-local <dynamics damping>/<dynamics friction> bias
@@ -156,7 +156,18 @@ class GRiDCodeGenerator:
         # 48 KB is roughly half the sm_120 ~100 KB per-block cap, so inline-CUDA
         # callers retain ~48 KB for their own outer-kernel scratch.
         self.cuda_target_lite_shared_mem_bytes = int(os.environ.get("GRID_CUDA_TARGET_LITE_SHARED_MEM_BYTES", "49152"))
-        self.cuda_shared_mem_type_size_bytes = int(os.environ.get("GRID_CUDA_SHARED_MEM_TYPE_SIZE_BYTES", "4"))
+        # fp64 (Phase 8): dtype="double" doubles every shared-arena T-region, so the
+        # codegen-time spill-tier pick (py_arena_bytes / select_shared_tier_3way) must
+        # size T at sizeof(double)=8. The fp32 default stays at 4 -> byte-identical.
+        # The emitted grid_shared_arena_bytes<T>() / device-cap fit-check / cudaFuncSetAttribute
+        # are already sizeof(T)-correct, so this is the ONLY codegen byte constant to flip.
+        # The env var still overrides (e.g. to force a spill tier on a small robot); dtype
+        # sets the default. ints stay 32-bit regardless (int_count term is *4 below).
+        if dtype not in ("float", "double"):
+            raise ValueError(f"GRiDCodeGenerator dtype must be 'float' or 'double', got {dtype!r}")
+        self.codegen_dtype = dtype
+        _default_t_bytes = "8" if dtype == "double" else "4"
+        self.cuda_shared_mem_type_size_bytes = int(os.environ.get("GRID_CUDA_SHARED_MEM_TYPE_SIZE_BYTES", _default_t_bytes))
 
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
         all_algorithms = {
