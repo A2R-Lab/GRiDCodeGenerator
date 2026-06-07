@@ -226,6 +226,35 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line(comment)
             # load in 0 to v and X*gravity to a in parallel
             # note that depending on S we need to add qd/qdd to one entry
+            if level_has_skew:
+                # Tier B (skew): each joint has a dense S column. Parallelize over
+                # the 6*len(inds) rows and dispatch by compile-time jid (mirrors
+                # aba/minv) so each joint adds its own dense (or unit) S column;
+                # handles multiple (branching) skew joints per BFS level.
+                self.gen_add_parallel_loop("ind", str(6*len(inds)))
+                self.gen_add_code_line("int row = ind % 6;")
+                for i, jid_val in enumerate(inds):
+                    self.gen_add_code_line(("if " if i == 0 else "else if ") + "(ind < " + str(6*(i+1)) + ") {", True)
+                    jid6 = 6 * jid_val
+                    self.gen_add_code_line("s_vaf[" + str(jid6) + " + row] = static_cast<T>(0);")
+                    if self.robot.floating_base:
+                        self.gen_add_code_line("s_vaf[" + str(n*6 + jid6) + " + row] = (row < 3 ? static_cast<T>(0) : -s_XImats[" + str(6*jid6) + " + 6*row + 5] * gravity);")
+                    else:
+                        self.gen_add_code_line("s_vaf[" + str(n*6 + jid6) + " + row] = -s_XImats[" + str(6*jid6 + 30) + " + row]*gravity;")
+                    S_desc = self._id_S_desc(jid_val)
+                    qd_term = _id_qd(jid_val)
+                    for r in range(6):
+                        coeff = _id_S_row_coeff(S_desc, r)
+                        if coeff is not None:
+                            ln = "if (row == " + str(r) + "){s_vaf[" + str(jid6 + r) + "] += (" + coeff + ") * " + qd_term + ";"
+                            if use_qdd_input:
+                                ln += " s_vaf[" + str(n*6 + jid6 + r) + "] += (" + coeff + ") * " + _id_qd(jid_val, "s_qdd") + ";"
+                            ln += "}"
+                            self.gen_add_code_line(ln)
+                    self.gen_add_end_control_flow()
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+                continue
             if len(inds) > 1:
                 self.gen_add_parallel_loop("ind",str(6*len(inds)))
                 self.gen_add_code_line("int row = ind % 6;")
@@ -243,24 +272,6 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             else:
                 self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = -s_XImats[6*jid6 + 30 + row]*gravity;")
             # then add in qd and qdd
-            if level_has_skew:
-                # Tier B: dense S column add. Single-ind level (synthetic skew
-                # arms are serial); emit `s_v[row] += S[row]*qd` for each row.
-                assert len(inds) == 1, "Tier-B level-0 emit assumes a single-ind level"
-                S_desc = self._id_S_desc(inds[0])
-                qd_term = _id_qd(jid)
-                lines = []
-                for r in range(6):
-                    coeff = _id_S_row_coeff(S_desc, r)
-                    if coeff is not None:
-                        lines.append("if (row == " + str(r) + "){s_vaf[jid6 + " + str(r) + "] += (" + coeff + ") * " + qd_term + ";}")
-                        if use_qdd_input:
-                            lines[-1] = lines[-1].replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + str(r) + "] += (" + coeff + ") * " + _id_qd(jid, "s_qdd") + ";}")
-                for ln in lines:
-                    self.gen_add_code_line(ln)
-                self.gen_add_end_control_flow()
-                self.gen_add_sync()
-                continue
             if S_ind_cpp == '-1': # floating base uses the root motion subspace, not raw row-wise copies
                 qd_qdd_code = "int fb_col = row < 3 ? row + 3 : row - 3; s_vaf[jid6 + row] = s_qd[fb_col];"
             else:
@@ -381,16 +392,17 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             if level_has_skew:
                 # Tier B: a += crm(v) * (S * qd). With a dense S column we cannot
                 # pick a precomputed mx{col}; emit the generic crm-times-dense-S.
-                assert len(inds) == 1, "Tier-B mxS emit assumes a single-ind level"
-                jid = inds[0]
-                S_desc = self._id_S_desc(jid)
-                assert S_desc[0] == "B"
-                S_arr = "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in S_desc[1]) + "}"
-                qd_term = ("s_qd[" + str(jid + 5) + "]" if self.robot.floating_base
-                           else (_id_qd(jid) if HAS_MIMIC else "s_qd[" + str(jid) + "]"))
+                # Loop over every joint in the level (branching ok); each joint
+                # with its own compile-time dense (or unit) S column.
                 self.gen_add_serial_ops()
-                self.gen_add_code_line("{ const T S_skew[6] = " + S_arr + ";")
-                self.gen_add_code_line("  mxS_general_peq_scaled<T>(&s_vaf[" + str(6*n + 6*jid) + "], &s_vaf[" + str(6*jid) + "], S_skew, " + qd_term + "); }")
+                for jid in inds:
+                    S_desc = self._id_S_desc(jid)
+                    S_arr = "{" + ", ".join(
+                        ((_id_S_row_coeff(S_desc, r) or "static_cast<T>(0)")) for r in range(6)) + "}"
+                    qd_term = ("s_qd[" + str(jid + 5) + "]" if self.robot.floating_base
+                               else (_id_qd(jid) if HAS_MIMIC else "s_qd[" + str(jid) + "]"))
+                    self.gen_add_code_line("{ const T S_skew[6] = " + S_arr + ";")
+                    self.gen_add_code_line("  mxS_general_peq_scaled<T>(&s_vaf[" + str(6*n + 6*jid) + "], &s_vaf[" + str(6*jid) + "], S_skew, " + qd_term + "); }")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
                 continue
