@@ -22,6 +22,7 @@ class GRiDCodeGenerator:
     # then import all of the algorithms
     from .algorithms import gen_inverse_dynamics_inner_temp_mem_size, gen_inverse_dynamics_inner_function_call, \
                             gen_inverse_dynamics_device_temp_mem_size, gen_inverse_dynamics_inner, gen_inverse_dynamics_device, \
+                            gen_inverse_dynamics_joint_dynamics_bias, \
                             gen_inverse_dynamics_kernel, gen_inverse_dynamics_host, gen_inverse_dynamics, \
                             gen_inverse_dynamics_regressor_inner_temp_mem_size, gen_inverse_dynamics_regressor_inner_function_call, \
                             gen_inverse_dynamics_regressor_inner, gen_inverse_dynamics_regressor_device_temp_mem_size, \
@@ -116,8 +117,18 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid"):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False):
         self.robot = robotObj
+        # USE_JOINT_DYNAMICS: when True, the RNEA/FD value path emits the
+        # joint-local <dynamics damping>/<dynamics friction> bias
+        # (tau += damping*qd + friction*sign(qd)). DEFAULT False so the emitted
+        # kernels stay consistent with bare Pinocchio's pin.rnea/pin.aba (which
+        # ignore model.damping/friction in the value path) — the authoritative
+        # CUDA-equivalence oracle. With the flag off the bias emit is skipped
+        # entirely, so EVERY robot (damped or not) stays byte-identical to the
+        # historical emit. Pair with RBDReference(use_joint_dynamics=True) to get
+        # a matching oracle when the term is enabled.
+        self.USE_JOINT_DYNAMICS = USE_JOINT_DYNAMICS
         # planar/spherical joints PARSE (URDFParser groundwork) but the CUDA
         # codegen transform chain does not yet emit them and RBDReference does
         # not model them — fail loudly here rather than silently mis-generating.

@@ -52,6 +52,60 @@ def gen_inverse_dynamics_inner_function_call(self, compute_c = False, use_qdd_in
     id_code = id_code_start + id_code_middle + id_code_end
     self.gen_add_code_line(id_code)
 
+def gen_inverse_dynamics_joint_dynamics_bias(self):
+    """Emit the gated joint-local damping + Coulomb friction bias into s_c.
+
+    tau += damping*qd + friction*sign(qd), per joint, folded into its v-slot.
+    EMITTED ONLY when USE_JOINT_DYNAMICS is enabled AND the robot declares
+    nonzero damping/friction (both decided at codegen time). With the flag off
+    (the DEFAULT) this is a pure no-op, so EVERY robot — damped or not — stays
+    byte-identical to the historical emit and consistent with the bare-Pinocchio
+    CUDA-equivalence oracle (pin.rnea/pin.aba ignore model.damping/friction).
+    Runs serially (thread 0): correctness-first for the rare opt-in robots.
+    """
+    if not getattr(self, "USE_JOINT_DYNAMICS", False):
+        return
+    if not (self.robot.robot_has_joint_damping() or self.robot.robot_has_joint_friction()):
+        return
+    HAS_DAMP = self.robot.robot_has_joint_damping()
+    HAS_FRIC = self.robot.robot_has_joint_friction()
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    fb = self.robot.floating_base
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// joint-local viscous damping + Coulomb friction: s_c += b*qd + f*sign(qd)")
+    self.gen_add_code_line("//")
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    for jid in range(self.robot.get_num_joints()):
+        b = float(self.robot.get_damping_by_id(jid)) if HAS_DAMP else 0.0
+        fr = float(self.robot.get_friction_by_id(jid)) if HAS_FRIC else 0.0
+        if b == 0.0 and fr == 0.0:
+            continue
+        # v-slot this joint folds into (mimic joints share their target's slot;
+        # for a floating base the root owns slots 0..5 so actuated joints start
+        # at v-slot 6). s_c and s_qd are both indexed by this v-slot, so the
+        # bias reads s_qd[vs] and accumulates into s_c[vs].
+        if fb and jid == 0:
+            continue  # floating root carries no damping/friction
+        if HAS_MIMIC:
+            vs = self._v_slot_cpp(jid)
+            alpha = float(self._alpha_for_jid(jid))
+        else:
+            vs = self.robot.get_joint_index_v(jid)
+            alpha = 1.0
+        qd = "s_qd[" + str(vs) + "]"
+        terms = []
+        if b != 0.0:
+            terms.append("static_cast<T>(" + repr(alpha * b) + ") * " + qd)
+        if fr != 0.0:
+            # exact sign matching np.sign (0 at qd==0): (qd>0) - (qd<0).
+            terms.append("static_cast<T>(" + repr(alpha * fr)
+                         + ") * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
+                         + qd + " < static_cast<T>(0)))")
+        self.gen_add_code_line("s_c[" + str(vs) + "] += " + " + ".join(terms) + ";")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
 def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1 # starts at 0
@@ -492,6 +546,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 + str(12*n + 6*jid + s_ind) + "];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+        self.gen_inverse_dynamics_joint_dynamics_bias()
         self.gen_add_end_function()
         return
     if compute_c and self.robot.robot_has_skew_axis():
@@ -513,6 +568,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line("s_c[" + str(jid) + "] = " + (" + ".join(terms) if terms else "static_cast<T>(0)") + ";")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+        self.gen_inverse_dynamics_joint_dynamics_bias()
         self.gen_add_end_function()
         return
     if compute_c:
@@ -533,6 +589,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         else: self.gen_add_code_line("s_c[dof_id] = (" + S_sign_cpp + ") * s_vaf[" + str(12*n) + " + 6*dof_id + " + S_ind_cpp + "];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+        self.gen_inverse_dynamics_joint_dynamics_bias()
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_device_temp_mem_size(self, compute_c = False):
