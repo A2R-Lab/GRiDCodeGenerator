@@ -53,12 +53,8 @@ is false (mirrors the regressor s_Y spill). cmm_time_variation (6*NV) never spil
 
 import numpy as np
 
-from ._coriolis import _emit_crm_cm, _emit_crf_cm
+from ._coriolis import _emit_crm_cm, _emit_crf_cm, _coriolis_int_array as _dccrba_int_array
 from ._centroidal import _centroidal_inner_temp_mem_size
-
-
-def _dccrba_int_array(values):
-    return ", ".join(map(str, values)) if values else "0"
 
 
 def _dccrba_metadata(self):

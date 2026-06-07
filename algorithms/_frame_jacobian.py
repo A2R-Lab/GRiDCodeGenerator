@@ -56,34 +56,12 @@ def _frame_jacobian_inner_temp_mem_size(self):
     return 16 * NJ
 
 
-def gen_frame_jacobian_inner(self):
-    """Emit frame_jacobian_inner: build per-joint world transforms then the
-    geometric Jacobian (6 x NV, [linear; angular]) of `target_jid` in
-    `reference_frame`. Correctness-first single-block assembly."""
-    NJ = self.robot.get_num_joints()
-    nv = self.robot.get_num_vel()
+def _emit_world_transform_chainup(self):
+    """Step 1: per-joint world homogeneous transforms by BFS level (chain-up of
+    local s_Xhom into s_temp[0..16*NJ)). The shared kinematics primitive behind
+    frame_jacobian and the runtime-target ee-pose surfaces (_eepose_runtime)."""
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
-
-    func_params = [
-        "s_J is the output 6 x NUM_VEL geometric Jacobian (column-major, [linear; angular])",
-        "target_jid is the joint id whose frame Jacobian is requested",
-        "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
-        "s_q is the vector of joint positions (unused; baked into s_Xhom)",
-        "s_Xhom is the per-joint LOCAL homogeneous transforms",
-        "d_robotModel is the GPU model helpers",
-        "s_temp is scratch of size " + str(_frame_jacobian_inner_temp_mem_size(self))]
-    func_def_middle = ("T *s_J, const int target_jid, const int reference_frame, "
-                       "const T *s_q, const T *s_Xhom, const robotModel<T> *d_robotModel, ")
-    func_def = "void frame_jacobian_inner(" + func_def_middle + "T *s_temp) {"
-    self.gen_add_func_doc("Compute a general-frame geometric Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line(func_def, True)
-    self.gen_add_code_line("(void)s_q;")
-
     self.gen_add_code_line("T *s_Xworld = &s_temp[0];")
-
-    # ---- Step 1: world homogeneous transforms by BFS level (chain-up) ----
     self.gen_add_code_line("// Step 1: world homogeneous transforms (chain-up of local s_Xhom)")
     for level in range(n_bfs_levels):
         ids_at_level = self.robot.get_ids_by_bfs_level(level)
@@ -104,6 +82,34 @@ def gen_frame_jacobian_inner(self):
         self.gen_add_code_line("else { s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]); }")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+
+
+def gen_frame_jacobian_inner(self):
+    """Emit frame_jacobian_inner: build per-joint world transforms then the
+    geometric Jacobian (6 x NV, [linear; angular]) of `target_jid` in
+    `reference_frame`. Correctness-first single-block assembly."""
+    NJ = self.robot.get_num_joints()
+    nv = self.robot.get_num_vel()
+
+    func_params = [
+        "s_J is the output 6 x NUM_VEL geometric Jacobian (column-major, [linear; angular])",
+        "target_jid is the joint id whose frame Jacobian is requested",
+        "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
+        "s_q is the vector of joint positions (unused; baked into s_Xhom)",
+        "s_Xhom is the per-joint LOCAL homogeneous transforms",
+        "d_robotModel is the GPU model helpers",
+        "s_temp is scratch of size " + str(_frame_jacobian_inner_temp_mem_size(self))]
+    func_def_middle = ("T *s_J, const int target_jid, const int reference_frame, "
+                       "const T *s_q, const T *s_Xhom, const robotModel<T> *d_robotModel, ")
+    func_def = "void frame_jacobian_inner(" + func_def_middle + "T *s_temp) {"
+    self.gen_add_func_doc("Compute a general-frame geometric Jacobian", [], func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("(void)s_q;")
+
+    # ---- Step 1: world homogeneous transforms by BFS level (chain-up) ----
+    _emit_world_transform_chainup(self)
 
     # ---- Step 2: zero the Jacobian ----
     self.gen_add_parallel_loop("ind", str(6 * nv))

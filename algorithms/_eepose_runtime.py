@@ -26,6 +26,8 @@ jid list for the multi-EE list API. Output 6 / 6*nv floats -> NO spill ladder.
 
 import numpy as np
 
+from ._frame_jacobian import _emit_world_transform_chainup
+
 
 __all__ = [
     "_gen_runtime_host",
@@ -46,33 +48,6 @@ def _runtime_inner_temp_mem_size(self):
     # world homogeneous transform per joint (16 each) -- identical to
     # _frame_jacobian_inner_temp_mem_size.
     return 16 * self.robot.get_num_joints()
-
-
-def _emit_world_transform_chainup(self):
-    """Step 1: per-joint world homogeneous transforms by BFS level (chain-up of
-    local s_Xhom). Byte-for-byte the frame_jacobian_inner Step 1."""
-    n_bfs_levels = self.robot.get_max_bfs_level() + 1
-    self.gen_add_code_line("T *s_Xworld = &s_temp[0];")
-    self.gen_add_code_line("// Step 1: world homogeneous transforms (chain-up of local s_Xhom)")
-    for level in range(n_bfs_levels):
-        ids_at_level = self.robot.get_ids_by_bfs_level(level)
-        if not ids_at_level:
-            continue
-        njs = len(ids_at_level)
-        self.gen_add_parallel_loop("ind", str(16 * njs))
-        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
-        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
-        jid_list = [str(j) for j in ids_at_level]
-        par_list = [str(self.robot.get_parent_id(j)) for j in ids_at_level]
-        if njs > 1:
-            self.gen_add_multi_threaded_select("slot", "<", [str(i + 1) for i in range(njs)],
-                                               [("int", "jid", jid_list), ("int", "par", par_list)])
-        else:
-            self.gen_add_code_line("const int jid = " + jid_list[0] + "; const int par = " + par_list[0] + ";")
-        self.gen_add_code_line("if (par == -1) { s_Xworld[16*jid + ele] = s_Xhom[16*jid + ele]; }")
-        self.gen_add_code_line("else { s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]); }")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
 
 
 # =====================================================================
