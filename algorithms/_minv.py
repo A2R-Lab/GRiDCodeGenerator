@@ -218,17 +218,19 @@ def gen_minv_inner(self):
 
 
         elif any(not self.robot.S_is_cardinal_by_id(j) for j in inds):
-            # Tier B (skew, fixed-base): U = IA*S_dense; D = S^T U; Dinv = 1/D;
-            # Minv[i,i] = Dinv. Single-ind serial emit (skew arms are serial).
-            assert len(inds) == 1, "Tier-B minv backward emit assumes a single-ind level"
-            jid = inds[0]; jid6 = 6 * jid
-            Svec = _minv_Svec_cpp(self.robot, jid)
+            # Tier B (skew): U = IA*S_dense; D = S^T U; Dinv = 1/D; Minv[i,i] = Dinv.
+            # Loop over every joint in the level (branching ok); each with its own
+            # dense (or unit) S column.
             self.gen_add_code_line("// U = IA*S, D = S^T*U, DInv = 1/D, Minv[i,i] = Dinv (Tier-B dense S)")
             self.gen_add_serial_ops()
-            self.gen_add_code_line("{ const T S_skew[6] = " + Svec + ";")
-            self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[" + str(IAOffset) + " + 6*" + str(jid6) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(UOffset) + " + " + str(jid6) + " + r] = acc; }")
-            self.gen_add_code_line("  s_temp[" + str(DinvOffset) + " + " + str(jid) + "] = static_cast<T>(1)/dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(UOffset) + " + " + str(jid6) + "]);")
-            self.gen_add_code_line("  s_Minv[" + str(n + 1) + " * " + str(jid) + "] = s_temp[" + str(DinvOffset) + " + " + str(jid) + "]; }")
+            for jid in inds:
+                jid6 = 6 * jid
+                dof_diag = (jid + 5) if self.robot.floating_base else jid  # fb dof offset
+                Svec = _minv_Svec_cpp(self.robot, jid)
+                self.gen_add_code_line("{ const T S_skew[6] = " + Svec + ";")
+                self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[" + str(IAOffset) + " + 6*" + str(jid6) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(UOffset) + " + " + str(jid6) + " + r] = acc; }")
+                self.gen_add_code_line("  s_temp[" + str(DinvOffset) + " + " + str(jid) + "] = static_cast<T>(1)/dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(UOffset) + " + " + str(jid6) + "]);")
+                self.gen_add_code_line("  s_Minv[" + str(n + 1) + " * " + str(dof_diag) + "] = s_temp[" + str(DinvOffset) + " + " + str(jid) + "]; }")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
         else:
@@ -315,11 +317,19 @@ def gen_minv_inner(self):
             level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
             if level_has_skew:
                 # Tier B (skew): the S^T*F[:,col] projection is a dense dot over
-                # the 6 rows of the F column (single-ind level).
-                assert len(inds) == 1, "Tier-B minv F-subtree emit assumes a single-ind level"
-                Svec = _minv_Svec_cpp(self.robot, inds[0])
-                self.gen_add_code_line("const T S_skew[6] = " + Svec + ";")
-                S_proj = "dot_prod<T,6,1,1>(S_skew, &s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + "])"
+                # the 6 rows of the F column. For a branching level jid is a
+                # runtime var, so pick the per-joint dense S column by jid before
+                # the dot (each joint with its own compile-time S constant).
+                Fcol = "&s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + "]"
+                if len(inds) > 1:
+                    self.gen_add_code_line("T S_skew[6];")
+                    for i, jid_val in enumerate(inds):
+                        Svec = _minv_Svec_cpp(self.robot, jid_val)
+                        self.gen_add_code_line(("if " if i == 0 else "else if ") + "(" + jid + " == " + str(jid_val) + ") { const T tmp[6] = " + Svec + "; for (int r=0;r<6;r++) S_skew[r]=tmp[r]; }")
+                else:
+                    Svec = _minv_Svec_cpp(self.robot, inds[0])
+                    self.gen_add_code_line("const T S_skew[6] = " + Svec + ";")
+                S_proj = "dot_prod<T,6,1,1>(S_skew, " + Fcol + ")"
                 self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + S_proj + ";")
             else:
                 self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + \

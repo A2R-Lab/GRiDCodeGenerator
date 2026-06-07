@@ -451,30 +451,45 @@ def gen_aba_inner(self):
             self.gen_add_code_line("//     links are: " + ", ".join(link_names))
             # compute the initial v which is just S*qd
             self.gen_add_code_line("// s_v[k] = S[k]*qd[k]")
-            if len(inds) > 1:
-                self.gen_add_parallel_loop("ind",str(6*len(inds)))
+            level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+            if level_has_skew:
+                # Tier B (skew): each joint has a dense S column. Parallelize the
+                # zero+column-add over the 6*len(inds) rows; per-thread dispatch
+                # is by compile-time jid so each jid uses its own S constant.
+                self.gen_add_parallel_loop("ind", str(6*len(inds)))
                 self.gen_add_code_line("int row = ind % 6;")
-                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
-                jid = "jid"
+                for i, jid_val in enumerate(inds):
+                    self.gen_add_code_line(("if " if i == 0 else "else if ") + "(ind < " + str(6*(i+1)) + ") {", True)
+                    self.gen_add_code_line("int jid6 = 6*" + str(jid_val) + ";")
+                    self.gen_add_code_line("s_va[jid6 + row] = static_cast<T>(0);")
+                    if self.robot.S_is_cardinal_by_id(jid_val):
+                        s_ind_val = self.robot.get_S_index_by_id(jid_val)
+                        s_sign_val = self.robot.get_S_sign_by_id(jid_val)
+                        self.gen_add_code_line("if (row == " + str(s_ind_val) + ") { s_va[jid6 + " + str(s_ind_val) + "] += (" + str(s_sign_val) + ") * s_qd[" + str(jid_val) + "]; }")
+                    else:
+                        Svec = _aba_Svec_cpp(self.robot, jid_val)
+                        self.gen_add_code_line("const T S_skew[6] = " + Svec + "; s_va[jid6 + row] += S_skew[row] * s_qd[" + str(jid_val) + "];")
+                    self.gen_add_end_control_flow()
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
             else:
-                self.gen_add_parallel_loop("row",str(6))
-                jid = str(inds[0])
-                self.gen_add_code_line("int jid = " + jid + ";")
-            # load in 0 to v
-            self.gen_add_code_lines(["int jid6 = 6*jid;", \
-                                     "s_va[jid6 + row] = static_cast<T>(0);"])
-            # add in qd. Tier-B (skew) joints have a dense S column -> add the
-            # whole column scaled by qd; cardinal joints keep the single-row add.
-            skew_inds = [j for j in inds if not self.robot.S_is_cardinal_by_id(j)]
-            if skew_inds:
-                assert len(inds) == 1, "Tier-B aba level-0 emit assumes a single-ind level"
-                Svec = _aba_Svec_cpp(self.robot, inds[0])
-                self.gen_add_code_line("{ const T S_skew[6] = " + Svec + "; s_va[jid6 + row] += S_skew[row] * s_qd[" + jid + "]; }")
-            else:
+                if len(inds) > 1:
+                    self.gen_add_parallel_loop("ind",str(6*len(inds)))
+                    self.gen_add_code_line("int row = ind % 6;")
+                    select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
+                    self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
+                    jid = "jid"
+                else:
+                    self.gen_add_parallel_loop("row",str(6))
+                    jid = str(inds[0])
+                    self.gen_add_code_line("int jid = " + jid + ";")
+                # load in 0 to v
+                self.gen_add_code_lines(["int jid6 = 6*jid;", \
+                                         "s_va[jid6 + row] = static_cast<T>(0);"])
+                # add in qd
                 self.gen_add_code_line("if (row == " + S_ind_cpp + "){s_va[jid6 + " + S_ind_cpp + "] += (" + S_sign_cpp + ") * s_qd[" + jid + "];}")
-            self.gen_add_end_control_flow()
-            self.gen_add_sync()
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
 
             # add debug if requested
             if self.DEBUG_MODE:
@@ -615,17 +630,18 @@ def gen_aba_inner(self):
         level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
         if level_has_skew:
             # Tier B (skew): U = IA*S_dense (full 6x6 * 6 matvec); d = S^T*U;
-            # u = tau - S^T*pA. Single-ind serial emit (skew arms are serial).
-            assert len(inds) == 1, "Tier-B aba backward emit assumes a single-ind level"
-            jid = inds[0]; jid6 = 6 * jid
-            Svec = _aba_Svec_cpp(self.robot, jid)
+            # u = tau - S^T*pA. Loop over every joint in the level (branching ok);
+            # each joint with its own dense (or unit) S column.
             self.gen_add_serial_ops()
-            self.gen_add_code_line("{ const T S_skew[6] = " + Svec + ";")
-            # U = IA[jid] (col-major 6x6) * S
-            self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[36*" + str(jid) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(84*n + jid6) + " + r] = acc; }")
-            # d = S^T U ; u = tau - S^T pA
-            self.gen_add_code_line("  s_temp[" + str(96*n + jid) + "] = dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(84*n + jid6) + "]);")
-            self.gen_add_code_line("  s_temp[" + str(97*n + jid) + "] = s_tau[" + str(jid) + "] - dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(78*n + jid6) + "]); }")
+            for jid in inds:
+                jid6 = 6 * jid
+                Svec = _aba_Svec_cpp(self.robot, jid)
+                self.gen_add_code_line("{ const T S_skew[6] = " + Svec + ";")
+                # U = IA[jid] (col-major 6x6) * S
+                self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[36*" + str(jid) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(84*n + jid6) + " + r] = acc; }")
+                # d = S^T U ; u = tau - S^T pA
+                self.gen_add_code_line("  s_temp[" + str(96*n + jid) + "] = dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(84*n + jid6) + "]);")
+                self.gen_add_code_line("  s_temp[" + str(97*n + jid) + "] = s_tau[" + str(jid) + "] - dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(78*n + jid6) + "]); }")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
         else:
@@ -813,26 +829,35 @@ def gen_aba_inner(self):
 
         # update a by adding qdd*S
         self.gen_add_code_line("// a[k] += qdd[k]*S[k]")
-        self.gen_add_parallel_loop("ind",str(6*len(inds)))
-        
-        if len(inds) > 1:
-            self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int comp_mod = comp % " + str(len(inds)) + ";")
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            jid = "jid"
-            self.gen_add_multi_threaded_select("comp_mod", "==", [str(i) for i in range(len(inds))], select_var_vals)
-        else:
-            self.gen_add_code_line("int row = ind % 6;")
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + jid + ";")
-        self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
         level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+        self.gen_add_parallel_loop("ind",str(6*len(inds)))
         if level_has_skew:
-            # Tier B: a[row] += S_dense[row]*qdd (single-ind level).
-            assert len(inds) == 1, "Tier-B aba 2nd-forward emit assumes a single-ind level"
-            Svec = _aba_Svec_cpp(self.robot, inds[0])
-            self.gen_add_code_line("const T S_skew[6] = " + Svec + ";")
-            self.gen_add_code_line("s_va[6*"+str(n)+"+jid6+row] += S_skew[row] * s_qdd[jid];")
+            # Tier B (skew): a[:,jid] += S_dense * qdd[jid]. Per-jid dispatch by
+            # compile-time index so each joint adds its own dense (or unit) S
+            # column; handles multiple (branching) joints per level.
+            self.gen_add_code_line("int row = ind % 6;")
+            for i, jid_val in enumerate(inds):
+                self.gen_add_code_line(("if " if i == 0 else "else if ") + "(ind < " + str(6*(i+1)) + ") {", True)
+                jid6 = 6 * jid_val
+                if self.robot.S_is_cardinal_by_id(jid_val):
+                    s_ind_val = self.robot.get_S_index_by_id(jid_val)
+                    s_sign_val = self.robot.get_S_sign_by_id(jid_val)
+                    self.gen_add_code_line("s_va[6*"+str(n)+"+"+str(jid6)+"+row] += (row == " + str(s_ind_val) + ") * (" + str(s_sign_val) + ") * s_qdd[" + str(jid_val) + "];")
+                else:
+                    Svec = _aba_Svec_cpp(self.robot, jid_val)
+                    self.gen_add_code_line("const T S_skew[6] = " + Svec + "; s_va[6*"+str(n)+"+"+str(jid6)+"+row] += S_skew[row] * s_qdd[" + str(jid_val) + "];")
+                self.gen_add_end_control_flow()
         else:
+            if len(inds) > 1:
+                self.gen_add_code_line("int row = ind % 6; int comp = ind / 6; int comp_mod = comp % " + str(len(inds)) + ";")
+                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
+                jid = "jid"
+                self.gen_add_multi_threaded_select("comp_mod", "==", [str(i) for i in range(len(inds))], select_var_vals)
+            else:
+                self.gen_add_code_line("int row = ind % 6;")
+                jid = str(inds[0])
+                self.gen_add_code_line("int jid = " + jid + ";")
+            self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
             self.gen_add_code_line("T qdd_val = (row == " + S_ind_cpp + ") * (" + S_sign_cpp + ") * (s_qdd[jid]);")
             self.gen_add_code_line("s_va[6*"+str(n)+"+jid6+row] += qdd_val;")
 
