@@ -142,7 +142,15 @@ def gen_crba_inner(self):
     
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
-    has_linear_axis = any(self.robot.get_S_index_by_id(jid) >= 3 for jid in range(n))
+    HAS_SKEW = self.robot.robot_has_skew_axis()
+    # has_linear_axis only selects between two byte-identical Phase-1 emit
+    # blocks below (so its value never changes output); for a skew joint use the
+    # dense S's linear half. Guard the cardinal query so it doesn't raise.
+    def _is_linear(jid):
+        if self.robot.S_is_cardinal_by_id(jid):
+            return self.robot.get_S_index_by_id(jid) >= 3
+        return any(v != 0.0 for v in self.robot._get_flat_S_by_id(jid)[3:])
+    has_linear_axis = any(_is_linear(jid) for jid in range(n))
     imat_offset = n if has_linear_axis else 7
 
     #construct the boilerplate and function definition
@@ -224,6 +232,43 @@ def gen_crba_inner(self):
             parent_ind = self.robot.get_parent_id(jid)
             self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &s_XImats[{36*(jid+n)}], &alpha[{36*jid}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
             self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&alpha[{36*jid}], &s_XImats[{36*jid}], &s_XImats[{36*(parent_ind+n)}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+
+    if HAS_SKEW:
+        # Tier B (skew axis) H-assembly: dense motion subspace columns. The
+        # composite-inertia Phase 1 above is S-independent (X^T IC X) so it is
+        # SHARED with the cardinal path; only the projections onto S differ.
+        # M[i,i] = S_i^T IC[i] S_i ; fh_i = IC[i] S_i ; walk ancestors with
+        # fh <- X^T fh and M[i,p] = S_p^T fh. Serial (skew robots are rare; the
+        # gate keeps every cardinal robot on the byte-identical fast path).
+        ImatOffset = 36*n
+        S_vecs = [[float(v) for v in self.robot._get_flat_S_by_id(j)] for j in range(n)]
+        def _Svec_cpp(j):
+            return "{" + ", ".join("static_cast<T>(" + repr(c) + ")" for c in S_vecs[j]) + "}"
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Calculation of M (Tier-B dense S^T (IC chain) S)")
+        self.gen_add_code_line("//")
+        self.gen_add_serial_ops()
+        self.gen_add_code_line("T s_Sj[6]; T s_fhj[6]; T s_fhj2[6];")
+        for jid in range(n):
+            self.gen_add_code_line("{ const T S_" + str(jid) + "[6] = " + _Svec_cpp(jid) + ";")
+            # fh = IC[jid] * S  (column-major 6x6 * 6-vector)
+            self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_XImats[" + str(ImatOffset) + " + 36*" + str(jid) + " + r + 6*p] * S_" + str(jid) + "[p]; } s_fhj[r] = acc; }")
+            # M[jid,jid] = S^T fh
+            self.gen_add_code_line("  s_M[" + str(jid + jid*n) + "] = dot_prod<T,6,1,1>(S_" + str(jid) + ", s_fhj);")
+            # walk ancestors
+            chain = self.robot.get_ancestors_by_id(jid)
+            cur, nxt = "s_fhj", "s_fhj2"
+            X_ind = jid
+            for parent_ind in chain:
+                self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_XImats[36*" + str(X_ind) + " + p + 6*r] * " + cur + "[p]; } " + nxt + "[r] = acc; }")
+                self.gen_add_code_line("  { const T Sp[6] = " + _Svec_cpp(parent_ind) + "; T mij = dot_prod<T,6,1,1>(Sp, " + nxt + "); s_M[" + str(jid*n + parent_ind) + "] = mij; s_M[" + str(parent_ind*n + jid) + "] = mij; }")
+                cur, nxt = nxt, cur
+                X_ind = parent_ind
+            self.gen_add_code_line("}")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_function()
+        return
 
     # Calculation of M[ind,ind]
     self.gen_add_code_line("//")

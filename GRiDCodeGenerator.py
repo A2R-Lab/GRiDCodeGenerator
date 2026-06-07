@@ -16,8 +16,8 @@ class GRiDCodeGenerator:
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
                          gen_topology_S_sign_for_cpp, gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
-                         gen_grid_linalg_backend_helpers, gen_linalg_smem_setup, gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_outer_product, custom_is_constant, \
-                         robot_has_mimic_joints, _v_slot_cpp, _alpha_for_jid, _alpha_prefix_cpp
+                         gen_grid_linalg_backend_helpers, gen_linalg_smem_setup, gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_mxS_general, gen_outer_product, custom_is_constant, \
+                         robot_has_mimic_joints, _v_slot_cpp, _alpha_for_jid, _alpha_prefix_cpp, _id_S_desc
 
     # then import all of the algorithms
     from .algorithms import gen_inverse_dynamics_inner_temp_mem_size, gen_inverse_dynamics_inner_function_call, \
@@ -2568,6 +2568,11 @@ class GRiDCodeGenerator:
         self.gen_spatial_algebra_helpers()
         self.gen_crm()
         self.gen_crm_mul()
+        # Tier-B (skew/general axis) helper: additive, emitted ONLY when the
+        # model carries a non-cardinal motion column. All-cardinal robots get
+        # byte-identical headers (no extra device function).
+        if self.robot.robot_has_skew_axis():
+            self.gen_mxS_general()
         self.gen_invert_matrix()
         self.gen_matmul()
         self.gen_matmul_trans() 

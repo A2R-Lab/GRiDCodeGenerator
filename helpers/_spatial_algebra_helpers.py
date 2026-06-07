@@ -57,10 +57,33 @@ def gen_crm_mul(self):
     self.gen_add_end_function()
 
 
+def gen_mxS_general(self):
+    """Tier-B (skew/general axis) motion cross product against a DENSE S column.
+
+    For a cardinal axis the codegen uses the specialized mx0..mx5 columns; a
+    skew joint's motion subspace S is a dense 6-vector, so mxS(v) = crm(v) * S
+    cannot pick a precomputed column. This generic helper computes
+        s_vecX += alpha * (crm(s_vec) * S)
+    reusing crm_mul (row r of crm(v)*x). Emitted ONLY for models with a skew
+    axis (gated by robot_has_skew_axis), so all-cardinal headers are unchanged.
+    """
+    self.gen_add_func_doc(
+        "Adds alpha*(crm(s_vec)*S) into s_vecX for a DENSE motion subspace column S",
+        ["Assumes only one thread is running each function call", "Tier-B skew-axis helper"],
+        ["s_vecX is the destination 6-vector", "s_vec is the source 6-vector",
+         "S is the dense 6-vector motion subspace column", "alpha is the scaling factor"],
+        None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void mxS_general_peq_scaled(T *s_vecX, const T *s_vec, const T *S, const T alpha) {", True)
+    self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_vecX[r] += alpha * crm_mul<T>(r, (T *)s_vec, (T *)S); }")
+    self.gen_add_end_function()
+
+
 def gen_crm(self):
     """
-    This function generates the code for 
-    the spatial motion cross product 
+    This function generates the code for
+    the spatial motion cross product
     operation function. It computes the
     motion cross product operation of a vector.
     """

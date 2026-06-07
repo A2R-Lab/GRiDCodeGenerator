@@ -1109,7 +1109,15 @@ def gen_topology_helpers_pointers_for_cpp(self, inds = None, updated_var_names =
             df_col_that_is_jid = var_names["s_topology_helpers_name"] + "[" + str(ancestor_offset) + " + " + var_names["jid_name"] + "]"
 
     if IDENTICAL_S_FLAG_INDS: # always true for one ind
-        S_ind = str(self.robot.get_S_index_by_id(inds[0]))
+        # Tier-B (skew) joints have no signed unit index. Callers that need S
+        # for a skew joint (RNEA forward/c-extract) take a Tier-B branch BEFORE
+        # consuming this; the S-independent callers (backward f-update) just
+        # discard S_ind. Emit a "0" placeholder so those S-free uses don't trip
+        # the cardinal guard. Cardinal robots are unaffected (byte-identical).
+        if self.robot.S_is_cardinal_by_id(inds[0]):
+            S_ind = str(self.robot.get_S_index_by_id(inds[0]))
+        else:
+            S_ind = "0"
 
     if NO_GRAD_FLAG:
         return parent_ind, S_ind

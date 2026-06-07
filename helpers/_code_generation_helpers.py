@@ -56,6 +56,24 @@ def _alpha_for_jid(self, jid):
         return float(j.get_mimic_multiplier())
     return 1.0
 
+def _id_S_desc(self, jid):
+    """Classify body ``jid``'s 1-DoF motion subspace for codegen dispatch.
+
+    Returns one of:
+      ("A", s_ind, s_sign) -- Tier A cardinal axis (single signed unit index);
+                              the byte-identical fast path every current robot
+                              takes.
+      ("B", S_vec)         -- Tier B skew/general axis (dense 6-vector column,
+                              >=2 nonzero entries). Consumers emit dense
+                              dot/axpy/GEMV ops instead of an indexed scale.
+
+    Only single-column (1-DoF) joints are classified here; multi-column
+    planar/spherical (Tier C) is rejected upstream by _assert_single_axis_S.
+    """
+    if self.robot.S_is_cardinal_by_id(jid):
+        return ("A", self.robot.get_S_index_by_id(jid), self.robot.get_S_sign_by_id(jid))
+    return ("B", [float(v) for v in self.robot._get_flat_S_by_id(jid)])
+
 def _alpha_prefix_cpp(self, jid):
     """Return a C++ multiplicative prefix ``"<alpha> * "`` for body ``jid``,
     or the empty string when alpha == 1.0 (non-mimic). Used so non-mimic emit

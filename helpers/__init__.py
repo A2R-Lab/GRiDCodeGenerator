@@ -4,6 +4,7 @@ from ._code_generation_helpers import (
     _v_slot_cpp,
     _alpha_for_jid,
     _alpha_prefix_cpp,
+    _id_S_desc,
 )
 from ._spatial_algebra_helpers import *
 from ._topology_helpers import *

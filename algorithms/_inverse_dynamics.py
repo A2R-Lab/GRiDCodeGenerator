@@ -1,3 +1,17 @@
+def _id_S_row_coeff(S_desc, row):
+    """C++ coefficient string for S[row] of a 1-DoF joint, or None if S[row]==0.
+
+    S_desc is the (tier, ...) tuple from self._id_S_desc(jid): Tier A
+    ("A", s_ind, s_sign) contributes sign at s_ind; Tier B ("B", S_vec)
+    contributes the dense float at each nonzero row. Used by the skew (Tier-B)
+    emit paths in RNEA to fan a dense motion column across rows."""
+    if S_desc[0] == "A":
+        _, s_ind, s_sign = S_desc
+        return str(s_sign) if row == s_ind else None
+    S_vec = S_desc[1]
+    return ("static_cast<T>(" + repr(float(S_vec[row])) + ")") if S_vec[row] != 0.0 else None
+
+
 def gen_inverse_dynamics_inner_temp_mem_size(self):
         # The forward f-pass stashes each BODY's I*v product in s_temp indexed by
         # raw body id (6*jid+row, jid in [0, get_num_joints())), so the scratch must
@@ -135,10 +149,18 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         inds = self.robot.get_ids_by_bfs_level(bfs_level)
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
-        parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
-        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
+        # Tier-B (skew axis): any joint at this level whose single-column S is
+        # non-cardinal. The signed-index topology helpers raise on such joints,
+        # so we route the whole level through the dense-6-vector emit. Cardinal-
+        # only levels (every current robot) take the byte-identical fast path.
+        level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+        if not level_has_skew:
+            parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
+            S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
+        else:
+            parent_ind_cpp, S_ind_cpp, S_sign_cpp = None, None, None
 
-        if bfs_level == 0: 
+        if bfs_level == 0:
             self.gen_add_code_line("// s_v, s_a where parent is base")
             self.gen_add_code_line("//     joints are: " + ", ".join(joint_names))
             self.gen_add_code_line("//     links are: " + ", ".join(link_names))
@@ -167,6 +189,24 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             else:
                 self.gen_add_code_line("s_vaf[" + str(n*6) + " + jid6 + row] = -s_XImats[6*jid6 + 30 + row]*gravity;")
             # then add in qd and qdd
+            if level_has_skew:
+                # Tier B: dense S column add. Single-ind level (synthetic skew
+                # arms are serial); emit `s_v[row] += S[row]*qd` for each row.
+                assert len(inds) == 1, "Tier-B level-0 emit assumes a single-ind level"
+                S_desc = self._id_S_desc(inds[0])
+                qd_term = _id_qd(jid)
+                lines = []
+                for r in range(6):
+                    coeff = _id_S_row_coeff(S_desc, r)
+                    if coeff is not None:
+                        lines.append("if (row == " + str(r) + "){s_vaf[jid6 + " + str(r) + "] += (" + coeff + ") * " + qd_term + ";}")
+                        if use_qdd_input:
+                            lines[-1] = lines[-1].replace("}", " s_vaf[" + str(n*6) + " + jid6 + " + str(r) + "] += (" + coeff + ") * " + _id_qd(jid, "s_qdd") + ";}")
+                for ln in lines:
+                    self.gen_add_code_line(ln)
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+                continue
             if S_ind_cpp == '-1': # floating base uses the root motion subspace, not raw row-wise copies
                 qd_qdd_code = "int fb_col = row < 3 ? row + 3 : row - 3; s_vaf[jid6 + row] = s_qd[fb_col];"
             else:
@@ -208,8 +248,10 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             # column reduction order is unchanged), but it keeps threads busy across siblings.
             seg = len(inds)
             parents = [self.robot.get_parent_id(jid_val) for jid_val in inds]
-            s_inds = [self.robot.get_S_index_by_id(jid_val) for jid_val in inds]
-            s_signs = [self.robot.get_S_sign_by_id(jid_val) for jid_val in inds]
+            # Tier-A joints expose a signed unit index; Tier-B (skew) joints
+            # carry a dense 6-vector S filled directly into the selector below.
+            # _id_S_cols returns either ("A", s_ind, s_sign) or ("B", S_vec).
+            s_descs = [self._id_S_desc(jid_val) for jid_val in inds]
             qd_idxs = [str(jid_val + 5) if self.robot.floating_base else str(jid_val) for jid_val in inds]
             tag = "lvl" + str(bfs_level)
             # compile-time descriptor / selector arrays for this level (element offsets)
@@ -223,7 +265,15 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             sel_vals = []
             for i in range(seg):
                 row_vals = ["static_cast<T>(0)"]*6
-                row_vals[s_inds[i]] = f"static_cast<T>({s_signs[i]})"
+                desc = s_descs[i]
+                if desc[0] == "A":
+                    _, s_ind, s_sign = desc
+                    row_vals[s_ind] = f"static_cast<T>({s_sign})"
+                else:  # Tier B: dense skew column
+                    S_vec = desc[1]
+                    for r in range(6):
+                        if S_vec[r] != 0.0:
+                            row_vals[r] = f"static_cast<T>({repr(float(S_vec[r]))})"
                 sel_vals.extend(row_vals)
             self.gen_add_code_line(f"static const int seg_s_off_{tag}[{seg}] = {{{', '.join(str(6*i) for i in range(seg))}}};")
             self.gen_add_code_line(f"static const T S_sel_{tag}[{6*seg}] = {{{', '.join(sel_vals)}}};")
@@ -273,7 +323,24 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 self.gen_add_sync()
             self.gen_add_code_line("// sync before a += MxS(v)*qd[S] ")
             self.gen_add_sync()
-            
+
+            if level_has_skew:
+                # Tier B: a += crm(v) * (S * qd). With a dense S column we cannot
+                # pick a precomputed mx{col}; emit the generic crm-times-dense-S.
+                assert len(inds) == 1, "Tier-B mxS emit assumes a single-ind level"
+                jid = inds[0]
+                S_desc = self._id_S_desc(jid)
+                assert S_desc[0] == "B"
+                S_arr = "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in S_desc[1]) + "}"
+                qd_term = ("s_qd[" + str(jid + 5) + "]" if self.robot.floating_base
+                           else (_id_qd(jid) if HAS_MIMIC else "s_qd[" + str(jid) + "]"))
+                self.gen_add_serial_ops()
+                self.gen_add_code_line("{ const T S_skew[6] = " + S_arr + ";")
+                self.gen_add_code_line("  mxS_general_peq_scaled<T>(&s_vaf[" + str(6*n + 6*jid) + "], &s_vaf[" + str(6*jid) + "], S_skew, " + qd_term + "); }")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+                continue
+
             # attempt to do as much of the Mx in parallel as possible (will branch on different S but that is inevitable)
             self.gen_add_parallel_loop("ind",str(len(inds)))
             if len(inds) > 1:
@@ -423,6 +490,27 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line(
                 "s_c[" + str(vs) + "] += static_cast<T>(" + repr(coeff) + ") * s_vaf["
                 + str(12*n + 6*jid + s_ind) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_function()
+        return
+    if compute_c and self.robot.robot_has_skew_axis():
+        # Tier B (skew axis, non-mimic): c[k] = S[k]^T f[k] with a dense S.
+        # Serial dense dot per joint (correctness-first; skew robots are rare).
+        # Non-floating fixed-base: dof_id == jid.
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// s_c extracted serially (Tier-B dense S^T f)")
+        self.gen_add_code_line("//")
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
+        for jid in range(n):
+            S_desc = self._id_S_desc(jid)
+            terms = []
+            for r in range(6):
+                coeff = _id_S_row_coeff(S_desc, r)
+                if coeff is not None:
+                    terms.append("(" + coeff + ") * s_vaf[" + str(12*n + 6*jid + r) + "]")
+            self.gen_add_code_line("s_c[" + str(jid) + "] = " + (" + ".join(terms) if terms else "static_cast<T>(0)") + ";")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
         self.gen_add_end_function()
