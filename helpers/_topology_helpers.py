@@ -190,6 +190,60 @@ def gen_init_XImats(self, include_base_inertia = False, include_homogenous_trans
     # add the function end
     self.gen_add_end_function()
 
+def gen_get_inertia_params_size(self, include_base_inertia = False):
+    # 10 standard inertial parameters per body, body-indexed, mirroring the
+    # I-region layout of gen_init_XImats: bodies 1..N by default (Imats[1:]),
+    # or all N+1 bodies when include_base_inertia.
+    n = self.robot.get_num_joints()
+    return 10 * (n + (1 if include_base_inertia else 0))
+
+def gen_init_inertia_params(self, include_base_inertia = False):
+    # D.4 / Phase 5: host-side init of the flag-gated mutable inertia table.
+    # Fills d_inertia_params from the SAME URDF (frozen regressor basis), so
+    # init_robotModel reproduces the baked answer until set_inertia_params is
+    # called. Layout mirrors the I-region of gen_init_XImats exactly: bodies
+    # 1..N by default (the base inertia is dropped just like Imats[1:]).
+    self.gen_add_func_doc("Initializes the mutable inertia parameter table in GPU memory",
+            ["Memory order is pi[0...N-1], each pi_i = [m, h(3)=m*c, I_O(6)=[Ixx,Ixy,Ixz,Iyy,Iyz,Izz]]"],
+            [], "A pointer to the inertia-params memory in the GPU")
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("T* init_inertia_params() {", True)
+    size = self.gen_get_inertia_params_size(include_base_inertia)
+    self.gen_add_code_line("T *h_inertia_params = (T *)calloc(" + str(size) + ",sizeof(T));")
+    params = self.robot.get_inertia_params_ordered_by_id()
+    if not include_base_inertia:
+        params = params[1:]
+    for ind in range(len(params)):
+        self.gen_add_code_line("// pi[" + str(ind) + "]")
+        for k in range(10):
+            self.gen_add_code_line("h_inertia_params[" + str(10*ind + k) + "] = static_cast<T>(" + str(params[ind][k]) + ");")
+    self.gen_add_code_line("T *d_inertia_params; gpuErrchk(cudaMalloc((void**)&d_inertia_params," + str(size) + "*sizeof(T)));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(d_inertia_params,h_inertia_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_code_line("free(h_inertia_params);")
+    self.gen_add_code_line("return d_inertia_params;")
+    self.gen_add_end_function()
+
+def gen_set_inertia_params(self, include_base_inertia = False):
+    # D.4 / Phase 5: public mutator. Thin cudaMemcpy of the 10*NB (or 10*(NB+1))
+    # param table into d_inertia_params. The sysID / domain-randomization /
+    # payload entry point. h_params must be in the frozen regressor basis
+    # (see Robot.get_inertia_params), body-indexed, bodies 1..N (or 0..N when
+    # include_base_inertia).
+    size = self.gen_get_inertia_params_size(include_base_inertia)
+    self.gen_add_func_doc("Updates the mutable inertia parameter table on the GPU at runtime (no recompile)",
+            ["h_params is the host array of " + str(size) + " floats, body-indexed 10-vectors [m, h(3), I_O(6)]"],
+            [], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void set_inertia_params(robotModel<T> *d_robotModel, const T *h_params) {", True)
+    # d_inertia_params is an inner pointer inside the device-resident struct; read
+    # it back to host so we can memcpy into the buffer it points at.
+    self.gen_add_code_line("robotModel<T> h_robotModel;")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(&h_robotModel,d_robotModel,sizeof(robotModel<T>),cudaMemcpyDeviceToHost));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(h_robotModel.d_inertia_params,h_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_end_function()
+
 def gen_load_update_XImats_helpers_temp_mem_size(self):
     if self.robot_has_mimic_joints():
         # Mimic path needs per-BODY scratch: s_q_eff[NB] (the folded angle
@@ -225,7 +279,15 @@ def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None,
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    tparams = "<T, true>" if (skip_floating_base_X and self.robot.floating_base) else "<T>"
+    # D.4 / Phase 5: thread RUNTIME_INERTIA (3rd tparam) through every call-site
+    # when self.runtime_inertia. SKIP_FLOATING_BASE_X (2nd tparam) must then be
+    # spelled explicitly so the 3rd can be set. Baked default keeps the legacy
+    # <T> / <T,true> tparams byte-identical (the 3rd param doesn't exist).
+    skip_val = "true" if (skip_floating_base_X and self.robot.floating_base) else "false"
+    if getattr(self, "runtime_inertia", False):
+        tparams = "<T, " + skip_val + ", true>"
+    else:
+        tparams = "<T, true>" if (skip_floating_base_X and self.robot.floating_base) else "<T>"
     code_start = "load_update_XImats_helpers" + tparams + "(" + var_names["s_XImats_name"] + ", " + var_names["s_q_name"] + ", "
     code_end = var_names["d_robotModel_name"] + ", " + var_names["s_temp_name"] + ");"
     n = self.robot.get_num_pos()
@@ -312,6 +374,64 @@ def _xi_fixed_sincos_subst(self, str_val, ind):
     str_val = str_val.replace("theta", "s_q[" + str(ind) + "]")
     return str_val
 
+def _emit_runtime_inertia_rebuild(self, n):
+    """D.4 / Phase 5: rebuild the I-region of s_XImats from d_inertia_params.
+
+    Emitted only inside the `if constexpr (RUNTIME_INERTIA)` path. The I-region
+    holds bodies 1..N at static slot `ind` in [0,n): base offset 36*(n+ind),
+    element (row,col) at 36*(n+ind)+6*col+row (column-major 6x6). Each body's
+    10-vector p = [m, hx,hy,hz, Ixx,Ixy,Ixz,Iyy,Iyz,Izz] is scattered into the
+    6x6 as
+        I = [[ I_O,        skew(h) ],
+             [ skew(h)^T,  m*I3    ]]
+    a pure divide-free scatter of the SAME numbers the baked path stored (read
+    out verbatim by Robot.get_inertia_params) -> BIT-IDENTICAL to the baked path.
+    One thread per body writes its 36 entries; n is tiny and this runs once per
+    kernel on the cold XImats load.
+    """
+    # (within-6x6 col-major offset, expr-in-terms-of m,h,IO) for all 36 entries.
+    # Zeros are written explicitly because the bulk copy skipped the I-region.
+    def off(row, col):
+        return 6 * col + row
+    entries = {}
+    for r in range(6):
+        for c in range(6):
+            entries[off(r, c)] = "static_cast<T>(0)"
+    IO_names = {  # (row,col within top-left 3x3) -> param index for symmetric I_O
+        (0, 0): 4, (1, 1): 7, (2, 2): 9,
+        (0, 1): 5, (1, 0): 5, (0, 2): 6, (2, 0): 6, (1, 2): 8, (2, 1): 8,
+    }
+    for (r, c), k in IO_names.items():
+        entries[off(r, c)] = "IO" + str(k - 4)  # IO0..IO5
+    # TR = skew(h) at rows0-2, cols3-5 ; BL = skew(h)^T at rows3-5, cols0-2
+    # skew(h) = [[0,-hz,hy],[hz,0,-hx],[-hy,hx,0]]
+    skew = {(0, 1): "-hz", (0, 2): "hy", (1, 0): "hz",
+            (1, 2): "-hx", (2, 0): "-hy", (2, 1): "hx"}
+    for (r, c), e in skew.items():
+        entries[off(r, c + 3)] = e          # TR
+        entries[off(r + 3, c)] = e          # BL = skew^T -> transpose (r<->c) but skew^T[i,j]=skew[j,i]
+    # Correct BL = skew(h)^T: BL[i,j] = skew(h)[j,i]
+    for (r, c), e in skew.items():
+        entries[off(c + 3, r)] = e
+    # BR = m*I3
+    entries[off(3, 3)] = "m"
+    entries[off(4, 4)] = "m"
+    entries[off(5, 5)] = "m"
+    # NB: the syncs and the loop all live INSIDE the if-constexpr so the baked
+    # path (RUNTIME_INERTIA=false) emits NOTHING here -> byte-identical.
+    self.gen_add_code_line("if constexpr (RUNTIME_INERTIA) {", True)
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("rib", str(n))
+    self.gen_add_code_line("const T *p = &d_robotModel->d_inertia_params[10*rib];")
+    self.gen_add_code_line("T m = p[0]; T hx = p[1]; T hy = p[2]; T hz = p[3];")
+    self.gen_add_code_line("T IO0 = p[4]; T IO1 = p[5]; T IO2 = p[6]; T IO3 = p[7]; T IO4 = p[8]; T IO5 = p[9];")
+    self.gen_add_code_line("int base = 36*(" + str(n) + " + rib);")
+    for o in range(36):
+        self.gen_add_code_line("s_XImats[base + " + str(o) + "] = " + entries[o] + ";")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+
 def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_homogenous_transforms = False):
     n = self.robot.get_num_joints()
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
@@ -340,7 +460,19 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
     # M-fill chain walk only uses X[X_id] for X_id != 0). Fixed-base robots
     # ignore the flag (X[0] is a regular joint). Default false keeps every
     # other algorithm (ID/FD/Minv/ABA/IDSVA-SO/integrator/EE-pose) unchanged.
-    self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false>")
+    # RUNTIME_INERTIA (D.4 / Phase 5): when true, the I-region of s_XImats is
+    # reconstructed on-device from the mutable d_inertia_params table instead of
+    # streamed verbatim from the baked d_XImats. The rebuild is a divide-free
+    # scatter of the SAME 10 numbers the baked path stored (Robot.get_inertia_params
+    # reads them out of the baked 6x6), so the runtime path is BIT-IDENTICAL to the
+    # baked path until set_inertia_params mutates the table. The whole template
+    # param + branch is emitted ONLY under self.runtime_inertia so a baked header
+    # stays byte-identical (the param doesn't even appear in the signature).
+    runtime_inertia = getattr(self, "runtime_inertia", False)
+    if runtime_inertia:
+        self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false, bool RUNTIME_INERTIA = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false>")
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # test to see if we need to compute any trig functions
@@ -351,10 +483,19 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
             use_trig = True
             break
     # if trig is needed, compute sin/cos while loading XImats from global to shared
+    # D.4 / Phase 5: the I-region of s_XImats lives at [36*n, 36*2*n). Under
+    # RUNTIME_INERTIA it is NOT streamed from the baked d_XImats (it is rebuilt
+    # below from d_inertia_params); under the default it is copied verbatim.
+    i_region_lo = 36 * n
+    i_region_hi = 36 * 2 * n
     if use_trig:
         self.gen_add_parallel_loop("ind",str(XI_size))
+        if runtime_inertia:
+            self.gen_add_code_line("if constexpr (RUNTIME_INERTIA) { if (ind >= " + str(i_region_lo) + " && ind < " + str(i_region_hi) + ") { continue; } }")
         self.gen_add_code_line("s_XImats[ind] = d_robotModel->d_XImats[ind];")
         self.gen_add_end_control_flow()
+        if runtime_inertia:
+            _emit_runtime_inertia_rebuild(self, n)
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
@@ -374,10 +515,25 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
             self.gen_add_sync()
     # else just load in XI from global to shared efficiently
     else:
-        self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + ");")
+        if runtime_inertia:
+            # RUNTIME_INERTIA: copy only the X-region [0,36*n) and any Xhom tail
+            # [36*2*n, XI_size); rebuild the I-region [36*n,36*2*n) from the
+            # param table. Default: one contiguous memcpy_async of the whole XI.
+            self.gen_add_code_line("if constexpr (RUNTIME_INERTIA) {", True)
+            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(i_region_lo) + ");")
+            if XI_size > i_region_hi:
+                self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats+" + str(i_region_hi) + ",d_robotModel->d_XImats+" + str(i_region_hi) + "," + str(XI_size - i_region_hi) + ");")
+            self.gen_add_end_control_flow()
+            self.gen_add_code_line("else {", True)
+            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + ");")
+            self.gen_add_end_control_flow()
+        else:
+            self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_XImats,d_robotModel->d_XImats," + str(XI_size) + ");")
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_code_line("cgrps::memcpy_async(tgrp,s_topology_helpers,d_robotModel->d_topology_helpers," + str(self.gen_topology_helpers_size()) + "*sizeof(int));")
         self.gen_add_code_line("cgrps::wait(tgrp);")
+        if runtime_inertia:
+            _emit_runtime_inertia_rebuild(self, n)
     # loop through Xmats and update all non-constant values serially
     self.gen_add_serial_ops()
     for ind in range(n):
@@ -1039,9 +1195,13 @@ def gen_init_robotModel(self):
     self.gen_add_code_line("__host__")
     self.gen_add_code_line("robotModel<T>* init_robotModel() {", True)
     # then construct the host side struct
-    self.gen_add_code_lines(["robotModel<T> h_robotModel;", \
-                             "h_robotModel.d_XImats = init_XImats<T>();", \
-                             "h_robotModel.d_topology_helpers = init_topology_helpers<T>();"])
+    init_lines = ["robotModel<T> h_robotModel;", \
+                  "h_robotModel.d_XImats = init_XImats<T>();", \
+                  "h_robotModel.d_topology_helpers = init_topology_helpers<T>();"]
+    if getattr(self, "runtime_inertia", False):
+        # D.4 / Phase 5: flag-gated mutable inertia table init.
+        init_lines.append("h_robotModel.d_inertia_params = init_inertia_params<T>();")
+    self.gen_add_code_lines(init_lines)
     # then allocate memeory and copy to device
     self.gen_add_code_lines(["robotModel<T> *d_robotModel; gpuErrchk(cudaMalloc((void**)&d_robotModel,sizeof(robotModel<T>)));",
                              "gpuErrchk(cudaMemcpy(d_robotModel,&h_robotModel,sizeof(robotModel<T>),cudaMemcpyHostToDevice));"])

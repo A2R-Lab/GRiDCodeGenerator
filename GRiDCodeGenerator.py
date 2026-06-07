@@ -10,7 +10,8 @@ class GRiDCodeGenerator:
                          gen_static_array_ind_2d, gen_static_array_ind_3d, gen_add_debug_print_code_lines, \
                          gen_mx_func_call_for_cpp, gen_add_shared_memory_helpers, gen_declare_shared_arena, \
                          gen_shared_arena_t_count, gen_device_wrapper, gen_tier_dispatch, gen_spatial_algebra_helpers, \
-                         gen_get_XI_size, gen_init_XImats, gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
+                         gen_get_XI_size, gen_init_XImats, gen_get_inertia_params_size, gen_init_inertia_params, gen_set_inertia_params, \
+                         gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
@@ -1518,11 +1519,17 @@ class GRiDCodeGenerator:
         # then the structs
         # first add the struct
         self.gen_add_code_line("// Define custom structs")
-        self.gen_add_code_lines(["template <typename T>", \
-                                 "struct robotModel {", \
-                                 "    T *d_XImats;", \
-                                 "    int *d_topology_helpers;", \
-                                 "};"])
+        struct_lines = ["template <typename T>", \
+                        "struct robotModel {", \
+                        "    T *d_XImats;", \
+                        "    int *d_topology_helpers;"]
+        if getattr(self, "runtime_inertia", False):
+            # D.4 / Phase 5: flag-gated mutable inertia table (10*NB or 10*(NB+1)
+            # floats, body-indexed, in the frozen regressor basis). Emitted ONLY
+            # under runtime_inertia so the baked struct stays byte-identical.
+            struct_lines.append("    T *d_inertia_params;")
+        struct_lines.append("};")
+        self.gen_add_code_lines(struct_lines)
         self.gen_add_code_lines(["template <typename T, gridDataKind KIND = GRID_DATA_ALL>", \
                                  "struct gridData {", \
                                  "    // GPU INPUTS", \
@@ -2363,7 +2370,7 @@ class GRiDCodeGenerator:
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
-                     enable_idsva_so_world_frame = None):
+                     enable_idsva_so_world_frame = None, runtime_inertia = False):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -2390,6 +2397,12 @@ class GRiDCodeGenerator:
         if "idsva_so_world_frame" in algorithms:
             enable_idsva_so_world_frame = True
         self.include_fixed_kinematic_targets = fixed_target_name != ""
+        # D.4 / Phase 5: runtime-mutable inertia table. When True, the per-link
+        # spatial inertia is reconstructed on-device from a mutable d_inertia_params
+        # table (set_inertia_params) instead of streamed from the baked d_XImats.
+        # Default False keeps the BAKED path byte-identical (the field + device
+        # branch are entirely flag-gated).
+        self.runtime_inertia = runtime_inertia
         self.generated_algorithms = algorithms
         # MIMIC GRADIENTS — fully supported, no refusal. All first/second-order mimic
         # gradients emit correctly for BOTH bases via the alpha-weighted reduced-v-slot
@@ -2562,6 +2575,13 @@ class GRiDCodeGenerator:
         # then generate the robot specific transformation and inertia matricies
         self.gen_init_topology_helpers()
         self.gen_init_XImats(include_base_inertia, include_homogenous_transforms)
+        # D.4 / Phase 5: flag-gated mutable inertia table init + mutator. Emitted
+        # only under runtime_inertia. The device XImats helper rebuilds the
+        # I-region from this table; both use include_base_inertia=False to mirror
+        # the I-region layout the helper streams (Imats[1:], bodies 1..N).
+        if getattr(self, "runtime_inertia", False):
+            self.gen_init_inertia_params()
+            self.gen_set_inertia_params()
         self.gen_init_robotModel()
         self.gen_init_gridData()
         self.gen_joint_limits_size()
