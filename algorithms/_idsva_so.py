@@ -1982,11 +1982,29 @@ def gen_idsva_so_body_frame_inner(self, use_qdd_input = False):
     # Transform S
     self.gen_add_code_line("\n\n")
     self.gen_add_code_line('// Transform S')
-    self.gen_add_parallel_loop('i','6*NUM_BODIES')
-    self.gen_add_code_line('int jid = i / 6;')
-    self.gen_add_code_line(f'S[i] = ({S_sign_cpp}) * Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
+    if self.robot.robot_has_skew_axis():
+        # Tier B (skew): S_world = Xdown @ S_dense (per-body dense column). Bake a
+        # per-body dense S table; cardinal bodies keep their single signed-index
+        # column (so a mixed robot still picks the indexed read per body, and an
+        # all-cardinal robot never reaches this branch -> byte-identical).
+        flat_S = [c for jid in range(num_bodies) for c in self.robot._get_flat_S_by_id(jid)]
+        is_skew = [0 if self.robot.S_is_cardinal_by_id(jid) else 1 for jid in range(num_bodies)]
+        self.gen_add_code_line("static const T so_S_vec[] = { " + ", ".join("static_cast<T>(" + repr(float(v)) + ")" for v in flat_S) + " };")
+        self.gen_add_code_line("static const int so_is_skew[] = { " + ", ".join(str(v) for v in is_skew) + " };")
+        self.gen_add_parallel_loop('i','6*NUM_BODIES')
+        self.gen_add_code_line('int jid = i / 6; int row = i % 6;')
+        self.gen_add_code_line("if (so_is_skew[jid]) {", True)
+        self.gen_add_code_line("T a = static_cast<T>(0); for (int k = 0; k < 6; ++k) a += Xdown[jid*XIMAT_SIZE + k*6 + row] * so_S_vec[jid*6 + k]; S[i] = a;")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line(f"else {{ S[i] = ({S_sign_cpp}) * Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + row]; }}")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+    else:
+        self.gen_add_parallel_loop('i','6*NUM_BODIES')
+        self.gen_add_code_line('int jid = i / 6;')
+        self.gen_add_code_line(f'S[i] = ({S_sign_cpp}) * Xdown[jid*XIMAT_SIZE + {S_ind_cpp}*6 + (i % 6)];')
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
 
     # Compute vJ = S @ qd & aJ = S @ qdd in parallel
     self.gen_add_code_line("\n\n")

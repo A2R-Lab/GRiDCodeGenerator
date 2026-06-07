@@ -51,14 +51,17 @@ import numpy as np
 
 
 def _coriolis_unit_axis(column):
-    """Return (row, sign) of the unit entry of a single S column (mirrors
-    _idsva_so_unit_axis)."""
+    """Return (row, sign) of the unit entry of a single CARDINAL S column, or
+    (None, None) for a Tier-B (skew/general) column (>=2 nonzero entries). The
+    caller bakes the dense column for the skew case and an indexed read for the
+    cardinal case (so cardinal robots stay byte-identical)."""
     values = column.reshape(-1).tolist() if hasattr(column, "reshape") else list(column)
+    nz = [v for v in values if float(v) != 0.0]
     for row, value in enumerate(values):
         value = float(value)
-        if abs(value) == 1.0:
+        if abs(value) == 1.0 and len(nz) == 1:
             return row, (1 if value > 0.0 else -1)
-    raise ValueError("Coriolis expected unit joint subspace columns.")
+    return None, None
 
 
 def _coriolis_int_array(values):
@@ -78,8 +81,10 @@ def _coriolis_metadata(self):
     col_body = []     # internal slot -> owning body id
     col_true_vel = [] # internal slot -> reduced velocity slot (qd read)
     col_alpha = []    # internal slot -> mimic multiplier (1.0 for non-mimic)
-    col_s_index = []  # internal slot -> S unit-axis row
-    col_s_sign = []   # internal slot -> S unit-axis sign
+    col_s_index = []  # internal slot -> S unit-axis row (cardinal); 0 for skew
+    col_s_sign = []   # internal slot -> S unit-axis sign (cardinal); 0 for skew
+    col_S_vec = []    # internal slot -> dense 6-vector S column (Tier-B skew)
+    col_is_skew = []  # internal slot -> 1 if Tier-B skew, else 0
     body_col_start = [0]  # body i's internal columns are [body_col_start[i], body_col_start[i+1])
     for i in range(NB):
         joint = robot.get_joint_by_id(i)
@@ -97,8 +102,17 @@ def _coriolis_metadata(self):
             col_body.append(i)
             col_true_vel.append(vel)
             col_alpha.append(alpha)
-            col_s_index.append(s_row)
-            col_s_sign.append(s_sign)
+            if s_row is None:
+                # Tier-B skew column: bake the dense S, sentinel the index/sign.
+                col_s_index.append(0)
+                col_s_sign.append(0)
+                col_S_vec.append([float(v) for v in S[:, c].reshape(-1)])
+                col_is_skew.append(1)
+            else:
+                col_s_index.append(s_row)
+                col_s_sign.append(s_sign)
+                col_S_vec.append([0.0] * 6)
+                col_is_skew.append(0)
         body_col_start.append(len(col_body))
     n_int = len(col_body)
 
@@ -149,6 +163,9 @@ def _coriolis_metadata(self):
         "col_alpha": col_alpha,
         "col_s_index": col_s_index,
         "col_s_sign": col_s_sign,
+        "col_S_vec": col_S_vec,
+        "col_is_skew": col_is_skew,
+        "has_skew": any(col_is_skew),
         "job_icol": job_icol,
         "job_tcol": job_tcol,
         "job_body": job_body,
@@ -233,6 +250,14 @@ def gen_coriolis_matrix_inner(self):
         f"static const int cor_job_body[] = {{ {_coriolis_int_array(md['job_body'])} }};",
         f"static const int cor_job_kind[] = {{ {_coriolis_int_array(md['job_kind'])} }};",
     ])
+    if md["has_skew"]:
+        # Tier-B (skew) only: dense per-column S table + per-column skew flag.
+        # Gated on has_skew so cardinal robots emit no extra table -> byte-identical.
+        flat_S = [c for col in md["col_S_vec"] for c in col]
+        self.gen_add_code_lines([
+            "static const T cor_col_S_vec[] = { " + ", ".join("static_cast<T>(" + repr(v) + ")" for v in flat_S) + " };",
+            f"static const int cor_col_is_skew[] = {{ {_coriolis_int_array(md['col_is_skew'])} }};",
+        ])
 
     # ---- scratch band pointers ----
     self.gen_add_code_lines([
@@ -311,7 +336,14 @@ def gen_coriolis_matrix_inner(self):
     self.gen_add_code_line("// Sw[c] = oXi[body(c)] . S_col(c)  (world motion subspace, per internal column)")
     self.gen_add_parallel_loop("c", str(n_int))
     self.gen_add_code_line("int jid = cor_col_body[c]; int s_row = cor_col_s_index[c]; T s_sgn = static_cast<T>(cor_col_s_sign[c]);")
-    self.gen_add_code_line("for (int row = 0; row < 6; ++row) s_Sw[c*6 + row] = s_sgn * s_oXi[jid*36 + s_row*6 + row];")
+    if md["has_skew"]:
+        # Tier B: dense Sw = oXi @ S_col (6x6 * 6 matvec); cardinal stays indexed.
+        self.gen_add_code_line("if (cor_col_is_skew[c]) {", True)
+        self.gen_add_code_line("for (int row = 0; row < 6; ++row) { T a = static_cast<T>(0); for (int kk = 0; kk < 6; ++kk) a += s_oXi[jid*36 + kk*6 + row] * cor_col_S_vec[c*6 + kk]; s_Sw[c*6 + row] = a; }")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else { for (int row = 0; row < 6; ++row) s_Sw[c*6 + row] = s_sgn * s_oXi[jid*36 + s_row*6 + row]; }")
+    else:
+        self.gen_add_code_line("for (int row = 0; row < 6; ++row) s_Sw[c*6 + row] = s_sgn * s_oXi[jid*36 + s_row*6 + row];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 

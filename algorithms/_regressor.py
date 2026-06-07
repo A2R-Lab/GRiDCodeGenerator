@@ -236,6 +236,18 @@ def gen_inverse_dynamics_regressor_inner(self):
                         self.gen_add_code_line(
                             "s_Y[" + str(fidx) + "*" + str(10 * NB) + " + col] += " +
                             scale_pref + sgn_pref + "f[" + str(int(row)) + "];")
+            elif not self.robot.S_is_cardinal_by_id(j):
+                # Tier B (skew): project f onto the dense S column: Y[fidx,col] +=
+                # scale * (S^T f) = scale * sum_r S[r]*f[r].
+                fidx = self.robot.get_joint_index_f(j)
+                if isinstance(fidx, (list, tuple)):
+                    fidx = fidx[0]
+                S_vec = self.robot._get_flat_S_by_id(j)
+                terms = [("static_cast<T>(" + repr(float(S_vec[r]) * scale) + ") * f[" + str(r) + "]")
+                         for r in range(6) if S_vec[r] != 0.0]
+                self.gen_add_code_line(
+                    "s_Y[" + str(fidx) + "*" + str(10 * NB) + " + col] += " +
+                    (" + ".join(terms) if terms else "static_cast<T>(0)") + ";")
             else:
                 s_ind = self.robot.get_S_index_by_id(j)
                 s_sign = self.robot.get_S_sign_by_id(j)

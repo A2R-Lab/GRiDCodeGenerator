@@ -1,3 +1,9 @@
+def _idg_Svec_cpp(S_vec):
+    """C++ brace-init for a dense 6-vector motion subspace column (Tier-B skew
+    emit in the dense serial ID-gradient inner)."""
+    return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in S_vec) + "}"
+
+
 def _emit_fb_bfs_level_indexing(self, inds, n, dq_flag_line = None):
     """Emit the shared floating-base per-BFS-level index decode used by the
     dv/du, da/du and df/du sweeps, and return the (jid_cpp, parent_jid_cpp)
@@ -33,11 +39,11 @@ def _emit_fb_bfs_level_indexing(self, inds, n, dq_flag_line = None):
     return inds[0], self.robot.get_parent_id(inds[0])
 
 def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
-        if self.robot_has_mimic_joints():
-            # The mimic path emits a DENSE serial fold (6 dense per-body buffers
-            # + Iv) rather than the sparse-compressed band, so it needs its own
-            # (larger) scratch. Big-NB humanoids route this whole pool to
-            # d_workspace at the global-temp tier (SCRATCH_IN_SMEM=false).
+        if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis():
+            # The mimic AND skew (Tier-B) paths emit the DENSE serial fold (6 dense
+            # per-body buffers + Iv) rather than the sparse-compressed band, so they
+            # need its own (larger) scratch. Big-NB humanoids route this whole pool
+            # to d_workspace at the global-temp tier (SCRATCH_IN_SMEM=false).
             return _inverse_dynamics_gradient_mimic_temp_count(self)
         return self.gen_inverse_dynamics_gradient_temp_layout()["full_count"]
 
@@ -158,11 +164,17 @@ def gen_inverse_dynamics_gradient_inner(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    if self.robot_has_mimic_joints():
+    if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis():
         # MIMIC (T3-finisher P3): the sparse NJ-indexed gradient assembly below
         # writes s_dc_du by raw body id and assumes NJ == NV, so it can't fold a
         # mimic model (NB > NV, shared v-slots). Emit instead a DENSE serial
         # reduced-space fold that mirrors RBDReference.rnea_grad exactly:
+        #
+        # SKEW (Tier B): the same dense serial inner ALSO carries the general
+        # motion-subspace (skew) case — the scalar (s_ind, s_sign) sites below
+        # switch to a dense 6-vector S (mxS_general / S^T dot) per body when the
+        # body is non-cardinal. Cardinal+non-mimic robots never enter here, so
+        # their byte-identical sparse path is untouched.
         # alpha-scaled velocity/accel reads in the forward pass + per-body
         # v-slot accumulate (+=) in the backward pass. Correctness, not perf, is
         # the goal here (mimic robots are the gripper/hand class). The large
@@ -1116,7 +1128,7 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
     # ignores d_temp_spill and reads the whole dense pool from s_temp/workspace).
     _selective_shared = (
         self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-        if self.robot_has_mimic_joints()
+        if (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
         else self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
     )
     shared_mem_size = 0 if use_global_temp else (
@@ -1393,8 +1405,12 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         # (alpha == 1). Non-root bodies stay on the proven scalar path.
         is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
+        is_skew = (not is_float_root) and (not self.robot.S_is_cardinal_by_id(ind))
+        S_vec = None if is_float_root else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
         if is_float_root:
             idx = None; s_ind = None; s_sign = None
+        elif is_skew:
+            idx = self._v_slot_cpp(ind); s_ind = None; s_sign = None
         else:
             idx = self._v_slot_cpp(ind)
             s_ind = self.robot.get_S_index_by_id(ind)
@@ -1460,7 +1476,10 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]. mxS(S,.) carries the
             # joint sign (S = s_sign*e_{s_ind}); mx<ind>_peq_scaled only applies
             # the UNIT-axis column, so fold s_sign into the scale (alpha*s_sign).
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+            if is_skew:
+                self.gen_add_code_line("{ const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + "; mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, S_skew, static_cast<T>(" + repr(alpha) + ")); }")
+            else:
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # dv_dq[:,idx] now visible to the da += mxS(dv) reader below
 
@@ -1521,7 +1540,10 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             # Single reduced-column (idx) fold -> ONE lane (bit-exact accumulate).
             self.gen_add_serial_ops()
             self.gen_add_code_line("// dv_dqd[:,idx] += alpha*S (all bodies incl. root)")
-            self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
+            if is_skew:
+                self.gen_add_code_line("{ const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + "; for (int r = 0; r < 6; r++) s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + r] += static_cast<T>(" + repr(alpha) + ") * S_skew[r]; }")
+            else:
+                self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(idx) + " + " + str(s_ind) + "] += static_cast<T>(" + repr(alpha * s_sign) + ");")
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # dv_dqd[:,idx] visible to the da += mxS(dv_dqd) reader below
 
@@ -1531,8 +1553,13 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             self.gen_add_code_line("// da_du[:,c] += mxS(S, dv_du[:,c], alpha*qd[idx])")
             self.gen_add_parallel_loop("c", str(nv))
             self.gen_add_code_line("T qd_a = static_cast<T>(" + repr(alpha) + ") * s_qd[" + str(idx) + "];")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+            if is_skew:
+                self.gen_add_code_line("{ const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + ";")
+                self.gen_add_code_line("  mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], S_skew, qd_a);")
+                self.gen_add_code_line("  mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], S_skew, qd_a); }")
+            else:
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], static_cast<T>(" + repr(s_sign) + ") * qd_a);")
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # all da cols before the single-column (idx) da folds below
 
@@ -1542,19 +1569,30 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             self.gen_add_serial_ops()
             self.gen_add_code_line("T s_mtmp[6];")
             self.gen_add_code_line("// da_dq[:,idx] += alpha*mxS(S, X*a_parent); da_dqd[:,idx] += alpha*mxS(S, v[ind])")
+            if is_skew:
+                self.gen_add_code_line("const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + ";")
             if parent != -1:
                 self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
                 self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
-                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+                if is_skew:
+                    self.gen_add_code_line("mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, S_skew, static_cast<T>(" + repr(alpha) + "));")
+                else:
+                    self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
             else:
                 # fixed-base root: the base's accel is PURE gravity (NOT the body's
                 # own a, which also carries S*qdd when use_qdd_input — that would
                 # corrupt forward_dynamics_gradient). X*gravity is column 5 of X scaled by `gravity`:
                 #   (X*gravity)[r] = s_XImats[36*root + 30 + r] * gravity (col5=+30).
                 self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = -s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
-                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
+                if is_skew:
+                    self.gen_add_code_line("mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, S_skew, static_cast<T>(" + repr(alpha) + "));")
+                else:
+                    self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
             # da_dqd[:,idx,ind] += alpha*mxS(S, v[ind])
-            self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
+            if is_skew:
+                self.gen_add_code_line("mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], S_skew, static_cast<T>(" + repr(alpha) + "));")
+            else:
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(idx) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(alpha * s_sign) + "));")
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # all da cols (incl col idx) before df reads them
 
@@ -1601,8 +1639,12 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         parent = self.robot.get_parent_id(ind)
         is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
+        is_skew = (not is_float_root) and (not self.robot.S_is_cardinal_by_id(ind))
+        S_vec = None if is_float_root else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
         if is_float_root:
             idx = None; s_ind = None; s_sign = None
+        elif is_skew:
+            idx = self._v_slot_cpp(ind); s_ind = None; s_sign = None
         else:
             idx = self._v_slot_cpp(ind)
             s_ind = self.robot.get_S_index_by_id(ind)
@@ -1630,10 +1672,17 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         # dc_dqd[idx, c] += alpha * s_sign * df_dqd[s_ind, c, ind]
         # WIN B: one lane per gradient column c. Each c writes a distinct dc_du
         # entry; the cross-body accumulate at row idx is serialized by the walk.
-        coeff = alpha * s_sign
         self.gen_add_parallel_loop("c", str(nv))
-        self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
-        self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
+        if is_skew:
+            # dc[idx,c] += alpha * S^T df[:,c] = alpha * sum_r S[r]*df[r,c]
+            dq_terms = " + ".join("static_cast<T>(" + repr(alpha * S_vec[r]) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(r) + "]" for r in range(6) if S_vec[r] != 0.0)
+            qd_terms = " + ".join("static_cast<T>(" + repr(alpha * S_vec[r]) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(r) + "]" for r in range(6) if S_vec[r] != 0.0)
+            self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(idx) + "] += " + (dq_terms if dq_terms else "static_cast<T>(0)") + ";")
+            self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(idx) + "] += " + (qd_terms if qd_terms else "static_cast<T>(0)") + ";")
+        else:
+            coeff = alpha * s_sign
+            self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
+            self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(idx) + "] += static_cast<T>(" + repr(coeff) + ") * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(s_ind) + "];")
         self.gen_add_end_control_flow()
         if parent != -1:
             self.gen_add_sync()  # dc_du fold reads df[ind]; df[parent] += below must wait
@@ -1642,8 +1691,11 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             # fxS(S, f) = Fx(S)*f = fx_times_v(S, f); S = s_sign*e_{s_ind}
             self.gen_add_serial_ops()
             self.gen_add_code_line("T s_fxs[6]; T s_xtfxs[6]; T s_Svec[6];")
-            self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
-            self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
+            if is_skew:
+                self.gen_add_code_line("{ const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + "; for (int r = 0; r < 6; r++) s_Svec[r] = S_skew[r]; }")
+            else:
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
+                self.gen_add_code_line("s_Svec[" + str(s_ind) + "] = static_cast<T>(" + repr(s_sign) + ");")
             self.gen_add_code_line("fx_times_v<T>(s_fxs, s_Svec, &s_vaf[" + str(f_ind) + "]);")
             # X^T * s_fxs : (X^T)[r,p] = X[p,r] = s_XImats[Xoff + p + 6*r]
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_xtfxs[r] = static_cast<T>(0);")

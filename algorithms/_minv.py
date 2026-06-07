@@ -1,3 +1,9 @@
+def _minv_Svec_cpp(robot, jid):
+    """C++ brace-init for body ``jid``'s dense 6-vector motion subspace (Tier-B
+    skew emit)."""
+    return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in robot._get_flat_S_by_id(jid)) + "}"
+
+
 def gen_minv_inner_F_size(self):
     """Size of the F-region buffer used by minv_inner (6 * NV * NV
     floats). Phase 3a splits this out as a separate `s_F` parameter so
@@ -180,7 +186,11 @@ def gen_minv_inner(self):
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
         parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
-        S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
+        # Tier-B (skew) levels consume the dense S directly; the signed-index
+        # S_sign helper raises on a skew joint, so only query it for cardinal
+        # levels (cardinal robots unchanged -> byte-identical).
+        level_has_skew_bwd = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+        S_sign_cpp = None if level_has_skew_bwd else self.gen_topology_S_sign_for_cpp(inds)
         ind_subtree_inds = []
         subree_counts = []
         for ind in inds:
@@ -207,6 +217,20 @@ def gen_minv_inner(self):
             self.gen_add_sync()
 
 
+        elif any(not self.robot.S_is_cardinal_by_id(j) for j in inds):
+            # Tier B (skew, fixed-base): U = IA*S_dense; D = S^T U; Dinv = 1/D;
+            # Minv[i,i] = Dinv. Single-ind serial emit (skew arms are serial).
+            assert len(inds) == 1, "Tier-B minv backward emit assumes a single-ind level"
+            jid = inds[0]; jid6 = 6 * jid
+            Svec = _minv_Svec_cpp(self.robot, jid)
+            self.gen_add_code_line("// U = IA*S, D = S^T*U, DInv = 1/D, Minv[i,i] = Dinv (Tier-B dense S)")
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("{ const T S_skew[6] = " + Svec + ";")
+            self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[" + str(IAOffset) + " + 6*" + str(jid6) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(UOffset) + " + " + str(jid6) + " + r] = acc; }")
+            self.gen_add_code_line("  s_temp[" + str(DinvOffset) + " + " + str(jid) + "] = static_cast<T>(1)/dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(UOffset) + " + " + str(jid6) + "]);")
+            self.gen_add_code_line("  s_Minv[" + str(n + 1) + " * " + str(jid) + "] = s_temp[" + str(DinvOffset) + " + " + str(jid) + "]; }")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
         else:
             # U = Scol of IA then D = Srow of U then note that DInv = 1/D, Minv[i,i] = Dinv
             self.gen_add_code_line("// U = IA*S, D = S^T*U, DInv = 1/D, Minv[i,i] = Dinv")
@@ -288,8 +312,18 @@ def gen_minv_inner(self):
                     jid_subtree6 = str(subId*6)
                     jid_subtreeN = str(subId*n)
 
-            self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + \
-                                                    "(" + S_sign_cpp + ") * s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
+            level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+            if level_has_skew:
+                # Tier B (skew): the S^T*F[:,col] projection is a dense dot over
+                # the 6 rows of the F column (single-ind level).
+                assert len(inds) == 1, "Tier-B minv F-subtree emit assumes a single-ind level"
+                Svec = _minv_Svec_cpp(self.robot, inds[0])
+                self.gen_add_code_line("const T S_skew[6] = " + Svec + ";")
+                S_proj = "dot_prod<T,6,1,1>(S_skew, &s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + "])"
+                self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + S_proj + ";")
+            else:
+                self.gen_add_code_line("s_Minv[" + jid_subtreeN + " + " + dof_id + "] -= s_temp[" + str(DinvOffset) + " + " + jid + "] * " + \
+                                                        "(" + S_sign_cpp + ") * s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + " + S_ind_cpp + "];")
             if bfs_level != 0:
                 self.gen_add_code_line("for(int row = 0; row < 6; row++) {", True)
                 self.gen_add_code_line("s_F[" + str(FOffset) + " + " + str(n*6) + "*" + dof_id + " + " + jid_subtree6 + " + row] += " + \
@@ -470,9 +504,15 @@ def gen_minv_inner(self):
         jid_cols = list(range(jid,NJ))
         dof_cols = list(range(jid,n))
 
+        jid_is_skew = not (self.robot.floating_base and jid == 0) and not self.robot.S_is_cardinal_by_id(jid)
         if self.robot.floating_base and jid == 0:
             SInd = '-1'
             SSign = '1'
+        elif jid_is_skew:
+            # Tier B (skew): no signed unit index; the F writeback below uses the
+            # dense S column directly (S_skew_fwd) instead of (row==SInd)*SSign.
+            SInd = None
+            SSign = None
         else:
             SInd = str(self.robot.get_S_index_by_id(jid))
             SSign = str(self.robot.get_S_sign_by_id(jid))
@@ -510,7 +550,12 @@ def gen_minv_inner(self):
                                    "s_temp[" + str(DinvOffset + jid) + "] * " + \
                                    "dot_prod<T,6,1,1>(s_Fcol,&s_temp[" + str(UOffset + 6*jid) + "]);")
             if jid < n-1: # skip redundant comp on last loop
-                self.gen_add_code_line("s_Fcol[" + SInd + "] += (" + SSign + ") * s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "];")
+                if jid_is_skew:
+                    # Tier B: F[:,col] += S_dense * Minv[i,col] (dense column add)
+                    Svec = _minv_Svec_cpp(self.robot, jid)
+                    self.gen_add_code_line("{ const T S_skew_fwd[6] = " + Svec + "; for (int r = 0; r < 6; r++) { s_Fcol[r] += S_skew_fwd[r] * s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "]; } }")
+                else:
+                    self.gen_add_code_line("s_Fcol[" + SInd + "] += (" + SSign + ") * s_Minv[" + str(n) + " * col_ind + " + str(dof_id) + "];")
             if diag_offset > 0:
                 self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
@@ -532,6 +577,11 @@ def gen_minv_inner(self):
             self.gen_add_parallel_loop("ind",str(6*len(dof_cols)))
             self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
             if self.robot.floating_base: self.gen_add_code_line(f"s_F[ind] = s_Minv[row + {n} * col];") # update F[0] (Phase 3a: F is in s_F)
+            elif jid_is_skew:
+                # Tier B: F[row,col] = S_dense[row] * Minv[i,col]
+                Svec = _minv_Svec_cpp(self.robot, jid)
+                self.gen_add_code_line("const T S_skew[6] = " + Svec + ";")
+                self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = S_skew[row] * s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
             else:
                 self.gen_add_code_line("s_F[" + str(FOffset + 6*n*jid + 6*jid) + " + ind] = (row == " + SInd + ") * " + \
                                             "(" + SSign + ") * s_Minv[" + str(n*jid + jid) + " + " + str(n) + " * col];")
