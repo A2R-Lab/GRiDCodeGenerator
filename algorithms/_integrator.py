@@ -731,12 +731,46 @@ def _emit_integrator_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_ca
             self.gen_add_code_line("T *int_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
+        # mjx input convert (RETRACT family): reorder ONLY the input base
+        # quaternion wxyz->xyzw so the kernel's SE(3) quaternion integration
+        # (grid_integrate_floating_q reads/writes xyzw) and XImats X[0] are
+        # built correctly. Do NOT convert qd: the mjx retract needs the RAW mjx
+        # GLOBAL base-linear velocity qd[0:3], and the quaternion integration
+        # uses qd[3:6] (angular, frame-shared) -> qd stays raw mjx. Must precede
+        # the XImats build below.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_integrator_inner_function_call(integrator_type="IT",
             updated_var_names=(dict(d_workspace_name="int_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr=minv_f_expr)
         self.gen_add_sync()
+        # mjx output (RETRACT): the kernel integrated q in the PIN convention
+        # (SE(3) V(phi) base-position coupling, which is O(dt^2) wrong for mjx).
+        # OVERWRITE the base-linear position of s_x_kp1 with the mjx GLOBAL
+        # additive step  s_q[0:3] + dt*s_qd[0:3]  (s_q still holds the ORIGINAL
+        # pre-integration base position -- the kernel integrates OUT-of-place
+        # into the separate s_x_kp1 buffer; s_qd[0:3] is the raw mjx global
+        # base-linear velocity). The quaternion + joints the kernel computed are
+        # kept. Then convert the output base quaternion xyzw->wxyz back to mjx
+        # order: gen_mjx_quat_reorder is a cyclic LEFT-rotate of slots[3..6]
+        # (wxyz->xyzw), NOT an involution, so the inverse (xyzw->wxyz) is the
+        # cyclic RIGHT-rotate emitted inline here.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_retract("s_x_kp1", "s_q", "s_qd", "dt")
+            self.gen_add_code_lines([
+                "// mjx output: base quaternion xyzw->wxyz (inverse of input reorder)",
+                "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+                "T qw_out = s_x_kp1[6];",
+                "s_x_kp1[6] = s_x_kp1[5]; s_x_kp1[5] = s_x_kp1[4]; s_x_kp1[4] = s_x_kp1[3]; s_x_kp1[3] = qw_out;",
+            ])
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("x_kp1",str(out_count),stride=str(out_count))
         self.gen_add_end_control_flow()
     else:
@@ -775,7 +809,14 @@ def gen_integrator_kernel(self, single_call_timing=False):
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes a single integrator step per timestep (Euler by default)",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,IT,TIER> call sites are
+    # unaffected; default false if-constexpr-elides the mjx retract epilogue ->
+    # byte-identical PTX on the pin path.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (the PERF cap), NOT tier_max_threads:
     # the integrator is register-bound by its RBD callees (load_update_XImats ~86,
@@ -813,15 +854,23 @@ def gen_integrator_host(self, mode=0):
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Run a single integrator step (default Euler) per timestep",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel
+    # launch (naming IT + the tier positionally to reach the trailing flag).
+    # Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"integrator requires all-data or dynamics gridData\");")
-    func_call_start = "integrator_kernel<T, IT><<<block_dimms,thread_dimms,INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_x_kp1,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    integrator_kernel_tmpl = "integrator_kernel<T, IT, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "integrator_kernel<T, IT>"
+    func_call_start = integrator_kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_x_kp1,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T, IT>", "kernel_single_timing<T, IT>")
+        func_call_start = func_call_start.replace("integrator_kernel<", "integrator_kernel_single_timing<")
     self.gen_add_code_line("int stride_q_qd_u = 3*NUM_JOINTS;")
     if not compute_only:
         self.gen_add_code_lines([
