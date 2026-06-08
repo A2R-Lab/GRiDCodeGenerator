@@ -708,6 +708,12 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
             self.gen_add_code_line("s_temp = crba_d_workspace;")
         else:
             self.gen_add_code_line("(void)d_workspace;")
+        # mjx input convert (quaternion only -> the congruence epilogue's R; M(q)
+        # is base-orientation-independent so no qd/accel convert is needed).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         # compute
         # A.3 surgical lever: skip the floating-base X[0] recompute on every
         # CRBA call (see gen_crba_device for the trace argument).
@@ -717,6 +723,11 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
             updated_var_names = (dict(d_workspace_name = "crba_d_workspace") if use_workspace_temp else None),
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"))
         self.gen_add_sync()
+        # mjx output: mass matrix is a congruence G M G^T (base rows then base cols)
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_congruence("s_M", nv)
+            self.gen_add_end_control_flow()
         # save to global  (stride = nv*nv per timestep — without this, batches
         # overlap since each block writes nv*nv elements starting at offset k*1)
         self.gen_kernel_save_result("M",str(nv*nv),stride=str(nv*nv))
@@ -769,7 +780,13 @@ def gen_crba_kernel(self, single_call_timing = False):
     # then generate the code
     self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)", \
                             func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -806,15 +823,23 @@ def gen_crba_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the CRBA (Composite Rigid Body Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"crba requires all-data or dynamics gridData\");")
-    func_call_start = "crba_kernel<T><<<block_dimms,thread_dimms,CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_M,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
+    crba_kernel_tmpl = "crba_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "crba_kernel<T>"
+    func_call_start = crba_kernel_tmpl + "<<<block_dimms,thread_dimms,CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_M,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("crba_kernel<","crba_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \

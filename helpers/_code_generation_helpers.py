@@ -294,6 +294,25 @@ def gen_mjx_input_convert(self, q_name="s_q", qd_name="s_qd", qdd_name=None, u_n
     self.gen_add_sync()
 
 
+def gen_mjx_quat_reorder(self, q_name="s_q"):
+    """Reorder ONLY the base quaternion mjx wxyz (scalar-first) -> pin xyzw
+    (scalar-last) in place at ``q_name[3..6]``, then sync. This is the q-only
+    subset of :func:`gen_mjx_input_convert` (no velocity/accel/force conversion) for
+    functions that read just ``q`` (crba, minv, com, end_effector_pose,
+    generalized_gravity): the value is base-orientation-independent in body frame,
+    so only the OUTPUT epilogue's R (built from the xyzw quaternion) needs it.
+    Emitted right after `gen_kernel_load_inputs` + sync, BEFORE the XImats build so
+    a non-`skip_floating_base_X` kernel builds X[0] from the correct quaternion."""
+    self.gen_add_code_lines([
+        "// mjx input convert: base quaternion wxyz->xyzw (q-only; value frame-independent)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        f"T qw_in = {q_name}[3];",
+        f"{q_name}[3] = {q_name}[4]; {q_name}[4] = {q_name}[5]; {q_name}[5] = {q_name}[6]; {q_name}[6] = qw_in;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_mjx_base_rotate(self, buf, q_name="s_q"):
     """Covector/contravector OUTPUT row map ``out[0:3] = R out[0:3]`` (the
     ``base_rotate`` family: generalized_gravity, inverse_dynamics tau, and -- via
