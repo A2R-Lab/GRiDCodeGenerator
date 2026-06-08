@@ -481,7 +481,13 @@ def gen_cmm_time_variation_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute cmm_time_variation (Adot) per timestep", [], [], None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogues -> byte-identical pin PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -506,9 +512,26 @@ def gen_cmm_time_variation_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
 
     def _compute():
+        # mjx INPUT convert (floating only): reorder the base quaternion wxyz->xyzw
+        # (so XmatsHom builds X[0] correctly + the output R reads xyzw) and convert
+        # the base-linear velocity to the pin frame (Adot = dA/dt depends on qd via
+        # the contraction sum_m (dA/dq_m) qd_m, so qd must be pin-framed before the
+        # inner). Emitted BEFORE the XmatsHom build.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd")
+            self.gen_add_end_control_flow()
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("cmm_time_variation_inner<T>(s_out, s_A, s_com, s_extra, s_q, s_qd, s_XmatsHom, d_robotModel, s_temp, s_J, s_linalg_smem);")
         self.gen_add_sync()
+        # mjx OUTPUT: Adot (6 x NV col-major at s_out) column-reframes Adot . G^{-1}
+        # (base-linear cols . R^T); hdot = Adot qd + A qddot is invariant (the qd
+        # input was already pin-converted above so the contraction is correct). R
+        # reads the already-reordered xyzw quaternion in s_q.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_column_reframe("s_out", 6, nv)
+            self.gen_add_end_control_flow()
 
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
@@ -547,12 +570,23 @@ def gen_cmm_time_variation_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute cmm_time_variation (Adot)", [], [], None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # naming the tier positionally (<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>) to
+    # reach the trailing flag. Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"cmm_time_variation requires all-data or kinematics gridData\");")
-    kname = "cmm_time_variation_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+    if mjx_host:
+        ktmpl = "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
+        kname = "cmm_time_variation_kernel" + ("_single_timing" if single_call_timing else "") + ktmpl
+    else:
+        kname = "cmm_time_variation_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_cmm_time_variation,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,d_robotModel,num_timesteps);")
     if not compute_only:
         self.gen_add_code_lines([
