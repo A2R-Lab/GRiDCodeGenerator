@@ -1013,13 +1013,17 @@ def gen_inverse_dynamics_gradient_device_function_call(self,
                                                            use_da_df_spill_expr = "false",
                                                            d_workspace_pool_name = "nullptr",
                                                            d_temp_spill_name = "nullptr",
-                                                           d_f_ext_name = "d_f_ext"):
+                                                           d_f_ext_name = "d_f_ext",
+                                                           mujoco_output_expr = None):
     """Emit the call to `inverse_dynamics_gradient_device`. Arg order MUST
     match the def in gen_inverse_dynamics_gradient_device. Pool/spill regions
     default to nullptr (unused under the matching if-constexpr); the kernel passes
-    real pointers per tier. The _qdd C++ name variant additionally threads s_qdd."""
+    real pointers per tier. The _qdd C++ name variant additionally threads s_qdd.
+    `mujoco_output_expr` (floating only) appends the trailing MUJOCO_OUTPUT template
+    arg; None keeps the legacy 3-arg template (byte-identical for non-mjx call sites)."""
     fname = "inverse_dynamics_gradient_device_qdd" if use_qdd_input else "inverse_dynamics_gradient_device"
-    tmpl = "<T, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + ">"
+    tmpl = "<T, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + \
+           ((", " + mujoco_output_expr) if mujoco_output_expr is not None else "") + ">"
     start = fname + tmpl + "(s_dc_du, s_q, s_qd, s_vaf, "
     if use_qdd_input:
         start += "s_qdd, "
@@ -1027,6 +1031,196 @@ def gen_inverse_dynamics_gradient_device_function_call(self,
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
            + "d_robotModel, " + d_f_ext_name + ", gravity);")
     self.gen_add_code_line(start + middle + end)
+
+def _emit_inverse_dynamics_gradient_mjx_output(self, use_qdd_input):
+    """Emit the MuJoCo (mjx) output-convention epilogue for the id-gradient, in
+    place on ``s_dc_du`` (2*nv*nv col-major: dc_dq at [0,nv*nv), dc_dqd at
+    [nv*nv,2*nv*nv); element [row,col] -> [col*nv + row]). Floating-base only.
+
+    This runs INSIDE inverse_dynamics_gradient_device, AFTER the gradient inner
+    call, where ``s_XImats`` and ``s_vaf`` are still live (the kernel body has no
+    access to s_XImats — it is built inside this device fn). The gradient inner's
+    ``s_temp`` pool is DEAD here, so we carve it as [M | crba-scratch | assembly]
+    with NO smem growth: crba_inner writes the full nv x nv generalized mass
+    matrix M into the head of s_temp (same [lin;ang;joints] ordering the recipe
+    needs — validated by the mjx-crba congruence test), using the tail of s_temp
+    as its own working scratch. s_temp is whatever pool SCRATCH_IN_SMEM selected
+    (smem or d_workspace), so this is tier-agnostic.
+
+    The exact linear transform recipe (validated to 5.7e-14 vs id_gradient_pin_to
+    _mjx — see /tmp/proto_idgrad_mjx_cindex.py) is reproduced op-for-op below.
+    Sources: R from the (already xyzw-reordered) base quaternion s_q[3..6];
+    v_lin=s_qd[0:3], omega=s_qd[3:6]; qdd_lin=s_qdd[0:3] (or 0 in the qdd=0 bias
+    case); tau_lin = LINEAR part of base wrench f[0] = s_vaf[12*nv+3 : 12*nv+6]
+    (GRiD spatial vectors are [angular(0:3); linear(3:6)])."""
+    nv = self.robot.get_num_vel()
+    DQ = 0
+    DQD = nv * nv
+    # Dead gradient pool layout: [ M (nv*nv) | crba working scratch ].
+    M_off = 0
+    crba_scr_off = M_off + nv * nv
+    self.gen_add_code_line("// === mjx output convention (floating-base id-gradient) ===")
+    # 1) Mass matrix via crba_inner. crba reads the live s_XImats and writes M
+    #    (nv x nv col-major, generalized [lin;ang;joints] ordering); we only need
+    #    M[:,0:3] but compute the full M (correctness-first). crba's scratch is the
+    #    tail of the dead pool; SCRATCH_IN_SMEM matches the surrounding pool.
+    self.gen_add_code_line("// build the generalized mass matrix M into the (dead) gradient pool via crba_inner")
+    self.gen_crba_inner_function_call(
+        updated_var_names = dict(
+            s_M_name = "(s_temp + " + str(M_off) + ")",
+            s_temp_name = "(s_temp + " + str(crba_scr_off) + ")",
+            d_workspace_name = "nullptr"),
+        temp_in_smem_expr = "SCRATCH_IN_SMEM")
+    self.gen_add_sync()
+    # 2) The assembly itself — single thread (register-cheap; nv small). Mirrors
+    #    the validated op order: dq column_reframe -> dq couplings -> dq base_rotate
+    #    rows -> dq pref ; dqd column_reframe -> dqd couplings -> dqd base_rotate rows.
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    # Build R (row-major R[3*i+j]) from the xyzw base quaternion (s_q already
+    # reordered by the input epilogue) — mirrors mujoco_convention.rotation_from
+    # _quat_xyzw / the _gen_mjx_build_R_lines helper exactly.
+    self.gen_add_code_lines([
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+    ])
+    self.gen_add_code_lines([
+        "T *s_M = s_temp + " + str(M_off) + ";",
+        # sources
+        "T v_lin[3] = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T omega[3] = {s_qd[3], s_qd[4], s_qd[5]};",
+        ("T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};" if use_qdd_input
+         else "T qdd_lin[3] = {static_cast<T>(0), static_cast<T>(0), static_cast<T>(0)};"),
+        # tau_lin = base-linear generalized force tau[0:3] = the value f[0] linear part
+        # (spatial [ang;lin], s_vaf[12*nv+3..5]) CAPTURED into mjx_tau_lin* BEFORE the
+        # gradient inner ran (it overwrites the s_vaf f-band with df, so reading s_vaf
+        # here would give the gradient, not the value — see gen_..._device capture).
+        "T tau_lin[3] = {mjx_tau_lin0, mjx_tau_lin1, mjx_tau_lin2};",
+        # cross-product helper expressed inline below via explicit components
+    ])
+    # Helper-free inline emit. We index s_dc_du as flat col-major.
+    def cell(base, r, c):
+        return "s_dc_du[" + str(base) + " + (" + str(c) + ")*" + str(nv) + " + (" + str(r) + ")]"
+    # ---- dc_dq half ----
+    self.gen_add_code_line("// dc_dq: column_reframe cols 0:3 <- cols . R^T")
+    self.gen_add_code_line("for (int r = 0; r < " + str(nv) + "; r++) {", True)
+    self.gen_add_code_lines([
+        "T c0 = s_dc_du[" + str(DQ) + " + 0*" + str(nv) + " + r], c1 = s_dc_du[" + str(DQ) + " + 1*" + str(nv) + " + r], c2 = s_dc_du[" + str(DQ) + " + 2*" + str(nv) + " + r];",
+        "s_dc_du[" + str(DQ) + " + 0*" + str(nv) + " + r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "s_dc_du[" + str(DQ) + " + 1*" + str(nv) + " + r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "s_dc_du[" + str(DQ) + " + 2*" + str(nv) + " + r] = c0*R[6] + c1*R[7] + c2*R[8];",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// dc_dq: base-velocity couplings into angular cols 3+a (all rows)")
+    self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
+    self.gen_add_code_lines([
+        # e_a x w  for a basis vector e_a:  (e x w)[i] = sum_jk eps_ijk e_a_j w_k
+        # = derivative columns of the unit-axis cross product.  We form jv and ja.
+        "T jv[3], ja[3];",
+        # e_a x w (basis-vector cross): [0]=(a==1)w2-(a==2)w1, [1]=-(a==0)w2+(a==2)w0,
+        #   [2]=(a==0)w1-(a==1)w0  (verified == numpy cross(e_a,w)).
+        # jv = -(e_a x v_lin)
+        "jv[0] = -((a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]));",
+        "jv[1] = -((a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]));",
+        "jv[2] = -((a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]));",
+        # ov = omega x v_lin
+        "T ov0 = omega[1]*v_lin[2] - omega[2]*v_lin[1];",
+        "T ov1 = omega[2]*v_lin[0] - omega[0]*v_lin[2];",
+        "T ov2 = omega[0]*v_lin[1] - omega[1]*v_lin[0];",
+        # ev = e_a x v_lin
+        "T ev0 = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",
+        "T ev1 = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "T ev2 = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        # ja = -(e_a x qdd_lin) - (e_a x ov) + (omega x ev)
+        "T eq0 = (a==1)*( qdd_lin[2]) + (a==2)*(-qdd_lin[1]);",
+        "T eq1 = (a==0)*(-qdd_lin[2]) + (a==2)*( qdd_lin[0]);",
+        "T eq2 = (a==0)*( qdd_lin[1]) + (a==1)*(-qdd_lin[0]);",
+        "T eov0 = (a==1)*( ov2) + (a==2)*(-ov1);",
+        "T eov1 = (a==0)*(-ov2) + (a==2)*( ov0);",
+        "T eov2 = (a==0)*( ov1) + (a==1)*(-ov0);",
+        "T oev0 = omega[1]*ev2 - omega[2]*ev1;",
+        "T oev1 = omega[2]*ev0 - omega[0]*ev2;",
+        "T oev2 = omega[0]*ev1 - omega[1]*ev0;",
+        "ja[0] = -eq0 - eov0 + oev0;",
+        "ja[1] = -eq1 - eov1 + oev1;",
+        "ja[2] = -eq2 - eov2 + oev2;",
+        # dc_dq[:,3+a] += dc_dqd[:,0:3] @ jv + M[:,0:3] @ ja   (all nv rows)
+        "for (int r = 0; r < " + str(nv) + "; r++) {", True,
+        "T acc = static_cast<T>(0);",
+        "for (int k = 0; k < 3; k++) { acc += s_dc_du[" + str(DQD) + " + k*" + str(nv) + " + r]*jv[k] + s_M[r + " + str(nv) + "*k]*ja[k]; }",
+        "s_dc_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + r] += acc;",
+    ])
+    self.gen_add_end_control_flow()  # for r
+    self.gen_add_end_control_flow()  # for a
+    self.gen_add_code_line("// dc_dq: base_rotate_rows rows 0:3 <- R . rows")
+    self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+    self.gen_add_code_lines([
+        "T m0 = s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 0], m1 = s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 1], m2 = s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 2];",
+        "s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
+        "s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
+        "s_dc_du[" + str(DQ) + " + c*" + str(nv) + " + 2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// dc_dq: pref  dq[0:3, 3+a] += R @ (e_a x tau_lin)")
+    self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
+    self.gen_add_code_lines([
+        "T et0 = (a==1)*( tau_lin[2]) + (a==2)*(-tau_lin[1]);",
+        "T et1 = (a==0)*(-tau_lin[2]) + (a==2)*( tau_lin[0]);",
+        "T et2 = (a==0)*( tau_lin[1]) + (a==1)*(-tau_lin[0]);",
+        "T w0 = R[0]*et0 + R[1]*et1 + R[2]*et2;",
+        "T w1 = R[3]*et0 + R[4]*et1 + R[5]*et2;",
+        "T w2 = R[6]*et0 + R[7]*et1 + R[8]*et2;",
+        "s_dc_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + 0] += w0;",
+        "s_dc_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + 1] += w1;",
+        "s_dc_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + 2] += w2;",
+    ])
+    self.gen_add_end_control_flow()  # for a
+    # ---- dc_dqd half ----
+    self.gen_add_code_line("// dc_dqd: column_reframe cols 0:3 <- cols . R^T")
+    self.gen_add_code_line("for (int r = 0; r < " + str(nv) + "; r++) {", True)
+    self.gen_add_code_lines([
+        "T c0 = s_dc_du[" + str(DQD) + " + 0*" + str(nv) + " + r], c1 = s_dc_du[" + str(DQD) + " + 1*" + str(nv) + " + r], c2 = s_dc_du[" + str(DQD) + " + 2*" + str(nv) + " + r];",
+        "s_dc_du[" + str(DQD) + " + 0*" + str(nv) + " + r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "s_dc_du[" + str(DQD) + " + 1*" + str(nv) + " + r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "s_dc_du[" + str(DQD) + " + 2*" + str(nv) + " + r] = c0*R[6] + c1*R[7] + c2*R[8];",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("// dc_dqd: couplings  col 0+a += M[:,0:3]@(-(omega x R^T e_a)) ; col 3+a += M[:,0:3]@(-(e_a x v_lin))")
+    self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
+    self.gen_add_code_lines([
+        # R^T e_a = column a of R^T = row a of R = (R[3a+0],R[3a+1],R[3a+2])
+        "T rte0 = R[3*a + 0], rte1 = R[3*a + 1], rte2 = R[3*a + 2];",
+        # jv_lin = -(omega x R^T e_a)
+        "T jl0 = -(omega[1]*rte2 - omega[2]*rte1);",
+        "T jl1 = -(omega[2]*rte0 - omega[0]*rte2);",
+        "T jl2 = -(omega[0]*rte1 - omega[1]*rte0);",
+        # jv_ang = -(e_a x v_lin)
+        "T jn0 = -((a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]));",
+        "T jn1 = -((a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]));",
+        "T jn2 = -((a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]));",
+        "for (int r = 0; r < " + str(nv) + "; r++) {", True,
+        "T mr0 = s_M[r + " + str(nv) + "*0], mr1 = s_M[r + " + str(nv) + "*1], mr2 = s_M[r + " + str(nv) + "*2];",
+        "s_dc_du[" + str(DQD) + " + (0+a)*" + str(nv) + " + r] += mr0*jl0 + mr1*jl1 + mr2*jl2;",
+        "s_dc_du[" + str(DQD) + " + (3+a)*" + str(nv) + " + r] += mr0*jn0 + mr1*jn1 + mr2*jn2;",
+    ])
+    self.gen_add_end_control_flow()  # for r
+    self.gen_add_end_control_flow()  # for a
+    self.gen_add_code_line("// dc_dqd: base_rotate_rows rows 0:3 <- R . rows")
+    self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+    self.gen_add_code_lines([
+        "T m0 = s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 0], m1 = s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 1], m2 = s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 2];",
+        "s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
+        "s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
+        "s_dc_du[" + str(DQD) + " + c*" + str(nv) + " + 2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_sync()
+
 
 def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     """Emit `inverse_dynamics_gradient_device` — the whole inverse_dynamics_gradient orchestration
@@ -1078,7 +1272,24 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     self.gen_add_func_doc("inverse_dynamics_gradient orchestration as a single inner-owns-placement device function",
                           ["Owns the s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch)"],
                           func_params, None)
-    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag. Added
+    # LAST so existing positional <T,SCRATCH,SPILL> call sites are unaffected; the
+    # default (false) instantiation if-constexpr-elides the epilogue -> byte-
+    # identical. The epilogue runs HERE (not in the kernel body) because it needs
+    # the live s_XImats (crba M) + s_vaf (tau) that only exist inside this fn.
+    mjx_device = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_device:
+        # Forward-declare crba_inner: the mjx epilogue reuses it to build M, but crba
+        # is emitted LATER in grid.cuh than this gradient. A declaration before the
+        # use resolves the ordering (the definition follows in the same translation
+        # unit). Gated on mjx_device so fixed-base headers stay byte-identical.
+        self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM>")
+        self.gen_add_code_line("__device__")
+        self.gen_add_code_line("void crba_inner(T *s_M, const T *s_q, const T *s_qd, T *s_XImats, int *s_topology_helpers, T *s_temp, T *d_workspace, const T gravity);  // fwd decl (default arg lives on the definition)")
+    if mjx_device:
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc a separate __device__ wrapper keeps its callees as distinct
     # functions whose regcount must fit the kernel's launch_bounds budget
@@ -1091,9 +1302,33 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
     self.gen_load_update_XImats_helpers_function_call()
     self.gen_inverse_dynamics_inner_function_call(False, use_qdd_input)
+    if mjx_device:
+        # CAPTURE the base-linear generalized force tau[0:3] = the VALUE f[0] linear
+        # part (s_vaf[12*nv+3..5]) NOW — the gradient inner below overwrites the s_vaf
+        # f-band with df (gradient), so the mjx pref term must use the captured value.
+        # Declared unconditionally (floating) so the registers persist into the
+        # epilogue; populated only in the mjx instantiation (if constexpr) -> the pin
+        # PTX is unchanged (unused-decl DCE).
+        # The f-band in the GRADIENT kernel is body-indexed at 12*NJ (NJ=num_joints=
+        # num_bodies for non-mimic), NOT 12*nv — the base wrench f[0] is at s_vaf[12*NJ
+        # : +6], spatial [ang;lin], so tau[0:3] (base-linear generalized force) = the
+        # LINEAR part f[0][3:6] = s_vaf[12*NJ+3 : 12*NJ+6].
+        _fb = 12 * self.robot.get_num_joints()
+        self.gen_add_code_line("T mjx_tau_lin0 = static_cast<T>(0), mjx_tau_lin1 = static_cast<T>(0), mjx_tau_lin2 = static_cast<T>(0);")
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_add_sync()
+        self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+        self.gen_add_code_line("mjx_tau_lin0 = s_vaf[" + str(_fb + 3) + "]; mjx_tau_lin1 = s_vaf[" + str(_fb + 4) + "]; mjx_tau_lin2 = s_vaf[" + str(_fb + 5) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
     self.gen_inverse_dynamics_gradient_inner_function_call(
         dict(d_temp_spill_name = "d_temp_spill", temp_spill_flag_name = "USE_DA_DF_SPILL")
     )
+    if mjx_device:
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        _emit_inverse_dynamics_gradient_mjx_output(self, use_qdd_input)
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 def gen_inverse_dynamics_gradient_kernel_max_temp_mem_size(self):
@@ -1113,8 +1348,11 @@ _INVERSE_DYNAMICS_GRADIENT_PICK_FLAGS = [
 ]
 
 def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_selective_spill, use_global_temp,
-                                      use_qdd_input, single_call_timing):
-    """Emit the inverse_dynamics_gradient kernel body for one tier's spill flags."""
+                                      use_qdd_input, single_call_timing, mjx_kernel = False):
+    """Emit the inverse_dynamics_gradient kernel body for one tier's spill flags.
+    `mjx_kernel` (floating + non-mimic/skew, with-qdd): emit the MUJOCO_OUTPUT
+    input-convert (before the device fn builds XImats) and forward the flag to the
+    device call (the output epilogue lives inside the device fn)."""
     # s_vaf is body-indexed (the ID inner writes NB bodies, stride 6). For a
     # MIMIC robot (fixed base) NB > nv, so size it 18*NB to avoid overflowing
     # into the adjacent arena buffers. Non-mimic keeps 18*n (byte-identical;
@@ -1144,6 +1382,13 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
             self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(NUM_POS))
         else:
             self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),stride="stride_q_qd")
+        # mjx input convert (before the device fn builds XImats so X[0] uses the
+        # reordered quaternion). Reorders the base quaternion + converts the base
+        # velocity/accel to the pin frame in place on s_q/s_qd/s_qdd.
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", qdd_name="s_qdd")
+            self.gen_add_end_control_flow()
         # The kernel only SLICES the workspace band pointers; the device owns
         # the s_temp pool placement (the whole-pool global-temp repoint is its
         # SCRATCH_IN_SMEM=false path). Per-rung flags are passed as literals.
@@ -1155,7 +1400,8 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             d_workspace_pool_name = ("reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()])" if use_global_temp else "nullptr"),
-            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
+            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"),
+            mujoco_output_expr = ("MUJOCO_OUTPUT" if mjx_kernel else None))
         self.gen_add_sync()
         self.gen_kernel_save_result("dc_du",str(n*2*n),stride=str(n*2*n))
         self.gen_add_end_control_flow()
@@ -1173,12 +1419,16 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
         else:
             self.gen_anti_licm_input_reload("q_qd",str(n + NUM_POS),feedback_from="dc_du")
         # device owns s_temp placement (whole-pool global path = SCRATCH_IN_SMEM=false).
+        # Single-timing forwards MUJOCO_OUTPUT (perf only; the input-convert is
+        # omitted here — the anti-LICM loop reloads raw inputs each rep, so a one-
+        # shot convert would not apply; correctness is validated via the full kernel).
         self.gen_inverse_dynamics_gradient_device_function_call(
             use_qdd_input,
             scratch_in_smem_expr = ("false" if use_global_temp else "true"),
             use_da_df_spill_expr = ("true" if use_selective_spill else "false"),
             d_workspace_pool_name = ("reinterpret_cast<T *>(d_workspace)" if use_global_temp else "nullptr"),
-            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
+            d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"),
+            mujoco_output_expr = ("MUJOCO_OUTPUT" if mjx_kernel else None))
         self.gen_anti_licm_output_write("dc_du")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("dc_du",str(n*2*n))
@@ -1206,7 +1456,17 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes the gradient of inverse dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating + non-mimic/skew, with-qdd kernel only): compile-time
+    # mjx output-convention flag. Added LAST after RESOURCE_TIER so existing
+    # positional <T,TIER> call sites are unaffected; default false -> the input
+    # convert + output epilogue if-constexpr-elide to byte-identical PTX. The
+    # qdd=0 (bias) kernel never carries it (mjx needs the with-qdd surface).
+    mjx_kernel = (self.robot.floating_base and use_qdd_input
+                  and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -1215,7 +1475,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
     picks = getattr(self, "inverse_dynamics_gradient_spill_tier_3way", (0, 0, 0))
     def _emit_inverse_dynamics_gradient_body(pick):
         uss, ugt = _INVERSE_DYNAMICS_GRADIENT_PICK_FLAGS[pick]
-        _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing)
+        _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, uss, ugt, use_qdd_input, single_call_timing, mjx_kernel)
     self.gen_tier_dispatch(picks, _emit_inverse_dynamics_gradient_body)
     self.gen_add_end_function()
 
@@ -1242,15 +1502,29 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating + non-mimic/skew) host template flag: forwarded ONLY
+    # to the with-qdd kernel launch (the mjx-capable overload). Added LAST so
+    # existing positional template args are unaffected; default false -> byte-
+    # identical. The qdd=0 launch never carries it (mjx needs the with-qdd surface).
+    mjx_host = (self.robot.floating_base
+                and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics_gradient requires all-data or dynamics gridData\");")
     func_call_start = "inverse_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dc_du,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
+    # the with-qdd launch is the mjx-capable overload: name the tier positionally
+    # to reach the trailing MUJOCO_OUTPUT flag.
+    qdd_kernel_tmpl = "inverse_dynamics_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_gradient_kernel<T>"
+    func_call_qdd_start = qdd_kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dc_du,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_qdd_start = func_call_qdd_start.replace("inverse_dynamics_gradient_kernel<","inverse_dynamics_gradient_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -1269,7 +1543,8 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     # then compute but adjust for compressed mem and qdd usage
     self.gen_add_code_line("// then call the kernel")
     func_call = func_call_start + func_call_end
-    func_call_with_qdd = func_call_start + "hd_data->d_qdd, " + func_call_end
+    # the with-qdd launch uses the mjx-capable template (func_call_qdd_start).
+    func_call_with_qdd = func_call_qdd_start + "hd_data->d_qdd, " + func_call_end
     # add in compressed mem adjusts
     func_call_mem_adjust = "    if (USE_COMPRESSED_MEM) {" + func_call + "}"
     func_call_mem_adjust2 = "    else                    {" + func_call.replace("hd_data->d_q_qd","hd_data->d_q_qd_u") + "}"

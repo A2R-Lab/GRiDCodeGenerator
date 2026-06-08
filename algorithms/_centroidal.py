@@ -86,7 +86,7 @@ def gen_id_bias_device(self, gravity_only):
         func_params=func_params, extra_t_buffers=extra, include_linalg_scratch=True)
 
 
-def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing):
+def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing, mjx_kernel=False):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     input_count = 2 * n
@@ -118,9 +118,22 @@ def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(input_count), stride="stride_q_qd")
+        # mjx input convert: q only (g depends on q; qd is zeroed internally so no qd
+        # convert). Reorder the base quaternion wxyz->xyzw BEFORE the XImats build so
+        # X[0] uses the correctly-ordered quaternion.
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder(q_name="s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         _compute()
         self.gen_add_sync()
+        # mjx output: g is a covector -> base-linear rows rotate by R (base_rotate).
+        # No omega x v term: gravity is evaluated at qd=0.
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_base_rotate("s_out")
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("out", str(nv), stride=str(nv))
         self.gen_add_end_control_flow()
     else:
@@ -141,12 +154,23 @@ def gen_id_bias_kernel(self, gravity_only, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute " + name + " (RNEA bias) per timestep", [], [], None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating-base generalized_gravity only): compile-time mjx
+    # output-convention flag. gravity is evaluated at qd=0 so there is NO omega x v
+    # acceleration coupling -- the transform is the trivial base_rotate (G.g): only
+    # the base-linear rows of the covector output g rotate by R. Added LAST so the
+    # existing positional <T,TIER> call sites are unaffected; the default (false)
+    # instantiation if-constexpr-elides the epilogue -> byte-identical PTX. Never
+    # emitted for nonlinear_effects (separate omega x v task) or fixed-base.
+    mjx_kernel = self.robot.floating_base and gravity_only
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
     self.gen_add_code_line("(void)d_workspace;")
-    _emit_id_bias_kernel_body(self, gravity_only, single_call_timing)
+    _emit_id_bias_kernel_body(self, gravity_only, single_call_timing, mjx_kernel)
     self.gen_add_end_function()
 
 
@@ -165,12 +189,21 @@ def gen_id_bias_host(self, gravity_only, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute " + name + " (RNEA bias)", [], [], None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating-base generalized_gravity only) host template flag:
+    # forwarded to the kernel launch. The kernel template is <T, RESOURCE_TIER, MUJOCO_OUTPUT>
+    # so the flag must be named positionally (tier defaulted explicitly). Added LAST so
+    # existing positional template args are unaffected; default false -> byte-identical.
+    mjx_host = self.robot.floating_base and gravity_only
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"" + name + " requires all-data or dynamics gridData\");")
-    kname = name + ("_kernel_single_timing<T>" if single_call_timing else "_kernel<T>")
+    kbase = name + ("_kernel_single_timing" if single_call_timing else "_kernel")
+    kname = (kbase + "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>") if mjx_host else (kbase + "<T>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_c,hd_data->d_workspace,"
                  "hd_data->d_q_qd,stride_q_qd,d_robotModel,gravity,num_timesteps);")
     if not compute_only:
