@@ -118,8 +118,19 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float"):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False):
         self.robot = robotObj
+        # MUJOCO_OUTPUT: when True AND the robot is floating-base, the generator
+        # additionally INSTANTIATES the `MUJOCO_OUTPUT=true` variant of every
+        # convention-sensitive floating kernel/host wrapper (the mjx output
+        # convention: quaternion wxyz + global base-linear velocity; see
+        # RBDReference/equivalents/mujoco_convention.py). The `template <..., bool
+        # MUJOCO_OUTPUT = false>` parameter and its `if constexpr` epilogue are
+        # ALWAYS emitted (so the default pin instantiation is byte-identical PTX);
+        # this flag only controls whether the extra `true` instantiation is also
+        # emitted, to avoid binary bloat on robots that never use mjx mode. No-op on
+        # a fixed base (the epilogue is gated out at Python time, flag is inert).
+        self.MUJOCO_OUTPUT = MUJOCO_OUTPUT and robotObj.floating_base
         # USE_JOINT_DYNAMICS: when True, the RNEA/FD value path emits the
         # joint-local <dynamics damping>/<dynamics friction> bias
         # (tau += damping*qd + friction*sign(qd)). DEFAULT False so the emitted

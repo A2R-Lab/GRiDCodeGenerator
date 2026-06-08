@@ -683,7 +683,14 @@ def gen_inverse_dynamics_kernel(self, use_qdd_input = False, single_call_timing 
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag. Added
+    # LAST so existing positional <T,TIER> call sites are unaffected; the default
+    # (false) instantiation if-constexpr-elides the epilogue -> byte-identical PTX.
+    mjx_kernel = self.robot.floating_base and use_qdd_input
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -704,11 +711,21 @@ def gen_inverse_dynamics_kernel(self, use_qdd_input = False, single_call_timing 
             self.gen_kernel_load_inputs("q_qd",str(2*n),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
         else:
             self.gen_kernel_load_inputs("q_qd",str(2*n),stride="stride_q_qd")
+        # mjx input convert (before XImats so X[0] uses the reordered quaternion)
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(qdd_name="s_qdd")
+            self.gen_add_end_control_flow()
         # compute
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_inverse_dynamics_inner_function_call(compute_c,use_qdd_input)
         self.gen_add_sync()
+        # mjx output: tau is a covector -> base-linear rows rotate by R
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_base_rotate("s_c")
+            self.gen_add_end_control_flow()
         # save to global
         self.gen_kernel_save_result("c",str(n),stride=str(n))
         self.gen_add_end_control_flow()
@@ -756,15 +773,27 @@ def gen_inverse_dynamics_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host template flag: forwarded to the with-qdd
+    # kernel launch (the only mjx-capable overload). Added LAST so existing
+    # positional template args are unaffected; default false -> byte-identical.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics requires all-data or dynamics gridData\");")
     func_call_start = "inverse_dynamics_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
+    # the with-qdd launch is the mjx-capable overload: forward MUJOCO_OUTPUT (and
+    # the default tier, which it must name positionally to reach the trailing flag).
+    qdd_kernel_tmpl = "inverse_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_kernel<T>"
+    func_call_qdd_start = qdd_kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_qdd_start = func_call_qdd_start.replace("inverse_dynamics_kernel<","inverse_dynamics_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -783,7 +812,7 @@ def gen_inverse_dynamics_host(self, mode = 0):
     # then compute but adjust for compressed mem and qdd usage
     self.gen_add_code_line("// then call the kernel")
     func_call = func_call_start + func_call_end
-    func_call_with_qdd = func_call_start + "hd_data->d_qdd, " + func_call_end
+    func_call_with_qdd = func_call_qdd_start + "hd_data->d_qdd, " + func_call_end
     # add in compressed mem adjusts
     func_call_mem_adjust = "    if (USE_COMPRESSED_MEM) {" + func_call + "}"
     func_call_mem_adjust2 = "    else                    {" + func_call.replace("hd_data->d_q_qd","hd_data->d_q_qd_u") + "}"
