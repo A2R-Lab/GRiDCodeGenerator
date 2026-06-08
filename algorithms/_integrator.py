@@ -665,7 +665,8 @@ def gen_integrator_inner(self):
 
 def gen_integrator_device(self):
     n = self.robot.get_num_vel()
-    func_params = ["s_x_kp1 is a pointer to memory for the next state (size 2*NUM_VEL)",
+    nq = self.robot.get_num_pos()
+    func_params = ["s_x_kp1 is a pointer to memory for the next state (size NUM_POS + NUM_VEL)",
                    "s_q is the vector of joint positions",
                    "s_qd is the vector of joint velocities",
                    "s_u is the vector of joint input torques",
@@ -681,7 +682,7 @@ def gen_integrator_device(self):
     extra_t_buffers = [
         ("s_qdd", n),
         ("s_stage_qdd", (max_stages - 1) * n),
-        ("s_stage_point", (max_stages - 1) * 2 * n),
+        ("s_stage_point", (max_stages - 1) * (nq + n)),  # per-stage [q (nq); qd (nv)]
     ]
     # shared device-wrapper skeleton (B+C §1.1)
     self.gen_device_wrapper(
@@ -693,7 +694,7 @@ def gen_integrator_device(self):
         extra_t_buffers = extra_t_buffers, include_linalg_scratch = True)
 
 
-def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
+def _emit_integrator_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_call_timing):
     """Emit integrator_kernel body for one tier's Minv-F spill flag.
     spill_minv_F=False: the FD inner's Minv F-region lives in smem (s_temp);
     spill_minv_F=True:  it lives in the L2-pinned d_workspace (surgical spill,
@@ -703,22 +704,29 @@ def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_ti
     # Inner-controlled: forward_dynamics_inner slices its own Minv-F from s_temp
     # (smem) or d_workspace (global). The arena size already reflects the choice.
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=not spill_minv_F)
+    # Canonical INPUT packing (mirrors id/crba/aba/forward_dynamics): q, qd, u each
+    # occupy a NUM_JOINTS(=nq)-wide slot at stride 3*nq; slice qd at nq, u at 2*nq.
+    # For a FIXED base nq==nv so 3*nq == 3*nv+fb byte-identical; for a FLOATING
+    # base nq=nv+1 the old nv-strided u offset (2*nv+fb) under-read by nq-nv and
+    # mis-sliced u -- the floating B=1 + batch input bug. The OUTPUT state x_kp1 is
+    # genuinely nq+nv wide (q is nq, qd is nv), so out_count stays nq+nv.
+    input_count = 3 * nq
     extra_t_buffers = [
-        ("s_q_qd_u", 3 * n + fb),
-        ("s_qdd", n),
-        ("s_stage_qdd", (max_stages - 1) * n),
-        ("s_stage_point", (max_stages - 1) * 2 * n),
-        ("s_x_kp1", 2 * n + fb),  # = nq + nv  (floating-base adds 1 for the quaternion)
+        ("s_q_qd_u", input_count),
+        ("s_qdd", nv),
+        ("s_stage_qdd", (max_stages - 1) * nv),
+        ("s_stage_point", (max_stages - 1) * (nq + nv)),
+        ("s_x_kp1", nq + nv),  # next state [q (nq); qd (nv)]
     ]
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line(
-        "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
+        "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(nq) + "]; T *s_u = &s_q_qd_u[" + str(2 * nq) + "];"
     )
     minv_f_expr = "false" if spill_minv_F else "true"
-    out_count = 2 * n + fb  # nq + nv
+    out_count = nq + nv  # next state [q (nq); qd (nv)]
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-        self.gen_kernel_load_inputs("q_qd_u",str(3 * n + fb),stride="stride_q_qd_u")
+        self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
         if spill_minv_F:
             self.gen_add_code_line("T *int_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
@@ -732,7 +740,6 @@ def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_ti
         self.gen_kernel_save_result("x_kp1",str(out_count),stride=str(out_count))
         self.gen_add_end_control_flow()
     else:
-        input_count = 3 * n + fb
         self.gen_kernel_load_inputs("q_qd_u",str(input_count))
         if spill_minv_F:
             self.gen_add_code_line("T *int_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
@@ -751,7 +758,8 @@ def _emit_integrator_kernel_body_for_flags(self, n, spill_minv_F, single_call_ti
 
 
 def gen_integrator_kernel(self, single_call_timing=False):
-    n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
     func_params = ["d_x_kp1 is a pointer to memory for the next state (size 2*NUM_VEL per timestep)",
                    "d_workspace is the L2-pinned global scratch for the spilled Minv F-region (LITE/MINIMAL tiers)",
                    "d_q_qd_u is the packed joint positions, velocities, and input torques",
@@ -782,7 +790,7 @@ def gen_integrator_kernel(self, single_call_timing=False):
     # emit a single body; else gate per tier on RESOURCE_TIER (mirrors fd).
     picks = getattr(self, "integrator_spill_tier_3way", (0, 0, 0))
     self.gen_tier_dispatch(picks, lambda pick:
-        _emit_integrator_kernel_body_for_flags(self, n, bool(pick), single_call_timing))
+        _emit_integrator_kernel_body_for_flags(self, nq, nv, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 

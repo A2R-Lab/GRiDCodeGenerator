@@ -563,7 +563,12 @@ class GRiDCodeGenerator:
         # so the full vs surgical kernel arenas come straight from the sized
         # helper (no separate F term — avoids double-counting). Level 0 = F in
         # smem; Level 1 = F in L2-pinned workspace.
-        _fd_base = 3*nv + int(self.robot.floating_base) + nv + XI_size
+        # Canonical input slot: q/qd/u each NUM_JOINTS(=nq=n here)-wide -> s_q_qd_u
+        # is 3*n (matches _emit_fd_kernel_body_for_flags' ("s_q_qd_u", 3*nq)); qdd is
+        # nv. For a FIXED base n==nv so 3*n == old 3*nv+fb byte-identical; FLOATING
+        # n>nv so the arena must reserve the wider 3*n slot the kernel slices (the
+        # old 3*nv+fb under-reserved by 3*(n-nv)-fb floats -> smem overrun).
+        _fd_base = 3*n + nv + XI_size
         _fd_t_count_full      = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
         _fd_t_count_surgical  = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
         self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
@@ -573,18 +578,21 @@ class GRiDCodeGenerator:
             (_fd_t_count_full, _fd_t_count_surgical)[i] for i in self.fd_spill_tier_3way
         )
         # Integrator: kernel-shared t-count layout is
-        #   s_q_qd_u (3nv+fb) + s_qdd (nv) + s_stage_qdd ((max_stages-1)*nv)
-        #   + s_stage_point ((max_stages-1)*(2nv+fb)) + s_x_kp1 (2nv+fb)
+        #   s_q_qd_u (3*nq) + s_qdd (nv) + s_stage_qdd ((max_stages-1)*nv)
+        #   + s_stage_point ((max_stages-1)*(nq+nv)) + s_x_kp1 (nq+nv)
         #   + s_temp (= FD inner)
-        # The "+fb" terms account for the floating-base quaternion (q has 1
-        # more element than v).  max_stages = 4 (RK4) — see
-        # _integrator._max_stages_in_use().
+        # Canonical input slot: q/qd/u each NUM_JOINTS(=nq=n here)-wide -> 3*n; the
+        # per-stage point + next state are [q (nq); qd (nv)] = n+nv. Must match
+        # _emit_integrator_kernel_body_for_flags exactly. For a FIXED base n==nv so
+        # 3*n == old 3*nv+fb and n+nv == old 2*nv+fb (byte-identical); FLOATING n>nv
+        # so this reserves the wider input slot (old 3*nv+fb under-reserved -> overrun).
+        # max_stages = 4 (RK4) — see _integrator._max_stages_in_use().
         _max_stages = 4
         _fb = int(self.robot.floating_base)
-        _integrator_base = ((3*nv + _fb) + nv
+        _integrator_base = ((3*n) + nv
                             + (_max_stages - 1) * nv
-                            + (_max_stages - 1) * (2 * nv + _fb)
-                            + (2 * nv + _fb) + XI_size)
+                            + (_max_stages - 1) * (n + nv)
+                            + (n + nv) + XI_size)
         integrator_t_count = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size()
         # Integrator VALUE surgical spill. The dominant inner buffer is the FD
         # inner's Minv F-region (6*NV*NV). Level 0 keeps it in smem; level 1
@@ -622,13 +630,18 @@ class GRiDCodeGenerator:
         _vaf_count = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
         # +72 for the two 6x6 SE(3) dIntegrate blocks (floating-base gradient;
         # allocated for fixed-base too but unused there).
-        integrator_gradient_t_count = ((3*nv + int(self.robot.floating_base)) + 2*nv*3*nv + 2*(nv*2*nv)
+        # Canonical input slot: q/qd/u each NUM_JOINTS(=nq=n here)-wide -> s_q_qd_u
+        # is 3*n (matches _emit_body's ("s_q_qd_u", 3*nq)). The (n+nv) term is
+        # s_q_orig(nq) + s_qd_orig(nv). For a FIXED base n==nv so 3*n == old 3*nv+fb
+        # and n+nv == old 2*nv+fb (byte-identical); FLOATING n>nv so this reserves
+        # the wider input slot (old 3*nv+fb under-reserved -> smem overrun).
+        integrator_gradient_t_count = ((3*n) + 2*nv*3*nv + 2*(nv*2*nv)
                                  + _vaf_count + nv*nv + nv
-                                 + (2*nv + int(self.robot.floating_base)) + _max_stages * nv + _max_stages * nv * 3*nv
+                                 + (n + nv) + _max_stages * nv + _max_stages * nv * 3*nv
                                  + 72
                                  + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
-        # The "with x_kp1" variant adds s_x_kp1 (nq+nv = 2nv+fb) on top.
-        integrator_gradient_with_x_kp1_t_count = integrator_gradient_t_count + 2*nv + int(self.robot.floating_base)
+        # The "with x_kp1" variant adds s_x_kp1 ([q (nq); qd (nv)] = n+nv) on top.
+        integrator_gradient_with_x_kp1_t_count = integrator_gradient_t_count + (n + nv)
         # Integrator-gradient surgical spill ladder (4 rungs, least-spill first).
         # Each rung spills only cold / output / coalesced matrices to d_workspace,
         # keeping the hot path (s_vaf + the FD-grad scaffold) in smem as long as
@@ -725,7 +738,12 @@ class GRiDCodeGenerator:
         inverse_dynamics_gradient_device_t_count = _vaf_cnt + inverse_dynamics_gradient_temp_count + XI_size
         forward_dynamics_gradient_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size
         inverse_dynamics_gradient_t_count_full = (nv + n) + (2*nv*nv) + (_vaf_cnt) + nv + inverse_dynamics_gradient_temp_count + XI_size
-        forward_dynamics_gradient_t_count_full = (3*nv + int(self.robot.floating_base)) + (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size
+        # Canonical input slot: q/qd/u each NUM_JOINTS(=nq=n here)-wide -> s_q_qd_u
+        # is 3*n (matches _emit_forward_dynamics_gradient_kernel_body_for_flags'
+        # ("s_q_qd_u", 3*nq)). For a FIXED base n==nv so 3*n == old 3*nv+fb
+        # byte-identical; FLOATING n>nv reserves the wider input slot (old 3*nv+fb
+        # under-reserved -> smem overrun on the s_q_qd_u load).
+        forward_dynamics_gradient_t_count_full = (3*n) + (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size
         inverse_dynamics_gradient_t_count_selective = inverse_dynamics_gradient_t_count_full - inverse_dynamics_gradient_temp_count + inverse_dynamics_gradient_selective_temp_count
         forward_dynamics_gradient_t_count_selective = forward_dynamics_gradient_t_count_full - forward_dynamics_gradient_temp_count + forward_dynamics_gradient_selective_temp_count
         inverse_dynamics_gradient_t_count_emergency = inverse_dynamics_gradient_t_count_full - inverse_dynamics_gradient_temp_count

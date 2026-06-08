@@ -180,7 +180,7 @@ def gen_forward_dynamics_device(self):
         func_notes = func_notes, func_params = func_params,
         include_linalg_scratch = True, tier_workspace_expr = "d_workspace")
 
-def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
+def _emit_fd_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_call_timing):
     """Emit forward_dynamics_kernel body for one tier's Minv-F spill flag.
     spill_minv_F=False: s_minv_F lives in extra smem (at start of s_temp);
     spill_minv_F=True:  s_minv_F lives in L2-pinned workspace."""
@@ -188,12 +188,19 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
     # s_temp (smem) or d_workspace (global) per MINV_F_IN_SMEM. The arena size
     # already reflects that choice.
     shared_mem_size = self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem = not spill_minv_F)
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", 3*n+self.robot.floating_base), ("s_qdd", n)], include_linalg_scratch=True)
-    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n+self.robot.floating_base) + "]; T *s_u = &s_q_qd_u[" + str(2*n+self.robot.floating_base) + "];")
+    # Canonical per-timestep packing (mirrors id/crba/aba): q, qd, u each occupy a
+    # NUM_JOINTS(=nq)-wide slot at stride 3*nq. The kernel loads the full 3*nq slot
+    # and slices qd at nq, u at 2*nq. For a FIXED base nq==nv so 3*nq == 3*nv and
+    # nq+2*nv (byte-identical); for a FLOATING base nq>nv a compressed nv-strided
+    # layout would read a misaligned u (off by nq-nv) even at slot 0 and shifted
+    # inputs for k>=1 -- the floating B=1 tau + batch bug.
+    input_count = 3 * nq
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_q_qd_u", input_count), ("s_qdd", nv)], include_linalg_scratch=True)
+    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(nq) + "]; T *s_u = &s_q_qd_u[" + str(2*nq) + "];")
     minv_f_expr = "false" if spill_minv_F else "true"
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
-        self.gen_kernel_load_inputs("q_qd_u",str(3*n),stride="stride_q_qd_u")
+        self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
         if spill_minv_F:
             self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
@@ -204,10 +211,13 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
             updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
         self.gen_add_sync()
-        self.gen_kernel_save_result("qdd",str(n),stride=str(n))
+        # Output slot is NUM_JOINTS(=nq)-wide (the binding/host read qdd nj-wide,
+        # the d_qdd buffer is nj-strided). qdd has nv real accelerations; the
+        # nj-wide slot stride keeps per-timestep outputs from overlapping for a
+        # FLOATING base (nq>nv). For a FIXED base nq==nv -> byte-identical.
+        self.gen_kernel_save_result("qdd",str(nv),stride=str(nq))
         self.gen_add_end_control_flow()
     else:
-        input_count = 3*n + self.robot.floating_base
         self.gen_kernel_load_inputs("q_qd_u",str(input_count))
         if spill_minv_F:
             self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
@@ -223,11 +233,12 @@ def _emit_fd_kernel_body_for_flags(self, n, spill_minv_F, single_call_timing):
         self.gen_anti_licm_output_write("qdd")
         self.gen_add_end_control_flow()
         # save to global
-        self.gen_kernel_save_result("qdd",str(n))
+        self.gen_kernel_save_result("qdd",str(nv))
 
 
 def gen_forward_dynamics_kernel(self, single_call_timing = False):
-    n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
     func_params = ["d_qdd is a pointer to memory for the final result", \
                    "d_workspace is the L2-pinned global spill buffer (used when Minv-F overflows smem)", \
                    "d_q_qd_u is the vector of joint positions, velocities, and input torques", \
@@ -250,7 +261,7 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
     # smem block); Level 1 = Minv-F in L2-pinned workspace.
     picks = getattr(self, "fd_spill_tier_3way", (0, 0, 0))
     self.gen_tier_dispatch(picks, lambda pick:
-        _emit_fd_kernel_body_for_flags(self, n, bool(pick), single_call_timing))
+        _emit_fd_kernel_body_for_flags(self, nq, nv, bool(pick), single_call_timing))
     self.gen_add_end_function()
 
 

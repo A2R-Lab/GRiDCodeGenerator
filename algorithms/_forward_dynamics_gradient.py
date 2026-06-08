@@ -181,8 +181,15 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
 
 def gen_forward_dynamics_gradient_kernel_max_temp_mem_size(self):
     n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
     vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-    base_size = 2*n + n*2*n + n*2*n + vaf_cnt + n + n*n + n
+    # Mirror the kernel body's extra_t_buffers (the non-qdd variant is the
+    # largest input buffer): s_q_qd_u uses the canonical 3*nq slot (NUM_JOINTS-
+    # wide q/qd/u), the gradient bands are tangent-space (nv). For a FIXED base
+    # nq==nv so 3*nq == old 3*n byte-identical; for a FLOATING base the +2*(nq-nv)
+    # here grows the dynamic-smem launch param to fit the wider input slot (else
+    # the kernel's s_q_qd_u load overflows the arena -> illegal __shared__ write).
+    base_size = 3*nq + n*2*n + n*2*n + vaf_cnt + n + n*n + n
     temp_mem_size = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     return base_size + temp_mem_size
 
@@ -193,20 +200,32 @@ _FD_DU_PICK_FLAGS = [
     (False, True),    # pick 2: global temp
 ]
 
-def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective_spill, use_global_temp,
+def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_selective_spill, use_global_temp,
                                       use_qdd_Minv_input, single_call_timing):
     """Emit forward_dynamics_gradient kernel body for one tier's spill flags."""
+    n = nv
+    # Canonical per-timestep packing (mirrors id/crba/aba/forward_dynamics): q, qd,
+    # u each occupy a NUM_JOINTS(=nq)-wide slot at stride 3*nq; the qd slot starts
+    # at nq, u at 2*nq. The qdd / Minv inputs (qdd-Minv variant) are stored at the
+    # canonical nq / nq*nq per-timestep strides too (the host transfers them
+    # NUM_JOINTS-wide). The intermediate s_qdd/s_Minv smem buffers hold nv real
+    # values. For a FIXED base nq==nv so every offset below is byte-identical to
+    # the old nv-strided form; for a FLOATING base nq>nv this reads qd/u from the
+    # right slot (was off by nq-nv) and strides batched inputs correctly. The
+    # df_du OUTPUT is genuinely tangent-space (nv x 2nv, dense 2*nv*nv-strided; the
+    # d_df_du buffer + binding transfer are 2*nv*nv-sized) -- the input-slot fix is
+    # the floating bug, the gradient output stride stays 2*nv*nv.
     # s_vaf is body-indexed (NB bodies, stride 6). For a MIMIC robot (fixed base)
     # NB > nv, so size 18*NB to keep the ID inner's writes from overflowing into
-    # s_qdd/s_Minv. Non-mimic keeps 18*n (byte-identical; floating nv > NB).
-    _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-    extra_t_buffers = [("s_q_qd", 2*n+self.robot.floating_base),
-                       ("s_dc_du", n*2*n),
+    # s_qdd/s_Minv. Non-mimic keeps 18*nv (byte-identical; floating nv > NB).
+    _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
+    extra_t_buffers = [("s_q_qd", 2*nq),
+                       ("s_dc_du", nv*2*nv),
                        ("s_vaf", _vaf_cnt),
-                       ("s_qdd", n),
-                       ("s_Minv", n*n)]
+                       ("s_qdd", nv),
+                       ("s_Minv", nv*nv)]
     if not use_qdd_Minv_input:
-        extra_t_buffers[0] = ("s_q_qd_u", 3*n+self.robot.floating_base)
+        extra_t_buffers[0] = ("s_q_qd_u", 3*nq)
     shared_mem_size = 0 if use_global_temp else (
         max(self.gen_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
@@ -214,20 +233,20 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if use_qdd_Minv_input:
-        self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{n+self.robot.floating_base}];")
+        self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{nq}];")
     else:
-        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{n+self.robot.floating_base}]; T *s_u = &s_q_qd_u[{2*n+self.robot.floating_base}];")
+        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{nq}]; T *s_u = &s_q_qd_u[{2*nq}];")
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs("q_qd",str(2*n+self.robot.floating_base),"qdd",str(n),"Minv",str(n*n),stride="stride_q_qd",stride2=str(n),stride3=str(n*n))
+            self.gen_kernel_load_inputs("q_qd",str(2*nq),"qdd",str(nv),"Minv",str(nv*nv),stride="stride_q_qd",stride2=str(nq),stride3=str(nq*nq))
         else:
-            self.gen_kernel_load_inputs("q_qd_u",str(3*n+self.robot.floating_base),stride="stride_q_qd_u")
+            self.gen_kernel_load_inputs("q_qd_u",str(3*nq),stride="stride_q_qd_u")
         # The kernel only SLICES the workspace band pointers; the device owns
         # the s_temp pool placement (the whole-pool global-temp repoint is its
         # SCRATCH_IN_SMEM=false path). Per-rung flags are passed as literals.
         if use_selective_spill or use_global_temp:
-            self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(n*2*n) + "];")
+            self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(nv*2*nv) + "];")
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
@@ -239,13 +258,13 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective
             d_workspace_pool_name = ("reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()])" if use_global_temp else "nullptr"),
             d_temp_spill_name = ("d_temp_spill" if use_selective_spill else "nullptr"))
         if not (use_global_temp or use_selective_spill):
-            self.gen_kernel_save_result("df_du",str(n*2*n),"s_temp",stride=str(n*2*n))
+            self.gen_kernel_save_result("df_du",str(nv*2*nv),"s_temp",stride=str(nv*2*nv))
         self.gen_add_end_control_flow()
     else:
         if use_qdd_Minv_input:
-            self.gen_kernel_load_inputs("q_qd",str(2*n+self.robot.floating_base),"qdd",str(n),"Minv",str(n*n))
+            self.gen_kernel_load_inputs("q_qd",str(2*nq),"qdd",str(nv),"Minv",str(nv*nv))
         else:
-            self.gen_kernel_load_inputs("q_qd_u",str(3*n+self.robot.floating_base))
+            self.gen_kernel_load_inputs("q_qd_u",str(3*nq))
         if use_selective_spill or use_global_temp:
             self.gen_add_code_line("T *d_df_du_k = d_df_du;")
         if use_selective_spill:
@@ -253,9 +272,9 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_Minv_input:
-            self.gen_anti_licm_input_reload("q_qd", str(2*n + self.robot.floating_base), "qdd", str(n), "Minv", str(n*n))
+            self.gen_anti_licm_input_reload("q_qd", str(2*nq), "qdd", str(nv), "Minv", str(nv*nv))
         else:
-            self.gen_anti_licm_input_reload("q_qd_u", str(3*n + self.robot.floating_base))
+            self.gen_anti_licm_input_reload("q_qd_u", str(3*nq))
         # device owns s_temp placement (whole-pool global path = SCRATCH_IN_SMEM=false).
         self.gen_forward_dynamics_gradient_device_function_call(
             use_qdd_Minv_input,
@@ -272,11 +291,13 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, use_selective
         )
         self.gen_add_end_control_flow()
         if not (use_global_temp or use_selective_spill):
-            self.gen_kernel_save_result("df_du",str(n*2*n),"s_temp")
+            self.gen_kernel_save_result("df_du",str(nv*2*nv),"s_temp")
 
 
 def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, single_call_timing = False):
-    n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    n = nv
     func_params = ["d_df_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
@@ -307,7 +328,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     picks = getattr(self, "forward_dynamics_gradient_spill_tier_3way", (0, 0, 0))
     def _emit_forward_dynamics_gradient_body(pick):
         uss, ugt = _FD_DU_PICK_FLAGS[pick]
-        _emit_forward_dynamics_gradient_kernel_body_for_flags(self, n, uss, ugt, use_qdd_Minv_input, single_call_timing)
+        _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, uss, ugt, use_qdd_Minv_input, single_call_timing)
     self.gen_tier_dispatch(picks, _emit_forward_dynamics_gradient_body)
     self.gen_add_end_function()
 
@@ -371,7 +392,12 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     self.gen_add_code_lines(func_call_code)
     self.gen_add_code_line("if (GRID_FORWARD_DYNAMICS_GRADIENT_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_end_l2_persisting(0));}")
     if not compute_only:
-        # then transfer memory back
+        # then transfer memory back. df_du is the tangent-space gradient
+        # (NUM_VEL x 2*NUM_VEL, dense 2*NUM_VEL*NUM_VEL-strided): the kernel writes
+        # it 2*NV*NV-strided and the binding reads 2*NV*NV. The d_df_du gridData
+        # buffer is NUM_JOINTS*2*NUM_JOINTS-sized (>= 2*NV*NV), so the legacy
+        # NUM_JOINTS*2*NUM_JOINTS transfer stays in bounds and is byte-identical
+        # for a FIXED base (nq==nv); kept as-is to preserve the standalone host ABI.
         self.gen_add_code_lines(["// finally transfer the result back", \
                                  "gpuErrchk(cudaMemcpy(hd_data->h_df_du,hd_data->d_df_du,NUM_JOINTS*2*NUM_JOINTS*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",

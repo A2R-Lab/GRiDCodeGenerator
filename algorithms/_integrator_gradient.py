@@ -691,6 +691,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
 
 def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing=False):
     n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
     func_params = ["d_dAB is a pointer to memory for [A | B] of size 2*NUM_VEL*3*NUM_VEL per timestep"]
     if compute_x_kp1:
         func_params.append("d_x_kp1 is a pointer to memory for the next state (size 2*NUM_VEL per timestep)")
@@ -764,7 +765,16 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         # in _forward_dynamics_gradient.py). Non-mimic keeps 18*n (byte-identical;
         # floating nv > NB).
         vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-        extra_t_buffers = [("s_q_qd_u", 3 * n + fb)]
+        # Canonical per-timestep INPUT packing (mirrors id/crba/aba/forward_dynamics):
+        # q, qd, u each in a NUM_JOINTS(=nq)-wide slot at stride 3*nq; slice qd at nq,
+        # u at 2*nq. For a FIXED base nq==nv -> 3*nq == 3*nv+fb byte-identical; for a
+        # FLOATING base nq=nv+1 the old nv-strided u offset (2*nv+fb) under-read by
+        # nq-nv and mis-sliced u -- the floating B=1 + batch input bug. The dAB OUTPUT
+        # is genuinely tangent-space: 2*nv x 3*nv real values, per-timestep stride
+        # 2*nv*3*nv (the d_dAB buffer + binding transfer are 2*nv*3*nv-sized), so the
+        # save stride stays 2*nv*3*nv. The x_kp1 output is [q (nq); qd (nv)] = nq+nv.
+        input_count = 3 * nq
+        extra_t_buffers = [("s_q_qd_u", input_count)]
         if dab_in_smem:
             extra_t_buffers.append(("s_dAB", 2 * n * 3 * n))
         extra_t_buffers += [
@@ -793,7 +803,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
             inner_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True,
         )
         self.gen_add_code_line(
-            "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(n + fb) + "]; T *s_u = &s_q_qd_u[" + str(2 * n + fb) + "];"
+            "T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(nq) + "]; T *s_u = &s_q_qd_u[" + str(2 * nq) + "];"
         )
         # The kernel only SLICES the de-aliased workspace band base pointers and
         # passes per-rung flags; the device OWNS the FD-grad inner s_temp pool
@@ -840,17 +850,16 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
 
         if not single_call_timing:
             self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-            self.gen_kernel_load_inputs("q_qd_u",str(3 * n + fb),stride="stride_q_qd_u")
+            self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
             self.gen_add_code_line("// compute — the orchestration inner owns its FD-grad s_temp pool placement")
             _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             _emit_device_call("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             self.gen_add_sync()
             self.gen_kernel_save_result("dAB",str(2 * n * 3 * n),stride=str(2 * n * 3 * n))
             if compute_x_kp1:
-                self.gen_kernel_save_result("x_kp1",str(2 * n + fb),stride=str(2 * n + fb))
+                self.gen_kernel_save_result("x_kp1",str(nq + n),stride=str(nq + n))
             self.gen_add_end_control_flow()
         else:
-            input_count = 3 * n + fb
             self.gen_kernel_load_inputs("q_qd_u",str(input_count))
             _emit_spill_pointers("0")
             self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
@@ -861,7 +870,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
             self.gen_add_end_control_flow()
             self.gen_kernel_save_result("dAB",str(2 * n * 3 * n))
             if compute_x_kp1:
-                self.gen_kernel_save_result("x_kp1",str(2 * n + fb))
+                self.gen_kernel_save_result("x_kp1",str(nq + n))
 
     # Per-tier surgical placement (perf, lite, minimal). When all three rungs
     # agree (small robots that fit at PERF), emit a single body; otherwise gate
