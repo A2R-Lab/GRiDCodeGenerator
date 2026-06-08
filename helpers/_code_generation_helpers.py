@@ -205,6 +205,199 @@ def gen_static_array_ind_3d(self, ind, col, row, ind_stride = 36, col_stride = 6
 def gen_add_sync(self):
     self.gen_add_code_line("__syncthreads();")
 
+
+# ---------------------------------------------------------------------------
+# MuJoCo / mjx output-convention emit helpers (shared across floating algorithms)
+# ---------------------------------------------------------------------------
+#
+# These emit the small base-block corner math that converts a GRiD/pinocchio
+# floating-base result to the MuJoCo/mjx convention (quaternion order wxyz<->xyzw
+# and the free-joint base-LINEAR velocity frame G = blockdiag(R, I); R = base
+# orientation). They are the CUDA mirror of `RBDReference/equivalents/
+# mujoco_convention.py` (the validated oracle). Each is emitted ONLY when the
+# robot is floating AND inside a compile-time `if constexpr (MUJOCO_OUTPUT)` block,
+# so the default pin PTX is byte-identical and fixed-base headers never contain it.
+#
+# Design: every transform runs on a single thread over the <=6x6 base block (the
+# work is trivially small), building the 3x3 rotation `R` from the configuration
+# quaternion in registers (so NO new shared memory is needed and we never depend
+# on the internal s_XImats[0] spatial-transform layout, which CRBA leaves stale).
+# Bracket with `gen_add_sync()` so the rest of the block sees the converted data.
+# Matrices are COLUMN-MAJOR: `mat[r + n_rows*c]` is element (row r, col c).
+#
+# `q_name` defaults to the per-kernel configuration buffer (`s_q`), whose layout
+# is [pos(3), quat_xyzw(4), joints]; the tangent buffers (`s_qd`/`s_qdd`/`s_c`/...)
+# are [lin(3), ang(3), joints]. Pass custom names for kernels that buffer elsewhere.
+
+def _gen_mjx_build_R_lines(q_name="s_q"):
+    """Emit (as a list) the register declaration of the 3x3 row-major rotation
+    ``R`` (``R[3*i+j]``) from the xyzw quaternion at ``q_name[3..6]`` -- matching
+    ``mujoco_convention.rotation_from_quat_xyzw`` exactly. Caller must already be
+    on a single thread (these are plain register writes)."""
+    q = q_name
+    return [
+        f"T qx = {q}[3], qy = {q}[4], qz = {q}[5], qw = {q}[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+    ]
+
+
+def gen_mjx_input_convert(self, q_name="s_q", qd_name="s_qd", qdd_name=None, u_name=None):
+    """Convert the mjx-frame INPUTS to the pin frame, in place, before the kernel
+    body runs. Emitted right after `gen_kernel_load_inputs` + sync, BEFORE the
+    XImats build (so X[0] is built from the correctly-ordered quaternion).
+
+    Steps (single thread): (1) reorder the base quaternion wxyz->xyzw in
+    ``q_name[3..6]``; (2) build R; (3) ``qd[0:3] = R^T qd[0:3]`` (mjx global base
+    velocity -> pin local); (4) if ``qdd_name``: ``qdd[0:3] = R^T qdd[0:3] -
+    omega x v_local`` (the acceleration is NOT a plain rotation -- see the oracle);
+    (5) if ``u_name``: ``u[0:3] = R^T u[0:3]`` (covector force). Steps 3-5 use the
+    base-angular block (``qd[3:6]``, frame-invariant) and the just-converted local
+    linear velocity."""
+    self.gen_add_code_lines([
+        "// mjx input convert: quaternion wxyz->xyzw, base-linear velocity/accel/force -> pin frame",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        # quaternion wxyz (mjx, scalar-first) -> xyzw (pin, scalar-last)
+        f"T qw_in = {q_name}[3];",
+        f"{q_name}[3] = {q_name}[4]; {q_name}[4] = {q_name}[5]; {q_name}[5] = {q_name}[6]; {q_name}[6] = qw_in;",
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        # v_pin_lin = R^T v_mjx_lin
+        f"T vlx = {qd_name}[0], vly = {qd_name}[1], vlz = {qd_name}[2];",
+        f"{qd_name}[0] = R[0]*vlx + R[3]*vly + R[6]*vlz;",
+        f"{qd_name}[1] = R[1]*vlx + R[4]*vly + R[7]*vlz;",
+        f"{qd_name}[2] = R[2]*vlx + R[5]*vly + R[8]*vlz;",
+    ])
+    if qdd_name is not None:
+        # a_pin_lin = R^T a_mjx_lin - omega x v_local  (v_local = converted qd[0:3])
+        self.gen_add_code_lines([
+            f"T alx = {qdd_name}[0], aly = {qdd_name}[1], alz = {qdd_name}[2];",
+            f"T wx_ = {qd_name}[3], wy_ = {qd_name}[4], wz_ = {qd_name}[5];",
+            f"T vx_ = {qd_name}[0], vy_ = {qd_name}[1], vz_ = {qd_name}[2];",
+            f"{qdd_name}[0] = (R[0]*alx + R[3]*aly + R[6]*alz) - (wy_*vz_ - wz_*vy_);",
+            f"{qdd_name}[1] = (R[1]*alx + R[4]*aly + R[7]*alz) - (wz_*vx_ - wx_*vz_);",
+            f"{qdd_name}[2] = (R[2]*alx + R[5]*aly + R[8]*alz) - (wx_*vy_ - wy_*vx_);",
+        ])
+    if u_name is not None:
+        self.gen_add_code_lines([
+            f"T ufx = {u_name}[0], ufy = {u_name}[1], ufz = {u_name}[2];",
+            f"{u_name}[0] = R[0]*ufx + R[3]*ufy + R[6]*ufz;",
+            f"{u_name}[1] = R[1]*ufx + R[4]*ufy + R[7]*ufz;",
+            f"{u_name}[2] = R[2]*ufx + R[5]*ufy + R[8]*ufz;",
+        ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_base_rotate(self, buf, q_name="s_q"):
+    """Covector/contravector OUTPUT row map ``out[0:3] = R out[0:3]`` (the
+    ``base_rotate`` family: generalized_gravity, inverse_dynamics tau, and -- via
+    the matrix overload, see :func:`gen_mjx_base_rotate_rows` -- the regressors).
+    Single thread + sync."""
+    self.gen_add_code_lines([
+        f"// mjx output: base-linear rows of {buf} <- R * rows",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        f"T b0 = {buf}[0], b1 = {buf}[1], b2 = {buf}[2];",
+        f"{buf}[0] = R[0]*b0 + R[1]*b1 + R[2]*b2;",
+        f"{buf}[1] = R[3]*b0 + R[4]*b1 + R[5]*b2;",
+        f"{buf}[2] = R[6]*b0 + R[7]*b1 + R[8]*b2;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_accel_out(self, qdd_buf, qd_buf, q_name="s_q"):
+    """Forward-dynamics acceleration OUTPUT pin->mjx:
+    ``qdd[0:3] = R (qdd[0:3] + omega x v_local)`` where ``omega = qd[3:6]`` and
+    ``v_local = qd[0:3]`` are the PIN-frame velocity (the kernel's own buffers,
+    pre-output). The ``omega x v`` term is what makes the acceleration not a plain
+    rotation. Single thread + sync."""
+    self.gen_add_code_lines([
+        f"// mjx output: forward-dynamics accel {qdd_buf}[0:3] <- R (qdd + omega x v_local)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        f"T wx_ = {qd_buf}[3], wy_ = {qd_buf}[4], wz_ = {qd_buf}[5];",
+        f"T vx_ = {qd_buf}[0], vy_ = {qd_buf}[1], vz_ = {qd_buf}[2];",
+        f"T c0 = {qdd_buf}[0] + (wy_*vz_ - wz_*vy_);",
+        f"T c1 = {qdd_buf}[1] + (wz_*vx_ - wx_*vz_);",
+        f"T c2 = {qdd_buf}[2] + (wx_*vy_ - wy_*vx_);",
+        f"{qdd_buf}[0] = R[0]*c0 + R[1]*c1 + R[2]*c2;",
+        f"{qdd_buf}[1] = R[3]*c0 + R[4]*c1 + R[5]*c2;",
+        f"{qdd_buf}[2] = R[6]*c0 + R[7]*c1 + R[8]*c2;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_congruence(self, mat, n, q_name="s_q"):
+    """Congruence / similarity ``X_mjx = G X G^T`` for an ``n x n`` COLUMN-MAJOR
+    matrix (mass matrix, Minv, coriolis): base-linear ROWS 0:3 <- R . rows, then
+    base-linear COLS 0:3 <- cols . R^T (the corner becomes ``R X00 R^T``). Works
+    for non-symmetric C (it is a true similarity, identical code). Single thread +
+    sync. NOTE for SYMMETRIC_UPPER storage (Minv): re-mirror the base block after."""
+    self.gen_add_code_lines([
+        f"// mjx output: congruence G {mat} G^T (base rows then base cols)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        # rows 0:3 <- R . rows, for every column c
+        f"for (int c = 0; c < {n}; c++) {{ T m0 = {mat}[0 + {n}*c], m1 = {mat}[1 + {n}*c], m2 = {mat}[2 + {n}*c];"
+        f" {mat}[0 + {n}*c] = R[0]*m0 + R[1]*m1 + R[2]*m2; {mat}[1 + {n}*c] = R[3]*m0 + R[4]*m1 + R[5]*m2; {mat}[2 + {n}*c] = R[6]*m0 + R[7]*m1 + R[8]*m2; }}",
+        # cols 0:3 <- cols . R^T, for every row r:  newcol[j] = sum_k M[r,k] R[j][k]
+        f"for (int r = 0; r < {n}; r++) {{ T m0 = {mat}[r + {n}*0], m1 = {mat}[r + {n}*1], m2 = {mat}[r + {n}*2];"
+        f" {mat}[r + {n}*0] = m0*R[0] + m1*R[1] + m2*R[2]; {mat}[r + {n}*1] = m0*R[3] + m1*R[4] + m2*R[5]; {mat}[r + {n}*2] = m0*R[6] + m1*R[7] + m2*R[8]; }}",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_column_reframe(self, mat, n_rows, n_cols, q_name="s_q"):
+    """Jacobian column reframe ``J_mjx = J G^{-1}`` for an ``n_rows x n_cols``
+    COLUMN-MAJOR matrix: base-linear COLS 0:3 <- cols . R^T (right-multiply only;
+    the output rows are frame-invariant). Covers frame_jacobian/_dot, jacobian_com,
+    the CCRBA matrix A, cmm_time_variation, end_effector_pose_gradient and dh/dqd.
+    Single thread + sync."""
+    self.gen_add_code_lines([
+        f"// mjx output: column reframe {mat} G^{{-1}} (base-linear cols . R^T)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        f"for (int r = 0; r < {n_rows}; r++) {{ T j0 = {mat}[r + {n_rows}*0], j1 = {mat}[r + {n_rows}*1], j2 = {mat}[r + {n_rows}*2];"
+        f" {mat}[r + {n_rows}*0] = j0*R[0] + j1*R[1] + j2*R[2]; {mat}[r + {n_rows}*1] = j0*R[3] + j1*R[4] + j2*R[5]; {mat}[r + {n_rows}*2] = j0*R[6] + j1*R[7] + j2*R[8]; }}",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_retract(self, q_out, q_in, qd, dt_expr, q_name=None):
+    """mjx free-joint retract for the integrator: the base POSITION takes a GLOBAL
+    additive step ``q_out[0:3] = q_in[0:3] + dt * qd[0:3]`` (vs pin's SE(3) V(phi)
+    coupling, which is O(dt^2) wrong for MuJoCo). The base quaternion and all
+    internal joints integrate exactly as pin -- the caller emits those normally and
+    this helper OVERWRITES only the base-linear position block. ``qd[0:3]`` is the
+    mjx (global) base-linear velocity. Single thread + sync."""
+    self.gen_add_code_lines([
+        f"// mjx retract: base position global additive step (q_out[0:3] = q_in[0:3] + dt*qd[0:3])",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        f"{q_out}[0] = {q_in}[0] + ({dt_expr}) * {qd}[0];",
+        f"{q_out}[1] = {q_in}[1] + ({dt_expr}) * {qd}[1];",
+        f"{q_out}[2] = {q_in}[2] + ({dt_expr}) * {qd}[2];",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
 def gen_add_debug_print_code_lines(self, print_code_string_arr):
     self.gen_add_sync()
     self.gen_add_serial_ops()
