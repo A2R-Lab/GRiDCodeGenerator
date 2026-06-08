@@ -648,7 +648,13 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute " + name + " per timestep", [], [], None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogues -> byte-identical pin PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -660,6 +666,18 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
         self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
 
     def _compute():
+        # mjx INPUT convert (floating only): reorder the base quaternion wxyz->xyzw
+        # (so XmatsHom builds X[0] correctly + the output R reads xyzw) and, for the
+        # qd-reading families (ccrba/energy), convert the base-linear velocity to the
+        # pin frame so the internal compute (h = A qd, KE) is correct. com reads q
+        # only -> quat reorder suffices. Emitted BEFORE the XmatsHom build.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            if has_qd:
+                self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd")
+            else:
+                self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_load_update_XmatsHom_helpers_function_call()
         _gen_centroidal_call(self)
         self.gen_add_sync()
@@ -670,6 +688,14 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
             self.gen_add_code_line("T inv_m = static_cast<T>(1)/s_extra[0];")
             self.gen_add_code_line("for (int vi=0; vi<" + str(nv) + "; ++vi) for (int r=0;r<3;++r) s_out[3 + 3*vi + r] = s_A[r + 6*vi]*inv_m;")
             self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            # mjx OUTPUT: p_com (s_out[0:3]) is INVARIANT; J_com (3 x NV col-major at
+            # s_out[3]) column-reframes J G^{-1} (base-linear cols . R^T). R reads the
+            # already-reordered xyzw quaternion in s_q.
+            if self.robot.floating_base:
+                self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+                self.gen_mjx_column_reframe("&s_out[3]", 3, nv)
+                self.gen_add_end_control_flow()
         elif name == "ccrba":
             self.gen_add_parallel_loop("ind", str(6 * nv))
             self.gen_add_code_line("s_out[ind] = s_A[ind];")
@@ -678,6 +704,14 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
             self.gen_add_serial_ops()
             self.gen_add_code_line("for (int r=0;r<6;++r){ T s=0; for(int vi=0;vi<" + str(nv) + ";++vi) s += s_A[r + 6*vi]*s_qd[vi]; s_out[" + str(6 * nv) + " + r] = s; }")
             self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            # mjx OUTPUT: A (6 x NV col-major at s_out[0]) column-reframes A G^{-1}
+            # (base-linear cols . R^T); h = A qd (s_out[6*NV:]) is INVARIANT (qd was
+            # already input-converted so h is computed correctly above).
+            if self.robot.floating_base:
+                self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+                self.gen_mjx_column_reframe("s_out", 6, nv)
+                self.gen_add_end_control_flow()
         elif name == "energy":
             NB = self.robot.get_num_bodies()
             off_J = 16 * self.robot.get_num_joints()
@@ -731,12 +765,23 @@ def _gen_kin_centroidal_host(self, name, out_buf, out_size, has_qd, has_gravity,
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute " + name, [], [], None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # naming the tier positionally (<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>) to
+    # reach the trailing flag. Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"" + name + " requires all-data or kinematics gridData\");")
-    kname = name + ("_kernel_single_timing<T>" if single_call_timing else "_kernel<T>")
+    if mjx_host:
+        ktmpl = "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
+        kname = name + ("_kernel_single_timing" if single_call_timing else "_kernel") + ktmpl
+    else:
+        kname = name + ("_kernel_single_timing<T>" if single_call_timing else "_kernel<T>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->" + out_buf + ",hd_data->d_" + in_name +
                  ",stride_" + in_name + ",d_robotModel," + grav_arg + "num_timesteps);")
     if not compute_only:

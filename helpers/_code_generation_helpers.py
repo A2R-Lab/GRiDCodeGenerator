@@ -333,6 +333,42 @@ def gen_mjx_base_rotate(self, buf, q_name="s_q"):
     self.gen_add_sync()
 
 
+def gen_mjx_base_rotate_rows(self, mat, n_rows, n_cols, q_name="s_q"):
+    """Base-linear ROW rotation ``rows0:3 <- R . rows`` for an ``n_rows x n_cols``
+    COLUMN-MAJOR matrix (the row-step of :func:`gen_mjx_congruence`, standalone). For
+    matrix covector outputs whose base-linear rows transform like the ID torque:
+    inverse_dynamics_regressor (``G.Y``) and forward_dynamics_parameter_gradient.
+    Single thread + sync."""
+    self.gen_add_code_lines([
+        f"// mjx output: base-linear rows of {mat} <- R . rows (all {n_cols} cols)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        f"for (int c = 0; c < {n_cols}; c++) {{ T m0 = {mat}[0 + {n_rows}*c], m1 = {mat}[1 + {n_rows}*c], m2 = {mat}[2 + {n_rows}*c];"
+        f" {mat}[0 + {n_rows}*c] = R[0]*m0 + R[1]*m1 + R[2]*m2; {mat}[1 + {n_rows}*c] = R[3]*m0 + R[4]*m1 + R[5]*m2; {mat}[2 + {n_rows}*c] = R[6]*m0 + R[7]*m1 + R[8]*m2; }}",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def gen_mjx_symmetrize_full(self, mat, n):
+    """Fully populate a SYMMETRIC_UPPER-stored ``n x n`` COLUMN-MAJOR matrix by
+    mirroring the upper triangle into the lower (``mat[r,c]=mat[c,r]`` for ``r>c``),
+    so a subsequent :func:`gen_mjx_congruence` reads complete base rows/cols. Used by
+    minv (stored upper-triangular). After the congruence the result is fully
+    symmetric, so the host symmetrize step becomes a no-op. Single thread + sync.
+    NOTE: assumes the UPPER triangle (``mat[i + n*j]`` for ``i<=j``) holds the data;
+    if the kernel stores the LOWER triangle instead, swap the copy direction."""
+    self.gen_add_code_lines([
+        f"// mjx: mirror upper->lower of SYMMETRIC_UPPER {mat} before the congruence",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        f"for (int c = 0; c < {n}; c++) {{ for (int r = c + 1; r < {n}; r++) {{ {mat}[r + {n}*c] = {mat}[c + {n}*r]; }} }}",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_mjx_accel_out(self, qdd_buf, qd_buf, q_name="s_q"):
     """Forward-dynamics acceleration OUTPUT pin->mjx:
     ``qdd[0:3] = R (qdd[0:3] + omega x v_local)`` where ``omega = qd[3:6]`` and

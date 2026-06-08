@@ -669,12 +669,28 @@ def _emit_minv_kernel_body_for_flags(self, n, NV, spill_F, single_call_timing):
             self.gen_add_code_line("T *minv_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
             self.gen_add_code_line("(void)d_workspace;")
+        # mjx input convert (quaternion only -> the congruence epilogue's R; Minv(q)
+        # is base-orientation-independent so no qd/accel convert is needed). Must
+        # precede the XImats build so X[0] is built from the xyzw quaternion.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_minv_inner_function_call(
             updated_var_names = (dict(d_workspace_name = "minv_d_workspace") if spill_F else None),
             f_in_smem_expr = ("false" if spill_F else "true"))
         self.gen_add_sync()
+        # mjx output: Minv is a congruence G Minv G^T. Minv is SYMMETRIC_UPPER
+        # storage (lower triangle zero), and the congruence reads FULL base rows/
+        # cols, so first mirror upper->lower to fully populate, THEN congruence. The
+        # result is fully dense symmetric mjx Minv (host symmetrize becomes a no-op).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_symmetrize_full("s_Minv", n)
+            self.gen_mjx_congruence("s_Minv", n)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("Minv",str(n*n),stride=str(n*n))
         self.gen_add_end_control_flow()
     else:
@@ -708,7 +724,13 @@ def gen_minv_kernel(self, single_call_timing = False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -741,15 +763,23 @@ def gen_minv_host(self, mode = 0):
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     # then generate the code
     self.gen_add_func_doc("Compute the inverse of the mass matrix",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"minv requires all-data or dynamics gridData\");")
-    func_call_start = "minv_kernel<T><<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_workspace,hd_data->d_q,stride_q,"
+    minv_kernel_tmpl = "minv_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "minv_kernel<T>"
+    func_call_start = minv_kernel_tmpl + "<<<block_dimms,thread_dimms,MINV_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Minv,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("minv_kernel<","minv_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \

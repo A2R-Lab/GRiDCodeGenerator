@@ -70,6 +70,39 @@ def _regressor_basis_nonzeros():
 _REGRESSOR_BASIS = _regressor_basis_nonzeros()
 
 
+def _emit_mjx_base_rotate_rows_rowmajor(self, mat, n_rows, n_cols, q_name="s_q"):
+    """ROW-MAJOR analogue of the shared `gen_mjx_base_rotate_rows` helper.
+
+    The shared helper rotates the base-linear ROWS 0:3 of a COLUMN-MAJOR matrix
+    (`mat[r + n_rows*c]`). The regressor `s_Y` is ROW-MAJOR (`mat[row*n_cols + c]`,
+    row = DOF, col = param), so its base-linear rows 0,1,2 live at offsets
+    `0*n_cols`, `1*n_cols`, `2*n_cols` with the column index stepping by 1 -- a
+    layout the column-major helper cannot express. This emits the same
+    transform (rows0:3 <- R . rows, R from the xyzw quaternion, matching
+    `mujoco_convention.rotation_from_quat_xyzw`) for the row-major storage.
+
+    Single thread + sync (mirrors the shared helpers; ~zero work, <=10*NB cols)."""
+    q = q_name
+    self.gen_add_code_lines([
+        "// mjx output: base-linear rows of " + mat + " <- R . rows (row-major nv x " + str(n_cols) + ")",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        "T qx = " + q + "[3], qy = " + q + "[4], qz = " + q + "[5], qw = " + q + "[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+        "for (int c = 0; c < " + str(n_cols) + "; c++) {"
+        " T m0 = " + mat + "[c], m1 = " + mat + "[" + str(n_cols) + " + c], m2 = " + mat + "[" + str(2 * n_cols) + " + c];"
+        " " + mat + "[c] = R[0]*m0 + R[1]*m1 + R[2]*m2;"
+        " " + mat + "[" + str(n_cols) + " + c] = R[3]*m0 + R[4]*m1 + R[5]*m2;"
+        " " + mat + "[" + str(2 * n_cols) + " + c] = R[6]*m0 + R[7]*m1 + R[8]*m2; }",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def _emit_dI_times_v(self, dst_name, k, vec_name):
     """Emit `dst[0..5] = dI_k @ vec` as a fixed 6-line expression."""
     # accumulate per-row terms
@@ -330,8 +363,18 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag. Added
+    # LAST (after RESOURCE_TIER) so existing positional <T,TIER> call sites are
+    # unaffected; the default (false) instantiation if-constexpr-elides the
+    # epilogue -> byte-identical PTX. Y is a covector matrix (Y.pi = tau), so its
+    # base-linear ROWS rotate like the ID torque covector (G.Y); inputs q,qd,qdd
+    # are mjx -> convert in (qdd: regressor is the full id regressor with a qdd input).
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_func_doc("Compute the joint-torque regressor", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -344,10 +387,20 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_qdd", str(in_size), stride="stride_q_qd_qdd")
+        # mjx input convert (before XImats so X[0] uses the reordered quaternion)
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(qdd_name="s_qdd")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_inverse_dynamics_regressor_inner_function_call()
         self.gen_add_sync()
+        # mjx output: Y.pi = tau is a covector -> base-linear ROWS rotate by R
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            _emit_mjx_base_rotate_rows_rowmajor(self, "s_Y", nv, 10 * NB)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("Y", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
     else:
@@ -384,16 +437,24 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
     if compute_only:
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    # MUJOCO_OUTPUT (floating only) host template flag, forwarded to the kernel
+    # launch (names RESOURCE_TIER positionally to reach the trailing flag). Added
+    # LAST so existing positional call sites don't rebind.
+    mjx_host = self.robot.floating_base
     self.gen_add_func_doc("Compute the joint-torque regressor Y (tau = Y . pi)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics_regressor requires all-data or dynamics gridData\");")
-    func_call_start = "inverse_dynamics_regressor_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Y,hd_data->d_q_qd_u,stride_q_qd_qdd,"
+    kernel_tmpl = "inverse_dynamics_regressor_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_regressor_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Y,hd_data->d_q_qd_u,stride_q_qd_qdd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("inverse_dynamics_regressor_kernel<", "inverse_dynamics_regressor_kernel_single_timing<")
     # q|qd|qdd block layout (floating-aware): stride is the standard Q_QD_U_STRIDE
     # (== NUM_POS + 2*NUM_VEL). The host reuses the d_q_qd_u buffer for q|qd|qdd.
     self.gen_add_code_line("int stride_q_qd_qdd = Q_QD_U_STRIDE;")
@@ -622,8 +683,18 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    # MUJOCO_OUTPUT (floating only): dqdd/dpi = -Minv.Y is a covector-row matrix
+    # (its base-linear ROWS transform like G.out). Because pi is the differentiation
+    # variable (NOT a state), the qacc accel-couple drops -> NO omega x v term: the
+    # input convert takes q,qd,u only (no qdd), and the output is a plain base-row
+    # rotate. Flag added LAST (after RESOURCE_TIER); default false if-constexpr-
+    # elides both -> byte-identical PTX.
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_func_doc("Compute the FD param gradient dqdd/dpi = -Minv . Y", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -659,11 +730,21 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_u", str(in_size), stride="stride_q_qd_u")
+        # mjx input convert (q,qd,u; NO qdd -- pi-gradient is accel-couple-free)
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(u_name="s_u")
+            self.gen_add_end_control_flow()
         _repoint_spilled_Y(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_forward_dynamics_parameter_gradient_inner_function_call()
         self.gen_add_sync()
+        # mjx output: -Minv.Y is a covector-row matrix -> base-linear ROWS rotate by R
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            _emit_mjx_base_rotate_rows_rowmajor(self, "s_dqdd_dpi", nv, 10 * NB)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("dqdd_dpi", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
     else:
@@ -700,18 +781,26 @@ def gen_forward_dynamics_parameter_gradient_host(self, mode=0):
     if compute_only:
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    # MUJOCO_OUTPUT (floating only) host template flag, forwarded to the kernel
+    # launch (names RESOURCE_TIER positionally to reach the trailing flag). Added
+    # LAST so existing positional call sites don't rebind.
+    mjx_host = self.robot.floating_base
     self.gen_add_func_doc("Compute the FD param gradient dqdd/dpi = -Minv . Y", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_parameter_gradient requires all-data or dynamics gridData\");")
     # g1-spill: pass hd_data->d_workspace as the kernel's 2nd arg. At the spilled
     # default tier (s_Y in d_workspace) it is read; at TIER_SHARED it is unused.
-    func_call_start = "forward_dynamics_parameter_gradient_kernel<T><<<block_dimms,thread_dimms,FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    kernel_tmpl = "forward_dynamics_parameter_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_parameter_gradient_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_dqdd_dpi,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("forward_dynamics_parameter_gradient_kernel<", "forward_dynamics_parameter_gradient_kernel_single_timing<")
     self.gen_add_code_line("int stride_q_qd_u = Q_QD_U_STRIDE;")
     if not compute_only:
         self.gen_add_code_lines([
@@ -903,8 +992,17 @@ def gen_kinetic_energy_regressor_kernel(self, single_call_timing=False):
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    # MUJOCO_OUTPUT (floating only): the KE regressor is INVARIANT (it lives in
+    # param space; KE = y_KE.pi is a frame-invariant scalar) -> NO output epilogue.
+    # Only the base velocity input needs converting (KE reads qd via the RNEA v
+    # sweep): input_convert q,qd. Flag added LAST so positional call sites are safe;
+    # default false if-constexpr-elides the input convert -> byte-identical PTX.
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_func_doc("Compute the kinetic-energy regressor", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -916,6 +1014,11 @@ def gen_kinetic_energy_regressor_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(in_size), stride="stride_q_qd")
+        # mjx input convert (before XImats so X[0] uses the reordered quaternion)
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert()
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_kinetic_energy_regressor_inner_function_call()
@@ -954,16 +1057,24 @@ def gen_kinetic_energy_regressor_host(self, mode=0):
     if compute_only:
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    # MUJOCO_OUTPUT (floating only) host template flag, forwarded to the kernel
+    # launch (names RESOURCE_TIER positionally to reach the trailing flag). KE is
+    # invariant -> only the kernel's input-convert changes; no host post-process.
+    mjx_host = self.robot.floating_base
     self.gen_add_func_doc("Compute the kinetic-energy regressor y_KE (KE = y_KE . pi)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"kinetic_energy_regressor requires all-data or dynamics gridData\");")
-    func_call_start = "kinetic_energy_regressor_kernel<T><<<block_dimms,thread_dimms,KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_ke_regressor,hd_data->d_q_qd,stride_q_qd,"
+    kernel_tmpl = "kinetic_energy_regressor_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "kinetic_energy_regressor_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_ke_regressor,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("kinetic_energy_regressor_kernel<", "kinetic_energy_regressor_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines([
             "// start code with memory transfer", "int stride_q_qd;",
@@ -1143,8 +1254,17 @@ def gen_potential_energy_regressor_kernel(self, single_call_timing=False):
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    # MUJOCO_OUTPUT (floating only): the PE regressor is INVARIANT (param space) ->
+    # NO output epilogue. PE reads only q; the only mjx difference is the base
+    # quaternion order (wxyz->xyzw) so the world-transform BFS builds the right R.
+    # quat_reorder BEFORE the XmatsHom build. Flag added LAST; default false
+    # if-constexpr-elides the reorder -> byte-identical PTX.
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_func_doc("Compute the potential-energy regressor", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -1155,6 +1275,11 @@ def gen_potential_energy_regressor_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(in_size), stride="stride_q")
+        # mjx input convert (quat reorder only; before XmatsHom so R is built right)
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder()
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_potential_energy_regressor_inner_function_call()
@@ -1193,16 +1318,24 @@ def gen_potential_energy_regressor_host(self, mode=0):
     if compute_only:
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    # MUJOCO_OUTPUT (floating only) host template flag, forwarded to the kernel
+    # launch (names RESOURCE_TIER positionally to reach the trailing flag). PE is
+    # invariant -> only the kernel's quat-reorder changes; no host post-process.
+    mjx_host = self.robot.floating_base
     self.gen_add_func_doc("Compute the potential-energy regressor y_PE (PE = y_PE . pi)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"potential_energy_regressor requires all-data or kinematics gridData\");")
-    func_call_start = "potential_energy_regressor_kernel<T><<<block_dimms,thread_dimms,POTENTIAL_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_pe_regressor,hd_data->d_q,stride_q,"
+    kernel_tmpl = "potential_energy_regressor_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "potential_energy_regressor_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,POTENTIAL_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_pe_regressor,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("potential_energy_regressor_kernel<", "potential_energy_regressor_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines([
             "// start code with memory transfer", "int stride_q = NUM_JOINTS;",
