@@ -357,7 +357,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_contract_temp_mem_size())
     # Phase 3e: s_df_du and s_Minv can now be in workspace too. Drop them from
     # extra_t_buffers when spilled; declare workspace pointers in the body.
-    extra_t_buffers = [("s_q_qd_u", NUM_POS + 2*n), ("s_qdd", n)]
+    extra_t_buffers = [("s_q_qd_u", 3*NUM_POS), ("s_qdd", n)]
     if not use_workspace_Minv:
         extra_t_buffers.append(("s_Minv", n*n))
     if not use_workspace_df_du:
@@ -371,7 +371,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("(void)d_workspace;")
     if not use_global_tensors:
         self.gen_add_code_line("(void)d_idsva_so;")
-    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + n) + "];")
+    self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) + "]; T *s_u = &s_q_qd_u[" + str(2*NUM_POS) + "];")
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     # Inner-controlled placement: forward_dynamics_inner slices its own Minv-F
     # from s_temp (smem; this kernel does not surgically spill Minv/FD-F — its
@@ -430,16 +430,16 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
 
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
-        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n),stride="stride_q_qd_u")
+        self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS),stride="stride_q_qd_u")
         _emit_fdsva_so_compute_pointers_and_call(timing=False)
         self.gen_add_sync()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n),stride=f"{4*n**3}")
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n))
+        self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS))
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n))
+        self.gen_anti_licm_input_reload("q_qd_u",str(3*NUM_POS))
         _emit_fdsva_so_compute_pointers_and_call(timing=True)
         self.gen_add_end_control_flow()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n))

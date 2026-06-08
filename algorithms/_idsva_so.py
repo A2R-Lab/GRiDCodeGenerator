@@ -2788,7 +2788,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     bc_in_global and tp_in_global are mutually exclusive (separate rungs). Floating-base
     (diagnostic) uses the gravity-shim spill at the SO offset regardless of flags.
     """
-    extra_t_buffers = [("s_q_qd_u", n*2+NUM_POS)]
+    extra_t_buffers = [("s_q_qd_u", 3*NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
     if use_qdd_input:
@@ -2828,7 +2828,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
     if use_qdd_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}];")
     else:
-        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
+        self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{2*NUM_POS}];")
     bc_in_smem_expr = "false" if bc_in_global else "true"
     scratch_in_smem_expr = "false" if s_temp_in_global else "true"
     # Only thread the 4th template arg when t/p actually spills, so every non-tp rung emits
@@ -2847,7 +2847,7 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         if use_qdd_input: # TODO
             self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
         else:
-            self.gen_kernel_load_inputs("q_qd_u",str(2*n + NUM_POS),stride="stride_q_qd_u")
+            self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS),stride="stride_q_qd_u")
         _emit_spill_ptrs()
         self.gen_add_code_line("// compute (the inner loads/updates XImats internally, after its scratch repoint)")
         if use_global_output:
@@ -2861,14 +2861,14 @@ def _emit_idsva_so_body_frame_kernel_body_for_flags(self, n, NUM_POS, use_qdd_in
         if use_qdd_input: # TODO
             self.gen_kernel_load_inputs("q_qd",str(2*n),"qdd",str(n))
         else:
-            self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n))
+            self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS))
         _emit_spill_ptrs()
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_input:
             self.gen_anti_licm_input_reload("q_qd",str(2*n),"qdd",str(n))
         else:
-            self.gen_anti_licm_input_reload("q_qd_u",str(NUM_POS + 2*n))
+            self.gen_anti_licm_input_reload("q_qd_u",str(3*NUM_POS))
         # The inner loads/updates XImats internally each rep (after its scratch repoint).
         if use_global_output:
             self.gen_add_code_line("// Write directly to RAM due to output tensor size")
@@ -3822,7 +3822,7 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     mirrors fdsva_so_device): the kernel no longer repoints s_temp nor calls
     load_update_XImats — it just forwards the flags + the d_temp_spill region.
     """
-    extra_t_buffers = [("s_q_qd_u", n*2 + NUM_POS)]
+    extra_t_buffers = [("s_q_qd_u", 3*NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
     inner_temp = gen_idsva_so_world_frame_temp_mem_size(self) if self.robot.floating_base else self.gen_idsva_so_body_frame_inner_temp_mem_size()
@@ -3841,14 +3841,14 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     needs_workspace = s_temp_in_global or cold_in_global
     if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
-    self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{NUM_POS + n}];")
+    self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{2*NUM_POS}];")
     scratch_in_smem_expr = "false" if s_temp_in_global else "true"
     cold_in_smem_expr = "false" if cold_in_global else "true"
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-        self.gen_kernel_load_inputs("q_qd_u",str(2*n + NUM_POS),stride="stride_q_qd_u")
+        self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS),stride="stride_q_qd_u")
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         if use_global_output:
@@ -3858,12 +3858,12 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
             self.gen_kernel_save_result("idsva_so",str(4*n**3),stride=str(4*n**3))
         self.gen_add_end_control_flow()
     else:
-        self.gen_kernel_load_inputs("q_qd_u",str(NUM_POS + 2*n))
+        self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS))
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q_qd_u", str(NUM_POS + 2*n))
+        self.gen_anti_licm_input_reload("q_qd_u", str(3*NUM_POS))
         if use_global_output:
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
         self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr)

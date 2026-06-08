@@ -1141,7 +1141,7 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         if use_qdd_input:
-            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(n))
+            self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),"qdd",str(n),stride="stride_q_qd",stride2=str(NUM_POS))
         else:
             self.gen_kernel_load_inputs("q_qd",str(n + NUM_POS),stride="stride_q_qd")
         # The kernel only SLICES the workspace band pointers; the device owns

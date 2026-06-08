@@ -316,7 +316,7 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
     out_size = nv * 10 * NB
-    in_size = NUM_POS + 2 * nv
+    in_size = 3 * NUM_POS
     func_params = [
         "d_Y is the output regressor, row-major nv x 10*NUM_BODIES = " + str(out_size),
         "d_q_qd_qdd is the vector of joint positions, velocities, accelerations (q|qd|qdd)",
@@ -340,7 +340,7 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd_qdd; T *s_qd = &s_q_qd_qdd[" + str(NUM_POS) +
-                           "]; T *s_qdd = &s_q_qd_qdd[" + str(NUM_POS + nv) + "];")
+                           "]; T *s_qdd = &s_q_qd_qdd[" + str(2 * NUM_POS) + "];")
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_qdd", str(in_size), stride="stride_q_qd_qdd")
@@ -602,7 +602,7 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
     out_size = nv * 10 * NB
-    in_size = NUM_POS + 2 * nv
+    in_size = 3 * NUM_POS
     func_params = [
         "d_dqdd_dpi is the output FD param-gradient, row-major nv x 10*NUM_BODIES = " + str(out_size),
         "d_q_qd_u is the vector of joint positions, velocities, torques (q|qd|u)",
@@ -643,7 +643,7 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("if constexpr (REGRESSOR_Y_OUTPUT_IN_SMEM) { (void)d_workspace; }")
     self.gen_add_code_line("T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[" + str(NUM_POS) +
-                           "]; T *s_u = &s_q_qd_u[" + str(NUM_POS + nv) + "];")
+                           "]; T *s_u = &s_q_qd_u[" + str(2 * NUM_POS) + "];")
 
     def _repoint_spilled_Y(in_timestep_loop):
         # When spilled, repoint s_Y at the L2-pinned d_workspace SO section

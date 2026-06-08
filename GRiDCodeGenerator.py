@@ -883,7 +883,7 @@ class GRiDCodeGenerator:
         # iiwa14/go2 behavior.
         def _compute_idsva_body_t_count():
             inner = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-            base = (2*nv + n) + inner + XI_size
+            base = (3*n) + inner + XI_size
             full = base + 4*nv**3
             use_global_output = py_arena_bytes(full) > self.cuda_target_shared_mem_bytes
             return base if use_global_output else full, use_global_output
@@ -917,9 +917,9 @@ class GRiDCodeGenerator:
         _idsva_bf_BC = 36 * self.robot.get_num_bodies()
         _idsva_bf_jids_a = len(self.robot.get_jid_ancestor_ids(include_joint=True)[0])
         _idsva_bf_TP = 36 * _idsva_bf_jids_a
-        _idsva_bf_base_smem = (2*nv + n) + XI_size                                  # whole s_temp -> global
-        _idsva_bf_full     = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3
-        _idsva_bf_out      = (2*nv + n) + idsva_so_body_frame_inner_temp_count + XI_size
+        _idsva_bf_base_smem = (3*n) + XI_size                                  # whole s_temp -> global
+        _idsva_bf_full     = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3
+        _idsva_bf_out      = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size
         _idsva_so_body_tiers = [
             ("full",          _idsva_bf_full,                False, False, False, False),
             ("global_output", _idsva_bf_out,                 True,  False, False, False),
@@ -944,7 +944,7 @@ class GRiDCodeGenerator:
         # world-frame path has its own (smaller) scratch — no gravity-shim shared, no
         # main-sweep extras. Sized via gen_idsva_so_world_frame_temp_mem_size.
         idsva_so_world_frame_inner_temp_count = self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base else idsva_so_body_frame_inner_temp_count
-        idsva_so_world_frame_base_t_count = (2*nv + n) + idsva_so_world_frame_inner_temp_count + XI_size
+        idsva_so_world_frame_base_t_count = (3*n) + idsva_so_world_frame_inner_temp_count + XI_size
         idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
         # ----- idsva_so WORLD-frame per-tier spill ladder -----
         # Flags = (use_global_output, s_temp_in_global, cold_in_global). The world inner
@@ -957,7 +957,7 @@ class GRiDCodeGenerator:
         #   output_cold:        + surgical cold trio (36*NB + 12*NB) -> d_workspace
         #   output_temp:        + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
         _idsva_wf_cold = 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
-        _idsva_wf_base_smem = (2*nv + n) + XI_size
+        _idsva_wf_base_smem = (3*n) + XI_size
         _idsva_so_world_tiers = [
             ("full",          idsva_so_world_frame_full_t_count,                  False, False, False),
             ("global_output", idsva_so_world_frame_base_t_count,                  True,  False, False),
@@ -1138,7 +1138,7 @@ class GRiDCodeGenerator:
                                  "const int NUM_BODIES = " + str(self.robot.get_num_bodies()) + ";", \
                                  "const int SECOND_ORDER_COORDS = " + str(self.robot.get_num_vel()) + ";", \
                                  "const int SECOND_ORDER_TENSOR_SIZE = " + str(4 * self.robot.get_num_vel()**3) + ";", \
-                                 "const int Q_QD_U_STRIDE = " + str(self.robot.get_num_pos() + 2 * self.robot.get_num_vel()) + ";", \
+                                 "const int Q_QD_U_STRIDE = " + str(3 * self.robot.get_num_pos()) + ";", \
                                  "const int NUM_EES = " + str(self.robot.get_total_leaf_nodes()) + ";", \
                                  "const int TOPOLOGY_HELPERS_COUNT = " + str(topology_count) + ";", \
                                  "const int DYNAMICS_XI_T_COUNT = " + str(XI_size) + ";", \
