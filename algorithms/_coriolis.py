@@ -564,7 +564,13 @@ def gen_coriolis_matrix_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the Coriolis matrix C(q, qd)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -577,10 +583,25 @@ def gen_coriolis_matrix_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(in_size), stride="stride_q_qd")
+        # mjx input convert: quaternion wxyz->xyzw AND qd[0:3] = R^T qd[0:3] (the
+        # Coriolis matrix reads qd, so the base-linear velocity must be in pin frame)
+        # before the XImats build (so X[0] is built from the reordered quaternion).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         gen_coriolis_matrix_inner_function_call(self)
         self.gen_add_sync()
+        # mjx output: Coriolis matrix is a congruence/similarity G C G^T (base rows
+        # then base cols). C is non-symmetric but the similarity code is identical;
+        # the row-major C buffer fed to the column-major helper yields G C G^T
+        # because the congruence commutes with transposition.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_congruence("s_coriolis", nv)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("coriolis", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
     else:
@@ -616,15 +637,23 @@ def gen_coriolis_matrix_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute the Coriolis matrix C(q, qd)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"coriolis_matrix requires all-data or dynamics gridData\");")
-    func_call_start = "coriolis_matrix_kernel<T><<<block_dimms,thread_dimms,CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_coriolis,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
+    coriolis_kernel_tmpl = "coriolis_matrix_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "coriolis_matrix_kernel<T>"
+    func_call_start = coriolis_kernel_tmpl + "<<<block_dimms,thread_dimms,CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_coriolis,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("coriolis_matrix_kernel<", "coriolis_matrix_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines([
             "// start code with memory transfer", "int stride_q_qd;",

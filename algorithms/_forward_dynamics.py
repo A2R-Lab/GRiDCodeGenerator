@@ -201,6 +201,13 @@ def _emit_fd_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_call_timin
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
+        # mjx input convert (before XImats so X[0] uses the reordered quaternion):
+        # quat wxyz->xyzw, qd[0:3]=R^T qd[0:3], u[0:3]=R^T u[0:3]. fd has no qdd
+        # input (qdd is the OUTPUT) so qdd_name stays None.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", u_name="s_u")
+            self.gen_add_end_control_flow()
         if spill_minv_F:
             self.gen_add_code_line("T *fd_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]);")
         else:
@@ -211,6 +218,13 @@ def _emit_fd_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_call_timin
             updated_var_names = (dict(d_workspace_name = "fd_d_workspace") if spill_minv_F else None),
             minv_f_in_smem_expr = minv_f_expr)
         self.gen_add_sync()
+        # mjx output: forward-dynamics accel qdd[0:3] = R (qdd[0:3] + omega x v_local);
+        # s_qd is the PIN-frame velocity (converted above). The omega x v term is why
+        # the acceleration is not a plain base rotation.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_accel_out(qdd_buf="s_qdd", qd_buf="s_qd")
+            self.gen_add_end_control_flow()
         # Output slot is NUM_JOINTS(=nq)-wide (the binding/host read qdd nj-wide,
         # the d_qdd buffer is nj-strided). qdd has nv real accelerations; the
         # nj-wide slot stride keeps per-timestep outputs from overlapping for a
@@ -253,7 +267,14 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes forward dynamics",func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX. The
+    # epilogue (in _emit_fd_kernel_body_for_flags) sees MUJOCO_OUTPUT in scope.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -288,15 +309,23 @@ def gen_forward_dynamics_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the RNEA (Recursive Newton-Euler Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics requires all-data or dynamics gridData\");")
-    func_call_start = "forward_dynamics_kernel<T><<<block_dimms,thread_dimms,FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    fd_kernel_tmpl = "forward_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_kernel<T>"
+    func_call_start = fd_kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("forward_dynamics_kernel<","forward_dynamics_kernel_single_timing<")
     self.gen_add_code_line("int stride_q_qd_u = 3*NUM_JOINTS;")
     if not compute_only:
         # start code with memory transfer

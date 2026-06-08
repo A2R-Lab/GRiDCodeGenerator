@@ -291,7 +291,13 @@ def gen_frame_jacobian_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Compute a general-frame geometric Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -303,10 +309,21 @@ def gen_frame_jacobian_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n), stride="stride_q")
+        # mjx input convert (quaternion only -> the column-reframe epilogue's R;
+        # J depends on q, so reorder before XmatsHom builds X[0] from the quat).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("frame_jacobian_inner<T>(s_frame_jacobian, target_jid, reference_frame, s_q, s_XmatsHom, d_robotModel, s_temp);")
         self.gen_add_sync()
+        # mjx output: geometric Jacobian column reframe J G^{-1} (base-linear cols . R^T)
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_column_reframe("s_frame_jacobian", 6, nv)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("frame_jacobian", str(6 * nv), stride=str(6 * nv))
         self.gen_add_end_control_flow()
     else:
@@ -353,18 +370,26 @@ def gen_frame_jacobian_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end
     self.gen_add_func_doc("Compute a general-frame geometric Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian requires all-data or kinematics gridData\");")
     self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default (frame still honored)")
     self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
-    func_call_start = ("frame_jacobian_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+    fj_kernel_tmpl = "frame_jacobian_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_kernel<T>"
+    func_call_start = (fj_kernel_tmpl + "<<<block_dimms,thread_dimms,FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                        "(hd_data->d_frame_jacobian,hd_data->d_q,stride_q,target_jid,reference_frame,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("frame_jacobian_kernel<", "frame_jacobian_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines(["// start code with memory transfer",
                                  "int stride_q;",
@@ -514,7 +539,13 @@ def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -531,9 +562,20 @@ def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(n_pos + n_vel), stride="stride_q_qd")
+        # mjx input convert (q quat reorder + qd base-linear -> pin; Jdot depends on
+        # qd, so use the full input_convert before the device rebuilds transforms).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert("s_q", "s_qd")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_add_code_line("frame_jacobian_dot_device<T>(s_frame_jacobian_dot, target_jid, reference_frame, s_q, s_qd, d_robotModel);")
         self.gen_add_sync()
+        # mjx output: Jdot column reframe Jdot G^{-1} (base-linear cols . R^T)
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_column_reframe("s_frame_jacobian_dot", 6, n_vel)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("frame_jacobian_dot", str(6 * n_vel), stride=str(6 * n_vel))
         self.gen_add_end_control_flow()
     else:
@@ -576,7 +618,14 @@ def gen_frame_jacobian_dot_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end
     self.gen_add_func_doc("Compute the time derivative of a general-frame geometric Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). Default false ->
+    # byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
@@ -585,10 +634,11 @@ def gen_frame_jacobian_dot_host(self, mode=0):
     self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
     # Jdot needs qd; always source from the full q|qd|u buffer (stride 3*NUM_JOINTS),
     # the kernel reads the leading [q; qd] slice.
-    func_call = ("frame_jacobian_dot_kernel<T><<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+    fjd_kernel_tmpl = "frame_jacobian_dot_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_dot_kernel<T>"
+    func_call = (fjd_kernel_tmpl + "<<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                  "(hd_data->d_frame_jacobian_dot,hd_data->d_q_qd_u,stride_q_qd,target_jid,reference_frame,d_robotModel,num_timesteps);")
     if single_call_timing:
-        func_call = func_call.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call = func_call.replace("frame_jacobian_dot_kernel<", "frame_jacobian_dot_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines(["// start code with memory transfer",
                                  "int stride_q_qd = 3*NUM_JOINTS;",
@@ -761,7 +811,16 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Compute the operational-space (task) inertia", [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected.
+    # osc_inertia (Lambda = (J Minv J^T)^{-1}) is frame-INVARIANT: the G's cancel,
+    # so there is NO output epilogue; only the q quaternion is reordered so the
+    # internal J/Minv build from the correct base orientation. Default false ->
+    # byte-identical pin codegen.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -772,6 +831,12 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n), stride="stride_q")
+        # mjx input convert (quaternion only -> the internal J/Minv build from the
+        # correct base orientation; Lambda is frame-INVARIANT so NO output epilogue).
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_add_code_line("osc_inertia_device<T>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel);")
         self.gen_add_sync()
@@ -808,16 +873,25 @@ def gen_osc_inertia_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute the operational-space (task) inertia", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). osc_inertia is
+    # frame-INVARIANT (no output epilogue) but the kernel still input-converts the
+    # quaternion under the flag. Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"osc_inertia requires all-data or kinematics gridData\");")
-    func_call_start = ("osc_inertia_kernel<T><<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+    osc_kernel_tmpl = "osc_inertia_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "osc_inertia_kernel<T>"
+    func_call_start = (osc_kernel_tmpl + "<<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                        "(hd_data->d_osc_inertia,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("osc_inertia_kernel<", "osc_inertia_kernel_single_timing<")
     if not compute_only:
         self.gen_add_code_lines(["// start code with memory transfer",
                                  "int stride_q;",

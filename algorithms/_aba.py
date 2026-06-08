@@ -967,7 +967,7 @@ def _aba_surgical_inner_smem_size(self):
         return self.gen_aba_inner_temp_mem_size() - 138
     return 98 * n
 
-def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_call_timing):
+def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_call_timing, mjx_kernel=False):
     """Emit aba_kernel body for one tier's spill level.
     level 0 (full)     : s_temp in smem, whole inner arena in smem (PERF; byte-identical to original).
     level 1 (surgical) : hot recursion stays in smem; only the cold band spills to d_cold
@@ -1007,6 +1007,13 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_
     else:
         self.gen_add_code_line("(void)d_workspace;")
     if not single_call_timing:
+        # mjx input convert (before XImats so X[0] uses the reordered quaternion):
+        # quat wxyz->xyzw on s_q, qd[0:3]=R^T qd[0:3], u(force) s_tau[0:3]=R^T s_tau[0:3].
+        # qdd is the OUTPUT (accel_out class) -> no qdd_name here.
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", u_name="s_tau")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_aba_inner_function_call(
@@ -1015,6 +1022,12 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"),
             cold_in_smem_expr = ("false" if use_cold_spill else "true"))
         self.gen_add_sync()
+        # mjx output: forward-dynamics accel qdd[0:3] = R (qdd[0:3] + omega x v_local),
+        # omega=s_qd[3:6], v_local=s_qd[0:3] (PIN qd after the input convert).
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_accel_out(qdd_buf="s_qdd", qd_buf="s_qd")
+            self.gen_add_end_control_flow()
         # Output slot is NUM_JOINTS(=nq)-wide (the binding/host read qdd nj-wide,
         # the d_qdd buffer is nj-strided). qdd has nv real accelerations; the
         # nj-wide slot stride keeps per-timestep outputs from overlapping for a
@@ -1062,7 +1075,15 @@ def gen_aba_kernel(self, single_call_timing = False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the ABA (Articulated Body Algorithm)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag. Added
+    # LAST so existing positional <T,TIER> call sites are unaffected; the default
+    # (false) instantiation if-constexpr-elides the epilogue -> byte-identical PTX.
+    # ABA is the accel_out class (same as forward_dynamics): qdd = aba(q, qd, u).
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -1074,7 +1095,7 @@ def gen_aba_kernel(self, single_call_timing = False):
     # picks[tier] IS the level for that tier (see aba_spill_tier_3way).
     picks = getattr(self, "aba_spill_tier_3way", (0, 0, 0))
     self.gen_tier_dispatch(picks, lambda pick:
-        _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, pick, single_call_timing))
+        _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, pick, single_call_timing, mjx_kernel))
     self.gen_add_end_function()
 
 def gen_aba_host(self, mode = 0):
@@ -1100,13 +1121,22 @@ def gen_aba_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the ABA (Articulated Body Algorithm)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host template flag: forwarded to the kernel
+    # launch (the only mjx-capable overload). Added LAST so existing positional
+    # template args are unaffected; default false -> byte-identical.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"aba requires all-data or dynamics gridData\");")
 
-    func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
+    # mjx-capable launch names the tier positionally to reach the trailing flag.
+    aba_kernel_tmpl = "aba_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "aba_kernel<T>"
+    func_call_start = aba_kernel_tmpl + "<<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     # Canonical GRiD per-timestep stride: q/qd/u each in a NUM_JOINTS-wide slot
     # (mirrors id/crba/forward_dynamics + the binding's pack_q_qd_u). NUM_JOINTS +
@@ -1114,7 +1144,8 @@ def gen_aba_host(self, mode = 0):
     # compressed stride for a FLOATING base -> shifted inputs for batch>1.
     self.gen_add_code_line("int stride_q_qd = 3*NUM_JOINTS;")
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        # Robust rename (the mjx template appends args after <T>, so match the fn name).
+        func_call_start = func_call_start.replace("aba_kernel<","aba_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
