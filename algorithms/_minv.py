@@ -777,7 +777,7 @@ def gen_minv_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                 "gpuErrchk(cudaMemcpy(hd_data->h_Minv,hd_data->d_Minv,NUM_JOINTS*NUM_JOINTS*" + \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_Minv,hd_data->d_Minv,NUM_VEL*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested

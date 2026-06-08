@@ -119,7 +119,7 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
     the caller supplies them as inputs; otherwise they are scratch outputs."""
     n = self.robot.get_num_vel()
     func_params = [
-        "s_df_du is the output buffer (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
+        "s_df_du is the output buffer (caller places); size 2*NUM_VEL*NUM_VEL = " + str(2*n*n),
         "s_q is the vector of joint positions",
         "s_qd is the vector of joint velocities",
     ]
@@ -132,9 +132,9 @@ def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):
         func_params.append("s_u is the vector of input torques")
     func_params += [
         "s_vaf is the id intermediate band (caller places); size 18*NUM_JOINTS = " + str(18*n),
-        "s_dc_du is the inverse_dynamics_gradient output band (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
+        "s_dc_du is the inverse_dynamics_gradient output band (caller places); size 2*NUM_VEL*NUM_VEL = " + str(2*n*n),
         "s_qdd is the joint-accel scratch (caller places); size NUM_JOINTS = " + str(n),
-        "s_Minv is the mass-matrix scratch (caller places); size NUM_JOINTS*NUM_JOINTS = " + str(n*n),
+        "s_Minv is the mass-matrix scratch (caller places); size NUM_VEL*NUM_VEL = " + str(n*n),
         "s_temp is the shared scratch pool (used when SCRATCH_IN_SMEM)",
         "d_workspace is the global scratch pool (used when !SCRATCH_IN_SMEM)",
         "d_temp_spill is the inverse_dynamics_gradient da_df band spill region (used when USE_DA_DF_SPILL)",
@@ -298,7 +298,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     n = nv
-    func_params = ["d_df_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
+    func_params = ["d_df_du is a pointer to memory for the final result of size 2*NUM_VEL*NUM_VEL = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
@@ -373,7 +373,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
                                  "if (USE_QDD_MINV_FLAG) {" ,\
                                  "    gpuErrchk(cudaMemcpyAsync(hd_data->d_qdd,hd_data->h_qdd,NUM_JOINTS*" + \
                                         ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[1]));", \
-                                 "    gpuErrchk(cudaMemcpyAsync(hd_data->d_Minv,hd_data->h_Minv,NUM_JOINTS*NUM_JOINTS*" + \
+                                 "    gpuErrchk(cudaMemcpyAsync(hd_data->d_Minv,hd_data->h_Minv,NUM_VEL*NUM_VEL*" + \
                                         ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[2]));", \
                                  "}", \
                                  "gpuErrchkKernel();"])
@@ -394,12 +394,11 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back. df_du is the tangent-space gradient
         # (NUM_VEL x 2*NUM_VEL, dense 2*NUM_VEL*NUM_VEL-strided): the kernel writes
-        # it 2*NV*NV-strided and the binding reads 2*NV*NV. The d_df_du gridData
-        # buffer is NUM_JOINTS*2*NUM_JOINTS-sized (>= 2*NV*NV), so the legacy
-        # NUM_JOINTS*2*NUM_JOINTS transfer stays in bounds and is byte-identical
-        # for a FIXED base (nq==nv); kept as-is to preserve the standalone host ABI.
+        # it 2*NV*NV-strided, so the host copy + h_df_du buffer are 2*NV*NV-strided
+        # too. (Previously NUM_JOINTS*2*NUM_JOINTS, which mis-strided h_df_du for a
+        # BATCHED floating base, nq>nv; byte-identical for fixed base nq==nv.)
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                 "gpuErrchk(cudaMemcpy(hd_data->h_df_du,hd_data->d_df_du,NUM_JOINTS*2*NUM_JOINTS*" + \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_df_du,hd_data->d_df_du,2*NUM_VEL*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested

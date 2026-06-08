@@ -145,7 +145,7 @@ def gen_inverse_dynamics_gradient_inner(self):
     n_bfs_levels = max_bfs_levels + 1 # starts at 0
 
     # construct the boilerplate and function definition
-    func_params = ["s_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
+    func_params = ["s_dc_du is a pointer to memory for the final result of size 2*NUM_VEL*NUM_VEL = " + str(2*n*n), \
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
                    "s_vaf are the helper intermediate variables computed by inverse_dynamics", \
@@ -1055,7 +1055,7 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     passing it through is correct with no id-side change."""
     n = self.robot.get_num_vel()
     func_params = [
-        "s_dc_du is the output buffer (caller places); size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n),
+        "s_dc_du is the output buffer (caller places); size 2*NUM_VEL*NUM_VEL = " + str(2*n*n),
         "s_q is the vector of joint positions",
         "s_qd is the vector of joint velocities",
         "s_vaf is the id intermediate band (caller places); size 18*NUM_JOINTS = " + str(18*n),
@@ -1187,7 +1187,7 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
 def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_call_timing = False):
     NUM_POS = self.robot.get_num_pos()
     n = self.robot.get_num_vel()
-    func_params = ["d_dc_du is a pointer to memory for the final result of size 2*NUM_JOINTS*NUM_JOINTS = " + str(2*n*n), \
+    func_params = ["d_dc_du is a pointer to memory for the final result of size 2*NUM_VEL*NUM_VEL = " + str(2*n*n), \
                    "d_q_dq is the vector of joint positions and velocities", \
                    "stride_q_qd is the stide between each q, qd", \
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
@@ -1290,7 +1290,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                 "gpuErrchk(cudaMemcpy(hd_data->h_dc_du,hd_data->d_dc_du,NUM_JOINTS*2*NUM_JOINTS*" + \
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_dc_du,hd_data->d_dc_du,2*NUM_VEL*NUM_VEL*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                  "gpuErrchkKernel();"])
     # finally report out timing if requested
