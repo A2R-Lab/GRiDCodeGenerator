@@ -2605,6 +2605,14 @@ class GRiDCodeGenerator:
             "#define GRID_HAS_INTEGRATOR " + str(int("integrator" in algorithms)))
         self.gen_add_code_line(
             "#define GRID_HAS_INTEGRATOR_GRADIENT " + str(int("integrator_gradient" in algorithms)))
+        # GRID_FLOATING_BASE gates the binding's mjx (MuJoCo output-convention)
+        # C-ABI entry points: the `grid::*<...,MUJOCO_OUTPUT>` template overloads
+        # only EXIST on a floating-base header (the trailing bool template param is
+        # emitted only when floating), so the wrapper's mjx symbols must compile
+        # ONLY for floating robots. Defined (to 1) iff floating; absent otherwise so
+        # `#ifdef GRID_FLOATING_BASE` is a clean no-op on fixed-base headers.
+        if self.robot.floating_base:
+            self.gen_add_code_line("#define GRID_FLOATING_BASE 1")
         self.gen_add_code_line("")
         # then open our namespace
         self.gen_add_func_doc("All functions are kept in this namespace")
