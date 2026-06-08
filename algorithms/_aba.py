@@ -982,7 +982,10 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_
     else:
         shared_mem_size = self.gen_aba_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_qdd", nv), ("s_q_qd_tau", input_count), ("s_va", 12*n)], include_linalg_scratch=True)
-    self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(nq + nv) + "];")
+    # Canonical NUM_JOINTS(=nq)-wide slots: qd at nq, tau/u at 2*nq (mirrors
+    # id/forward_dynamics). Using nq+nv here would point s_tau into the qd slot
+    # for a floating base (nq>nv) -- the off-by-(nq-nv) tau bug.
+    self.gen_add_code_line("T *s_q = s_q_qd_tau; T *s_qd = &s_q_qd_tau[" + str(nq) + "]; T *s_tau = &s_q_qd_tau[" + str(2 * nq) + "];")
     # per-timestep workspace base expr (k-indexed in the batched kernel, slot 0 for single-timing)
     ws_base = "&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]" if not single_call_timing else "d_workspace"
     if not single_call_timing:
@@ -1012,7 +1015,11 @@ def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_
             temp_in_smem_expr = ("false" if use_workspace_temp else "true"),
             cold_in_smem_expr = ("false" if use_cold_spill else "true"))
         self.gen_add_sync()
-        self.gen_kernel_save_result("qdd",str(nv),stride=str(nv))
+        # Output slot is NUM_JOINTS(=nq)-wide (the binding/host read qdd nj-wide,
+        # the d_qdd buffer is nj-strided). qdd has nv real accelerations; the
+        # nj-wide slot stride keeps per-timestep outputs from overlapping for a
+        # FLOATING base (nq>nv). For a FIXED base nq==nv -> byte-identical.
+        self.gen_kernel_save_result("qdd",str(nv),stride=str(nq))
         self.gen_add_end_control_flow()
     else:
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
@@ -1033,7 +1040,13 @@ def gen_aba_kernel(self, single_call_timing = False):
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     n = self.robot.get_num_joints()
-    input_count = nq + 2 * nv
+    # Canonical per-timestep packing (mirrors id/forward_dynamics): q, qd, u/tau
+    # each occupy a NUM_JOINTS(=nq)-wide slot at stride 3*NUM_JOINTS. The kernel
+    # loads the full 3*nq slot and slices qd at nq, tau at 2*nq. For a FIXED base
+    # nq==nv so 3*nq == nq+2*nv (byte-identical); for a FLOATING base nq>nv, so a
+    # compressed nq+2*nv stride would read shifted/garbage inputs for k>=1 and a
+    # misaligned tau even at slot 0 -- the floating batch>1 (and tau) bug.
+    input_count = 3 * nq
     func_params = ["d_qdd is the vector of joint accelerations (output)", \
                     "d_workspace is the L2-pinned global spill buffer (used at LITE/MINIMAL on h1_2-scale)", \
                     "d_q_qd_tau is the vector of joint positions, velocities, torques", \
@@ -1095,7 +1108,11 @@ def gen_aba_host(self, mode = 0):
 
     func_call_start = "aba_kernel<T><<<block_dimms,thread_dimms,ABA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
-    self.gen_add_code_line("int stride_q_qd = NUM_JOINTS + 2*NUM_VEL;")
+    # Canonical GRiD per-timestep stride: q/qd/u each in a NUM_JOINTS-wide slot
+    # (mirrors id/crba/forward_dynamics + the binding's pack_q_qd_u). NUM_JOINTS +
+    # 2*NUM_VEL coincides for a FIXED base (NUM_JOINTS==NUM_VEL) but is a
+    # compressed stride for a FLOATING base -> shifted inputs for batch>1.
+    self.gen_add_code_line("int stride_q_qd = 3*NUM_JOINTS;")
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
@@ -1117,7 +1134,7 @@ def gen_aba_host(self, mode = 0):
     if not compute_only:
         # then transfer memory back
         self.gen_add_code_lines(["// finally transfer the result back", \
-                                "gpuErrchk(cudaMemcpy(hd_data->h_qdd,hd_data->d_qdd,NUM_VEL*" + \
+                                "gpuErrchk(cudaMemcpy(hd_data->h_qdd,hd_data->d_qdd,NUM_JOINTS*" + \
                                 ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
                                 "gpuErrchkKernel();"])
     # finally report out timing if requested

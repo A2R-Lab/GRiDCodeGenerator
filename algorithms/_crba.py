@@ -819,14 +819,14 @@ def gen_crba_host(self, mode = 0):
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
                                  "int stride_q_qd;", \
-                                 "if (USE_COMPRESSED_MEM) {stride_q_qd = NUM_JOINTS + NUM_VEL; " + \
+                                 "if (USE_COMPRESSED_MEM) {stride_q_qd = 2*NUM_JOINTS; " + \
                                     "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd,hd_data->h_q_qd,stride_q_qd*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}", \
-                                 "else {stride_q_qd = NUM_JOINTS + 2*NUM_VEL; " + \
+                                 "else {stride_q_qd = 3*NUM_JOINTS; " + \
                                     "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q_qd*" + \
                                     ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}"])
     else:
-        self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? NUM_JOINTS + NUM_VEL : NUM_JOINTS + 2*NUM_VEL;")
+        self.gen_add_code_line("int stride_q_qd = USE_COMPRESSED_MEM ? 2*NUM_JOINTS : 3*NUM_JOINTS;")
     self.gen_add_code_line("// then call the kernel")
     func_call = func_call_start + func_call_end
     # add in compressed mem adjusts
