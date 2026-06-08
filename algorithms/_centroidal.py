@@ -694,7 +694,7 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
             # already-reordered xyzw quaternion in s_q.
             if self.robot.floating_base:
                 self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
-                self.gen_mjx_column_reframe("&s_out[3]", 3, nv)
+                self.gen_mjx_column_reframe("(s_out + 3)", 3, nv)
                 self.gen_add_end_control_flow()
         elif name == "ccrba":
             self.gen_add_parallel_loop("ind", str(6 * nv))
