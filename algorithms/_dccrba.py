@@ -362,6 +362,107 @@ def _emit_dccrba_assembly(self, out_name, contract_qd):
 
 
 # ===========================================================================
+# mjx output-convention epilogue for the dccrba TENSOR dA_dq[:,k,m]
+# ===========================================================================
+
+def _emit_dccrba_mjx_output(self, out_name):
+    """Emit the MuJoCo/mjx output-convention transform of the dccrba tensor, in
+    place on ``out_name`` (the buffer holding s_dccrba, whichever tier routed it).
+
+    Tensor layout (kernel): ``out_name[i + 6*k + 6*NV*m] = dA[i,k]/dq_m`` with
+    i:momentum-row(0..5), k:qd-COLUMN(NV), m:q-TANGENT(NV). This is the oracle
+    ``T[i,l,m]`` (l==k). The centroidal momentum lives in the world-aligned CoM
+    frame, so the momentum-row index i is INVARIANT; only the velocity/config
+    tangent reparameterization G = blockdiag(R, I) acts. Transform (validated vs
+    `RBDReference.equivalents.mujoco_convention.dccrba_dA_dq_pin_to_mjx` to 4e-16):
+
+        out[i,a,k] = sum_{l,m} T[i,l,m] Ginv[l,a] Ginv[m,k]              (double reframe)
+        out[i,:,k=3+c] += (A_pin @ g_dot(R,c)^T)[i,:]   c=0,1,2          (frame term)
+
+    Ginv = G^T => base-linear 3x3 block = R^T (Ginv[l,a]=R[a][l] for l,a in 0..2;
+    identity elsewhere), so each reframe MIXES ONLY the base-linear indices {0,1,2}.
+    g_dot(R,c) base-linear block = R @ skew(e_c); A_pin is read live from s_A (the
+    centroidal_inner CMM value, col-major s_A[i+6*l], NOT overwritten by the tensor
+    assembly). Single thread over the <=6*NV*NV cells (cheap: NV<=~36); ends with a
+    sync. Fixed base never reaches here (the call site gates on floating_base)."""
+    nv = self.robot.get_num_vel()
+    self.gen_add_code_lines([
+        "// mjx output-convention transform of the dccrba tensor dA_dq[i + 6*k + 6*NV*m]",
+        "// (double G^{-1} reframe of the qd-col k and q-tangent m base-linear indices",
+        "//  + base-rotation frame term A_pin @ g_dot(R,c)^T). See _emit_dccrba_mjx_output.",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    # Build the 3x3 row-major rotation R (R[3*i+j]) from the xyzw quaternion at
+    # s_q[3..6] -- EXACTLY mirroring helpers._gen_mjx_build_R_lines /
+    # mujoco_convention.rotation_from_quat_xyzw (inlined to keep this file self-
+    # contained; the q-only quat reorder wxyz->xyzw is applied on the kernel input).
+    self.gen_add_code_lines([
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+    ])
+    # ---- Step 1: reframe the q-tangent index m on base cols m=0,1,2, for every
+    #      (i,k) cell. tmp[i,k,a] = sum_{m=0..2} T[i,k,m] R[a][m] (Ginv[m,a]=R[a][m]).
+    #      Read the 3 originals into registers, then overwrite. ----
+    self.gen_add_code_line("// step 1: reframe the q-tangent index m (base-linear cols 0,1,2)")
+    self.gen_add_code_line(f"for (int ik = 0; ik < {6*nv}; ++ik) {{", True)
+    self.gen_add_code_line(f"T t0 = {out_name}[ik + {6*nv}*0], t1 = {out_name}[ik + {6*nv}*1], t2 = {out_name}[ik + {6*nv}*2];")
+    self.gen_add_code_line(f"{out_name}[ik + {6*nv}*0] = R[0]*t0 + R[1]*t1 + R[2]*t2;")
+    self.gen_add_code_line(f"{out_name}[ik + {6*nv}*1] = R[3]*t0 + R[4]*t1 + R[5]*t2;")
+    self.gen_add_code_line(f"{out_name}[ik + {6*nv}*2] = R[6]*t0 + R[7]*t1 + R[8]*t2;")
+    self.gen_add_end_control_flow()
+    # ---- Step 2: reframe the qd-col index k on base cols k=0,1,2, for every (i,m)
+    #      cell. out[i,a,m] = sum_{k=0..2} R[a][k] tmp[i,k,m]. Reads step-1 values. ----
+    self.gen_add_code_line("// step 2: reframe the qd-col index k (base-linear cols 0,1,2)")
+    self.gen_add_code_line(f"for (int m = 0; m < {nv}; ++m) {{", True)
+    self.gen_add_code_line("for (int i = 0; i < 6; ++i) {", True)
+    self.gen_add_code_line(f"int b = i + {6*nv}*m;")
+    self.gen_add_code_line(f"T t0 = {out_name}[b + 6*0], t1 = {out_name}[b + 6*1], t2 = {out_name}[b + 6*2];")
+    self.gen_add_code_line(f"{out_name}[b + 6*0] = R[0]*t0 + R[1]*t1 + R[2]*t2;")
+    self.gen_add_code_line(f"{out_name}[b + 6*1] = R[3]*t0 + R[4]*t1 + R[5]*t2;")
+    self.gen_add_code_line(f"{out_name}[b + 6*2] = R[6]*t0 + R[7]*t1 + R[8]*t2;")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    # ---- Step 3: base-rotation frame term. For c=0,1,2 (q-tangent col k=3+c) and
+    #      qd-col a in {0,1,2}, ALL rows i:
+    #        out[i, a, 3+c] += sum_{b=0..2} A_pin[i,b] * Gd_c[a][b],  Gd_c = R @ skew(e_c).
+    #      Kernel index out_name[i + 6*a + 6*NV*(3+c)]; A_pin col-major s_A[i + 6*b].
+    #      Gd_c[a][b] = sum_p R[a][p] skew(e_c)[p][b], R row-major (R[3*a+p]):
+    #        skew(e0)=[[0,0,0],[0,0,-1],[0,1,0]] -> Gd0[a]=[0, R[3a+2], -R[3a+1]]
+    #        skew(e1)=[[0,0,1],[0,0,0],[-1,0,0]] -> Gd1[a]=[-R[3a+2], 0, R[3a+0]]
+    #        skew(e2)=[[0,-1,0],[1,0,0],[0,0,0]] -> Gd2[a]=[R[3a+1], -R[3a+0], 0]
+    #      The (e_c x .) signs are BAKED in the per-(c,a) rhs below (validated vs the
+    #      oracle by transcribing this exact encoding -> 4e-16). ----
+    self.gen_add_code_line("// step 3: base-rotation frame term  out[i,a,3+c] += A_pin[i,:] . (R skew(e_c))[a][:]")
+    self.gen_add_code_line("for (int i = 0; i < 6; ++i) {", True)
+    self.gen_add_code_line("T a0 = s_A[i + 6*0], a1 = s_A[i + 6*1], a2 = s_A[i + 6*2];")
+    # gd[c][a] = list over b of (R-index or None, negate?) for Gd_c[a][b]
+    gd = {
+        0: lambda a: [(None, False), (3 * a + 2, False), (3 * a + 1, True)],
+        1: lambda a: [(3 * a + 2, True), (None, False), (3 * a + 0, False)],
+        2: lambda a: [(3 * a + 1, False), (3 * a + 0, True), (None, False)],
+    }
+    for c in range(3):
+        k = 3 + c
+        for a in range(3):
+            terms = []
+            for b, (ridx, neg) in enumerate(gd[c](a)):
+                if ridx is None:
+                    continue
+                terms.append(f"{'- ' if neg else '+ '}a{b}*R[{ridx}]")
+            rhs = " ".join(terms)
+            rhs = rhs[2:] if rhs.startswith("+ ") else "-" + rhs[2:]
+            self.gen_add_code_line(f"{out_name}[i + 6*{a} + {6*nv}*{k}] += {rhs};")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+# ===========================================================================
 # cmm_time_variation (Adot, 6*NV, NO spill)
 # ===========================================================================
 
@@ -634,7 +735,13 @@ def gen_dccrba_kernel(self, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the dCCRBA tensor dA_dq[:,k,m] per timestep", [], [], None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogues -> byte-identical pin PTX.
+    if self.robot.floating_base:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -672,9 +779,25 @@ def gen_dccrba_kernel(self, single_call_timing=False):
         self.gen_kernel_load_inputs("q", str(in_size), stride="stride_q")
         _repoint(in_loop=True)
         self.gen_add_code_line("// compute")
+        # mjx INPUT (floating only): dccrba is q-only and the CMM tensor is base-
+        # orientation-independent in body frame, so only the base quaternion needs
+        # reordering wxyz->xyzw (so XmatsHom builds X[0] correctly + the output
+        # epilogue's R reads xyzw). Emitted BEFORE the XmatsHom build.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("dccrba_inner<T>(s_dccrba, s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_J, s_linalg_smem);")
         self.gen_add_sync()
+        # mjx OUTPUT (floating only): transform the dccrba tensor (double G^{-1}
+        # reframe + base-rotation frame term) in place on s_dccrba (whichever tier
+        # buffer holds it). A_pin is read live from s_A (not overwritten). R is built
+        # from the already-reordered xyzw quaternion in s_q.
+        if self.robot.floating_base:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            _emit_dccrba_mjx_output(self, "s_dccrba")
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("dccrba", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
     else:
@@ -706,12 +829,27 @@ def gen_dccrba_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute the dCCRBA tensor dA_dq[:,k,m]", [], [], None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # naming the tier positionally (<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>) to
+    # reach the trailing flag. Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"dccrba requires all-data or kinematics gridData\");")
-    kname = "dccrba_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+    # The non-timing kernel carries the MUJOCO_OUTPUT epilogue; name the tier
+    # positionally so the trailing flag binds. The single-timing kernel takes the
+    # flag too (host forwarding) but elides the epilogue (perf-phase follow-up).
+    if mjx_host:
+        ktmpl = ("_single_timing<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
+                 if single_call_timing else "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>")
+        kname = "dccrba_kernel" + ktmpl
+    else:
+        kname = "dccrba_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_dccrba,hd_data->d_workspace,hd_data->d_q,stride_q,d_robotModel,num_timesteps);")
     if not compute_only:
         self.gen_add_code_lines([
