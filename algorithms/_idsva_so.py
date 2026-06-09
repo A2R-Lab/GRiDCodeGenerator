@@ -3100,8 +3100,21 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
         "d_robotModel holds XImats/topology; the inner owns the load_update_XImats call (inner-owns-placement)",
         "gravity is the gravity constant",
     ]
+    # MUJOCO_OUTPUT (floating + non-mimic/skew): compile-time mjx output-convention
+    # flag. Mirrors the id-gradient gate exactly (so the same robots are mjx-capable).
+    # When set, an epilogue at the END of this inner (where s_temp is DEAD) transforms
+    # the 4 pin SO tensors in s_idsva_so to the mjx convention in place, reusing the
+    # id-value / id-gradient / crba inners (M, tau, dtau_dq, dtau_dqd) from a carve of
+    # d_mjx_scratch (the SO-temp region of d_workspace; dead post-assembly).
+    mjx_inner = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    # qdd is mutated in place by gen_mjx_input_convert (accel reframe), so s_qdd is
+    # non-const here regardless (it already is: T *s_qdd).
     func_def_start = "void idsva_so_world_frame_inner(T *s_idsva_so, const T *s_q, const T *s_qd, T *s_qdd, "
-    func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
+    if mjx_inner:
+        func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity, T *d_mjx_scratch = nullptr) {"
+        func_params.append("d_mjx_scratch is the mjx-epilogue scratch arena (SO-temp region of d_workspace; only read when MUJOCO_OUTPUT)")
+    else:
+        func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = [
         "world-frame propagation, gravity baked into main sweep.",
@@ -3114,7 +3127,13 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
         "Computes IDSVA second-order derivatives via the world-frame single-pass formulation",
         func_notes, func_params, None,
     )
-    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool COLD_IN_SMEM = true>")
+    if mjx_inner:
+        # MUJOCO_OUTPUT appended LAST so existing positional <T,SCRATCH,COLD> call
+        # sites are unaffected; default false -> the epilogue if-constexpr-elides to
+        # byte-identical PTX. Fixed-base / mimic / skew never emit it.
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool COLD_IN_SMEM = true, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool COLD_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
     # Inner owns the XImats load too: the s_temp repoint below covers the helper's
@@ -3787,24 +3806,703 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
+    # ---- mjx output-convention epilogue (floating non-mimic/skew only) ----
+    # Runs at the very END of the inner, where s_temp (Xup/IC/BC/.../Xdown/v_w/a_w)
+    # is DEAD and s_idsva_so holds the finalized pin SO tensors. s_XImats/s_q/s_qd/
+    # s_qdd are live. Transforms the 4 pin tensors in s_idsva_so to mjx in place,
+    # reusing the id-value / id-gradient / crba inners out of d_mjx_scratch.
+    if mjx_inner:
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        _emit_idsva_so_mjx_output(self)
+        self.gen_add_end_control_flow()
+
     self.gen_add_end_function()
 
 
+def _emit_idsva_so_mjx_output(self):
+    """Emit the MuJoCo (mjx) output-convention epilogue for idsva_so, transforming
+    the 4 pin second-order tensors held in ``s_idsva_so`` to the mjx convention IN
+    PLACE. Floating-base (non-mimic/skew) only; runs at the END of
+    ``idsva_so_world_frame_inner`` where ``s_temp`` is dead.
+
+    ``s_idsva_so`` is 4 contiguous NV^3 ROW-major blocks ``[i*NV*NV + j*NV + k]``:
+      [0] d2tau_dq2[i,j,k]  [1] d2tau_dqd2[i,j,k]  [2] d2tau_dvdq[i,qd,q] (=cross)
+      [3] dM_dq[i,l,m].
+
+    Scratch (``d_mjx_scratch``, the SO-temp region of d_workspace; size 8*NV^3
+    floats, dead post-assembly — see the kernel-body carve) is laid out:
+      [0,            NV*NV)            s_M     (dense mass matrix, crba_inner)
+      [NV*NV,      3*NV*NV)            s_dc_du (pin dtau_dq | dtau_dqd, col-major)
+      [3*NV*NV,    3*NV*NV+18*NJ)      s_vaf   (id-value intermediate band)
+      [INNERTMP,   INNERTMP+IDG_TEMP)  reused-inner scratch (id/crba/id-grad temps,
+                                       used one-at-a-time; size = id-grad full band)
+      [OUT,        OUT+4*NV*NV*NV)     mjx output band (4 slabs; copied back at end)
+
+    The closed-form dM block and the explicit per-k form (a) for the other three
+    tensors are transcribed verbatim from docs/open-tasks/mjx_proto/
+    proto_idsva_so_emit_spec.py (validated <1e-13 vs second_order_id_pin_to_mjx)."""
+    nv = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
+    nv2 = nv * nv
+    nv3 = nv * nv * nv
+    M_off = 0
+    DCDU_off = nv2          # dtau_dq at [DCDU_off + j*nv + i]; dtau_dqd at [DCDU_off + nv2 + j*nv + i]
+    DQ = DCDU_off
+    DQD = DCDU_off + nv2
+    VAF_off = 3 * nv2
+    vaf_band = 18 * NJ
+    INNERTMP_off = VAF_off + vaf_band
+    idgrad_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    OUT_off = INNERTMP_off + idgrad_temp
+    # tau base-linear = LINEAR part of base wrench f[0] = s_vaf[12*NJ+3..5] (spatial [ang;lin]).
+    _fb = 12 * NJ
+
+    self.gen_add_code_line("// === mjx output convention (floating-base idsva_so, form (a)) ===")
+    self.gen_add_code_lines([
+        "T *s_M     = d_mjx_scratch + " + str(M_off) + ";   // dense mass matrix (crba_inner)",
+        "T *s_dc_du = d_mjx_scratch + " + str(DCDU_off) + ";   // pin dtau_dq | dtau_dqd",
+        "T *s_vaf   = d_mjx_scratch + " + str(VAF_off) + ";   // id-value band (tau via f[0])",
+        "T *s_mjx_tmp = d_mjx_scratch + " + str(INNERTMP_off) + ";   // reused-inner scratch (one at a time)",
+        "T *s_mjx_out = d_mjx_scratch + " + str(OUT_off) + ";   // 4*NV^3 mjx output band",
+    ])
+    # 1) id-value (vaf), 2) crba (dense M), 3) id-gradient (pin dtau_dq|dtau_dqd).
+    #    All read the live s_XImats (built for the converted q). Each uses s_mjx_tmp
+    #    as its own scratch (TEMP_IN_SMEM=true with a global ptr — the inner just uses
+    #    whatever s_temp points to). Sequential so the scratch band is reused.
+    self.gen_add_code_line("// reuse the id-value / crba / id-gradient inners for tau, M, dtau_dq|dtau_dqd")
+    self.gen_inverse_dynamics_inner_function_call(
+        compute_c=False, use_qdd_input=True,
+        updated_var_names=dict(s_vaf_name="s_vaf", s_temp_name="s_mjx_tmp", d_f_ext_name="nullptr"))
+    self.gen_add_sync()
+    self.gen_crba_inner_function_call(
+        updated_var_names=dict(s_M_name="s_M", s_temp_name="s_mjx_tmp", d_workspace_name="nullptr"),
+        temp_in_smem_expr="true")
+    self.gen_add_sync()
+    self.gen_inverse_dynamics_gradient_inner_function_call(
+        dict(s_dc_du_name="s_dc_du", s_vaf_name="s_vaf", s_temp_name="s_mjx_tmp",
+             d_temp_spill_name="nullptr", temp_spill_flag_name="false"))
+    self.gen_add_sync()
+
+    # ---- single-thread assembly (correctness-first; nv small) ----
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6] — matches
+    # mujoco_convention.rotation_from_quat_xyzw / _gen_mjx_build_R_lines exactly.
+    self.gen_add_code_lines([
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+    ])
+    self.gen_add_code_lines([
+        "T v_lin[3]   = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T omega[3]   = {s_qd[3], s_qd[4], s_qd[5]};",
+        "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
+        "T tau_lin[3] = {s_vaf[" + str(_fb + 3) + "], s_vaf[" + str(_fb + 4) + "], s_vaf[" + str(_fb + 5) + "]};",
+        "// flat index helpers (row-major tensors, col-major matrices)",
+        "// pin tensor blocks in s_idsva_so:",
+        "T *T_d2q   = s_idsva_so + " + str(0 * nv3) + ";",
+        "T *T_d2qd  = s_idsva_so + " + str(1 * nv3) + ";",
+        "T *T_cross = s_idsva_so + " + str(2 * nv3) + ";",
+        "T *T_dM    = s_idsva_so + " + str(3 * nv3) + ";",
+        "// mjx output blocks in s_mjx_out (same layout):",
+        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
+        "T *O_d2qd  = s_mjx_out + " + str(1 * nv3) + ";",
+        "T *O_cross = s_mjx_out + " + str(2 * nv3) + ";",
+        "T *O_dM    = s_mjx_out + " + str(3 * nv3) + ";",
+    ])
+    _emit_idsva_so_mjx_perk_assembly(self, nv)
+    _emit_idsva_so_mjx_dM_closed_form(self, nv)
+    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_sync()
+    # ---- copy the mjx output band back over s_idsva_so (block-parallel) ----
+    self.gen_add_parallel_loop("ci", str(4 * nv3))
+    self.gen_add_code_line("s_idsva_so[ci] = s_mjx_out[ci];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
+def _emit_idsva_so_mjx_perk_assembly(self, nv):
+    """Per-k assembly of d2tau_dq2 / d2tau_dvdq(cross) / d2tau_dqd2 (form (a)).
+    Transcribed op-for-op from proto_idsva_so_emit_spec.py. Matrices are flat
+    col-major X[c*nv + r]; tensors row-major T[(i*nv + j)*nv + k]."""
+    n = nv
+    def t3(i, j, k):  # python ints
+        return "((" + i + ")*" + str(n) + " + (" + j + "))*" + str(n) + " + (" + k + ")"
+    # Scratch matrices on the thread stack (col-major nv*nv) for one k:
+    #   sd_dtdq, sd_dtdqd, sd_M (sensitivities); A/inner_v/B reuse; corr/g0 accum.
+    # nv is small (<=~40); nv*nv floats on the stack per buffer. We need:
+    #   d_dtdq, d_dtdqd, d_M  (sensitivities, persisted across the slab build)
+    #   work1, work2          (A / inner_v / B reuse)
+    # plus d_tau[nv]. Declare once outside the k-loop.
+    self.gen_add_code_lines([
+        "T d_dtdq[" + str(n * n) + "], d_dtdqd[" + str(n * n) + "], d_Msens[" + str(n * n) + "];",
+        "T work1[" + str(n * n) + "], work2[" + str(n * n) + "];",
+        "T d_tau[" + str(n) + "];",
+        "T jqk[" + str(n) + "], jvk[" + str(n) + "], jak[" + str(n) + "];",
+    ])
+    self.gen_add_code_line("for (int k = 0; k < " + str(n) + "; k++) {", True)
+    # ---- jqk / jvk / jak (base-block sparse) ----
+    self.gen_add_code_lines([
+        "for (int q_ = 0; q_ < " + str(n) + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); jak[q_] = static_cast<T>(0); }",
+        "bool is_rot = (k >= 3 && k < 6);",
+        "int a_rot = k - 3;",
+        "if (k < 3) { jqk[0] = R[3*k+0]; jqk[1] = R[3*k+1]; jqk[2] = R[3*k+2]; }",
+        "else { jqk[k] = static_cast<T>(1); }",
+        "if (is_rot) {",
+        "  // e_a x w with the exact component encoding (a = a_rot)",
+        "  T evx = (a_rot==1)*( v_lin[2]) + (a_rot==2)*(-v_lin[1]);",
+        "  T evy = (a_rot==0)*(-v_lin[2]) + (a_rot==2)*( v_lin[0]);",
+        "  T evz = (a_rot==0)*( v_lin[1]) + (a_rot==1)*(-v_lin[0]);",
+        "  jvk[0] = -evx; jvk[1] = -evy; jvk[2] = -evz;",
+        "  T ovx = omega[1]*v_lin[2] - omega[2]*v_lin[1];",
+        "  T ovy = omega[2]*v_lin[0] - omega[0]*v_lin[2];",
+        "  T ovz = omega[0]*v_lin[1] - omega[1]*v_lin[0];",
+        "  T eqx = (a_rot==1)*( qdd_lin[2]) + (a_rot==2)*(-qdd_lin[1]);",
+        "  T eqy = (a_rot==0)*(-qdd_lin[2]) + (a_rot==2)*( qdd_lin[0]);",
+        "  T eqz = (a_rot==0)*( qdd_lin[1]) + (a_rot==1)*(-qdd_lin[0]);",
+        "  T eovx = (a_rot==1)*( ovz) + (a_rot==2)*(-ovy);",
+        "  T eovy = (a_rot==0)*(-ovz) + (a_rot==2)*( ovx);",
+        "  T eovz = (a_rot==0)*( ovy) + (a_rot==1)*(-ovx);",
+        "  T oevx = omega[1]*evz - omega[2]*evy;",
+        "  T oevy = omega[2]*evx - omega[0]*evz;",
+        "  T oevz = omega[0]*evy - omega[1]*evx;",
+        "  jak[0] = -eqx - eovx + oevx; jak[1] = -eqy - eovy + oevy; jak[2] = -eqz - eovz + oevz;",
+        "}",
+    ])
+    # Rd = R @ skew(e_{a_rot}) (row-major), only when is_rot.
+    # skew(e_a) columns: skew(e0)=[[0,0,0],[0,0,-1],[0,1,0]], etc. Rd = R@skew(e_a).
+    # Rd[r,c] = sum_p R[r,p] skew[p,c]. We just compute Rd via the generic skew.
+    self.gen_add_code_lines([
+        "T Rd[9];",
+        "for (int ii = 0; ii < 9; ii++) Rd[ii] = static_cast<T>(0);",
+        "if (is_rot) {",
+        "  // skew(e_a): sk[p][c]; Rd[r][c] = sum_p R[3r+p]*sk[p][c]",
+        "  T sk[9]; for (int ii=0; ii<9; ii++) sk[ii]=static_cast<T>(0);",
+        "  // skew(e_a)[p][c] = -eps(a,p,c): e0->(1,2)=-1,(2,1)=1; e1->(2,0)=-1,(0,2)=1; e2->(0,1)=-1,(1,0)=1",
+        "  if (a_rot==0){ sk[1*3+2] = static_cast<T>(-1); sk[2*3+1] = static_cast<T>(1); }",
+        "  if (a_rot==1){ sk[2*3+0] = static_cast<T>(-1); sk[0*3+2] = static_cast<T>(1); }",
+        "  if (a_rot==2){ sk[0*3+1] = static_cast<T>(-1); sk[1*3+0] = static_cast<T>(1); }",
+        "  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {",
+        "    T acc = static_cast<T>(0);",
+        "    for (int p = 0; p < 3; p++) acc += R[3*r+p]*sk[3*p+c];",
+        "    Rd[3*r+c] = acc;",
+        "  }",
+        "}",
+    ])
+    # ---- sensitivities ----
+    self.gen_add_code_line("// sensitivities d_dtdq, d_dtdqd, d_Msens (col-major), d_tau")
+    self.gen_add_code_line("for (int i = 0; i < " + str(n) + "; i++) {", True)
+    self.gen_add_code_line("for (int j = 0; j < " + str(n) + "; j++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int m = 0; m < " + str(n) + "; m++) s += T_d2q[" + t3("i", "j", "m") + "]*jqk[m];",
+        "for (int nn = 0; nn < " + str(n) + "; nn++) s += T_cross[" + t3("i", "nn", "j") + "]*jvk[nn];",
+        "for (int l = 0; l < " + str(n) + "; l++) s += T_dM[" + t3("i", "l", "j") + "]*jak[l];",
+        "d_dtdq[j*" + str(n) + " + i] = s;",
+        "T s2 = static_cast<T>(0);",
+        "for (int m = 0; m < " + str(n) + "; m++) s2 += T_cross[" + t3("i", "j", "m") + "]*jqk[m];",
+        "for (int nn = 0; nn < " + str(n) + "; nn++) s2 += T_d2qd[" + t3("i", "j", "nn") + "]*jvk[nn];",
+        "d_dtdqd[j*" + str(n) + " + i] = s2;",
+        "T s3 = static_cast<T>(0);",
+        "for (int m = 0; m < " + str(n) + "; m++) s3 += T_dM[" + t3("i", "j", "m") + "]*jqk[m];",
+        "d_Msens[j*" + str(n) + " + i] = s3;",
+    ])
+    self.gen_add_end_control_flow()  # j
+    self.gen_add_code_lines([
+        "T st = static_cast<T>(0);",
+        "for (int j = 0; j < " + str(n) + "; j++) st += s_dc_du[" + str(0) + " + j*" + str(n) + " + i]*jqk[j]"
+        " + s_dc_du[" + str(n * n) + " + j*" + str(n) + " + i]*jvk[j] + s_M[i + " + str(n) + "*j]*jak[j];",
+        "d_tau[i] = st;",
+    ])
+    self.gen_add_end_control_flow()  # i
+    # ---- assemble the three slabs ----
+    _emit_idsva_so_mjx_slab_d2q(self, n)
+    _emit_idsva_so_mjx_slab_cross(self, n)
+    _emit_idsva_so_mjx_slab_d2qd(self, n)
+    self.gen_add_end_control_flow()  # k loop
+
+
+# ----------------------------------------------------------------------------
+# Per-tensor slab assemblers (single-thread, one k). All operate on flat
+# col-major matrices X[c*nv + r]; the three jqk/jvk/jak vectors + Rd are in
+# scope from _emit_idsva_so_mjx_perk_assembly. Output written to O_d2q/O_cross/
+# O_d2qd row-major [(i*nv + j)*nv + k]. Transcribed from proto_idsva_so_emit_spec.py.
+# ----------------------------------------------------------------------------
+def _emit_idsva_so_mjx_slab_d2q(self, n):
+    """d2tau_dq2[:,:,k] = MAIN + CORR (form a)."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2tau_dq2 slab[:,:,k] = MAIN + CORR ---")
+    self.gen_add_code_lines([
+        "// MAIN: A = reframe_cols(d_dtdq); A[:,3+a] += d_dtdqd[:,0:3]@Jvq_col(a) + d_Msens[:,0:3]@Jaq_col(a)",
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = d_dtdq[0*" + N + "+r], c1 = d_dtdq[1*" + N + "+r], c2 = d_dtdq[2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  work1[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work1[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = d_dtdq[c*" + N + "+r];",
+        "}",
+    ])
+    # couplings into angular cols 3+a (all rows). Jvq_col(a) = -(e_a x v_lin);
+    # Jaq_col(a) = -(e_a x qdd_lin) - (e_a x (omega x v_lin)) + (omega x (e_a x v_lin)).
+    self.gen_add_code_lines(_emit_jvq_jaq_block(n, "d_dtdqd", "d_Msens", "work1"))
+    # g0 = rot_rows(work1) -> work2 ; then pref g0[0:3,3+a] += R(e_a x d_tau[0:3])
+    self.gen_add_code_lines(_emit_rot_rows_block(n, "work1", "work2", "R"))
+    self.gen_add_code_lines(_emit_pref_block(n, "work2", "d_tau", "R"))
+    # CORR into work1: inner_v = reframe_cols(dtau_dq) + couplings ; Gd@inner_v -> O accum
+    self.gen_add_code_lines([
+        "// CORR: inner_v = reframe_cols(dtau_dq); inner_v[:,3+a] += dtau_dqd[:,0:3]@Jvq + M[:,0:3]@Jaq",
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = s_dc_du[0*" + N + "+r], c1 = s_dc_du[1*" + N + "+r], c2 = s_dc_du[2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  work1[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work1[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = s_dc_du[c*" + N + "+r];",
+        "}",
+    ])
+    # couplings use s_dc_du[DQD..] (dtau_dqd) and s_M
+    self.gen_add_code_lines(_emit_jvq_jaq_block(n, "(s_dc_du + " + str(n * n) + ")", "_SM_", "work1"))
+    # corr (start) = Gd @ inner_v(work1) rows0:3 ; write directly into work2 accum via +=,
+    # but g0 already in work2. We accumulate corr into work2.
+    self.gen_add_code_lines(_emit_gd_inner_block(n, "work1", "work2"))
+    # B (into work1, fresh) = (dtau_dq cols0:3 @ Rd^T) + dtau_dqd@Jvq_d + M@Jaq_d
+    self.gen_add_code_lines([
+        "// B = (dtau_dq cols0:3 @ Rd^T) + dtau_dqd@Jvq_d + M@Jaq_d ; then work2 += rot_rows(B)",
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = s_dc_du[0*" + N + "+r], c1 = s_dc_du[1*" + N + "+r], c2 = s_dc_du[2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*Rd[0] + c1*Rd[1] + c2*Rd[2];",  # Rd^T[cp,c]=Rd[c,cp]=Rd[3c+cp]
+        "  work1[1*" + N + "+r] = c0*Rd[3] + c1*Rd[4] + c2*Rd[5];",
+        "  work1[2*" + N + "+r] = c0*Rd[6] + c1*Rd[7] + c2*Rd[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = static_cast<T>(0);",
+        "}",
+    ])
+    self.gen_add_code_lines(_emit_jvqd_jaqd_block(n, "(s_dc_du + " + str(n * n) + ")", "_SM_", "work1"))
+    self.gen_add_code_lines(_emit_rot_rows_accum_block(n, "work1", "work2", "R"))
+    # pref_Rd: work2[0:3,3+a] += Rd(e_a x tau_lin)
+    self.gen_add_code_lines(_emit_pref_block(n, "work2", "tau_lin", "Rd"))
+    # write slab: O_d2q[i,j,k] = work2[j*nv+i]
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++)",
+        "  O_d2q[(i*" + N + " + j)*" + N + " + k] = work2[j*" + N + " + i];",
+    ])
+
+
+def _emit_idsva_so_mjx_slab_cross(self, n):
+    """d2tau_dvdq (cross)[:,:,k] = rot_rows(reframe_cols(d_dtdqd) + d_M@Jav) + Gd@inner1_v + rot_rows(B1)."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2tau_dvdq (cross) slab[:,:,k] ---")
+    # A1 = reframe_cols(d_dtdqd); + d_Msens@Jav (lin cols 0+a, ang cols 3+a)
+    self.gen_add_code_lines([
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = d_dtdqd[0*" + N + "+r], c1 = d_dtdqd[1*" + N + "+r], c2 = d_dtdqd[2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  work1[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work1[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = d_dtdqd[c*" + N + "+r];",
+        "}",
+    ])
+    self.gen_add_code_lines(_emit_jav_block(n, "d_Msens", "work1", "R"))   # Jav uses R^T e_a
+    self.gen_add_code_lines(_emit_rot_rows_block(n, "work1", "work2", "R"))   # g1
+    # inner1_v = reframe_cols(dtau_dqd) + M@Jav ; Gd@inner1_v accum into work2
+    self.gen_add_code_lines([
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = s_dc_du[" + str(n * n) + "+0*" + N + "+r], c1 = s_dc_du[" + str(n * n) + "+1*" + N + "+r], c2 = s_dc_du[" + str(n * n) + "+2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  work1[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work1[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = s_dc_du[" + str(n * n) + "+c*" + N + "+r];",
+        "}",
+    ])
+    self.gen_add_code_lines(_emit_jav_block(n, "_SM_", "work1", "R"))
+    self.gen_add_code_lines(_emit_gd_inner_block(n, "work1", "work2"))
+    # B1 = (dtau_dqd cols0:3 @ Rd^T) + M@Jav_d ; work2 += rot_rows(B1)
+    self.gen_add_code_lines([
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = s_dc_du[" + str(n * n) + "+0*" + N + "+r], c1 = s_dc_du[" + str(n * n) + "+1*" + N + "+r], c2 = s_dc_du[" + str(n * n) + "+2*" + N + "+r];",
+        "  work1[0*" + N + "+r] = c0*Rd[0] + c1*Rd[1] + c2*Rd[2];",
+        "  work1[1*" + N + "+r] = c0*Rd[3] + c1*Rd[4] + c2*Rd[5];",
+        "  work1[2*" + N + "+r] = c0*Rd[6] + c1*Rd[7] + c2*Rd[8];",
+        "  for (int c = 3; c < " + N + "; c++) work1[c*" + N + "+r] = static_cast<T>(0);",
+        "}",
+    ])
+    self.gen_add_code_lines(_emit_javd_block(n, "_SM_", "work1"))
+    self.gen_add_code_lines(_emit_rot_rows_accum_block(n, "work1", "work2", "R"))
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++)",
+        "  O_cross[(i*" + N + " + j)*" + N + " + k] = work2[j*" + N + " + i];",
+    ])
+
+
+def _emit_idsva_so_mjx_slab_d2qd(self, n):
+    """d2tau_dqd2[:,:,k] = rot_rows(reframe_cols(dv_dtdqd)) + rot_rows(M@Jav_dv).
+    jvvk = G^T col k (= jqk: base-mixed for k<3, else e_k)."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2tau_dqd2 slab[:,:,k] (qvel perturbation, R fixed) ---")
+    # dv_dtdqd[i,j] = sum_n d2qd[i,j,n]*jvvk[n] ; jvvk == jqk (G^T col k).
+    self.gen_add_code_line("for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int nn = 0; nn < " + N + "; nn++) s += T_d2qd[(i*" + N + " + j)*" + N + " + nn]*jqk[nn];",
+        "work1[j*" + N + " + i] = s;",
+    ])
+    self.gen_add_end_control_flow()
+    # A2 = reframe_cols(work1) (in place into work2 then rot) — do reframe into work2 cols
+    self.gen_add_code_lines([
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = work1[0*" + N + "+r], c1 = work1[1*" + N + "+r], c2 = work1[2*" + N + "+r];",
+        "  work2[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  work2[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work2[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) work2[c*" + N + "+r] = work1[c*" + N + "+r];",
+        "}",
+    ])
+    # g1v = rot_rows(work2) -> work1
+    self.gen_add_code_lines(_emit_rot_rows_block(n, "work2", "work1", "R"))
+    # MJ = M @ Jav_dv with dqv_v = jqk[0:3], dqv_om = jqk[3:6]
+    self.gen_add_code_lines([
+        "// MJ = M[:,0:3] @ Jav_dv : lin col a = -(dqv_om x R^T e_a), ang col a = -(e_a x dqv_v)",
+        "for (int rr = 0; rr < " + N + "*" + N + "; rr++) work2[rr] = static_cast<T>(0);",
+        "for (int a = 0; a < 3; a++) {",
+        "  T rte0 = R[3*a+0], rte1 = R[3*a+1], rte2 = R[3*a+2];",   # R^T e_a = row a of R
+        "  T dvo0 = jqk[3], dvo1 = jqk[4], dvo2 = jqk[5];",
+        "  T dvv0 = jqk[0], dvv1 = jqk[1], dvv2 = jqk[2];",
+        "  T jl0 = -(dvo1*rte2 - dvo2*rte1);",
+        "  T jl1 = -(dvo2*rte0 - dvo0*rte2);",
+        "  T jl2 = -(dvo0*rte1 - dvo1*rte0);",
+        "  T evx = (a==1)*( dvv2) + (a==2)*(-dvv1);",
+        "  T evy = (a==0)*(-dvv2) + (a==2)*( dvv0);",
+        "  T evz = (a==0)*( dvv1) + (a==1)*(-dvv0);",
+        "  T jn0 = -evx, jn1 = -evy, jn2 = -evz;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T mr0 = s_M[r + " + N + "*0], mr1 = s_M[r + " + N + "*1], mr2 = s_M[r + " + N + "*2];",
+        "    work2[(0+a)*" + N + "+r] += mr0*jl0 + mr1*jl1 + mr2*jl2;",
+        "    work2[(3+a)*" + N + "+r] += mr0*jn0 + mr1*jn1 + mr2*jn2;",
+        "  }",
+        "}",
+    ])
+    # work1 += rot_rows(work2)
+    self.gen_add_code_lines(_emit_rot_rows_accum_block(n, "work2", "work1", "R"))
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++)",
+        "  O_d2qd[(i*" + N + " + j)*" + N + " + k] = work1[j*" + N + " + i];",
+    ])
+
+
+# ---- reusable inline blocks (return list[str]); _SM_ marks the dense s_M source ----
+def _emit_jvq_jaq_block(n, src_dtqd, src_M, dest):
+    """dest[:,3+a] += src_dtqd[:,0:3]@Jvq_col(a) + src_M[:,0:3]@Jaq_col(a) (all rows)."""
+    N = str(n)
+    sm = "s_M[r + " + N + "*0]" if src_M == "_SM_" else src_M + "[0*" + N + "+r]"
+    sm1 = "s_M[r + " + N + "*1]" if src_M == "_SM_" else src_M + "[1*" + N + "+r]"
+    sm2 = "s_M[r + " + N + "*2]" if src_M == "_SM_" else src_M + "[2*" + N + "+r]"
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T evx = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",
+        "  T evy = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "  T evz = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "  T jvc0 = -evx, jvc1 = -evy, jvc2 = -evz;",
+        "  T ovx = omega[1]*v_lin[2] - omega[2]*v_lin[1];",
+        "  T ovy = omega[2]*v_lin[0] - omega[0]*v_lin[2];",
+        "  T ovz = omega[0]*v_lin[1] - omega[1]*v_lin[0];",
+        "  T eqx = (a==1)*( qdd_lin[2]) + (a==2)*(-qdd_lin[1]);",
+        "  T eqy = (a==0)*(-qdd_lin[2]) + (a==2)*( qdd_lin[0]);",
+        "  T eqz = (a==0)*( qdd_lin[1]) + (a==1)*(-qdd_lin[0]);",
+        "  T eovx = (a==1)*( ovz) + (a==2)*(-ovy);",
+        "  T eovy = (a==0)*(-ovz) + (a==2)*( ovx);",
+        "  T eovz = (a==0)*( ovy) + (a==1)*(-ovx);",
+        "  T oevx = omega[1]*evz - omega[2]*evy;",
+        "  T oevy = omega[2]*evx - omega[0]*evz;",
+        "  T oevz = omega[0]*evy - omega[1]*evx;",
+        "  T jac0 = -eqx - eovx + oevx, jac1 = -eqy - eovy + oevy, jac2 = -eqz - eovz + oevz;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T q0 = " + src_dtqd + "[0*" + N + "+r], q1 = " + src_dtqd + "[1*" + N + "+r], q2 = " + src_dtqd + "[2*" + N + "+r];",
+        "    T m0 = " + sm + ", m1 = " + sm1 + ", m2 = " + sm2 + ";",
+        "    " + dest + "[(3+a)*" + N + "+r] += q0*jvc0 + q1*jvc1 + q2*jvc2 + m0*jac0 + m1*jac1 + m2*jac2;",
+        "  }",
+        "}",
+    ]
+
+
+def _emit_jvqd_jaqd_block(n, src_dtqd, src_M, dest):
+    """dest[:,3+a] += src_dtqd[:,0:3]@Jvq_d_col(a) + src_M[:,0:3]@Jaq_d_col(a).
+    d_v=jvk[0:3], d_om=jvk[3:6], d_qdd=jak[0:3]."""
+    N = str(n)
+    sm = "s_M[r + " + N + "*0]" if src_M == "_SM_" else src_M + "[0*" + N + "+r]"
+    sm1 = "s_M[r + " + N + "*1]" if src_M == "_SM_" else src_M + "[1*" + N + "+r]"
+    sm2 = "s_M[r + " + N + "*2]" if src_M == "_SM_" else src_M + "[2*" + N + "+r]"
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T dv0 = jvk[0], dv1 = jvk[1], dv2 = jvk[2];",
+        "  T dom0 = jvk[3], dom1 = jvk[4], dom2 = jvk[5];",
+        "  T dqd0 = jak[0], dqd1 = jak[1], dqd2 = jak[2];",
+        # Jvq_d col a = -(e_a x d_v)
+        "  T edvx = (a==1)*( dv2) + (a==2)*(-dv1);",
+        "  T edvy = (a==0)*(-dv2) + (a==2)*( dv0);",
+        "  T edvz = (a==0)*( dv1) + (a==1)*(-dv0);",
+        "  T jvc0 = -edvx, jvc1 = -edvy, jvc2 = -edvz;",
+        # Jaq_d col a = -(e_a x d_qdd) - (e_a x (d_om x v_lin + omega x d_v)) + (d_om x (e_a x v_lin)) + (omega x (e_a x d_v))
+        "  T edqx = (a==1)*( dqd2) + (a==2)*(-dqd1);",
+        "  T edqy = (a==0)*(-dqd2) + (a==2)*( dqd0);",
+        "  T edqz = (a==0)*( dqd1) + (a==1)*(-dqd0);",
+        "  T mid0 = (dom1*v_lin[2]-dom2*v_lin[1]) + (omega[1]*dv2-omega[2]*dv1);",
+        "  T mid1 = (dom2*v_lin[0]-dom0*v_lin[2]) + (omega[2]*dv0-omega[0]*dv2);",
+        "  T mid2 = (dom0*v_lin[1]-dom1*v_lin[0]) + (omega[0]*dv1-omega[1]*dv0);",
+        "  T emx = (a==1)*( mid2) + (a==2)*(-mid1);",
+        "  T emy = (a==0)*(-mid2) + (a==2)*( mid0);",
+        "  T emz = (a==0)*( mid1) + (a==1)*(-mid0);",
+        "  T evx = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",   # e_a x v_lin
+        "  T evy = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "  T evz = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "  T edvx2 = (a==1)*( dv2) + (a==2)*(-dv1);",            # e_a x d_v
+        "  T edvy2 = (a==0)*(-dv2) + (a==2)*( dv0);",
+        "  T edvz2 = (a==0)*( dv1) + (a==1)*(-dv0);",
+        "  T t1x = dom1*evz - dom2*evy;",                        # d_om x (e_a x v_lin)
+        "  T t1y = dom2*evx - dom0*evz;",
+        "  T t1z = dom0*evy - dom1*evx;",
+        "  T t2x = omega[1]*edvz2 - omega[2]*edvy2;",            # omega x (e_a x d_v)
+        "  T t2y = omega[2]*edvx2 - omega[0]*edvz2;",
+        "  T t2z = omega[0]*edvy2 - omega[1]*edvx2;",
+        "  T jac0 = -edqx - emx + t1x + t2x;",
+        "  T jac1 = -edqy - emy + t1y + t2y;",
+        "  T jac2 = -edqz - emz + t1z + t2z;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T q0 = " + src_dtqd + "[0*" + N + "+r], q1 = " + src_dtqd + "[1*" + N + "+r], q2 = " + src_dtqd + "[2*" + N + "+r];",
+        "    T m0 = " + sm + ", m1 = " + sm1 + ", m2 = " + sm2 + ";",
+        "    " + dest + "[(3+a)*" + N + "+r] += q0*jvc0 + q1*jvc1 + q2*jvc2 + m0*jac0 + m1*jac1 + m2*jac2;",
+        "  }",
+        "}",
+    ]
+
+
+def _emit_jav_block(n, src_M, dest, Rname):
+    """dest[:,0+a] += src_M[:,0:3]@(-(omega x R^T e_a)) ; dest[:,3+a] += src_M[:,0:3]@(-(e_a x v_lin))."""
+    N = str(n)
+    sm = "s_M[r + " + N + "*0]" if src_M == "_SM_" else src_M + "[0*" + N + "+r]"
+    sm1 = "s_M[r + " + N + "*1]" if src_M == "_SM_" else src_M + "[1*" + N + "+r]"
+    sm2 = "s_M[r + " + N + "*2]" if src_M == "_SM_" else src_M + "[2*" + N + "+r]"
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T rte0 = " + Rname + "[3*a+0], rte1 = " + Rname + "[3*a+1], rte2 = " + Rname + "[3*a+2];",
+        "  T jl0 = -(omega[1]*rte2 - omega[2]*rte1);",
+        "  T jl1 = -(omega[2]*rte0 - omega[0]*rte2);",
+        "  T jl2 = -(omega[0]*rte1 - omega[1]*rte0);",
+        "  T evx = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",
+        "  T evy = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "  T evz = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "  T jn0 = -evx, jn1 = -evy, jn2 = -evz;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T m0 = " + sm + ", m1 = " + sm1 + ", m2 = " + sm2 + ";",
+        "    " + dest + "[(0+a)*" + N + "+r] += m0*jl0 + m1*jl1 + m2*jl2;",
+        "    " + dest + "[(3+a)*" + N + "+r] += m0*jn0 + m1*jn1 + m2*jn2;",
+        "  }",
+        "}",
+    ]
+
+
+def _emit_javd_block(n, src_M, dest):
+    """dest[:,0+a] += M[:,0:3]@(-(d_om x R^T e_a) - (omega x Rd^T e_a)) ;
+       dest[:,3+a] += M[:,0:3]@(-(e_a x d_v)). d_v=jvk[0:3], d_om=jvk[3:6]."""
+    N = str(n)
+    sm = "s_M[r + " + N + "*0]"
+    sm1 = "s_M[r + " + N + "*1]"
+    sm2 = "s_M[r + " + N + "*2]"
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T dv0 = jvk[0], dv1 = jvk[1], dv2 = jvk[2];",
+        "  T dom0 = jvk[3], dom1 = jvk[4], dom2 = jvk[5];",
+        "  T rte0 = R[3*a+0], rte1 = R[3*a+1], rte2 = R[3*a+2];",
+        "  T rdte0 = Rd[3*a+0], rdte1 = Rd[3*a+1], rdte2 = Rd[3*a+2];",
+        "  T jl0 = -((dom1*rte2 - dom2*rte1) + (omega[1]*rdte2 - omega[2]*rdte1));",
+        "  T jl1 = -((dom2*rte0 - dom0*rte2) + (omega[2]*rdte0 - omega[0]*rdte2));",
+        "  T jl2 = -((dom0*rte1 - dom1*rte0) + (omega[0]*rdte1 - omega[1]*rdte0));",
+        "  T edvx = (a==1)*( dv2) + (a==2)*(-dv1);",
+        "  T edvy = (a==0)*(-dv2) + (a==2)*( dv0);",
+        "  T edvz = (a==0)*( dv1) + (a==1)*(-dv0);",
+        "  T jn0 = -edvx, jn1 = -edvy, jn2 = -edvz;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T m0 = " + sm + ", m1 = " + sm1 + ", m2 = " + sm2 + ";",
+        "    " + dest + "[(0+a)*" + N + "+r] += m0*jl0 + m1*jl1 + m2*jl2;",
+        "    " + dest + "[(3+a)*" + N + "+r] += m0*jn0 + m1*jn1 + m2*jn2;",
+        "  }",
+        "}",
+    ]
+
+
+def _emit_rot_rows_block(n, srcX, dstX, Rname):
+    """dstX = copy(srcX) then rows0:3 <- Rname @ rows."""
+    N = str(n)
+    return [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T m0 = " + srcX + "[c*" + N + "+0], m1 = " + srcX + "[c*" + N + "+1], m2 = " + srcX + "[c*" + N + "+2];",
+        "  " + dstX + "[c*" + N + "+0] = " + Rname + "[0]*m0 + " + Rname + "[1]*m1 + " + Rname + "[2]*m2;",
+        "  " + dstX + "[c*" + N + "+1] = " + Rname + "[3]*m0 + " + Rname + "[4]*m1 + " + Rname + "[5]*m2;",
+        "  " + dstX + "[c*" + N + "+2] = " + Rname + "[6]*m0 + " + Rname + "[7]*m1 + " + Rname + "[8]*m2;",
+        "  for (int r = 3; r < " + N + "; r++) " + dstX + "[c*" + N + "+r] = " + srcX + "[c*" + N + "+r];",
+        "}",
+    ]
+
+
+def _emit_rot_rows_accum_block(n, srcX, dstX, Rname):
+    """dstX += rot_rows(srcX): rows0:3 += Rname@srcX[0:3,:]; rows3+ += srcX[3+,:]."""
+    N = str(n)
+    return [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T m0 = " + srcX + "[c*" + N + "+0], m1 = " + srcX + "[c*" + N + "+1], m2 = " + srcX + "[c*" + N + "+2];",
+        "  " + dstX + "[c*" + N + "+0] += " + Rname + "[0]*m0 + " + Rname + "[1]*m1 + " + Rname + "[2]*m2;",
+        "  " + dstX + "[c*" + N + "+1] += " + Rname + "[3]*m0 + " + Rname + "[4]*m1 + " + Rname + "[5]*m2;",
+        "  " + dstX + "[c*" + N + "+2] += " + Rname + "[6]*m0 + " + Rname + "[7]*m1 + " + Rname + "[8]*m2;",
+        "  for (int r = 3; r < " + N + "; r++) " + dstX + "[c*" + N + "+r] += " + srcX + "[c*" + N + "+r];",
+        "}",
+    ]
+
+
+def _emit_gd_inner_block(n, srcX, dstX):
+    """dstX += Gd@srcX: rows0:3 += Rd@srcX[0:3,:] (other rows unchanged)."""
+    N = str(n)
+    return [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T m0 = " + srcX + "[c*" + N + "+0], m1 = " + srcX + "[c*" + N + "+1], m2 = " + srcX + "[c*" + N + "+2];",
+        "  " + dstX + "[c*" + N + "+0] += Rd[0]*m0 + Rd[1]*m1 + Rd[2]*m2;",
+        "  " + dstX + "[c*" + N + "+1] += Rd[3]*m0 + Rd[4]*m1 + Rd[5]*m2;",
+        "  " + dstX + "[c*" + N + "+2] += Rd[6]*m0 + Rd[7]*m1 + Rd[8]*m2;",
+        "}",
+    ]
+
+
+def _emit_pref_block(n, dstX, vec, Rname):
+    """dstX[0:3, 3+a] += Rname @ (e_a x vec[0:3])."""
+    N = str(n)
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T etx = (a==1)*( " + vec + "[2]) + (a==2)*(-" + vec + "[1]);",
+        "  T ety = (a==0)*(-" + vec + "[2]) + (a==2)*( " + vec + "[0]);",
+        "  T etz = (a==0)*( " + vec + "[1]) + (a==1)*(-" + vec + "[0]);",
+        "  T w0 = " + Rname + "[0]*etx + " + Rname + "[1]*ety + " + Rname + "[2]*etz;",
+        "  T w1 = " + Rname + "[3]*etx + " + Rname + "[4]*ety + " + Rname + "[5]*etz;",
+        "  T w2 = " + Rname + "[6]*etx + " + Rname + "[7]*ety + " + Rname + "[8]*etz;",
+        "  " + dstX + "[(3+a)*" + N + "+0] += w0;",
+        "  " + dstX + "[(3+a)*" + N + "+1] += w1;",
+        "  " + dstX + "[(3+a)*" + N + "+2] += w2;",
+        "}",
+    ]
+
+
+def _emit_idsva_so_mjx_dM_closed_form(self, n):
+    """dM_dq (block3) closed form (congruence + base-rot frame), scalar transcription.
+    Reads T_dM, writes O_dM. Uses s_M for the frame terms."""
+    N = str(n)
+    self.gen_add_code_line("// --- dM_dq (block3) closed form: Step1 reframe q-tangent, Step2 congruence, Step3 frame ---")
+    # Step1+2 fused per k: tmp[i,l] then congruence rows(i<3) & cols(l<3).
+    self.gen_add_code_line("for (int k = 0; k < " + N + "; k++) {", True)
+    # Build tmp[i*nv+l] (row i, col l) for this k into work1 (col-major: work1[l*nv+i]).
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) for (int l = 0; l < " + N + "; l++) {",
+        "  T val;",
+        "  if (k < 3) {",
+        "    val = static_cast<T>(0);",
+        "    for (int m = 0; m < 3; m++) val += T_dM[(i*" + N + " + l)*" + N + " + m]*R[3*k+m];",
+        "  } else { val = T_dM[(i*" + N + " + l)*" + N + " + k]; }",
+        "  work1[l*" + N + " + i] = val;",   # col-major store (i row, l col)
+        "}",
+    ])
+    # Step2: rows i<3 <- R@rows (over cols l) into work2; then cols l<3 <- cols@R^T.
+    self.gen_add_code_lines(_emit_rot_rows_block(n, "work1", "work2", "R"))
+    # cols l<3 <- cols . R^T : out[i,l] = sum_lp work2[i,lp] R[l,lp] for l<3
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) {",
+        "  T c0 = work2[0*" + N + "+i], c1 = work2[1*" + N + "+i], c2 = work2[2*" + N + "+i];",
+        "  work1[0*" + N + "+i] = c0*R[0] + c1*R[1] + c2*R[2];",   # R[l=0,lp]=R[0..2]
+        "  work1[1*" + N + "+i] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  work1[2*" + N + "+i] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int l = 3; l < " + N + "; l++) work1[l*" + N + "+i] = work2[l*" + N + "+i];",
+        "}",
+        # write O_dM[i,l,k] = work1[l*nv+i]
+        "for (int i = 0; i < " + N + "; i++) for (int l = 0; l < " + N + "; l++)",
+        "  O_dM[(i*" + N + " + l)*" + N + " + k] = work1[l*" + N + " + i];",
+    ])
+    self.gen_add_end_control_flow()  # k loop
+    # Step3: base-rot frame for c in 0..2, kk=3+c: O_dM[:,:,kk] += Gd@M@G^T + G@M@Gd^T
+    self.gen_add_code_line("// Step3: base-rot frame term added to columns kk=3+c")
+    self.gen_add_code_line("for (int c = 0; c < 3; c++) {", True)
+    self.gen_add_code_lines([
+        "int kk = 3 + c;",
+        "T Rdc[9]; for (int ii=0; ii<9; ii++) Rdc[ii]=static_cast<T>(0);",
+        "T skc[9]; for (int ii=0; ii<9; ii++) skc[ii]=static_cast<T>(0);",
+        "if (c==0){ skc[1*3+2]=static_cast<T>(-1); skc[2*3+1]=static_cast<T>(1); }",
+        "if (c==1){ skc[2*3+0]=static_cast<T>(-1); skc[0*3+2]=static_cast<T>(1); }",
+        "if (c==2){ skc[0*3+1]=static_cast<T>(-1); skc[1*3+0]=static_cast<T>(1); }",
+        "for (int r = 0; r < 3; r++) for (int cc = 0; cc < 3; cc++) {",
+        "  T acc = static_cast<T>(0);",
+        "  for (int p = 0; p < 3; p++) acc += R[3*r+p]*skc[3*p+cc];",
+        "  Rdc[3*r+cc] = acc;",
+        "}",
+        # MGt = M @ G^T : cols0:3 <- M[:,0:3]@R^T (store into work1 col-major work1[b*nv+a])
+        "for (int a = 0; a < " + N + "; a++) {",
+        "  T m0 = s_M[a + " + N + "*0], m1 = s_M[a + " + N + "*1], m2 = s_M[a + " + N + "*2];",
+        "  work1[0*" + N + "+a] = m0*R[0] + m1*R[1] + m2*R[2];",
+        "  work1[1*" + N + "+a] = m0*R[3] + m1*R[4] + m2*R[5];",
+        "  work1[2*" + N + "+a] = m0*R[6] + m1*R[7] + m2*R[8];",
+        "  for (int b = 3; b < " + N + "; b++) work1[b*" + N + "+a] = s_M[a + " + N + "*b];",
+        "}",
+        # term = Gd@MGt : rows0:3 = Rdc@work1[0:3,:] ; store col-major into work2
+        "for (int rr = 0; rr < " + N + "*" + N + "; rr++) work2[rr] = static_cast<T>(0);",
+        "for (int b = 0; b < " + N + "; b++) {",
+        "  T r0 = work1[b*" + N + "+0], r1 = work1[b*" + N + "+1], r2 = work1[b*" + N + "+2];",
+        "  work2[b*" + N + "+0] += Rdc[0]*r0 + Rdc[1]*r1 + Rdc[2]*r2;",
+        "  work2[b*" + N + "+1] += Rdc[3]*r0 + Rdc[4]*r1 + Rdc[5]*r2;",
+        "  work2[b*" + N + "+2] += Rdc[6]*r0 + Rdc[7]*r1 + Rdc[8]*r2;",
+        "}",
+        # GM = G@M : rows0:3 <- R@M[0:3,:] (col-major work1[b*nv+a])
+        "for (int b = 0; b < " + N + "; b++) {",
+        "  T r0 = s_M[0 + " + N + "*b], r1 = s_M[1 + " + N + "*b], r2 = s_M[2 + " + N + "*b];",
+        "  work1[b*" + N + "+0] = R[0]*r0 + R[1]*r1 + R[2]*r2;",
+        "  work1[b*" + N + "+1] = R[3]*r0 + R[4]*r1 + R[5]*r2;",
+        "  work1[b*" + N + "+2] = R[6]*r0 + R[7]*r1 + R[8]*r2;",
+        "  for (int a = 3; a < " + N + "; a++) work1[b*" + N + "+a] = s_M[a + " + N + "*b];",
+        "}",
+        # term += G@M@Gd^T : cols0:3 <- (G@M)[:,0:3]@Rdc^T : out[a,l<3]=sum_lp work1[a,lp]Rdc[l,lp]
+        "for (int a = 0; a < " + N + "; a++) {",
+        "  T c0 = work1[0*" + N + "+a], c1 = work1[1*" + N + "+a], c2 = work1[2*" + N + "+a];",
+        "  work2[0*" + N + "+a] += c0*Rdc[0] + c1*Rdc[1] + c2*Rdc[2];",
+        "  work2[1*" + N + "+a] += c0*Rdc[3] + c1*Rdc[4] + c2*Rdc[5];",
+        "  work2[2*" + N + "+a] += c0*Rdc[6] + c1*Rdc[7] + c2*Rdc[8];",
+        "}",
+        # O_dM[a,l,kk] += work2[l*nv+a]
+        "for (int a = 0; a < " + N + "; a++) for (int l = 0; l < " + N + "; l++)",
+        "  O_dM[(a*" + N + " + l)*" + N + " + kk] += work2[l*" + N + " + a];",
+    ])
+    self.gen_add_end_control_flow()  # c loop
+
+
 def gen_idsva_so_world_frame_inner_function_call(self, scratch_in_smem_expr = "true",
-                                                 cold_in_smem_expr = "true"):
+                                                 cold_in_smem_expr = "true",
+                                                 mujoco_output_expr = None):
     """Emit the call to `idsva_so_world_frame_inner` mirroring the existing call helper.
     scratch_in_smem_expr selects the inner's scratch placement (s_temp vs d_workspace);
     cold_in_smem_expr selects the surgical cold-trio placement (Xdown/v_w/a_w in smem vs
     d_workspace). Callers spilling the whole inner pass scratch="false" + a valid
     d_temp_spill region; callers doing the surgical spill pass cold="false" + d_temp_spill.
-    The inner now OWNS the load_update_XImats call, so d_robotModel is threaded through."""
-    id_so_code_start = ("idsva_so_world_frame_inner<T, " + scratch_in_smem_expr + ", "
-                        + cold_in_smem_expr + ">(s_idsva_so, s_q, s_qd, s_qdd, ")
+    The inner now OWNS the load_update_XImats call, so d_robotModel is threaded through.
+
+    `mujoco_output_expr` (floating non-mimic/skew only): when not None, appends the
+    trailing MUJOCO_OUTPUT template arg + the d_mjx_scratch pointer (the SO-temp
+    region of d_workspace); None keeps the legacy template/signature byte-identical
+    for the pin path."""
+    tmpl = "idsva_so_world_frame_inner<T, " + scratch_in_smem_expr + ", " + cold_in_smem_expr
+    if mujoco_output_expr is not None:
+        tmpl += ", " + mujoco_output_expr
+    tmpl += ">"
+    id_so_code_start = tmpl + "(s_idsva_so, s_q, s_qd, s_qdd, "
     id_so_code_middle = self.gen_insert_helpers_function_call()
     # Unified signature: world inner takes (s_temp, d_workspace, d_robotModel, gravity).
     # `d_temp_spill` is the kernel-local typed view into d_workspace (nullptr at the full
     # rung). d_robotModel is forwarded so the inner can own the XImats load.
-    id_so_code_end = "s_temp, d_temp_spill, d_robotModel, gravity);"
+    if mujoco_output_expr is not None:
+        id_so_code_end = "s_temp, d_temp_spill, d_robotModel, gravity, d_mjx_scratch);"
+    else:
+        id_so_code_end = "s_temp, d_temp_spill, d_robotModel, gravity);"
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
@@ -3822,6 +4520,12 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     mirrors fdsva_so_device): the kernel no longer repoints s_temp nor calls
     load_update_XImats — it just forwards the flags + the d_temp_spill region.
     """
+    # MUJOCO_OUTPUT (floating non-mimic/skew): the kernel template flag in scope.
+    # When set: (1) input-convert q/qd/qdd to the pin frame before the inner builds
+    # XImats; (2) carve d_mjx_scratch from the SO-temp region of d_workspace (dead
+    # post-assembly) and forward it + the flag to the inner. Default false ->
+    # if-constexpr-elided to byte-identical PTX.
+    mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     extra_t_buffers = [("s_q_qd_u", 3*NUM_POS)]
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
@@ -3839,21 +4543,34 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     # or the cold-trio base / d_cold (cold_in_global). nullptr at the full rung.
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     needs_workspace = s_temp_in_global or cold_in_global
-    if not needs_workspace:
+    # mjx ALSO needs d_workspace (for d_mjx_scratch), so don't void it then.
+    if not needs_workspace and not mjx_kernel:
         self.gen_add_code_line("(void)d_workspace;")
+    if mjx_kernel:
+        self.gen_add_code_line("T *d_mjx_scratch = nullptr; (void)d_mjx_scratch;")
     self.gen_add_code_line(f"T *s_q = s_q_qd_u; T *s_qd = &s_q_qd_u[{NUM_POS}]; T *s_qdd = &s_q_qd_u[{2*NUM_POS}];")
     scratch_in_smem_expr = "false" if s_temp_in_global else "true"
     cold_in_smem_expr = "false" if cold_in_global else "true"
+    mjx_expr = "MUJOCO_OUTPUT" if mjx_kernel else None
     so_off = "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
     ts_off = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " + so_off) if not single_call_timing else so_off
+    def _emit_mjx_input_and_scratch(ts_expr):
+        # mjx scratch = SO-temp region of d_workspace (dead post-assembly). The
+        # input-convert mutates s_q/s_qd/s_qdd in place BEFORE the inner builds XImats.
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_add_code_line(f"d_mjx_scratch = reinterpret_cast<T *>(&d_workspace[{ts_expr}]);")
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", qdd_name="s_qdd")
+            self.gen_add_end_control_flow()
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS),stride="stride_q_qd_u")
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+        _emit_mjx_input_and_scratch(ts_off)
         if use_global_output:
             self.gen_add_code_line(f"T *s_idsva_so = &d_idsva_so[k*{4*n**3}];")
-        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr)
+        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr, mjx_expr)
         if not use_global_output:
             self.gen_kernel_save_result("idsva_so",str(4*n**3),stride=str(4*n**3))
         self.gen_add_end_control_flow()
@@ -3861,12 +4578,19 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
         self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS))
         if needs_workspace:
             self.gen_add_code_line(f"d_temp_spill = reinterpret_cast<T *>(&d_workspace[{ts_off}]);")
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) { d_mjx_scratch = reinterpret_cast<T *>(&d_workspace[" + so_off + "]); }")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u", str(3*NUM_POS))
+        # timing path: input-convert each rep (anti-LICM reloads raw inputs) before the inner
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", qdd_name="s_qdd")
+            self.gen_add_end_control_flow()
         if use_global_output:
             self.gen_add_code_line("T *s_idsva_so = d_idsva_so;")
-        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr)
+        self.gen_idsva_so_world_frame_inner_function_call(scratch_in_smem_expr, cold_in_smem_expr, mjx_expr)
         self.gen_add_end_control_flow()
         if not use_global_output:
             self.gen_kernel_save_result("idsva_so",str(4*n**3))
@@ -3891,7 +4615,14 @@ def gen_idsva_so_world_frame_kernel(self, single_call_timing = False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Computes IDSVA-SO via the world-frame single-pass formulation", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): appended LAST after RESOURCE_TIER so
+    # existing positional <T,TIER> call sites are unaffected; default false ->
+    # byte-identical PTX. Fixed-base / mimic / skew never carry it.
+    mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -3924,16 +4655,23 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute IDSVA-SO via the world-frame single-pass formulation", [], func_params, None)
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): host template flag appended LAST;
+    # forwarded positionally to the kernel (which names the tier to reach it).
+    mjx_host = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_world_frame requires all-data or dynamics gridData\");")
-    func_call_start = "idsva_so_world_frame_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
+    kernel_tmpl = "idsva_so_world_frame_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "idsva_so_world_frame_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T", "kernel_single_timing<T")
     self.gen_add_code_line("int stride_q_qd = Q_QD_U_STRIDE;")
     if not compute_only:
         self.gen_add_code_lines([
@@ -4085,7 +4823,15 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
          "streams are pointers to CUDA streams for async memory transfers (if needed)"],
         None,
     )
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew only — the dispatcher forwards to
+    # world_frame): appended LAST after KIND. The binding calls
+    # grid::idsva_so<T, KIND, /*MUJOCO_OUTPUT=*/true>. Fixed-base (body_frame, no
+    # mjx) keeps the legacy 2-arg template -> byte-identical.
+    mjx_disp = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_disp:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
@@ -4098,6 +4844,9 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         # Both body_frame_kernel and world_frame_kernel now take d_workspace
         # (unified signature; cold buffers spill there at LITE/MINIMAL).
         kernel_name = f"idsva_so_{frame_suffix}_kernel_single_timing"
+        # world_frame kernel carries the trailing MUJOCO_OUTPUT (named tier to reach it).
+        kernel_tmpl = (f"{kernel_name}<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_disp
+                       else f"{kernel_name}<T>")
         kernel_workspace_arg = "hd_data->d_workspace,"
         self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so requires all-data or dynamics gridData\");")
         self.gen_add_code_line("int stride_q_qd = Q_QD_U_STRIDE;")
@@ -4110,7 +4859,7 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         self.gen_add_code_line(f"gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", {smem_macro}));")
         self.gen_add_code_line("struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         self.gen_add_code_line(
-            f"{kernel_name}<T><<<block_dimms,thread_dimms,{smem_macro}>>>(hd_data->d_idsva_so,{kernel_workspace_arg}hd_data->d_q_qd_u,stride_q_qd,d_robotModel,gravity,num_timesteps);"
+            f"{kernel_tmpl}<<<block_dimms,thread_dimms,{smem_macro}>>>(hd_data->d_idsva_so,{kernel_workspace_arg}hd_data->d_q_qd_u,stride_q_qd,d_robotModel,gravity,num_timesteps);"
         )
         self.gen_add_code_line("gpuErrchkKernel();")
         self.gen_add_code_line("clock_gettime(CLOCK_MONOTONIC,&end);")
@@ -4132,7 +4881,9 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         forward_args = "hd_data, d_robotModel, gravity, num_timesteps, block_dimms, thread_dimms"
         if not compute_only:
             forward_args += ", streams"
-        self.gen_add_code_line(f"{target}<T, KIND>({forward_args});")
+        # forward MUJOCO_OUTPUT to the world_frame host (floating); fixed-base unchanged.
+        target_tmpl = "<T, KIND, MUJOCO_OUTPUT>" if mjx_disp else "<T, KIND>"
+        self.gen_add_code_line(f"{target}{target_tmpl}({forward_args});")
     self.gen_add_end_function()
 
 
