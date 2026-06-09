@@ -383,21 +383,38 @@ def gen_plant_step_hessian(self):
     nq = self.robot.get_num_pos()
     self.gen_add_func_doc("Plant step hessian s_d2AB (thin wrapper over grid::integrator_hessian_device — pass-through)",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                           "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing
+    # <T, IT, SCRATCH, SPILL, CONTRACT> call sites are unaffected; forwarded straight
+    # to grid::integrator_hessian_device (which owns the validated mjx d2AB epilogue).
+    # Fixed-base never emits it -> byte-identical pin codegen. The kernel does the
+    # INPUT convert into the mutable s_x/s_u smem BEFORE the call (mirroring
+    # plant_step_gradient), so s_q/s_qd/s_u here are already pin-frame (const OK).
+    mjx_wrapper = self.robot.floating_base
+    if mjx_wrapper:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     sig = "void plant_step_hessian(T *s_d2AB, "
     sig_middle = ("const T *s_x, const T *s_u, T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, ")
     sig_middle, func_params = self.gen_insert_helpers_func_def_params(sig_middle, func_params, -1)
-    sig_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
-               "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+    # d_mjx_ws: dedicated mjx-epilogue scratch band (floating only); forwarded
+    # straight to the device fn. FIXED-BASE OMITS it -> byte-identical pin codegen.
+    mjx_ws_param = ("T *d_mjx_ws, " if mjx_wrapper else "")
+    sig_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, " + mjx_ws_param
+               + "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {")
     self.gen_add_code_line(sig + sig_middle + sig_end, True)
     self.gen_add_code_line("const T *s_q  = s_x;")
     self.gen_add_code_line("const T *s_qd = &s_x[" + str(nq) + "];")
-    inner = ("grid::integrator_hessian_device<T, IT, SCRATCH_IN_SMEM, FD_GRAD_USE_SPILL, CONTRACT_IN_SMEM>"
-             "(s_d2AB, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, ")
+    inner_tmpl = ("<T, IT, SCRATCH_IN_SMEM, FD_GRAD_USE_SPILL, CONTRACT_IN_SMEM"
+                  + (", MUJOCO_OUTPUT>" if mjx_wrapper else ">"))
+    inner = ("grid::integrator_hessian_device" + inner_tmpl
+             + "(s_d2AB, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, ")
     inner_helpers = self.gen_insert_helpers_function_call()
-    inner_end = ("s_temp, d_workspace, d_fd_grad_spill, s_fdsva_temp, d_robotModel, gravity, dt);")
+    mjx_ws_arg = ("d_mjx_ws, " if mjx_wrapper else "")
+    inner_end = ("s_temp, d_workspace, d_fd_grad_spill, s_fdsva_temp, " + mjx_ws_arg + "d_robotModel, gravity, dt);")
     self.gen_add_code_line(inner + inner_helpers + inner_end)
     self.gen_add_end_function()
 
@@ -1270,7 +1287,9 @@ def _emit_plant_step_hessian_kernel_body_for_flags(self, n, nx, nz, d2ab_count,
     extra_t_buffers.append(("s_qdd", n))
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_temp_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
-    needs_workspace = spill_d2AB or spill_tensors or spill_fdsva_pool
+    # Floating mjx always needs d_workspace (the dedicated d_mjx_ws band), even at the
+    # SHARED tier where no other band spills.
+    needs_workspace = spill_d2AB or spill_tensors or spill_fdsva_pool or self.robot.floating_base
     if not needs_workspace:
         self.gen_add_code_line("(void)d_workspace;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
@@ -1281,12 +1300,21 @@ def _emit_plant_step_hessian_kernel_body_for_flags(self, n, nx, nz, d2ab_count,
     self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
+    # mjx input convert (floating only): quat wxyz->xyzw + base-linear velocity + force
+    # -> pin frame, in place on the staged s_x/s_u, BEFORE the device call (so the RBD
+    # callees + the d2AB epilogue see pin quantities). No-op on the pin path. Reuses
+    # the gradient-family helper (same stacked-state convert).
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        _gen_plant_step_gradient_mjx_kernel_input(self)
     # Per-timestep workspace bands (carved past the fdsva_so sections so they never
     # collide with the fdsva pool/contraction spill). Layout (per timestep slot):
     #   [0 .. d2AB)        : s_d2AB output band (18*nv^3) when spill_d2AB
     #   [d2AB .. +4nv^3)   : s_df2     when spill_tensors
     #   [.. +4nv^3)        : s_idsva_so when spill_tensors
     #   [.. + pool)        : s_fdsva_temp (the fdsva pool/contraction) when spill_fdsva_pool
+    #   [.. + mjx_ws)      : d_mjx_ws (floating mjx epilogue scratch) — ALWAYS carved
+    #                        for floating so the SHARED tier (no other spill) still has it
     if needs_workspace:
         self.gen_add_code_line("T *d_ws = reinterpret_cast<T *>(&d_workspace[k*PLANT_HESSIAN_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         self.gen_add_code_line("size_t ws_off = 0;")
@@ -1297,16 +1325,23 @@ def _emit_plant_step_hessian_kernel_body_for_flags(self, n, nx, nz, d2ab_count,
         self.gen_add_code_line("T *s_idsva_so = &d_ws[ws_off]; ws_off += " + str(4 * n * n * n) + ";")
     if spill_fdsva_pool:
         self.gen_add_code_line("T *s_fdsva_pool = &d_ws[ws_off]; ws_off += " + str(inner_temp_full) + ";")
+    if mjx_kernel:
+        from ._integrator_gradient import floating_hessian_mjx_ws_count
+        self.gen_add_code_line("T *d_mjx_ws = &d_ws[ws_off]; ws_off += " + str(floating_hessian_mjx_ws_count(n)) + ";")
+    if needs_workspace:
         self.gen_add_code_line("(void)ws_off;")
     # Compose flags: SCRATCH_IN_SMEM=false routes the fdsva pool to d_workspace
     # (the device fn hands it to the body-frame idsva inner + contraction).
     scratch_in_smem = "false" if spill_fdsva_pool else "true"
     contract_in_smem = "false" if spill_fdsva_pool else "true"
     pool_arg = "s_fdsva_pool" if spill_fdsva_pool else "nullptr"
-    self.gen_add_code_line("plant_step_hessian<T, IT, " + scratch_in_smem + ", false, " + contract_in_smem + ">("
+    # Fixed-base OMITS the d_mjx_ws arg (the wrapper has no such param) -> byte-identical.
+    mjx_ws_arg = ("d_mjx_ws, " if mjx_kernel else "")
+    mjx_flag = ", MUJOCO_OUTPUT" if mjx_kernel else ""
+    self.gen_add_code_line("plant_step_hessian<T, IT, " + scratch_in_smem + ", false, " + contract_in_smem + mjx_flag + ">("
                            "s_d2AB, s_x, s_u, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, "
                            + self.gen_insert_helpers_function_call()
-                           + "s_temp, " + pool_arg + ", nullptr, " + pool_arg + ", d_robotModel, gravity, dt);")
+                           + "s_temp, " + pool_arg + ", nullptr, " + pool_arg + ", " + mjx_ws_arg + "d_robotModel, gravity, dt);")
     self.gen_add_sync()
     # Scatter s_d2AB to the global output. When d2AB is already in workspace (spill)
     # the device fn wrote straight into the global band, but the public d_d2AB output
@@ -1357,6 +1392,11 @@ def gen_plant_step_hessian_kernel(self):
     # GRID_WORKSPACE_BYTES_PER_TIMESTEP used by every other algorithm. Emitted
     # BEFORE the kernel template so the kernel body can reference it.
     ws_t_count = d2ab_count + 8 * n * n * n + inner_temp_full
+    # Floating mjx: add the dedicated d_mjx_ws band (pin-d2AB copy + dInt_q + pin dAB)
+    # so the per-timestep workspace always covers it (carved AFTER the spill sections).
+    if self.robot.floating_base:
+        from ._integrator_gradient import floating_hessian_mjx_ws_count
+        ws_t_count += floating_hessian_mjx_ws_count(n)
     self.gen_add_code_line(
         "template <typename T> __host__ __device__ inline size_t "
         "PLANT_HESSIAN_WORKSPACE_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>("
@@ -1371,8 +1411,17 @@ def gen_plant_step_hessian_kernel(self):
                            "stride_x / stride_u are the per-timestep strides",
                            "d_robotModel / gravity / dt as for plant_step",
                            "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                           "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing
+    # <T, IT, RESOURCE_TIER> launches are unaffected; default false -> byte-identical
+    # pin codegen. Threaded to the input convert + forwarded to plant_step_hessian
+    # (whose d2AB epilogue is the validated grid::integrator_hessian_device mjx transform).
+    mjx_kernel_tmpl = self.robot.floating_base
+    if mjx_kernel_tmpl:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, unsigned char *d_workspace, const T *d_x, const T *d_u, "

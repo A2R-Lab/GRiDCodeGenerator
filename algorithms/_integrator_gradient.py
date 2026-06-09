@@ -1191,6 +1191,15 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
 FLOATING_HESSIAN_SE3_SCRATCH = 6 + 36 + 216 + 216
 
 
+def floating_hessian_mjx_ws_count(nv):
+    """Size of the dedicated mjx-epilogue scratch band d_mjx_ws (floating
+    MUJOCO_OUTPUT only): the 2nv*nz*nz read-only pin-d2AB copy + the 6x6 dInt_q block
+    + the reconstructed pin dAB band (2nv*3nv). Kept SEPARATE from the fdsva spill
+    pool / SE(3) scratch (s_se3) so they never collide at the spill tiers."""
+    nz = 3 * nv
+    return 2 * nv * nz * nz + 36 + 2 * nv * 3 * nv
+
+
 def gen_integrator_hessian_device_floating(self):
     """Emit the FLOATING-BASE body of integrator_hessian_device (after the
     EULER/SI-EULER static_assert). Composes fdsva_so_device (the four 2nd-order
@@ -1331,6 +1340,373 @@ def gen_integrator_hessian_device_floating(self):
     self.gen_add_code_line("s_d2AB[ind] = val;")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
+    # ---- mjx output-convention epilogue (floating, single-stage) ----
+    # s_d2AB now holds the PIN hessian. Transform it (+ the reconstructed pin dAB)
+    # to the mjx frame IN PLACE. Reuses the in-flight fdsva_so first-order gradient
+    # (s_df_du) + s_Minv + s_qdd + the SE(3) blocks (no recompute) — like fdsva_so /
+    # integrator_gradient. The pin-d2AB read-only copy lives in d_workspace (the
+    # fdsva_so pool is dead here); the SE(3) scratch + pin dAB stay in s_se3.
+    self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+    _emit_integrator_hessian_mjx_output(self)
+    self.gen_add_end_control_flow()
+
+
+def _emit_integrator_hessian_mjx_output(self):
+    """Emit the MuJoCo (mjx) output-convention epilogue for the integrator hessian,
+    transforming the pin ``s_d2AB`` (2nv x 3nv x 3nv, row-major [o*nz*nz + a*nz + b],
+    axis a=perturbation, b=column) to the mjx convention IN PLACE.
+
+    The mjx hessian is the single derivative of the validated first-order transform
+    integrator_gradient_pin_to_mjx along the mjx perturbation (same path as fdsva_so /
+    idsva_so SO epilogues). Implemented as REAL FORWARD-MODE: for each mjx axis k, the
+    directional derivative of every input to the first-order transform is built from
+    the in-kernel quantities, then propagated through a forward-mode clone of the
+    transform. Transcribed op-for-op from docs/open-tasks/mjx_proto/proto_integ_hess_mjx.py
+    (validated <1e-9 vs integrator_hessian_pin_to_mjx). In-kernel quantities (all live):
+      s_df_du = fd_dq|fd_dqd (col-major), s_Minv (SYMMETRIC_UPPER), s_qdd, s_q/s_qd/s_u,
+      the SE(3) blocks (s_dInt_v / s_d2Int_qv / s_d2Int_vv) + a freshly-computed
+      s_dInt_q. The full pin dAB = [A|B] is reconstructed (top rows from the SE(3)
+      blocks, bottom rows from s_df_du / s_Minv) into s_dAB_pin (s_se3 band).
+
+    Scratch: s_se3 holds (already) s_w/s_dInt_v/s_d2Int_qv/s_d2Int_vv; we append
+    s_dInt_q (36) + s_dAB_pin (2nv*3nv). The pin-d2AB read-only copy goes to
+    d_workspace (the dead fdsva_so pool, 2nv*nz*nz)."""
+    n = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
+    nz = 3 * n
+    twoN = 2 * n
+    N = str(n)
+    NZ = str(nz)
+    # Dedicated mjx scratch band (d_mjx_ws), laid out [pin-d2AB copy | dInt_q | pin dAB].
+    # Separate from the fdsva spill pool (d_workspace / s_se3) so they never collide at
+    # the spill tiers; the SE(3) blocks (s_dInt_v / s_d2Int_*) stay in s_se3 and are
+    # read (not overwritten) during the epilogue.
+    self.gen_add_code_line("T *s_d2AB_pin = d_mjx_ws;                       // read-only pin-hessian copy (2nv*nz*nz)")
+    self.gen_add_code_line("T *s_dInt_q  = &d_mjx_ws[" + str(twoN * nz * nz) + "];          // 6x6 dIntegrate_q")
+    self.gen_add_code_line("T *s_dAB_pin = &d_mjx_ws[" + str(twoN * nz * nz + 36) + "];      // pin dAB [A|B] col-major (2nv*3nv)")
+    # dInt_q at the same w the SE(3) blocks used (Euler dt*qd / SI dt*v_new). Double FD.
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("double wq_d[6]; for (int m = 0; m < 6; ++m) wq_d[m] = static_cast<double>(s_w[m]);")
+    self.gen_add_code_line("double dIq_d[36]; grid_dIntegrate_q_block<double>(wq_d, dIq_d);")
+    self.gen_add_code_line("for (int m = 0; m < 36; ++m) s_dInt_q[m] = static_cast<T>(dIq_d[m]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # Reconstruct the pin dAB = [A|B], COLUMN-major s_dAB_pin[col*2n + row], reusing
+    # the validated single-stage assembly (top rows from s_dInt_q/s_dInt_v, bottom
+    # rows from s_df_du/s_Minv). s_dInt_*_6x6 are the names that helper expects.
+    self.gen_add_code_line("// reconstruct the pin dAB = [A|B] (col-major) from the SE(3) + fd-grad blocks")
+    self.gen_add_code_line("T *s_dInt_q_6x6 = s_dInt_q; T *s_dInt_v_6x6 = s_dInt_v; (void)s_dInt_q_6x6; (void)s_dInt_v_6x6;")
+    gen_integrator_gradient_dAB_assembly(self, integrator_type="IT", s_dAB_name="s_dAB_pin",
+                                         s_df_du_name="s_df_du", s_Minv_name="s_Minv")
+    self.gen_add_sync()
+    # Copy the pin hessian to the read-only d_workspace band (block-parallel).
+    self.gen_add_parallel_loop("ci", str(twoN * nz * nz))
+    self.gen_add_code_line("s_d2AB_pin[ci] = s_d2AB[ci];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # ---- single-thread per-k forward-mode assembly (correctness-first; nv small) ----
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    self.gen_add_code_lines([
+        "const bool si_mjx = si;",
+        # R (row-major R[3r+c]) from the xyzw base quaternion s_q[3..6].
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+        # recovered fd gradient: Bottom = [dt*J_qq | I+dt*J_qv | dt*Minv].
+        # We read the pin dAB bottom blocks directly (col-major) when contracting.
+        "T v_lin[3] = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T u_lin[3] = {s_u[0],  s_u[1],  s_u[2]};",
+        "T qdd_v[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
+    ])
+    _emit_integrator_hessian_mjx_perk(self, n)
+    self.gen_add_end_control_flow()  # threadIdx == 0
+    self.gen_add_sync()
+
+
+def _emit_integrator_hessian_mjx_perk(self, n):
+    """The per-k forward-mode assembly, transcribed op-for-op from
+    proto_integ_hess_mjx.py. Builds the dot of every first-order-transform input
+    along mjx axis k, then propagates through a forward-mode clone of
+    integrator_gradient_pin_to_mjx, writing the result column-slice into s_d2AB.
+
+    Index conventions: pin hessian s_d2AB_pin row-major [o*nz*nz + a*nz + b]; pin
+    dAB s_dAB_pin COLUMN-major [col*2n + row]; matrices below COLUMN-major X[c*n+r];
+    s_Minv SYMMETRIC_UPPER; s_df_du col-major (fd_dq at [c*n+r], fd_dqd at
+    [n*n + c*n+r]). The mjx output cell [o, k, b] = out_dot[o, b]."""
+    N = str(n)
+    nz = 3 * n
+    NZ = str(nz)
+    twoN = 2 * n
+    # Per-k thread-stack buffers. dAB / its dot (col-major 2n x 3n); the forward-mode
+    # work blocks (col-major n x n) for the 6 dAB sub-blocks + their dots; Jz vectors.
+    self.gen_add_code_lines([
+        "T jqk[" + N + "], jvk[" + N + "], juk[" + N + "];",
+        "T dABd[" + str(twoN * nz) + "];                 // dot of pin dAB (col-major [c*2n+r])",
+        "T d_qdd[" + N + "];",
+        # forward-mode value/dot of the six output sub-blocks (col-major n x n):
+        "T botq[" + str(n * n) + "], botv[" + str(n * n) + "], botu[" + str(n * n) + "];",
+        "T topq[" + str(n * n) + "], topv[" + str(n * n) + "], topu[" + str(n * n) + "];",
+        "T dbotq[" + str(n * n) + "], dbotv[" + str(n * n) + "], dbotu[" + str(n * n) + "];",
+        "T dtopq[" + str(n * n) + "], dtopv[" + str(n * n) + "], dtopu[" + str(n * n) + "];",
+    ])
+    # Helper index lambdas emitted as macros-free inline (kept simple): pin dAB block
+    # accessors P_xx(r,c) read s_dAB_pin (col-major, full 2n x 3n). Bottom rows live
+    # at row n+.. ; top rows at row 0.. . Column blocks q:[0,n) qd:[n,2n) u:[2n,3n).
+    self.gen_add_code_line("for (int k = 0; k < " + NZ + "; k++) {", True)
+    # ---- build jqk / jvk / juk and the Rd (= R@skew(e_a)) for this axis ----
+    self.gen_add_code_lines([
+        "for (int q_ = 0; q_ < " + N + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); juk[q_] = static_cast<T>(0); }",
+        "int kblk = k / " + N + ";",
+        "T Rd[9]; for (int ii = 0; ii < 9; ii++) Rd[ii] = static_cast<T>(0);",
+        "if (kblk == 0) {",
+        "  int kk = k;",
+        "  if (kk < 3) { jqk[0] = R[3*kk+0]; jqk[1] = R[3*kk+1]; jqk[2] = R[3*kk+2]; }",   # Ginv[:,kk] base-linear: Ginv[r,kk]=R^T[r,kk]=R[kk,r]=R[3*kk+r]
+        "  else { jqk[kk] = static_cast<T>(1); }",
+        "  if (kk >= 3 && kk < 6) {",
+        "    int a = kk - 3;",
+        "    T ev0 = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",
+        "    T ev1 = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "    T ev2 = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "    jvk[0] = -ev0; jvk[1] = -ev1; jvk[2] = -ev2;",
+        "    T eu0 = (a==1)*( u_lin[2]) + (a==2)*(-u_lin[1]);",
+        "    T eu1 = (a==0)*(-u_lin[2]) + (a==2)*( u_lin[0]);",
+        "    T eu2 = (a==0)*( u_lin[1]) + (a==1)*(-u_lin[0]);",
+        "    juk[0] = -eu0; juk[1] = -eu1; juk[2] = -eu2;",
+        # Rd = R @ skew(e_a): skew(e_0)=[[0,0,0],[0,0,-1],[0,1,0]] etc.
+        "    T sk[9]; for (int ii=0; ii<9; ii++) sk[ii]=static_cast<T>(0);",
+        "    if (a==0){ sk[1*3+2] = static_cast<T>(-1); sk[2*3+1] = static_cast<T>(1); }",
+        "    if (a==1){ sk[2*3+0] = static_cast<T>(-1); sk[0*3+2] = static_cast<T>(1); }",
+        "    if (a==2){ sk[0*3+1] = static_cast<T>(-1); sk[1*3+0] = static_cast<T>(1); }",
+        "    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { T acc=static_cast<T>(0); for (int p=0;p<3;p++) acc += R[3*r+p]*sk[3*p+c]; Rd[3*r+c]=acc; }",
+        "  }",
+        "} else if (kblk == 1) {",
+        "  int kk = k - " + N + ";",
+        "  if (kk < 3) { jvk[0] = R[3*kk+0]; jvk[1] = R[3*kk+1]; jvk[2] = R[3*kk+2]; }",   # Jvv = Ginv[:,kk]
+        "  else { jvk[kk] = static_cast<T>(1); }",
+        "} else {",
+        "  int kk = k - " + str(2 * n) + ";",
+        "  if (kk < 3) { juk[0] = R[3*kk+0]; juk[1] = R[3*kk+1]; juk[2] = R[3*kk+2]; }",   # Ju_u = Ginv[:,kk]
+        "  else { juk[kk] = static_cast<T>(1); }",
+        "}",
+    ])
+    # ---- d_dAB[o,c] = sum_a s_d2AB_pin[o,a,c] * Jz[a]  (Jz = [jqk; jvk; juk]) ----
+    # Store dABd col-major [c*2n + o] to match s_dAB_pin's layout for the reframes.
+    self.gen_add_code_line("for (int o = 0; o < " + str(twoN) + "; o++) for (int c = 0; c < " + NZ + "; c++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int a = 0; a < " + N + "; a++)        s += s_d2AB_pin[(o*" + NZ + " + a)*" + NZ + " + c]        * jqk[a];",
+        "for (int a = 0; a < " + N + "; a++)        s += s_d2AB_pin[(o*" + NZ + " + (" + N + "+a))*" + NZ + " + c] * jvk[a];",
+        "for (int a = 0; a < " + N + "; a++)        s += s_d2AB_pin[(o*" + NZ + " + (" + str(2 * n) + "+a))*" + NZ + " + c] * juk[a];",
+        "dABd[c*" + str(twoN) + " + o] = s;",
+    ])
+    self.gen_add_end_control_flow()
+    # ---- d_qdd[i] = J_qq[i,:]@jqk + J_qv[i,:]@jvk + Minv[i,:]@juk ----
+    # J_qq = (dAB bottom q-block)/dt ; J_qv = (dAB bottom qd-block - I)/dt ;
+    # Minv = (dAB bottom u-block)/dt. Read s_dAB_pin (col-major, bottom rows = n+i).
+    self.gen_add_code_line("for (int i = 0; i < " + N + "; i++) {", True)
+    self.gen_add_code_lines([
+        "T st = static_cast<T>(0);",
+        "for (int j = 0; j < " + N + "; j++) {",
+        "  T jqq = s_dAB_pin[(0*" + N + "+j)*" + str(twoN) + " + (" + N + "+i)] / dt;",
+        "  T jqv = (s_dAB_pin[(" + N + "+j)*" + str(twoN) + " + (" + N + "+i)] - ((i==j)?static_cast<T>(1):static_cast<T>(0))) / dt;",
+        "  T mij = s_dAB_pin[(" + str(2 * n) + "+j)*" + str(twoN) + " + (" + N + "+i)] / dt;",
+        "  st += jqq*jqk[j] + jqv*jvk[j] + mij*juk[j];",
+        "}",
+        "d_qdd[i] = st;",
+    ])
+    self.gen_add_end_control_flow()
+    # ---- forward-mode through integrator_gradient_pin_to_mjx ----
+    _emit_integrator_hessian_mjx_fwd(self, n)
+    self.gen_add_end_control_flow()  # k loop
+
+
+def _emit_integrator_hessian_mjx_fwd(self, n):
+    """Forward-mode clone of integrator_gradient_pin_to_mjx for one axis k. Computes
+    only the DOT (the value is the already-written pin->mjx gradient, not needed).
+    Writes the mjx hessian column-slice into s_d2AB[(o*nz + k)*nz + b]. Op-for-op
+    from proto_integ_hess_mjx.integ_grad_fwd."""
+    N = str(n)
+    nz = 3 * n
+    NZ = str(nz)
+    twoN = 2 * n
+    # Block accessors into s_dAB_pin (col-major [c*2n + r]) and its dot dABd:
+    #   P(off, half, r, c) = pin dAB block value; Pd = its dot.
+    # half=0 top rows (row=r), half=1 bottom rows (row=n+r). off in {0,n,2n} cols.
+    def Pv(off, half, r, c):
+        return "s_dAB_pin[((" + off + ")+(" + c + "))*" + str(twoN) + " + ((" + half + ")*" + N + "+(" + r + "))]"
+    def Pd(off, half, r, c):
+        return "dABd[((" + off + ")+(" + c + "))*" + str(twoN) + " + ((" + half + ")*" + N + "+(" + r + "))]"
+    # We assemble botq/botv/botu/topq/topv/topu (value) and their dots, exactly as
+    # the proto, then write s_d2AB. For the DOT we need both value and dot of each
+    # block because md(A,A_d,B,B_d) = A_d@B + A@B_d. Build the inner products
+    # explicitly for the base-linear reframes.
+    #
+    # To keep the transcription tractable we materialize, per half (0=top,1=bot),
+    # the three column-block products with G^{-1}/Jv_q/Ju_q and the G row-rotation,
+    # carrying (value,dot). This mirrors integ_grad_fwd's md()/cross_cols/g_dot.
+    self.gen_add_code_lines([
+        "// forward-mode integrator_gradient_pin_to_mjx (dot only) for axis k.",
+        "// qd_{k+1,pin} value/dot for the g_dot velocity term (bottom rows).",
+        "T qk1[3] = {s_qd[0]+dt*s_qdd[0], s_qd[1]+dt*s_qdd[1], s_qd[2]+dt*s_qdd[2]};",
+        "T qk1d[3] = {jvk[0]+dt*d_qdd[0], jvk[1]+dt*d_qdd[1], jvk[2]+dt*d_qdd[2]};",
+    ])
+    # For each half assemble the q/qd/u output column blocks (value+dot).
+    # block names: for half h, columns: BLKq (=botq/topq), BLKv, BLKu.
+    for half, (bq, bv, bu, dbq, dbv, dbu) in (
+        ("1", ("botq", "botv", "botu", "dbotq", "dbotv", "dbotu")),
+        ("0", ("topq", "topv", "topu", "dtopq", "dtopv", "dtopu")),
+    ):
+        self.gen_add_code_line("{ // half " + half + (" (bottom/velocity rows)" if half == "1" else " (top/position rows)"))
+        # inner = Bq@Ginv + Bv@Jv_q + Bu@Ju_q ; value into bq, dot into dbq.
+        # Bv@Jv_q / Bu@Ju_q only fill ang cols (3..5). Ginv reframes base-linear cols.
+        self.gen_add_code_lines(_integ_hess_colblock(self, n, half, "0", bq, dbq, Pv, Pd,
+                                                     with_cross=True))
+        self.gen_add_code_lines(_integ_hess_colblock(self, n, half, str(n), bv, dbv, Pv, Pd,
+                                                     with_cross=False))
+        self.gen_add_code_lines(_integ_hess_colblock(self, n, half, str(2 * n), bu, dbu, Pv, Pd,
+                                                     with_cross=False))
+        if half == "1":
+            # G row-rotate (rows 0:3 by R) + g_dot @ qk1 on ang q-cols. The col-block
+            # builders above already applied G rows; the g_dot term is bottom-only.
+            self.gen_add_code_lines([
+                "for (int a = 0; a < 3; a++) {",
+                "  T sk0 = (a==1)*( qk1[2]) + (a==2)*(-qk1[1]);",   # (e_a x qk1)
+                "  T sk1 = (a==0)*(-qk1[2]) + (a==2)*( qk1[0]);",
+                "  T sk2 = (a==0)*( qk1[1]) + (a==1)*(-qk1[0]);",
+                "  T sd0 = (a==1)*( qk1d[2]) + (a==2)*(-qk1d[1]);",
+                "  T sd1 = (a==0)*(-qk1d[2]) + (a==2)*( qk1d[0]);",
+                "  T sd2 = (a==0)*( qk1d[1]) + (a==1)*(-qk1d[0]);",
+                # value col = R@(e_a x qk1); dot = Rd@(e_a x qk1) + R@(e_a x qk1d).
+                "  " + bq + "[(3+a)*" + N + "+0] += R[0]*sk0 + R[1]*sk1 + R[2]*sk2;",
+                "  " + bq + "[(3+a)*" + N + "+1] += R[3]*sk0 + R[4]*sk1 + R[5]*sk2;",
+                "  " + bq + "[(3+a)*" + N + "+2] += R[6]*sk0 + R[7]*sk1 + R[8]*sk2;",
+                "  " + dbq + "[(3+a)*" + N + "+0] += Rd[0]*sk0 + Rd[1]*sk1 + Rd[2]*sk2 + R[0]*sd0 + R[1]*sd1 + R[2]*sd2;",
+                "  " + dbq + "[(3+a)*" + N + "+1] += Rd[3]*sk0 + Rd[4]*sk1 + Rd[5]*sk2 + R[3]*sd0 + R[4]*sd1 + R[5]*sd2;",
+                "  " + dbq + "[(3+a)*" + N + "+2] += Rd[6]*sk0 + Rd[7]*sk1 + Rd[8]*sk2 + R[6]*sd0 + R[7]*sd1 + R[8]*sd2;",
+                "}",
+            ])
+        self.gen_add_code_line("}")
+    # ---- TOP-row base-linear overwrite (mjx global-add tangent) ----
+    self.gen_add_code_lines([
+        "// top base-linear output rows (0..2): overwrite with the mjx global-add tangent.",
+        "for (int a = 0; a < 3; a++) for (int c = 0; c < " + N + "; c++) {",
+        "  topq[c*" + N + "+a] = static_cast<T>(0); dtopq[c*" + N + "+a] = static_cast<T>(0);",
+        "  topv[c*" + N + "+a] = static_cast<T>(0); dtopv[c*" + N + "+a] = static_cast<T>(0);",
+        "  topu[c*" + N + "+a] = static_cast<T>(0); dtopu[c*" + N + "+a] = static_cast<T>(0);",
+        "}",
+        "for (int a = 0; a < 3; a++) { topq[a*" + N + "+a] = static_cast<T>(1); }",   # identity (dot 0)
+        "if (si_mjx) {",
+        "  for (int a = 0; a < 3; a++) for (int c = 0; c < " + N + "; c++) {",
+        "    topq[c*" + N + "+a] += dt*botq[c*" + N + "+a]; dtopq[c*" + N + "+a] += dt*dbotq[c*" + N + "+a];",
+        "    topv[c*" + N + "+a] += dt*botv[c*" + N + "+a]; dtopv[c*" + N + "+a] += dt*dbotv[c*" + N + "+a];",
+        "    topu[c*" + N + "+a] += dt*botu[c*" + N + "+a]; dtopu[c*" + N + "+a] += dt*dbotu[c*" + N + "+a];",
+        "  }",
+        "} else {",
+        "  for (int a = 0; a < 3; a++) { topv[a*" + N + "+a] = dt; }",   # constant (dot 0)
+        "}",
+    ])
+    # ---- write the mjx hessian column-slice: s_d2AB[(o*nz + k)*nz + b] = out_dot[o,b] ----
+    # out_dot rows: top (o<n) from dtop*, bottom (o>=n) from dbot*. cols: q/qd/u.
+    self.gen_add_code_lines([
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  for (int c = 0; c < " + N + "; c++) {",
+        "    s_d2AB[((r)*" + NZ + " + k)*" + NZ + " + (c)]            = dtopq[c*" + N + "+r];",
+        "    s_d2AB[((r)*" + NZ + " + k)*" + NZ + " + (" + N + "+c)]   = dtopv[c*" + N + "+r];",
+        "    s_d2AB[((r)*" + NZ + " + k)*" + NZ + " + (" + str(2 * n) + "+c)] = dtopu[c*" + N + "+r];",
+        "    s_d2AB[(((" + N + "+r))*" + NZ + " + k)*" + NZ + " + (c)]            = dbotq[c*" + N + "+r];",
+        "    s_d2AB[(((" + N + "+r))*" + NZ + " + k)*" + NZ + " + (" + N + "+c)]   = dbotv[c*" + N + "+r];",
+        "    s_d2AB[(((" + N + "+r))*" + NZ + " + k)*" + NZ + " + (" + str(2 * n) + "+c)] = dbotu[c*" + N + "+r];",
+        "  }",
+        "}",
+    ])
+
+
+def _integ_hess_colblock(self, n, half, off, dst, ddst, Pv, Pd, with_cross):
+    """Emit the value+dot of one output column-block (q/qd/u) of the integrator_gradient
+    transform for one half, as a list of code lines. block = G @ (P_off @ Ginv [+ cross]).
+
+      * base-linear cols (c<3) reframe by Ginv: col c <- sum_{cp<3} P[:,cp]*R[cp,c]
+        (Ginv[cp,c] = R[c,cp] = R[3*c+cp]); its dot adds Rd-term + the dot of P.
+      * cols c>=3 are identity-reframed (just P[:,c]); for the q-block (off=0) the
+        ang cols 3..5 additionally pick up Bv@Jv_q + Bu@Ju_q (the _cross_cols couple).
+      * then G rows: rows 0:3 <- R @ rows0:3 ; dot adds Rd-term.
+    dst/ddst are col-major n x n value/dot of THIS block (before the g_dot term)."""
+    N = str(n)
+    twoN = 2 * n
+    lines = []
+    h = half
+    # ---- column reframe (value + dot) into dst/ddst ----
+    lines += [
+        "for (int c = 0; c < " + N + "; c++) for (int r = 0; r < " + N + "; r++) {",
+        "  if (c < 3) {",
+        # value: sum_{cp<3} P[r,cp]*R[3*c+cp] ; dot: sum_{cp<3}(Pd*R + P*Rd^T-term).
+        "    T vv = static_cast<T>(0), dd = static_cast<T>(0);",
+        "    for (int cp = 0; cp < 3; cp++) {",
+        "      vv += " + Pv(off, h, "r", "cp") + " * R[3*c+cp];",
+        "      dd += " + Pd(off, h, "r", "cp") + " * R[3*c+cp] + " + Pv(off, h, "r", "cp") + " * Rd[3*c+cp];",
+        "    }",
+        "    " + dst + "[c*" + N + "+r] = vv; " + ddst + "[c*" + N + "+r] = dd;",
+        "  } else {",
+        "    " + dst + "[c*" + N + "+r] = " + Pv(off, h, "r", "c") + "; " + ddst + "[c*" + N + "+r] = " + Pd(off, h, "r", "c") + ";",
+        "  }",
+        "}",
+    ]
+    if with_cross:
+        # q-block ang cols (3..5): += Bv@Jv_q[:,c] + Bu@Ju_q[:,c].
+        # Jv_q[:,3+a] base-linear = -(e_a x v_lin); Ju_q[:,3+a] = -(e_a x u_lin).
+        # value uses v_lin/u_lin; dot uses jvk-of-vlin? No: the cross-col couple's
+        # vec is v_lin (value) and its DOT is the dot of v_lin = jvk[0:3], u_lin dot
+        # = juk[0:3] PLUS the dot of Bv/Bu (from dABd). Build all four products.
+        lines += [
+            "for (int a = 0; a < 3; a++) {",
+            "  int c = 3 + a;",
+            # (e_a x v_lin) and its dot (e_a x jvk[0:3]); same for u.
+            "  T ev0 = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",
+            "  T ev1 = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+            "  T ev2 = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+            "  T jc0 = -ev0, jc1 = -ev1, jc2 = -ev2;",
+            "  T dv0 = (a==1)*( jvk[2]) + (a==2)*(-jvk[1]);",
+            "  T dv1 = (a==0)*(-jvk[2]) + (a==2)*( jvk[0]);",
+            "  T dv2 = (a==0)*( jvk[1]) + (a==1)*(-jvk[0]);",
+            "  T djc0 = -dv0, djc1 = -dv1, djc2 = -dv2;",
+            "  T eu0 = (a==1)*( u_lin[2]) + (a==2)*(-u_lin[1]);",
+            "  T eu1 = (a==0)*(-u_lin[2]) + (a==2)*( u_lin[0]);",
+            "  T eu2 = (a==0)*( u_lin[1]) + (a==1)*(-u_lin[0]);",
+            "  T uc0 = -eu0, uc1 = -eu1, uc2 = -eu2;",
+            "  T du0 = (a==1)*( juk[2]) + (a==2)*(-juk[1]);",
+            "  T du1 = (a==0)*(-juk[2]) + (a==2)*( juk[0]);",
+            "  T du2 = (a==0)*( juk[1]) + (a==1)*(-juk[0]);",
+            "  T duc0 = -du0, duc1 = -du1, duc2 = -du2;",
+            "  for (int r = 0; r < " + N + "; r++) {",
+            # Bv[:,0:3] @ jc  + Bu[:,0:3] @ uc  (value); dot uses Pd + dot of jc/uc.
+            "    T bv0 = " + Pv(str(n), h, "r", "0") + ", bv1 = " + Pv(str(n), h, "r", "1") + ", bv2 = " + Pv(str(n), h, "r", "2") + ";",
+            "    T bu0 = " + Pv(str(2 * n), h, "r", "0") + ", bu1 = " + Pv(str(2 * n), h, "r", "1") + ", bu2 = " + Pv(str(2 * n), h, "r", "2") + ";",
+            "    T dbv0 = " + Pd(str(n), h, "r", "0") + ", dbv1 = " + Pd(str(n), h, "r", "1") + ", dbv2 = " + Pd(str(n), h, "r", "2") + ";",
+            "    T dbu0 = " + Pd(str(2 * n), h, "r", "0") + ", dbu1 = " + Pd(str(2 * n), h, "r", "1") + ", dbu2 = " + Pd(str(2 * n), h, "r", "2") + ";",
+            "    " + dst + "[c*" + N + "+r] += bv0*jc0 + bv1*jc1 + bv2*jc2 + bu0*uc0 + bu1*uc1 + bu2*uc2;",
+            "    " + ddst + "[c*" + N + "+r] += dbv0*jc0 + dbv1*jc1 + dbv2*jc2 + bv0*djc0 + bv1*djc1 + bv2*djc2"
+            + " + dbu0*uc0 + dbu1*uc1 + dbu2*uc2 + bu0*duc0 + bu1*duc1 + bu2*duc2;",
+            "  }",
+            "}",
+        ]
+    # ---- G rows: rows 0:3 <- R @ rows0:3 (value) ; dot adds Rd-term ----
+    lines += [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T m0 = " + dst + "[c*" + N + "+0], m1 = " + dst + "[c*" + N + "+1], m2 = " + dst + "[c*" + N + "+2];",
+        "  T d0 = " + ddst + "[c*" + N + "+0], d1 = " + ddst + "[c*" + N + "+1], d2 = " + ddst + "[c*" + N + "+2];",
+        "  " + dst + "[c*" + N + "+0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
+        "  " + dst + "[c*" + N + "+1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
+        "  " + dst + "[c*" + N + "+2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
+        "  " + ddst + "[c*" + N + "+0] = R[0]*d0 + R[1]*d1 + R[2]*d2 + Rd[0]*m0 + Rd[1]*m1 + Rd[2]*m2;",
+        "  " + ddst + "[c*" + N + "+1] = R[3]*d0 + R[4]*d1 + R[5]*d2 + Rd[3]*m0 + Rd[4]*m1 + Rd[5]*m2;",
+        "  " + ddst + "[c*" + N + "+2] = R[6]*d0 + R[7]*d1 + R[8]*d2 + Rd[6]*m0 + Rd[7]*m1 + Rd[8]*m2;",
+        "}",
+    ]
+    return lines
 
 
 def gen_integrator_hessian_device_function_call(self,
@@ -1339,17 +1715,22 @@ def gen_integrator_hessian_device_function_call(self,
                                                 contract_in_smem_expr="true",
                                                 d_workspace_pool_name="nullptr",
                                                 d_fd_grad_spill_name="nullptr",
-                                                s_fdsva_temp_name="nullptr"):
+                                                s_fdsva_temp_name="nullptr",
+                                                d_mjx_ws_name="nullptr",
+                                                mujoco_output_expr=None):
     """Emit the call to `integrator_hessian_device`. Arg order MUST match the def
     in gen_integrator_hessian_device. The fdsva_so spill/pool regions default to
-    nullptr (unused under the SHARED tier's all-smem placement)."""
+    nullptr (unused under the SHARED tier's all-smem placement). d_mjx_ws is the
+    mjx-epilogue scratch band (floating MUJOCO_OUTPUT only); mujoco_output_expr (if
+    not None) appends the trailing MUJOCO_OUTPUT template flag."""
+    mjx_tmpl = ("" if mujoco_output_expr is None else ", " + mujoco_output_expr)
     tmpl = ("<T, IT, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr
-            + ", " + contract_in_smem_expr + ">")
+            + ", " + contract_in_smem_expr + mjx_tmpl + ">")
     start = ("integrator_hessian_device" + tmpl
              + "(s_d2AB, s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, ")
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
-           + s_fdsva_temp_name + ", d_robotModel, gravity, dt);")
+           + s_fdsva_temp_name + ", " + d_mjx_ws_name + ", d_robotModel, gravity, dt);")
     self.gen_add_code_line(start + middle + end)
 
 
@@ -1390,14 +1771,29 @@ def gen_integrator_hessian_device(self):
     func_def_start = "void integrator_hessian_device(T *s_d2AB, "
     func_def_middle = ("T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, "
                        "const T *s_q, const T *s_qd, const T *s_u, ")
-    func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
-                    "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+    # d_mjx_ws (floating only): dedicated scratch band for the mjx epilogue (the
+    # 2nv*nz*nz read-only pin-d2AB copy + the reconstructed pin dAB + dInt_q).
+    # Separate from the fdsva spill pool so they never collide at the spill tiers.
+    # FIXED-BASE OMITS this param entirely -> byte-identical pin codegen.
+    mjx_ws_param = ("T *d_mjx_ws, " if self.robot.floating_base else "")
+    func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, " + mjx_ws_param
+                    + "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("integrator hessian (plant_step_hessian s_d2AB surface): composes fdsva_so + dt-scaled assembly",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, "
-                           "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST so
+    # existing <T,IT,SCRATCH,SPILL,CONTRACT> call sites are unaffected; default false
+    # if-constexpr-elides the mjx epilogue -> byte-identical pin codegen. Fixed-base
+    # never emits it. The kernel does the INPUT convert into the mutable s_x/s_u smem
+    # BEFORE this call, so s_q/s_qd/s_u here are already pin-frame (const OK).
+    mjx_device = self.robot.floating_base
+    if mjx_device:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # Clean-break deferrals: only single-stage Euler / SI-Euler on a fixed base.
