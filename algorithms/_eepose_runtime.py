@@ -145,7 +145,17 @@ def gen_end_effector_pose_runtime_kernel(self, single_call_timing=False):
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Compute a runtime-target end-effector pose at an offset point",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected.
+    # The world EE pose ([xyz; rpy]) is frame-INVARIANT regardless of the runtime
+    # target, so there is NO output epilogue; only the base quaternion is reordered
+    # (mjx wxyz -> pin xyzw) so the XmatsHom build forms X[0] from the correct
+    # orientation. Default false -> byte-identical pin codegen.
+    mjx = self.robot.floating_base
+    if mjx:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -160,6 +170,13 @@ def gen_end_effector_pose_runtime_kernel(self, single_call_timing=False):
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n), stride="stride_q")
+        # mjx input convert (quaternion only): reorder the base quaternion wxyz->xyzw
+        # before XmatsHom builds X[0]; the world EE pose is frame-INVARIANT (no output
+        # epilogue).
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("end_effector_pose_runtime_inner<T>(s_eePose, target_jid, s_offset, s_q, s_XmatsHom, d_robotModel, s_temp);")
@@ -168,6 +185,12 @@ def gen_end_effector_pose_runtime_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q", str(n))
+        # mjx input convert (quaternion only): see batch branch above. Reorder once
+        # before the rep loop so X[0] builds from the correct base orientation.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q", str(n), feedback_from="eePose")
@@ -205,17 +228,30 @@ def _gen_runtime_host(self, base_name, out_field, out_count, single_call_timing=
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end
     self.gen_add_func_doc("Compute a runtime-target end-effector pose surface", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). The value surface is
+    # frame-INVARIANT (input quat-reorder only); the gradient surface reframes its
+    # base-linear columns by R^T. Default false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"" + base_name + " requires all-data or kinematics gridData\");")
     self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default")
-    func_call_start = (base_name + "_kernel<T><<<block_dimms,thread_dimms," + smem + ">>>"
+    kernel_tmpl = (base_name + "_kernel"
+                   + ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
+    func_call_start = (kernel_tmpl + "<<<block_dimms,thread_dimms," + smem + ">>>"
                        "(hd_data->d_" + out_field + ",hd_data->d_q,stride_q,target_jid,hd_data->d_eepose_runtime_offset,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        if mjx_host:
+            func_call_start = func_call_start.replace(base_name + "_kernel<", base_name + "_kernel_single_timing<")
+        else:
+            func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
     if not compute_only:
         self.gen_add_code_lines(["// start code with memory transfer",
                                  "int stride_q;",
@@ -452,7 +488,17 @@ def gen_end_effector_pose_gradient_runtime_kernel(self, single_call_timing=False
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Compute a runtime-target end-effector pose gradient at an offset point",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected.
+    # The EE-pose Jacobian's base-linear COLUMNS reframe by R^T (J G^{-1}); the
+    # 6 x nv output is a single-target block (runtime target => single ee), so the
+    # epilogue is one column-reframe. Plus a base quaternion reorder on input.
+    # Default false -> byte-identical pin codegen.
+    mjx = self.robot.floating_base
+    if mjx:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -466,19 +512,42 @@ def gen_end_effector_pose_gradient_runtime_kernel(self, single_call_timing=False
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q", str(n), stride="stride_q")
+        # mjx input convert (quaternion only): reorder base quaternion wxyz->xyzw
+        # before XmatsHom builds X[0]; the Jacobian output gets a column-reframe below.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("end_effector_pose_gradient_runtime_inner<T>(s_eePoseGrad, target_jid, s_offset, s_q, s_XmatsHom, d_robotModel, s_temp);")
         self.gen_add_sync()
+        # mjx output: column reframe J G^{-1} (base-linear cols . R^T) of the single
+        # 6 x nv ee block, in place on s_eePoseGrad.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_column_reframe("s_eePoseGrad", 6, nv)
+            self.gen_add_end_control_flow()
         self.gen_kernel_save_result("eePoseGrad", str(6 * nv), stride=str(6 * nv))
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q", str(n))
+        # mjx input convert (quaternion only): see batch branch. Reorder once before
+        # the rep loop so X[0] builds from the correct base orientation.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q", str(n), feedback_from="eePoseGrad")
         self.gen_load_update_XmatsHom_helpers_function_call()
         self.gen_add_code_line("end_effector_pose_gradient_runtime_inner<T>(s_eePoseGrad, target_jid, s_offset, s_q, s_XmatsHom, d_robotModel, s_temp);")
+        # mjx output: column reframe J G^{-1} (base-linear cols . R^T) per ee block.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_column_reframe("s_eePoseGrad", 6, nv)
+            self.gen_add_end_control_flow()
         self.gen_anti_licm_output_write("eePoseGrad")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("eePoseGrad", str(6 * nv))
