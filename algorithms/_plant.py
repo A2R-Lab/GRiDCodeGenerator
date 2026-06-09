@@ -174,16 +174,54 @@ def _gen_cost_congruence_at_offset(self, mat, n, off, q_name="s_q"):
 # Plant step (value) + plant step gradient — thin wrappers over the integrator.
 # ---------------------------------------------------------------------------
 
+def _gen_plant_step_gradient_mjx_kernel_input(self, x_name="s_x", u_name="s_u"):
+    """Emit the GRADIENT-family mjx INPUT conversion for plant_step_gradient_kernel,
+    in place on the mutable smem state ``x_name = [q (NQ); qd (NV)]`` and ``u_name``,
+    so the underlying grid::integrator_gradient device fn + its dAB epilogue see
+    pin-frame inputs. Mirrors the integrator-gradient kernel's gen_mjx_input_convert
+    exactly, but operates on the STACKED state: q = x[0:NQ], qd = x[NQ:NQ+NV].
+
+    Full convert (single thread + sync inside the helper): base quat wxyz->xyzw +
+    qd[0:3]=R^T qd[0:3] (mjx GLOBAL base-linear velocity -> pin LOCAL) + u[0:3]=R^T
+    u[0:3] (covector force). Emitted AFTER staging x/u into smem, BEFORE the device
+    call (so XImats X[0] is built from the reordered quaternion). Wrapped in
+    `if constexpr (MUJOCO_OUTPUT)`; no-op on the pin path. Floating base only (caller
+    gates). The VALUE kernel uses a q-ONLY reorder inline instead (qd stays raw mjx
+    for the global-add retract), so it does not call this."""
+    nq = self.robot.get_num_pos()
+    self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+    # full input convert on the stacked state: q = x[0:NQ], qd = x[NQ:]. The qd
+    # sub-pointer is parenthesized so the helper's [i] indexing binds to the offset
+    # pointer, not the literal (operator precedence).
+    self.gen_mjx_input_convert(q_name=x_name, qd_name="(" + x_name + " + " + str(nq) + ")", u_name=u_name)
+    self.gen_add_end_control_flow()
+
+
 def gen_plant_step(self):
     """`plant_step` — thin wrapper over `grid::integrator_device` (value).
 
     x_{k+1} = integrator(x_k, u_k, dt). s_x is [q; qd]; we slice q/qd and call
     the integrator's auto-allocating device wrapper (which owns its own scratch).
+
+    mjx (MuJoCo output-convention): MUJOCO_OUTPUT is threaded LAST (floating-base
+    only). The integrator VALUE mjx convention lives in the RETRACT epilogue (the
+    base-linear position takes a GLOBAL additive step + the output quaternion is
+    reordered xyzw->wxyz), NOT in grid::integrator_device (which is pin-only). The
+    kernel does the q-only INPUT convert (quat wxyz->xyzw) into mutable smem BEFORE
+    the call; here, after the pin integrate, we OVERWRITE s_x_kp1's base-linear
+    position with the mjx global add (s_q[0:3] still holds the ORIGINAL base
+    position — integrator wrote OUT-of-place — and s_qd[0:3] is the RAW mjx global
+    base-linear velocity, NOT converted, exactly like grid::integrator_kernel's
+    RETRACT family). EULER/SI-EULER only (multistage static_asserts out in the
+    integrator device); MUJOCO_OUTPUT on a multistage IT would silently mis-retract,
+    but the value path has no analytic guard so callers stay on single-stage.
     """
     nq = self.robot.get_num_pos()
+    fb = self.robot.floating_base
     func_params = [
         "s_x_kp1 is the next state output (size NUM_POS + NUM_VEL)",
-        "s_x is the current state [q (NUM_POS); qd (NUM_VEL)]",
+        "s_x is the current state [q (NUM_POS); qd (NUM_VEL)]" +
+            (" (mjx: q already quat-reordered xyzw by the kernel)" if fb else ""),
         "s_u is the control torque vector (size NUM_VEL)",
         "d_robotModel is the GPU model helpers (XImats, topology, ...)",
         "gravity is the gravity constant",
@@ -191,13 +229,39 @@ def gen_plant_step(self):
     ]
     self.gen_add_func_doc("Plant step: x_{k+1} = integrator(x_k, u_k, dt) (thin wrapper over grid::integrator_device)",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
+    # sites are unaffected; default false if-constexpr-elides the mjx retract ->
+    # byte-identical pin codegen. Fixed-base never emits it (no base block).
+    if fb:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void plant_step(T *s_x_kp1, const T *s_x, const T *s_u, "
                            "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {", True)
     self.gen_add_code_line("const T *s_q  = s_x;")
     self.gen_add_code_line("const T *s_qd = &s_x[" + str(nq) + "];")
     self.gen_add_code_line("grid::integrator_device<T, IT>(s_x_kp1, s_q, s_qd, s_u, d_robotModel, gravity, dt);")
+    if fb:
+        # mjx output (RETRACT): the integrator integrated the base in the pin
+        # convention (SE(3) V(phi) base-position coupling, O(dt^2) wrong for mjx).
+        # OVERWRITE the base-linear position with the mjx GLOBAL additive step
+        # s_q[0:3] + dt*s_qd[0:3] (s_q still holds the ORIGINAL pre-integration base
+        # position — integrator wrote OUT-of-place into s_x_kp1; s_qd[0:3] is the raw
+        # mjx global base-linear velocity). Then reorder the output base quaternion
+        # xyzw->wxyz back to mjx order (inverse of the kernel's input reorder).
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_retract("s_x_kp1", "s_q", "s_qd", "dt")
+        self.gen_add_code_lines([
+            "// mjx output: base quaternion xyzw->wxyz (inverse of input reorder)",
+            "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+            "T qw_out = s_x_kp1[6];",
+            "s_x_kp1[6] = s_x_kp1[5]; s_x_kp1[5] = s_x_kp1[4]; s_x_kp1[4] = s_x_kp1[3]; s_x_kp1[3] = qw_out;",
+        ])
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -213,6 +277,14 @@ def gen_plant_step_gradient(self, with_value=False):
     device needs (it is an inner-owns-placement orchestrator); we forward them
     straight through. s_q / s_qd are NON-const because the multi-stage RK path
     mutates them in place across stages (see grid::integrator_gradient_device).
+
+    mjx (MuJoCo output-convention): MUJOCO_OUTPUT is threaded LAST (floating-base
+    only) and forwarded straight to grid::integrator_gradient[_with_value]_device,
+    whose state-transition-Jacobian epilogue (_emit_integrator_gradient_mjx_output,
+    plus the x_{k+1} retract for the with_value surface) is ALREADY validated. The
+    kernel does the INPUT convert (quat wxyz->xyzw, base-linear velocity + force ->
+    pin frame) into the mutable smem s_x/s_u BEFORE the call. EULER/SI-EULER only
+    (multistage RK mjx static_asserts out in the integrator-gradient device).
 
     Plant HESSIAN: per the ratified decision the plant-step hessian used by the
     cost layer is the Gauss-Newton outer product of the COST gradient, assembled
@@ -242,8 +314,17 @@ def gen_plant_step_gradient(self, with_value=False):
                           " (thin wrapper over grid::" + ("integrator_with_gradient" if with_value else "integrator_gradient") +
                           "_device — pass-through)",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                           "bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing
+    # <T, IT, SCRATCH_IN_SMEM, USE_DA_DF_SPILL> call sites are unaffected; forwarded
+    # straight to the integrator-gradient device (which owns the validated mjx dAB
+    # epilogue). Fixed-base never emits it -> byte-identical pin codegen.
+    mjx_device = self.robot.floating_base
+    if mjx_device:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                               "bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
     self.gen_add_code_line("__device__")
     sig = "void " + fname + "(T *s_dAB, "
     if with_value:
@@ -261,8 +342,9 @@ def gen_plant_step_gradient(self, with_value=False):
     self.gen_add_code_line(sig + sig_middle + sig_end, True)
     self.gen_add_code_line("T *s_q  = s_x;")
     self.gen_add_code_line("T *s_qd = &s_x[" + str(nq) + "];")
+    inner_tmpl = "<T, IT, SCRATCH_IN_SMEM, USE_DA_DF_SPILL" + (", MUJOCO_OUTPUT>" if mjx_device else ">")
     inner = "grid::" + ("integrator_with_gradient" if with_value else "integrator_gradient") + "_device" \
-            "<T, IT, SCRATCH_IN_SMEM, USE_DA_DF_SPILL>(s_dAB, "
+            + inner_tmpl + "(s_dAB, "
     if with_value:
         inner += "s_x_kp1, "
     inner_middle = ("s_q, s_qd, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
@@ -964,9 +1046,19 @@ def gen_plant_step_kernel(self):
 
     Inputs/outputs are global; the device fn (-> grid::integrator_device) owns
     the shared arena. Reuses grid::INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES.
+
+    mjx (MuJoCo output-convention, floating-base only): MUJOCO_OUTPUT is threaded
+    LAST. On the pin path (default) the kernel calls plant_step straight on the
+    global pointers (byte-identical to before). On the mjx path the per-timestep x
+    is staged into a small static-smem buffer so the q-only INPUT convert (base quat
+    wxyz->xyzw) can mutate it in place before the device call; plant_step then does
+    the pin integrate + the mjx RETRACT epilogue (base-position global add + output
+    quat xyzw->wxyz). The integrator_device owns the (separate, dynamic) RBD arena.
     """
+    nq = self.robot.get_num_pos()
     nx = self.robot.get_num_pos() + self.robot.get_num_vel()
     nv = self.robot.get_num_vel()
+    mjx_kernel = self.robot.floating_base
     self.gen_add_func_doc("plant_step kernel: x_{k+1} = integrator(x_k, u_k, dt) per timestep",
                           [],
                           ["d_x_kp1 is the next-state output (NUM_POS+NUM_VEL per timestep)",
@@ -975,15 +1067,44 @@ def gen_plant_step_kernel(self):
                            "stride_x / stride_u are the per-timestep strides",
                            "d_robotModel / gravity / dt as for plant_step",
                            "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
+    # sites are unaffected; default false -> byte-identical pin codegen.
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void plant_step_kernel(T *d_x_kp1, const T *d_x, const T *d_u, "
                            "const int stride_x, const int stride_u, "
                            "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
-    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-    self.gen_add_code_line("plant_step<T, IT>(&d_x_kp1[k*" + str(nx) + "], &d_x[k*stride_x], &d_u[k*stride_u], d_robotModel, gravity, dt);")
-    self.gen_add_sync()
-    self.gen_add_end_control_flow()
+    if mjx_kernel:
+        # Small static-smem state buffer for the in-place q-only input convert (the
+        # integrator_device owns the separate dynamic RBD arena). On the pin path we
+        # bypass staging and call straight on global, keeping that path byte-identical.
+        self.gen_add_code_line("__shared__ T s_x_mjx[" + str(nx) + "];")
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        # stage x into mutable smem, q-only reorder (RETRACT value family: qd stays
+        # RAW mjx for the global-add retract), then plant_step (pin integrate + mjx
+        # retract). u stays global (value path doesn't convert u). gen_mjx_quat_reorder
+        # is inlined here (the surrounding if-constexpr already gates MUJOCO_OUTPUT).
+        self.gen_add_parallel_loop("ind", str(nx))
+        self.gen_add_code_line("s_x_mjx[ind] = d_x[k*stride_x + ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_mjx_quat_reorder("s_x_mjx")
+        self.gen_add_code_line("plant_step<T, IT, true>(&d_x_kp1[k*" + str(nx) + "], s_x_mjx, &d_u[k*stride_u], d_robotModel, gravity, dt);")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        self.gen_add_code_line("plant_step<T, IT, false>(&d_x_kp1[k*" + str(nx) + "], &d_x[k*stride_x], &d_u[k*stride_u], d_robotModel, gravity, dt);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_add_code_line("plant_step<T, IT>(&d_x_kp1[k*" + str(nx) + "], &d_x[k*stride_x], &d_u[k*stride_u], d_robotModel, gravity, dt);")
+        self.gen_add_sync()
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -1021,7 +1142,15 @@ def gen_plant_step_gradient_kernel(self):
                            "stride_x / stride_u are the per-timestep strides",
                            "d_robotModel / gravity / dt as for plant_step",
                            "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+    # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
+    # sites are unaffected; default false -> byte-identical pin codegen. Threaded to
+    # the input convert + forwarded to plant_step_gradient (whose dAB epilogue is the
+    # validated grid::integrator_gradient_device mjx transform).
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line("void plant_step_gradient_kernel(T *d_dAB, const T *d_x, const T *d_u, "
@@ -1064,9 +1193,15 @@ def gen_plant_step_gradient_kernel(self):
     self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
+    # mjx input convert (GRADIENT family): quat wxyz->xyzw + base-linear velocity +
+    # force -> pin frame, in place on the staged s_x/s_u, BEFORE the device call (so
+    # the RBD callees + the dAB epilogue see pin quantities). No-op on the pin path.
+    if mjx_kernel:
+        _gen_plant_step_gradient_mjx_kernel_input(self)
     # All scratch is smem (SCRATCH_IN_SMEM=true, no spill): pass nullptr for the
     # global workspace + spill regions. The orchestrator owns its s_temp pool.
-    self.gen_add_code_line("plant_step_gradient<T, IT, true, false>("
+    mjx_flag = ", MUJOCO_OUTPUT" if mjx_kernel else ""
+    self.gen_add_code_line("plant_step_gradient<T, IT, true, false" + mjx_flag + ">("
                            "s_dAB, s_x, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
                            "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
                            "s_dInt_q_6x6, s_dInt_v_6x6, "
