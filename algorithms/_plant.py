@@ -34,6 +34,96 @@ by the caller). An `isfinite` guard skips any side whose bound is +/-inf, so an
 unbounded joint contributes EXACTLY zero to value/gradient/hessian.
 """
 
+from GRiDCodeGenerator.helpers._code_generation_helpers import _gen_mjx_build_R_lines
+
+
+# ---------------------------------------------------------------------------
+# mjx (MuJoCo output-convention) helper for the tracking-cost epilogues.
+#
+# The Gauss-Newton tracking costs (ee_pos_cost / com_cost q-block at offset 0;
+# momentum_cost qd-block at offset nq) have a single nonzero nv-wide tangent
+# block. Its base-LINEAR 3 entries reframe by the value-Jacobian column map
+# (J_mjx = J_pin G^{-1}): grad reframes as a covector (G·) and the GN hessian by
+# congruence (G·Gᵀ). For ee_pos/com the block sits at offset 0 so the shared
+# `gen_mjx_base_rotate(s_grad)` / `gen_mjx_congruence(s_hess, nx)` apply directly
+# (the zero qd rows/cols are untouched). For momentum the block is at offset nq,
+# so the congruence base rows/cols are at nq:nq+3 (NOT 0:3): the shared
+# `gen_mjx_congruence` hardcodes 0,1,2 and cannot be used. `_gen_cost_congruence_at_offset`
+# emits the identical R-rotation on rows/cols off:off+3 (transcribing the helper's
+# exact row-major R-indexing, validated in numpy vs `quadratic_tracking_cost_pin_to_mjx`).
+# The GN hessian DROPS the value-curvature, so there is NO frame-correction term.
+# ---------------------------------------------------------------------------
+
+def _gen_cost_mjx_kernel_input(self, nq, convert_qd=False):
+    """Emit the mjx INPUT conversion for a tracking-cost kernel, into per-block
+    ``__shared__`` buffers, so the underlying grid:: device fns (which consume the
+    base quaternion to place the world-frame EE/CoM/centroidal quantities) see the
+    correct PIN-frame config + velocity. Returns the names of the mutable buffers to
+    feed the device calls: ``("s_q_mjx",)`` or ``("s_q_mjx", "s_qd_mjx")``.
+
+    q: reorder the base quaternion wxyz (mjx, scalar-first) -> xyzw (pin, scalar-last).
+    qd (momentum only): ``qd[0:3] = R^T qd[0:3]`` (mjx GLOBAL base-linear velocity ->
+    pin LOCAL), R from the reordered xyzw quaternion. Mirrors gen_mjx_input_convert.
+    Single thread + sync; emitted inside the per-timestep block loop, BEFORE the
+    value/grad/hess device calls. Only meaningful for a floating base (caller gates)."""
+    nv = self.robot.get_num_vel()
+    self.gen_add_code_line("__shared__ T s_q_mjx[" + str(nq) + "];")
+    if convert_qd:
+        self.gen_add_code_line("__shared__ T s_qd_mjx[" + str(nv) + "];")
+    # copy q (and qd) in parallel, then reorder/convert the base block on one thread.
+    self.gen_add_parallel_loop("i", str(nq))
+    self.gen_add_code_line("s_q_mjx[i] = s_q[i];")
+    self.gen_add_end_control_flow()
+    if convert_qd:
+        self.gen_add_parallel_loop("i", str(nv))
+        self.gen_add_code_line("s_qd_mjx[i] = s_qd[i];")
+        self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_code_lines([
+        "// mjx input convert: base quaternion wxyz->xyzw" + (" + base-linear velocity -> pin frame" if convert_qd else ""),
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+        "T qw_in = s_q_mjx[3];",
+        "s_q_mjx[3] = s_q_mjx[4]; s_q_mjx[4] = s_q_mjx[5]; s_q_mjx[5] = s_q_mjx[6]; s_q_mjx[6] = qw_in;",
+    ])
+    if convert_qd:
+        self.gen_add_code_lines(_gen_mjx_build_R_lines("s_q_mjx"))
+        self.gen_add_code_lines([
+            # v_pin_lin = R^T v_mjx_lin
+            "T vlx = s_qd_mjx[0], vly = s_qd_mjx[1], vlz = s_qd_mjx[2];",
+            "s_qd_mjx[0] = R[0]*vlx + R[3]*vly + R[6]*vlz;",
+            "s_qd_mjx[1] = R[1]*vlx + R[4]*vly + R[7]*vlz;",
+            "s_qd_mjx[2] = R[2]*vlx + R[5]*vly + R[8]*vlz;",
+        ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    return ("s_q_mjx", "s_qd_mjx") if convert_qd else ("s_q_mjx",)
+
+
+def _gen_cost_congruence_at_offset(self, mat, n, off, q_name="s_q"):
+    """Emit a congruence ``X_mjx = G X G^T`` on the base-linear block at rows/cols
+    ``off:off+3`` of an ``n x n`` COLUMN-MAJOR matrix ``mat`` (element (r,c) at
+    ``mat[r + n*c]``). Mirrors :func:`gen_mjx_congruence` EXACTLY except the base
+    block is at ``off`` rather than 0 (for the momentum-cost qd-block at offset nq).
+    R is built row-major from the xyzw quaternion at ``q_name[3..6]``. Single
+    thread + sync."""
+    self.gen_add_code_lines([
+        "// mjx output: congruence G " + mat + " G^T on the base block at offset " + str(off) + " (rows then cols)",
+        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+    ])
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        # rows off:off+3 <- R . rows, for every column c
+        "for (int c = 0; c < " + str(n) + "; c++) {{ T m0 = {m}[{o0} + {n}*c], m1 = {m}[{o1} + {n}*c], m2 = {m}[{o2} + {n}*c];"
+        " {m}[{o0} + {n}*c] = R[0]*m0 + R[1]*m1 + R[2]*m2; {m}[{o1} + {n}*c] = R[3]*m0 + R[4]*m1 + R[5]*m2; {m}[{o2} + {n}*c] = R[6]*m0 + R[7]*m1 + R[8]*m2; }}".format(
+            m=mat, n=n, o0=off + 0, o1=off + 1, o2=off + 2),
+        # cols off:off+3 <- cols . R^T, for every row r:  newcol[j] = sum_k M[r,k] R[j][k]
+        "for (int r = 0; r < " + str(n) + "; r++) {{ T m0 = {m}[r + {n}*{o0}], m1 = {m}[r + {n}*{o1}], m2 = {m}[r + {n}*{o2}];"
+        " {m}[r + {n}*{o0}] = m0*R[0] + m1*R[1] + m2*R[2]; {m}[r + {n}*{o1}] = m0*R[3] + m1*R[4] + m2*R[5]; {m}[r + {n}*{o2}] = m0*R[6] + m1*R[7] + m2*R[8]; }}".format(
+            m=mat, n=n, o0=off + 0, o1=off + 1, o2=off + 2),
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
 
 # ---------------------------------------------------------------------------
 # Plant step (value) + plant step gradient — thin wrappers over the integrator.
@@ -362,7 +452,7 @@ def gen_ee_pos_cost(self):
          "s_q / s_p_des / s_W / d_robotModel as above",
          "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_end_effector_pose, T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
@@ -386,6 +476,14 @@ def gen_ee_pos_cost(self):
     self.gen_add_code_line("s_grad[" + str(nq) + " + i] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: the q-tangent block is at offset 0; its base-LINEAR 3 entries
+        # reframe as a covector grad_mjx[0:3] = R . grad_pin[0:3] (G·, G^{-T}=G).
+        # s_q is already xyzw (the kernel reorders the wxyz mjx quaternion once).
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_base_rotate("s_grad", q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # ---- GN hessian J_p^T W J_p over the q-block of x (qd rows/cols zero) ----
@@ -397,7 +495,7 @@ def gen_ee_pos_cost(self):
         ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
          "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
                            "T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
@@ -419,6 +517,15 @@ def gen_ee_pos_cost(self):
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: the active q-block is at offset 0 of the NX x NX col-major
+        # hessian; congruence reframes its base-LINEAR rows/cols 0:3 (the zero qd
+        # rows/cols >= NV are untouched). NO frame-correction term (GN drops the
+        # value-curvature). s_q is already xyzw (kernel reordered once).
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_congruence("s_hess", str(nx), q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -465,7 +572,7 @@ def gen_com_cost(self):
         ["J_com = rows of s_com starting at offset 3, layout s_com[3 + 3*vi + r] (3 x NUM_VEL column-major)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_p_des / s_W / d_robotModel as above",
          "s_com scratch (3 + 3*NUM_VEL)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
@@ -487,6 +594,13 @@ def gen_com_cost(self):
     self.gen_add_code_line("s_grad[" + str(nv) + " + i] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: the q-tangent block is at offset 0; reframe its base-LINEAR 3
+        # entries as a covector grad_mjx[0:3] = R . grad_pin[0:3]. s_q is xyzw (kernel).
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_base_rotate("s_grad", q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # ---- GN hessian J_com^T W J_com over the q-block of x ----
@@ -495,7 +609,7 @@ def gen_com_cost(self):
         ["Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_W / d_robotModel as above",
          "s_com scratch (3 + 3*NUM_VEL)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
                            "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
@@ -510,6 +624,13 @@ def gen_com_cost(self):
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: q-block at offset 0; congruence reframes base rows/cols 0:3
+        # of the NX x NX col-major hessian (zero qd rows/cols untouched). s_q xyzw.
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_congruence("s_hess", str(nx), q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -553,7 +674,7 @@ def gen_momentum_cost(self):
         ["A = s_ccrba[r + 6*vi] (6 x NUM_VEL column-major); h = s_ccrba[6*NUM_VEL + r]."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_qd / s_h_des / s_W / d_robotModel as above",
          "s_ccrba scratch (6*NUM_VEL + 6)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
                            "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
@@ -570,6 +691,14 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*i]; T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; g += Ari * s_W[r] * e; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[" + str(nq) + " + i] += g; } else { s_grad[" + str(nq) + " + i] = g; }")
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: the active qd-tangent block is at offset NQ; its base-LINEAR 3
+        # entries are at s_grad[NQ:NQ+3]. Reframe as a covector via base_rotate on the
+        # SUB-POINTER (s_grad + NQ), NEVER &s_grad[NQ]. s_q is xyzw (kernel reordered).
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_mjx_base_rotate("(s_grad + " + str(nq) + ")", q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # GN hessian A^T W A in the qd-block of the NX x NX hessian
@@ -578,7 +707,7 @@ def gen_momentum_cost(self):
         ["Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_qd / s_W / d_robotModel as above",
          "s_ccrba scratch (6*NUM_VEL + 6)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
                            "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
@@ -594,6 +723,15 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
+    if self.robot.floating_base:
+        # mjx output: the active qd-block is at offset NQ of the NX x NX col-major
+        # hessian; its base-LINEAR rows/cols are at NQ:NQ+3 (NOT 0:3), so the shared
+        # gen_mjx_congruence (hardcoded 0,1,2) cannot be used — emit the identical
+        # R-congruence on rows/cols NQ:NQ+3. NO frame-correction term (GN). s_q xyzw.
+        self.gen_add_sync()
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        _gen_cost_congruence_at_offset(self, "s_hess", nx, nq, q_name="s_q")
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
@@ -1094,7 +1232,8 @@ def gen_com_cost_kernel(self):
                                "d_W per-axis weight (3 per timestep)",
                                "d_com global scratch (3 + 3*NUM_VEL per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T>")
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_p_des, const T *d_W, T *d_com, "
@@ -1102,11 +1241,24 @@ def gen_com_cost_kernel(self):
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
     self.gen_add_code_line("T *s_com = &d_com[k*" + str(com_out) + "];")
-    self.gen_add_code_line("com_cost<T>(&d_out[k], s_q, s_p_des, s_W, s_com, d_robotModel);")
+    if self.robot.floating_base:
+        # mjx INPUT convert (q wxyz->xyzw) so the world-frame CoM/J_com are computed
+        # from the correct PIN base orientation; grad/hess epilogues reframe the output.
+        self.gen_add_code_line("const T *s_q_use = s_q;")
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        bufs = _gen_cost_mjx_kernel_input(self, nq, convert_qd=False)
+        self.gen_add_code_line("s_q_use = " + bufs[0] + ";")
+        self.gen_add_end_control_flow()
+        qname = "s_q_use"
+        gh_tmpl = ", false, MUJOCO_OUTPUT"
+    else:
+        qname = "s_q"
+        gh_tmpl = ""
+    self.gen_add_code_line("com_cost<T>(&d_out[k], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_gradient<T>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_hessian<T>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_com, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1132,7 +1284,8 @@ def gen_momentum_cost_kernel(self):
                                "d_W per-component weight (6 per timestep)",
                                "d_ccrba global scratch (6*NUM_VEL + 6 per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T>")
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, T *d_ccrba, "
@@ -1141,11 +1294,26 @@ def gen_momentum_cost_kernel(self):
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_qd = &d_qd[k*" + str(nv) + "];")
     self.gen_add_code_line("const T *s_h_des = &d_h_des[k*6]; const T *s_W = &d_W[k*6];")
     self.gen_add_code_line("T *s_ccrba = &d_ccrba[k*" + str(ccrba_out) + "];")
-    self.gen_add_code_line("momentum_cost<T>(&d_out[k], s_q, s_qd, s_h_des, s_W, s_ccrba, d_robotModel);")
+    if self.robot.floating_base:
+        # mjx INPUT convert: q wxyz->xyzw AND qd[0:3]=R^T qd[0:3] (mjx GLOBAL base
+        # velocity -> pin LOCAL), so the centroidal momentum h = A qd is computed in
+        # the pin frame (the cost VALUE + residual r = h - h_des need the pin h). The
+        # grad/hess qd-block epilogues then reframe the OUTPUT (gated MUJOCO_OUTPUT).
+        self.gen_add_code_line("const T *s_q_use = s_q; const T *s_qd_use = s_qd;")
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        bufs = _gen_cost_mjx_kernel_input(self, nq, convert_qd=True)
+        self.gen_add_code_line("s_q_use = " + bufs[0] + "; s_qd_use = " + bufs[1] + ";")
+        self.gen_add_end_control_flow()
+        qn, qdn = "s_q_use", "s_qd_use"
+        gh_tmpl = ", false, MUJOCO_OUTPUT"
+    else:
+        qn, qdn = "s_q", "s_qd"
+        gh_tmpl = ""
+    self.gen_add_code_line("momentum_cost<T>(&d_out[k], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_gradient<T>(&d_grad[k*" + str(nx) + "], s_q, s_qd, s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_hessian<T>(&d_hess[k*" + str(nx*nx) + "], s_q, s_qd, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qn + ", " + qdn + ", s_W, s_ccrba, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1206,7 +1374,8 @@ def gen_ee_pos_cost_kernel(self):
                                "d_W per-axis weight (3 per timestep)",
                                "d_end_effector_pose / d_end_effector_pose_gradient global scratch (6*NUM_EES / 6*NUM_VEL*NUM_EES per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    self.gen_add_code_line("template <typename T, int EE = 0>")
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    self.gen_add_code_line("template <typename T, int EE = 0" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_p_des, const T *d_W, T *d_end_effector_pose, T *d_end_effector_pose_gradient, "
@@ -1214,11 +1383,25 @@ def gen_ee_pos_cost_kernel(self):
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
     self.gen_add_code_line("T *s_end_effector_pose = &d_end_effector_pose[k*" + str(6*num_ees) + "]; T *s_end_effector_pose_gradient = &d_end_effector_pose_gradient[k*" + str(6*nv*num_ees) + "];")
-    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], s_q, s_p_des, s_W, s_end_effector_pose, d_robotModel);")
+    if self.robot.floating_base:
+        # mjx INPUT convert (q wxyz->xyzw) into a per-block buffer, so the world-frame
+        # EE pose/Jacobian are computed from the correct PIN-frame base orientation;
+        # the grad/hess device epilogues then reframe the OUTPUT (gated MUJOCO_OUTPUT).
+        self.gen_add_code_line("const T *s_q_use = s_q;")
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        bufs = _gen_cost_mjx_kernel_input(self, nq, convert_qd=False)
+        self.gen_add_code_line("s_q_use = " + bufs[0] + ";")
+        self.gen_add_end_control_flow()
+        qname = "s_q_use"
+        gh_tmpl = ", EE, false, MUJOCO_OUTPUT"
+    else:
+        qname = "s_q"
+        gh_tmpl = ", EE"
+    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], " + qname + ", s_p_des, s_W, s_end_effector_pose, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_gradient<T, EE>(&d_grad[k*" + str(nx) + "], s_q, s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_hessian<T, EE>(&d_hess[k*" + str(nx*nx) + "], s_q, s_W, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_end_effector_pose_gradient, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
