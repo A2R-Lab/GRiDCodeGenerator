@@ -42,7 +42,16 @@ _INTEGRATOR_BUTCHER = {
 def gen_integrator_gradient_inner_temp_mem_size(self):
     # Identical to FD-gradient's inner mem requirement; the dAB assembly is
     # a single parallel loop over shared inputs that already exist.
-    return self.gen_forward_dynamics_gradient_inner_temp_mem_size()
+    fd_grad = self.gen_forward_dynamics_gradient_inner_temp_mem_size()
+    # MUJOCO_OUTPUT epilogue (floating only) reuses the (dead) FD-grad s_temp pool
+    # as the 2n*3n mjx-output scratch band; guarantee the pool can hold it. For
+    # every robot tested fd_grad >> 2n*3n so this max is a no-op; it only bumps the
+    # pool for a hypothetical very-large-nv floating robot. Fixed-base is unchanged
+    # (no epilogue), so its codegen stays byte-identical.
+    if self.robot.floating_base:
+        n = self.robot.get_num_vel()
+        return max(fd_grad, 2 * n * 3 * n)
+    return fd_grad
 
 
 def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT",
@@ -216,6 +225,135 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT",
     self.gen_add_code_line("              \"dAB assembly handles single-stage IT only; Midpoint/RK3/RK4 are routed through gen_integrator_gradient_multistage.\");")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # end parallel loop
+
+
+def _emit_integrator_gradient_mjx_output(self, integrator_type, s_mjx_scratch="s_temp"):
+    """Emit the MuJoCo (mjx) output-convention epilogue for the integrator gradient,
+    transforming the pin dAB = [A | B] held in ``s_dAB`` to the mjx convention IN
+    PLACE. Floating-base, single-stage (Euler / SI-Euler) only. Runs at the END of
+    the single-stage path where the FD-grad ``s_temp`` pool is DEAD (reused as the
+    2n*3n mjx-output scratch band) and ``s_qdd`` / ``s_qd`` / ``s_u`` / ``s_q`` are
+    all live (no recompute needed, like fdsva_so's epilogue).
+
+    ``s_dAB`` is 2n*3n COLUMN-major (``s_dAB[col*2n + row]``); output rows are
+    ``[q_{k+1} tangent(n); qd_{k+1}(n)]``, input cols ``[dq(n) | dqd(n) | du(n)]``.
+    Transcribed verbatim from docs/open-tasks/mjx_proto/proto_integ_grad_mjx.py
+    (validated <1e-15 vs integrator_gradient_pin_to_mjx). The assembly:
+      * BOTTOM rows reframe as a VELOCITY output (G applied to base-linear rows; the
+        3 base-rotation q-cols pick up g_dot @ qd_{k+1,pin}); columns reframe by the
+        input-conversion Jacobians (Ginv on base-linear cols; the _cross_cols
+        velocity/force couplings on the 3 base-rotation cols).
+      * TOP rows: angular + joint output rows are the pin top block reframed; the 3
+        base-LINEAR output rows are overwritten with the mjx GLOBAL-add tangent
+        (identity on the base-linear q col + dt*W, W=qd for euler, W=qd_{k+1} for si).
+    """
+    n = self.robot.get_num_vel()
+    twoN = 2 * n
+    si = "(" + _integrator_type_token(integrator_type) + " == IntegratorType::SEMI_IMPLICIT_EULER)"
+    self.gen_add_code_line("// === mjx output convention (floating-base integrator gradient) ===")
+    self.gen_add_code_line("T *s_mjx = " + s_mjx_scratch + ";   // 2n*3n mjx output band (dead FD-grad pool)")
+    self.gen_add_code_line("const bool si_mjx = " + si + ";")
+    # ---- single-thread assembly (correctness-first; nv small) ----
+    # The inner C for/if blocks below carry their own balanced braces as literal
+    # text; only the outer threadIdx guard uses the codegen indent tracker
+    # (gen_add_end_control_flow). s_dAB is col-major P(o,c)=s_dAB[c*2n+o].
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    for line in [
+        # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6].
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+        "T vlin[3] = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T ulin[3] = {s_u[0],  s_u[1],  s_u[2]};",
+        "// qd_{k+1,pin}[lin] = (qd + dt*qdd)[lin] (for the g_dot velocity-output term)",
+        "T qk1lin[3] = {s_qd[0] + dt*s_qdd[0], s_qd[1] + dt*s_qdd[1], s_qd[2] + dt*s_qdd[2]};",
+        "// two output halves (top=0, bot=n); each column block reframed then G-row-rotated.",
+        "for (int half = 0; half < 2; ++half) {",
+        "  int base = half * " + str(n) + ";",
+        "  // --- q-block (cols 0..n-1) ---",
+        "  for (int c = 0; c < " + str(n) + "; ++c) {",
+        "    T inner[" + str(n) + "];",
+        "    for (int r = 0; r < " + str(n) + "; ++r) {",
+        "      int o = base + r;",
+        # (M @ Ginv)[r,c]: base-linear cols mix via Ginv[j,c]=R[c,j]; else identity.
+        "      if (c < 3) { inner[r] = s_dAB[0*" + str(twoN) + "+o]*R[c*3+0] + s_dAB[1*" + str(twoN) + "+o]*R[c*3+1] + s_dAB[2*" + str(twoN) + "+o]*R[c*3+2]; }",
+        "      else { inner[r] = s_dAB[c*" + str(twoN) + "+o]; }",
+        "    }",
+        # _cross_cols couplings on ANG cols (3..5): Jv_q on qd-block, Ju_q on u-block.
+        "    if (c >= 3 && c < 6) {",
+        "      int a = c - 3;",
+        "      T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
+        "      T jc[3] = {ea[1]*vlin[2]-ea[2]*vlin[1], ea[2]*vlin[0]-ea[0]*vlin[2], ea[0]*vlin[1]-ea[1]*vlin[0]};",
+        "      T uc[3] = {ea[1]*ulin[2]-ea[2]*ulin[1], ea[2]*ulin[0]-ea[0]*ulin[2], ea[0]*ulin[1]-ea[1]*ulin[0]};",
+        "      for (int r = 0; r < " + str(n) + "; ++r) {",
+        "        int o = base + r;",
+        "        inner[r] += s_dAB[(" + str(n) + "+0)*" + str(twoN) + "+o]*(-jc[0]) + s_dAB[(" + str(n) + "+1)*" + str(twoN) + "+o]*(-jc[1]) + s_dAB[(" + str(n) + "+2)*" + str(twoN) + "+o]*(-jc[2]);",
+        "        inner[r] += s_dAB[(" + str(2*n) + "+0)*" + str(twoN) + "+o]*(-uc[0]) + s_dAB[(" + str(2*n) + "+1)*" + str(twoN) + "+o]*(-uc[1]) + s_dAB[(" + str(2*n) + "+2)*" + str(twoN) + "+o]*(-uc[2]);",
+        "      }",
+        "    }",
+        # G applied to base-linear rows: R @ inner[0:3].
+        "    T l0 = inner[0], l1 = inner[1], l2 = inner[2];",
+        "    inner[0] = R[0]*l0 + R[1]*l1 + R[2]*l2;",
+        "    inner[1] = R[3]*l0 + R[4]*l1 + R[5]*l2;",
+        "    inner[2] = R[6]*l0 + R[7]*l1 + R[8]*l2;",
+        # g_dot @ qd_{k+1,pin} on the bottom-half ang q-cols (velocity output).
+        "    if (half == 1 && c >= 3 && c < 6) {",
+        "      int a = c - 3;",
+        "      T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
+        "      T sk[3] = {ea[1]*qk1lin[2]-ea[2]*qk1lin[1], ea[2]*qk1lin[0]-ea[0]*qk1lin[2], ea[0]*qk1lin[1]-ea[1]*qk1lin[0]};",
+        "      inner[0] += R[0]*sk[0] + R[1]*sk[1] + R[2]*sk[2];",
+        "      inner[1] += R[3]*sk[0] + R[4]*sk[1] + R[5]*sk[2];",
+        "      inner[2] += R[6]*sk[0] + R[7]*sk[1] + R[8]*sk[2];",
+        "    }",
+        "    for (int r = 0; r < " + str(n) + "; ++r) s_mjx[c*" + str(twoN) + "+(base+r)] = inner[r];",
+        "  }",
+        # --- qd-block (cols n..2n-1) and u-block (cols 2n..3n-1): plain M @ Ginv then G rows ---
+    ]:
+        self.gen_add_code_line(line)
+    for off in (n, 2 * n):
+        for line in [
+            "  for (int cl = 0; cl < " + str(n) + "; ++cl) {",
+            "    int c = " + str(off) + " + cl;",
+            "    T inner[" + str(n) + "];",
+            "    for (int r = 0; r < " + str(n) + "; ++r) {",
+            "      int o = base + r;",
+            "      if (cl < 3) { inner[r] = s_dAB[(" + str(off) + "+0)*" + str(twoN) + "+o]*R[cl*3+0] + s_dAB[(" + str(off) + "+1)*" + str(twoN) + "+o]*R[cl*3+1] + s_dAB[(" + str(off) + "+2)*" + str(twoN) + "+o]*R[cl*3+2]; }",
+            "      else { inner[r] = s_dAB[c*" + str(twoN) + "+o]; }",
+            "    }",
+            "    T l0 = inner[0], l1 = inner[1], l2 = inner[2];",
+            "    inner[0] = R[0]*l0 + R[1]*l1 + R[2]*l2;",
+            "    inner[1] = R[3]*l0 + R[4]*l1 + R[5]*l2;",
+            "    inner[2] = R[6]*l0 + R[7]*l1 + R[8]*l2;",
+            "    for (int r = 0; r < " + str(n) + "; ++r) s_mjx[c*" + str(twoN) + "+(base+r)] = inner[r];",
+            "  }",
+        ]:
+            self.gen_add_code_line(line)
+    self.gen_add_code_line("}")  # end half loop
+    # ---- base-LINEAR output rows of the TOP half: mjx GLOBAL-add tangent ----
+    for line in [
+        "for (int a = 0; a < 3; ++a) {",
+        "  int o = a;",
+        "  for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] = static_cast<T>(0);",
+        "  s_mjx[a*" + str(twoN) + "+o] = static_cast<T>(1);   // identity on base-linear q col a",
+        "  if (si_mjx) {",
+        "    for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] += dt * s_mjx[c*" + str(twoN) + "+(" + str(n) + "+a)];",
+        "  } else {",
+        "    s_mjx[(" + str(n) + "+a)*" + str(twoN) + "+o] += dt;   // dt on qd base-linear col a",
+        "  }",
+        "}",
+    ]:
+        self.gen_add_code_line(line)
+    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_sync()
+    # ---- copy the mjx band back over s_dAB (block-parallel) ----
+    self.gen_add_parallel_loop("ind", str(twoN * 3 * n))
+    self.gen_add_code_line("s_dAB[ind] = s_mjx[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
 
 def gen_integrator_gradient_multistage(self, compute_x_kp1=False,
@@ -511,7 +649,8 @@ def gen_integrator_gradient_multistage(self, compute_x_kp1=False,
 def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
                                           integrator_type="IT", s_dAB_name="s_dAB",
                                           s_x_kp1_name="s_x_kp1",
-                                          d_temp_spill_name="nullptr", temp_spill_flag_name="false"):
+                                          d_temp_spill_name="nullptr", temp_spill_flag_name="false",
+                                          mujoco_output_expr=None):
     """Compose: FD gradient (sets s_Minv, s_qdd, s_dc_du, s_df_du) → dAB assembly.
 
     This is the single-stage path (Euler / SI-Euler). For floating-base it also
@@ -560,21 +699,52 @@ def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
             integrator_type=integrator_type,
             updated_var_names=dict(s_x_kp1_name=s_x_kp1_name),
         )
+    # ---- mjx output-convention epilogue (floating single-stage only) ----
+    # Runs at the END where s_dAB holds the finalized pin gradient and the FD-grad
+    # s_temp pool is DEAD (reused as the 2n*3n mjx scratch). s_qdd / s_qd / s_u /
+    # s_q are all live (no recompute, like fdsva_so). The x_kp1 value (if built) is
+    # converted to mjx by the GLOBAL-add retract + qd reframe + quat reorder.
+    if fb and mujoco_output_expr is not None:
+        self.gen_add_code_line("if constexpr (" + mujoco_output_expr + ") {", True)
+        _emit_integrator_gradient_mjx_output(self, integrator_type, s_mjx_scratch="s_temp")
+        if compute_x_kp1:
+            # x_kp1 = [q (nq); qd (nv)]: base-position GLOBAL add (mjx retract), qd
+            # output reframe by G, base quaternion xyzw->wxyz. s_q still holds the
+            # ORIGINAL base position (integrate wrote OUT-of-place into s_x_kp1);
+            # s_qd[0:3] is the raw mjx global base-linear velocity used for the step.
+            self.gen_mjx_retract(s_x_kp1_name, "s_q", "s_qd", "dt")
+            # qd_{k+1,mjx} = G qd_{k+1,pin}: rotate the base-linear velocity rows by R.
+            # Parenthesize the qd-block base so the helper's [i] indexing binds to the
+            # offset pointer (s_x_kp1 + NQ), not to the literal (operator precedence).
+            self.gen_mjx_base_rotate("(" + s_x_kp1_name + " + " + str(self.robot.get_num_pos()) + ")", q_name="s_q")
+            self.gen_add_code_lines([
+                "// mjx x_kp1: base quaternion xyzw->wxyz (inverse of input reorder)",
+                "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
+                "T qw_out = " + s_x_kp1_name + "[6];",
+                s_x_kp1_name + "[6] = " + s_x_kp1_name + "[5]; " + s_x_kp1_name + "[5] = " + s_x_kp1_name + "[4]; "
+                    + s_x_kp1_name + "[4] = " + s_x_kp1_name + "[3]; " + s_x_kp1_name + "[3] = qw_out;",
+            ])
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+        self.gen_add_end_control_flow()
 
 
 def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
                                                      scratch_in_smem_expr="true",
                                                      use_da_df_spill_expr="false",
                                                      d_workspace_pool_name="nullptr",
-                                                     d_temp_spill_name="nullptr"):
+                                                     d_temp_spill_name="nullptr",
+                                                     mujoco_output_expr=None):
     """Emit the call to `integrator_gradient_device` / `integrator_with_gradient_device`. Arg order MUST
     match the def in gen_integrator_gradient_device. The FD-grad inner POOL
     placement region (d_workspace) and the inverse_dynamics_gradient da_df band spill region
     (d_temp_spill) default to nullptr (unused under the matching if-constexpr); the
     kernel passes real pointers per tier. s_D_qdd_stage / s_dAB remain SEPARATE
-    caller-placed pointers — they are threaded through unchanged."""
+    caller-placed pointers — they are threaded through unchanged. mujoco_output_expr
+    (floating only) appends the trailing MUJOCO_OUTPUT template flag."""
     fname = ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient") + "_device"
-    tmpl = "<T, IT, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr + ">"
+    tmpl_flags = "<T, IT, " + scratch_in_smem_expr + ", " + use_da_df_spill_expr
+    tmpl = (tmpl_flags + ", " + mujoco_output_expr + ">") if mujoco_output_expr is not None else (tmpl_flags + ">")
     start = fname + tmpl + "(s_dAB, "
     if compute_x_kp1:
         start += "s_x_kp1, "
@@ -649,7 +819,14 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
     self.gen_add_func_doc("integrator gradient orchestration as a single inner-owns-placement device function",
                           ["Owns the FD-grad inner s_temp pool placement; the repoint covers every consumer below (incl. the XImats helper's sincos scratch and the per-stage XImats refresh)"],
                           func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST so
+    # existing positional <T,IT,SCRATCH,SPILL> call sites are unaffected; default
+    # false if-constexpr-elides the epilogue -> byte-identical PTX on the pin path.
+    mjx_device = self.robot.floating_base
+    if mjx_device:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, bool SCRATCH_IN_SMEM = true, bool USE_DA_DF_SPILL = false>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc a separate __device__ wrapper keeps its RBD callees as distinct
     # functions whose regcount must fit the kernel's launch_bounds budget -> ptxas
@@ -677,9 +854,17 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
         s_x_kp1_name="s_x_kp1",
         d_temp_spill_name="d_temp_spill",
         temp_spill_flag_name=spill_flag,
+        mujoco_output_expr=("MUJOCO_OUTPUT" if mjx_device else None),
     )
     self.gen_add_end_control_flow()
     self.gen_add_code_line("else {", True)
+    if mjx_device:
+        # Multi-stage RK + mjx is a clean-break deferral (the 2nd-order-free chain
+        # rule still needs the mjx input/output reparam derived per stage). Refuse
+        # rather than emit a silently-wrong tensor.
+        self.gen_add_code_line("static_assert(!MUJOCO_OUTPUT, "
+                               "\"integrator_gradient MUJOCO_OUTPUT is single-stage (EULER/SEMI_IMPLICIT_EULER) only; \"")
+        self.gen_add_code_line("              \"multi-stage RK mjx is deferred.\");")
     self.gen_integrator_gradient_multistage(
         compute_x_kp1=compute_x_kp1,
         d_temp_spill_name="d_temp_spill",
@@ -717,7 +902,14 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     self.gen_add_func_doc("Computes the gradient of the integrator step per timestep" +
                           (" and the next state x_{k+1}" if compute_x_kp1 else ""),
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx flag appended LAST after
+    # RESOURCE_TIER so existing <T,IT,TIER> call sites are unaffected; default false
+    # if-constexpr-elides the input-convert + dAB epilogue -> byte-identical pin PTX.
+    mjx_kernel = self.robot.floating_base
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (PERF cap), NOT tier_max_threads: the
     # integrator gradient is register-bound by its RBD callees, so the LITE/MINIMAL
@@ -846,11 +1038,24 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
                 use_da_df_spill_expr=spill_flag,
                 d_workspace_pool_name=pool_name,
                 d_temp_spill_name=spill_name,
+                mujoco_output_expr=("MUJOCO_OUTPUT" if mjx_kernel else None),
             )
+
+        # MUJOCO_OUTPUT: convert the mjx-frame inputs (quat wxyz->xyzw, base-linear
+        # velocity R^T, force R^T) to the pin frame so the RBD callees + the dAB
+        # epilogue see pin quantities. The qdd is the kernel's own output (not an
+        # input), so only q/qd/u are converted. Must follow the load + precede the
+        # XImats build inside the device call. No-op on the pin path.
+        def _emit_mjx_input_convert():
+            if mjx_kernel:
+                self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+                self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", u_name="s_u")
+                self.gen_add_end_control_flow()
 
         if not single_call_timing:
             self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
             self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
+            _emit_mjx_input_convert()
             self.gen_add_code_line("// compute — the orchestration inner owns its FD-grad s_temp pool placement")
             _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
             _emit_device_call("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
@@ -861,6 +1066,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
             self.gen_add_end_control_flow()
         else:
             self.gen_kernel_load_inputs("q_qd_u",str(input_count))
+            _emit_mjx_input_convert()
             _emit_spill_pointers("0")
             self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
             self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -920,17 +1126,27 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
         (" and also write x_{k+1}" if compute_x_kp1 else ""),
         [], func_params, None,
     )
-    self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming IT + the tier positionally to reach the trailing flag). Default false
+    # -> byte-identical pin codegen. Binding calls grid::integrator_gradient<T, IT,
+    # KIND, /*MUJOCO_OUTPUT=*/true>.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"" + base_name + " requires all-data or dynamics gridData\");")
     kernel_args_x_kp1 = "hd_data->d_x_kp1," if compute_x_kp1 else ""
-    func_call_start = (base_name + "_kernel<T, IT><<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(" +
+    kernel_tmpl = ("<T, IT, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, IT>")
+    func_call_start = (base_name + "_kernel" + kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(" +
                        "hd_data->d_dAB," + kernel_args_x_kp1 + "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,")
     func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T, IT>", "kernel_single_timing<T, IT>")
+        func_call_start = func_call_start.replace(base_name + "_kernel" + kernel_tmpl,
+                                                  base_name + "_kernel_single_timing" + kernel_tmpl)
     self.gen_add_code_line("int stride_q_qd_u = 3*NUM_JOINTS;")
     if not compute_only:
         self.gen_add_code_lines([
