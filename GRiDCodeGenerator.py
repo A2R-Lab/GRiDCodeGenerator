@@ -2139,7 +2139,74 @@ class GRiDCodeGenerator:
                       "size_t _grid_smem_max = 0; gpuErrchk(grid_get_max_dynamic_shared_memory_bytes(&_grid_smem_max));"]
         generated_set = getattr(self, "generated_algorithms", None)
         alias_counter = 0
-        for entry in self.KERNEL_ATTR_MANIFEST:
+        # mjx (floating MUJOCO_OUTPUT) emits a SECOND __global__ instantiation of every
+        # mjx-capable kernel with the trailing MUJOCO_OUTPUT=true template flag. Those are
+        # DISTINCT device functions, so cudaFuncSetAttribute must run for them too — else a
+        # big mjx kernel (fdsva_so / idsva_so-world / integrator_gradient / id-grad on a
+        # humanoid) whose dynamic smem exceeds the 48 KB default launches with
+        # cudaErrorInvalidValue while its pin twin succeeds. The signature is identical
+        # (MUJOCO_OUTPUT is a non-type param). For the qdd-overloaded kernels (inverse_dynamics
+        # / inverse_dynamics_gradient) only the qdd overload carries MUJOCO_OUTPUT, so the
+        # qdd-overload signature is used; integrator_gradient mjx is single-stage (EULER/SI) only.
+        # Gate on floating_base, NOT self.MUJOCO_OUTPUT: the mjx kernel template flag is
+        # emitted for EVERY floating-base robot (the C-ABI/jax/torch mjx wrappers are
+        # #ifdef GRID_FLOATING_BASE), independent of the MUJOCO_OUTPUT constructor arg
+        # (which the .so build does not set). So the MUJOCO_OUTPUT=true instantiations
+        # exist for any floating .so and need their dynamic-smem attribute registered.
+        mujoco_manifest = []
+        if self.robot.floating_base:
+            _GT = "GRID_DEFAULT_RESOURCE_TIER"
+            mujoco_manifest = [
+                ("inverse_dynamics(mjx)", "inverse_dynamics", None, "INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"inverse_dynamics_kernel<T, {_GT}, true>",
+                   "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")]),
+                ("minv(mjx)", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"minv_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
+                ("forward_dynamics(mjx)", "forward_dynamics", None, "FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"forward_dynamics_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
+                ("aba(mjx)", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"aba_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
+                ("crba(mjx)", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"crba_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
+                ("end_effector_pose(mjx)", "end_effector_pose", None, "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"end_effector_pose_kernel<T, {_GT}, true>",
+                   "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")]),
+                ("end_effector_pose_gradient(mjx)", "end_effector_pose_gradient", None, "END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"end_effector_pose_gradient_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
+                ("end_effector_pose_hessian(mjx)", "end_effector_pose_hessian", "generate_end_effector_pose_hessian", "END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"end_effector_pose_hessian_kernel<T, {_GT}, true>",
+                   "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
+                ("inverse_dynamics_gradient(mjx)", "inverse_dynamics_gradient", "generate_inverse_dynamics_gradient", "INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"inverse_dynamics_gradient_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")]),
+                ("forward_dynamics_gradient(mjx)", "forward_dynamics_gradient", "generate_forward_dynamics_gradient", "FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"forward_dynamics_gradient_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
+                ("inverse_dynamics_regressor(mjx)", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"inverse_dynamics_regressor_kernel<T, {_GT}, true>",
+                   "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)")]),
+                ("idsva_so_world_frame(mjx)", "idsva_so_world_frame", "generate_idsva_so_world_frame", "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"idsva_so_world_frame_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
+                ("fdsva_so(mjx)", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"fdsva_so_kernel<T, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
+                ("integrator(mjx)", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"integrator_kernel<T, IntegratorType::{it}, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+                  for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")]),
+                # integrator_gradient mjx is single-stage (EULER / SI-Euler) only.
+                ("integrator_gradient(mjx)", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"integrator_gradient_kernel<T, IntegratorType::{it}, {_GT}, true>",
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+                  for it in ("EULER", "SEMI_IMPLICIT_EULER")]),
+            ]
+        for entry in self.KERNEL_ATTR_MANIFEST + mujoco_manifest:
             algo_label, algo_short, gate_attr, bytes_macro, kernels = entry
             # Honor the legacy generate_* gate when present; otherwise fall
             # back to membership in generated_algorithms; if neither is set

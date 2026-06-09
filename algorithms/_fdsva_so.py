@@ -332,7 +332,13 @@ def gen_fdsva_so_device(self):
     # Minv (s_Minv) and the first-order fd gradient (s_df_du) are already in-flight.
     if mjx_inner:
         self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
-        self.gen_add_code_line("T *s_mjx_scratch = CONTRACT_IN_SMEM ? s_temp : s_fdsva_temp;")
+        # The mjx output band (4*NV^3) reuses s_idsva_so: it is DEAD after the contract
+        # consumed it into s_df2, is exactly 4*NV^3, and is a DISTINCT buffer disjoint
+        # from every live source the assembly reads (s_df2 / s_df_du / s_Minv / s_q/qd/u/qdd).
+        # The previous choice (s_temp / s_fdsva_temp) ALIASES the spilled s_df_du / s_Minv
+        # in d_workspace on robots where fdsva_so spills (e.g. go2), corrupting the
+        # transform with prior-call workspace state. s_idsva_so is never read by the epilogue.
+        self.gen_add_code_line("T *s_mjx_scratch = s_idsva_so;")
         _emit_fdsva_so_mjx_output(self)
         self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -356,8 +362,8 @@ def _emit_fdsva_so_mjx_output(self):
     second_order_fd_pin_to_mjx). In-kernel quantities (all live):
       s_Minv (dense, SYMMETRIC; read [(r<=c)?c*n+r:r*n+c]), s_qdd (fd value qdd),
       s_df_du = dqdd_dq | dqdd_dqd (col-major, two NV*NV blocks), s_q/s_qd/s_u.
-    The mjx output band lives in s_mjx_scratch (4*NV^3, contract scratch; dead);
-    copied back over s_df2 at the end."""
+    The mjx output band lives in s_mjx_scratch (4*NV^3; bound to s_idsva_so, which is
+    dead after the contract and disjoint from every live source); copied back over s_df2."""
     nv = self.robot.get_num_vel()
     nv2 = nv * nv
     nv3 = nv * nv * nv
