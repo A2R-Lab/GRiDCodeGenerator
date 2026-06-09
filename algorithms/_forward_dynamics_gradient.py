@@ -117,12 +117,22 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
     DQ = 0
     DQD = nv * nv
     self.gen_add_code_line("// === mjx output convention (floating-base fd-gradient) ===")
-    # Single thread (register-cheap; nv small). Mirrors the validated op order.
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
-    # Build R (row-major R[3*i+j]) from the xyzw base quaternion (s_q already
-    # reordered by the input epilogue) -- mirrors mujoco_convention.rotation_from
-    # _quat_xyzw / the _gen_mjx_build_R_lines helper exactly.
-    self.gen_add_code_lines([
+    # PARALLELIZED across the block (was single-thread; ~50% runtime overhead at
+    # large batch). Mirrors the validated id-gradient parallelization: the work is
+    # split into phases, each a parallel loop over an independent axis, with a sync
+    # between any two phases that have a read-after-write dependency. The loop-
+    # invariant helpers (R, the base source vectors v_lin/omega/u_lin/qdd_lin, and
+    # s_M) are RE-MATERIALIZED register-local at the top of every parallel-loop body
+    # via the _LOAD block below — ALL their sources (s_q/s_qd/s_u/s_qdd/s_Minv) stay
+    # live in smem through the epilogue, so per-thread recompute is correct with
+    # ZERO aliasing risk (no smem staging). The op order within each accumulation is
+    # byte-identical to the validated serial version.
+    #
+    # _LOAD: re-materialize R + the base vectors + s_M at the top of each parallel
+    #   body. Build R (row-major R[3*i+j]) from the xyzw base quaternion (s_q already
+    #   reordered by the input epilogue) -- mirrors mujoco_convention.rotation_from
+    #   _quat_xyzw / the _gen_mjx_build_R_lines helper exactly.
+    _LOAD = [
         "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
         "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
         "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
@@ -130,15 +140,13 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
         "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
         "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
         "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
-    ])
-    self.gen_add_code_lines([
         # Minv (nv x nv): in-flight from minv_inner (the -Minv*dc/du step). NOTE
         # minv_inner stores Minv SYMMETRIC_UPPER (only the upper triangle is
         # populated; the -Minv*dc/du apply mirror-indexes it). The Minv[:,0:3]
         # coupling below needs the FULL dense column (all nv rows), so we read it
         # through the same (row<=col) symmetric index used by the apply loop --
-        # see MINV(r,k) below. (A naive dense s_Minv[r+nv*k] read would return 0
-        # for the lower-triangle rows r>k, zeroing the coupling for joint rows.)
+        # see the (r<=k) index below. (A naive dense s_Minv[r+nv*k] read would
+        # return 0 for the lower-triangle rows r>k, zeroing the joint-row coupling.)
         "const T *s_M = s_Minv;",
         # sources (pin frame, post input-convert)
         "T v_lin[3] = {s_qd[0], s_qd[1], s_qd[2]};",
@@ -146,19 +154,23 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
         "T u_lin[3] = {s_u[0], s_u[1], s_u[2]};",
         # qdd_lin = base-linear of the computed forward-dynamics accel s_qdd[0:3]
         "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
-    ])
+    ]
     # ---- df_dq half ----
-    self.gen_add_code_line("// df_dq: column_reframe cols 0:3 <- cols . R^T")
-    self.gen_add_code_line("for (int r = 0; r < " + str(nv) + "; r++) {", True)
+    # Phase A: df_dq column_reframe (cols 0:3, row r) THEN df_dq base couplings
+    #   (cols 3+a, row r). Disjoint df_dq column writes (0:3 vs 3:6), both per-row;
+    #   the couplings read df_dqd ORIGINAL + s_M. Parallel over r.
+    self.gen_add_code_line("// Phase A: df_dq column_reframe (cols 0:3) + base couplings (cols 3+a), per row")
+    self.gen_add_parallel_loop("r", str(nv))
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
+        "// df_dq: column_reframe cols 0:3 <- cols . R^T",
         "T c0 = s_df_du[" + str(DQ) + " + 0*" + str(nv) + " + r], c1 = s_df_du[" + str(DQ) + " + 1*" + str(nv) + " + r], c2 = s_df_du[" + str(DQ) + " + 2*" + str(nv) + " + r];",
         "s_df_du[" + str(DQ) + " + 0*" + str(nv) + " + r] = c0*R[0] + c1*R[1] + c2*R[2];",
         "s_df_du[" + str(DQ) + " + 1*" + str(nv) + " + r] = c0*R[3] + c1*R[4] + c2*R[5];",
         "s_df_du[" + str(DQ) + " + 2*" + str(nv) + " + r] = c0*R[6] + c1*R[7] + c2*R[8];",
     ])
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("// df_dq: base-velocity/force couplings into cols 3+a (all rows)")
-    self.gen_add_code_line("//   df_dq[:,3+a] += df_dqd[:,0:3] @ (-(e_a x v_lin)) + Minv[:,0:3] @ (-(e_a x u_lin))")
+    self.gen_add_code_line("// df_dq: base-velocity/force couplings into cols 3+a (this row)")
+    self.gen_add_code_line("//   df_dq[r,3+a] += df_dqd[r,0:3] @ (-(e_a x v_lin)) + Minv[r,0:3] @ (-(e_a x u_lin))")
     self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
     self.gen_add_code_lines([
         # jv = -(e_a x v_lin); ju = -(e_a x u_lin). Basis-vector cross (verified
@@ -170,26 +182,34 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
         "ju[0] = -((a==1)*( u_lin[2]) + (a==2)*(-u_lin[1]));",
         "ju[1] = -((a==0)*(-u_lin[2]) + (a==2)*( u_lin[0]));",
         "ju[2] = -((a==0)*( u_lin[1]) + (a==1)*(-u_lin[0]));",
-        "for (int r = 0; r < " + str(nv) + "; r++) {", True,
         "T acc = static_cast<T>(0);",
         # s_M is SYMMETRIC_UPPER: Minv[r,k] = s_M[(r<=k)?(k*nv+r):(r*nv+k)].
         "for (int k = 0; k < 3; k++) { T mrk = s_M[(r <= k) ? (k*" + str(nv) + " + r) : (r*" + str(nv) + " + k)]; acc += s_df_du[" + str(DQD) + " + k*" + str(nv) + " + r]*jv[k] + mrk*ju[k]; }",
         "s_df_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + r] += acc;",
     ])
-    self.gen_add_end_control_flow()  # for r
     self.gen_add_end_control_flow()  # for a
-    self.gen_add_code_line("// df_dq: base_rotate_rows rows 0:3 <- R . rows")
-    self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+    self.gen_add_end_control_flow()  # parallel r
+    self.gen_add_sync()
+    # Phase B: df_dq base_rotate_rows (rows 0:3 of col c). Reads df_dq rows 0:3 of
+    #   ALL cols (cols 0:3 written by A's reframe, cols 3+a by A's couplings) ->
+    #   MUST follow A. Parallel over c.
+    self.gen_add_code_line("// Phase B: df_dq base_rotate_rows rows 0:3 <- R . rows, per col")
+    self.gen_add_parallel_loop("c", str(nv))
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
         "T m0 = s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 0], m1 = s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 1], m2 = s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 2];",
         "s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
         "s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
         "s_df_du[" + str(DQ) + " + c*" + str(nv) + " + 2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
     ])
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("// df_dq: accel output-map terms (base-linear rows of cols 3+a), AFTER row-rotate")
-    self.gen_add_code_line("//   += R@(e_a x (qdd_lin + omega x v_lin)) + R@(omega x (-(e_a x v_lin)))")
-    self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
+    self.gen_add_end_control_flow()  # parallel c
+    self.gen_add_sync()
+    # Phase C: df_dq accel output-map (base-linear rows 0:3 of cols 3+a). RMW the
+    #   rows B just rotated -> MUST follow B. Parallel over a.
+    self.gen_add_code_line("// Phase C: df_dq accel output-map terms (base-linear rows of cols 3+a), AFTER row-rotate")
+    self.gen_add_code_line("//   += R@(e_a x (qdd_lin + omega x v_lin)) + R@(omega x (-(e_a x v_lin))), per a")
+    self.gen_add_parallel_loop("a", "3")
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
         # ov = omega x v_lin ; t = qdd_lin + ov
         "T ov0 = omega[1]*v_lin[2] - omega[2]*v_lin[1];",
@@ -213,29 +233,42 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
         "s_df_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + 1] += R[3]*g0 + R[4]*g1 + R[5]*g2;",
         "s_df_du[" + str(DQ) + " + (3+a)*" + str(nv) + " + 2] += R[6]*g0 + R[7]*g1 + R[8]*g2;",
     ])
-    self.gen_add_end_control_flow()  # for a
+    self.gen_add_end_control_flow()  # parallel a
+    self.gen_add_sync()
     # ---- df_dqd half ----
-    self.gen_add_code_line("// df_dqd: column_reframe cols 0:3 <- cols . R^T")
-    self.gen_add_code_line("for (int r = 0; r < " + str(nv) + "; r++) {", True)
+    # Phase D: df_dqd column_reframe (cols 0:3, row r). MUST follow Phase A (which
+    #   read df_dqd ORIGINAL cols 0:3); the intervening syncs guarantee it. Parallel
+    #   over r.
+    self.gen_add_code_line("// Phase D: df_dqd column_reframe cols 0:3 <- cols . R^T, per row")
+    self.gen_add_parallel_loop("r", str(nv))
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
         "T c0 = s_df_du[" + str(DQD) + " + 0*" + str(nv) + " + r], c1 = s_df_du[" + str(DQD) + " + 1*" + str(nv) + " + r], c2 = s_df_du[" + str(DQD) + " + 2*" + str(nv) + " + r];",
         "s_df_du[" + str(DQD) + " + 0*" + str(nv) + " + r] = c0*R[0] + c1*R[1] + c2*R[2];",
         "s_df_du[" + str(DQD) + " + 1*" + str(nv) + " + r] = c0*R[3] + c1*R[4] + c2*R[5];",
         "s_df_du[" + str(DQD) + " + 2*" + str(nv) + " + r] = c0*R[6] + c1*R[7] + c2*R[8];",
     ])
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("// df_dqd: base_rotate_rows rows 0:3 <- R . rows")
-    self.gen_add_code_line("for (int c = 0; c < " + str(nv) + "; c++) {", True)
+    self.gen_add_end_control_flow()  # parallel r
+    self.gen_add_sync()
+    # Phase E: df_dqd base_rotate_rows (rows 0:3 of col c). Reads df_dqd rows 0:3 of
+    #   cols 0:3 written by D -> MUST follow D. Parallel over c.
+    self.gen_add_code_line("// Phase E: df_dqd base_rotate_rows rows 0:3 <- R . rows, per col")
+    self.gen_add_parallel_loop("c", str(nv))
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
         "T m0 = s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 0], m1 = s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 1], m2 = s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 2];",
         "s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
         "s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
         "s_df_du[" + str(DQD) + " + c*" + str(nv) + " + 2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
     ])
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("// df_dqd: out_vd accel-map terms (base-linear rows), AFTER row-rotate")
-    self.gen_add_code_line("//   col 0+a += R@(omega x R^T e_a) ; col 3+a += R@(e_a x v_lin)")
-    self.gen_add_code_line("for (int a = 0; a < 3; a++) {", True)
+    self.gen_add_end_control_flow()  # parallel c
+    self.gen_add_sync()
+    # Phase F: df_dqd out_vd accel-map (base-linear rows 0:3 of cols 0+a and 3+a).
+    #   RMW the rows E just rotated -> MUST follow E. Parallel over a.
+    self.gen_add_code_line("// Phase F: df_dqd out_vd accel-map terms (base-linear rows), AFTER row-rotate")
+    self.gen_add_code_line("//   col 0+a += R@(omega x R^T e_a) ; col 3+a += R@(e_a x v_lin), per a")
+    self.gen_add_parallel_loop("a", "3")
+    self.gen_add_code_lines(_LOAD)
     self.gen_add_code_lines([
         # R^T e_a = row a of R = (R[3a+0],R[3a+1],R[3a+2])
         "T rte0 = R[3*a + 0], rte1 = R[3*a + 1], rte2 = R[3*a + 2];",
@@ -254,8 +287,7 @@ def _emit_forward_dynamics_gradient_mjx_output(self):
         "s_df_du[" + str(DQD) + " + (3+a)*" + str(nv) + " + 1] += R[3]*ev0 + R[4]*ev1 + R[5]*ev2;",
         "s_df_du[" + str(DQD) + " + (3+a)*" + str(nv) + " + 2] += R[6]*ev0 + R[7]*ev1 + R[8]*ev2;",
     ])
-    self.gen_add_end_control_flow()  # for a
-    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_end_control_flow()  # parallel a
     self.gen_add_sync()
 
 def gen_forward_dynamics_gradient_device(self, use_qdd_Minv_input = False):

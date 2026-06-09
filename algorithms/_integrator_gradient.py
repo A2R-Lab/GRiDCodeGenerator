@@ -253,12 +253,18 @@ def _emit_integrator_gradient_mjx_output(self, integrator_type, s_mjx_scratch="s
     self.gen_add_code_line("// === mjx output convention (floating-base integrator gradient) ===")
     self.gen_add_code_line("T *s_mjx = " + s_mjx_scratch + ";   // 2n*3n mjx output band (dead FD-grad pool)")
     self.gen_add_code_line("const bool si_mjx = " + si + ";")
-    # ---- single-thread assembly (correctness-first; nv small) ----
-    # The inner C for/if blocks below carry their own balanced braces as literal
-    # text; only the outer threadIdx guard uses the codegen indent tracker
-    # (gen_add_end_control_flow). s_dAB is col-major P(o,c)=s_dAB[c*2n+o].
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
-    for line in [
+    # ---- PARALLELIZED assembly (was single-thread; ~50% runtime at large batch). ----
+    # The transform is column-independent: for each (half, output-column c) it builds
+    # an inner[n] vector reading ONLY s_dAB (read-only here) + the loop-invariant
+    # helpers, and writes s_mjx[c*2n + base+r]. We parallelize over a flat index
+    # gi in [0, 6n): half = gi/(3n), c = gi%(3n). The R/vlin/ulin/qk1lin helpers are
+    # RE-MATERIALIZED into per-thread REGISTERS at the top of each loop body (a few
+    # dozen flops; zero aliasing risk — the byte-for-byte math is copied verbatim from
+    # the original single-thread block). The math (op order, indexing) is unchanged;
+    # only WHO computes each column changed. s_dAB is col-major P(o,c)=s_dAB[c*2n+o].
+    #
+    # _HELP re-materializes R + base source vectors at the top of every parallel body.
+    _HELP = [
         # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6].
         "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
         "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
@@ -271,83 +277,76 @@ def _emit_integrator_gradient_mjx_output(self, integrator_type, s_mjx_scratch="s
         "T ulin[3] = {s_u[0],  s_u[1],  s_u[2]};",
         "// qd_{k+1,pin}[lin] = (qd + dt*qdd)[lin] (for the g_dot velocity-output term)",
         "T qk1lin[3] = {s_qd[0] + dt*s_qdd[0], s_qd[1] + dt*s_qdd[1], s_qd[2] + dt*s_qdd[2]};",
-        "// two output halves (top=0, bot=n); each column block reframed then G-row-rotated.",
-        "for (int half = 0; half < 2; ++half) {",
-        "  int base = half * " + str(n) + ";",
-        "  // --- q-block (cols 0..n-1) ---",
-        "  for (int c = 0; c < " + str(n) + "; ++c) {",
-        "    T inner[" + str(n) + "];",
-        "    for (int r = 0; r < " + str(n) + "; ++r) {",
-        "      int o = base + r;",
-        # (M @ Ginv)[r,c]: base-linear cols mix via Ginv[j,c]=R[c,j]; else identity.
-        "      if (c < 3) { inner[r] = s_dAB[0*" + str(twoN) + "+o]*R[c*3+0] + s_dAB[1*" + str(twoN) + "+o]*R[c*3+1] + s_dAB[2*" + str(twoN) + "+o]*R[c*3+2]; }",
-        "      else { inner[r] = s_dAB[c*" + str(twoN) + "+o]; }",
-        "    }",
-        # _cross_cols couplings on ANG cols (3..5): Jv_q on qd-block, Ju_q on u-block.
-        "    if (c >= 3 && c < 6) {",
-        "      int a = c - 3;",
-        "      T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
-        "      T jc[3] = {ea[1]*vlin[2]-ea[2]*vlin[1], ea[2]*vlin[0]-ea[0]*vlin[2], ea[0]*vlin[1]-ea[1]*vlin[0]};",
-        "      T uc[3] = {ea[1]*ulin[2]-ea[2]*ulin[1], ea[2]*ulin[0]-ea[0]*ulin[2], ea[0]*ulin[1]-ea[1]*ulin[0]};",
-        "      for (int r = 0; r < " + str(n) + "; ++r) {",
-        "        int o = base + r;",
-        "        inner[r] += s_dAB[(" + str(n) + "+0)*" + str(twoN) + "+o]*(-jc[0]) + s_dAB[(" + str(n) + "+1)*" + str(twoN) + "+o]*(-jc[1]) + s_dAB[(" + str(n) + "+2)*" + str(twoN) + "+o]*(-jc[2]);",
-        "        inner[r] += s_dAB[(" + str(2*n) + "+0)*" + str(twoN) + "+o]*(-uc[0]) + s_dAB[(" + str(2*n) + "+1)*" + str(twoN) + "+o]*(-uc[1]) + s_dAB[(" + str(2*n) + "+2)*" + str(twoN) + "+o]*(-uc[2]);",
-        "      }",
-        "    }",
-        # G applied to base-linear rows: R @ inner[0:3].
-        "    T l0 = inner[0], l1 = inner[1], l2 = inner[2];",
-        "    inner[0] = R[0]*l0 + R[1]*l1 + R[2]*l2;",
-        "    inner[1] = R[3]*l0 + R[4]*l1 + R[5]*l2;",
-        "    inner[2] = R[6]*l0 + R[7]*l1 + R[8]*l2;",
-        # g_dot @ qd_{k+1,pin} on the bottom-half ang q-cols (velocity output).
-        "    if (half == 1 && c >= 3 && c < 6) {",
-        "      int a = c - 3;",
-        "      T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
-        "      T sk[3] = {ea[1]*qk1lin[2]-ea[2]*qk1lin[1], ea[2]*qk1lin[0]-ea[0]*qk1lin[2], ea[0]*qk1lin[1]-ea[1]*qk1lin[0]};",
-        "      inner[0] += R[0]*sk[0] + R[1]*sk[1] + R[2]*sk[2];",
-        "      inner[1] += R[3]*sk[0] + R[4]*sk[1] + R[5]*sk[2];",
-        "      inner[2] += R[6]*sk[0] + R[7]*sk[1] + R[8]*sk[2];",
-        "    }",
-        "    for (int r = 0; r < " + str(n) + "; ++r) s_mjx[c*" + str(twoN) + "+(base+r)] = inner[r];",
+    ]
+    # ---- Phase 1: per (half, column) column reframe -> G rows -> g_dot. ----
+    # Reads s_dAB (read-only), writes the disjoint column slice of s_mjx -> fully
+    # parallel, no intra-phase sync. Each gi owns one output column of one half.
+    self.gen_add_code_line("// Phase 1: per (half, output-column) reframe (reads s_dAB, writes s_mjx)")
+    self.gen_add_parallel_loop("gi", str(2 * 3 * n))
+    self.gen_add_code_lines(_HELP)
+    for line in [
+        "int half = gi / " + str(3 * n) + ";",
+        "int c    = gi % " + str(3 * n) + ";",
+        "int base = half * " + str(n) + ";",
+        "int cblk = c / " + str(n) + ";   // 0=q-block, 1=qd-block, 2=u-block",
+        "int cl   = c % " + str(n) + ";   // column-local index within the block",
+        "int boff = cblk * " + str(n) + ";   // block column offset (0, n, 2n)",
+        "T inner[" + str(n) + "];",
+        # (M @ Ginv): base-linear block cols (cl<3) mix via Ginv[j,cl]=R[cl,j]; else identity.
+        "for (int r = 0; r < " + str(n) + "; ++r) {",
+        "  int o = base + r;",
+        "  if (cl < 3) { inner[r] = s_dAB[(boff+0)*" + str(twoN) + "+o]*R[cl*3+0] + s_dAB[(boff+1)*" + str(twoN) + "+o]*R[cl*3+1] + s_dAB[(boff+2)*" + str(twoN) + "+o]*R[cl*3+2]; }",
+        "  else { inner[r] = s_dAB[c*" + str(twoN) + "+o]; }",
+        "}",
+        # _cross_cols couplings on ANG cols (3..5): only for the q-block (cblk==0).
+        "if (cblk == 0 && c >= 3 && c < 6) {",
+        "  int a = c - 3;",
+        "  T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
+        "  T jc[3] = {ea[1]*vlin[2]-ea[2]*vlin[1], ea[2]*vlin[0]-ea[0]*vlin[2], ea[0]*vlin[1]-ea[1]*vlin[0]};",
+        "  T uc[3] = {ea[1]*ulin[2]-ea[2]*ulin[1], ea[2]*ulin[0]-ea[0]*ulin[2], ea[0]*ulin[1]-ea[1]*ulin[0]};",
+        "  for (int r = 0; r < " + str(n) + "; ++r) {",
+        "    int o = base + r;",
+        "    inner[r] += s_dAB[(" + str(n) + "+0)*" + str(twoN) + "+o]*(-jc[0]) + s_dAB[(" + str(n) + "+1)*" + str(twoN) + "+o]*(-jc[1]) + s_dAB[(" + str(n) + "+2)*" + str(twoN) + "+o]*(-jc[2]);",
+        "    inner[r] += s_dAB[(" + str(2*n) + "+0)*" + str(twoN) + "+o]*(-uc[0]) + s_dAB[(" + str(2*n) + "+1)*" + str(twoN) + "+o]*(-uc[1]) + s_dAB[(" + str(2*n) + "+2)*" + str(twoN) + "+o]*(-uc[2]);",
         "  }",
-        # --- qd-block (cols n..2n-1) and u-block (cols 2n..3n-1): plain M @ Ginv then G rows ---
+        "}",
+        # G applied to base-linear rows: R @ inner[0:3].
+        "T l0 = inner[0], l1 = inner[1], l2 = inner[2];",
+        "inner[0] = R[0]*l0 + R[1]*l1 + R[2]*l2;",
+        "inner[1] = R[3]*l0 + R[4]*l1 + R[5]*l2;",
+        "inner[2] = R[6]*l0 + R[7]*l1 + R[8]*l2;",
+        # g_dot @ qd_{k+1,pin} on the bottom-half q-block ang cols (velocity output).
+        "if (half == 1 && cblk == 0 && c >= 3 && c < 6) {",
+        "  int a = c - 3;",
+        "  T ea[3] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)}; ea[a] = static_cast<T>(1);",
+        "  T sk[3] = {ea[1]*qk1lin[2]-ea[2]*qk1lin[1], ea[2]*qk1lin[0]-ea[0]*qk1lin[2], ea[0]*qk1lin[1]-ea[1]*qk1lin[0]};",
+        "  inner[0] += R[0]*sk[0] + R[1]*sk[1] + R[2]*sk[2];",
+        "  inner[1] += R[3]*sk[0] + R[4]*sk[1] + R[5]*sk[2];",
+        "  inner[2] += R[6]*sk[0] + R[7]*sk[1] + R[8]*sk[2];",
+        "}",
+        "for (int r = 0; r < " + str(n) + "; ++r) s_mjx[c*" + str(twoN) + "+(base+r)] = inner[r];",
     ]:
         self.gen_add_code_line(line)
-    for off in (n, 2 * n):
-        for line in [
-            "  for (int cl = 0; cl < " + str(n) + "; ++cl) {",
-            "    int c = " + str(off) + " + cl;",
-            "    T inner[" + str(n) + "];",
-            "    for (int r = 0; r < " + str(n) + "; ++r) {",
-            "      int o = base + r;",
-            "      if (cl < 3) { inner[r] = s_dAB[(" + str(off) + "+0)*" + str(twoN) + "+o]*R[cl*3+0] + s_dAB[(" + str(off) + "+1)*" + str(twoN) + "+o]*R[cl*3+1] + s_dAB[(" + str(off) + "+2)*" + str(twoN) + "+o]*R[cl*3+2]; }",
-            "      else { inner[r] = s_dAB[c*" + str(twoN) + "+o]; }",
-            "    }",
-            "    T l0 = inner[0], l1 = inner[1], l2 = inner[2];",
-            "    inner[0] = R[0]*l0 + R[1]*l1 + R[2]*l2;",
-            "    inner[1] = R[3]*l0 + R[4]*l1 + R[5]*l2;",
-            "    inner[2] = R[6]*l0 + R[7]*l1 + R[8]*l2;",
-            "    for (int r = 0; r < " + str(n) + "; ++r) s_mjx[c*" + str(twoN) + "+(base+r)] = inner[r];",
-            "  }",
-        ]:
-            self.gen_add_code_line(line)
-    self.gen_add_code_line("}")  # end half loop
-    # ---- base-LINEAR output rows of the TOP half: mjx GLOBAL-add tangent ----
+    self.gen_add_end_control_flow()  # parallel gi
+    self.gen_add_sync()
+    # ---- Phase 2: base-LINEAR output rows of the TOP half (mjx GLOBAL-add tangent). ----
+    # Reads s_mjx bottom-half rows (Phase 1 output) and writes s_mjx top-half rows ->
+    # read-after-write, hence the sync above. Parallel over a in [0,3). Each a owns
+    # the disjoint output row o=a across all 3n columns.
+    self.gen_add_code_line("// Phase 2: top-half base-linear rows = mjx global-add tangent (reads s_mjx bottom rows)")
+    self.gen_add_parallel_loop("a", "3")
     for line in [
-        "for (int a = 0; a < 3; ++a) {",
-        "  int o = a;",
-        "  for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] = static_cast<T>(0);",
-        "  s_mjx[a*" + str(twoN) + "+o] = static_cast<T>(1);   // identity on base-linear q col a",
-        "  if (si_mjx) {",
-        "    for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] += dt * s_mjx[c*" + str(twoN) + "+(" + str(n) + "+a)];",
-        "  } else {",
-        "    s_mjx[(" + str(n) + "+a)*" + str(twoN) + "+o] += dt;   // dt on qd base-linear col a",
-        "  }",
+        "int o = a;",
+        "for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] = static_cast<T>(0);",
+        "s_mjx[a*" + str(twoN) + "+o] = static_cast<T>(1);   // identity on base-linear q col a",
+        "if (si_mjx) {",
+        "  for (int c = 0; c < " + str(3 * n) + "; ++c) s_mjx[c*" + str(twoN) + "+o] += dt * s_mjx[c*" + str(twoN) + "+(" + str(n) + "+a)];",
+        "} else {",
+        "  s_mjx[(" + str(n) + "+a)*" + str(twoN) + "+o] += dt;   // dt on qd base-linear col a",
         "}",
     ]:
         self.gen_add_code_line(line)
-    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_end_control_flow()  # parallel a
     self.gen_add_sync()
     # ---- copy the mjx band back over s_dAB (block-parallel) ----
     self.gen_add_parallel_loop("ind", str(twoN * 3 * n))
@@ -1404,8 +1403,43 @@ def _emit_integrator_hessian_mjx_output(self):
     self.gen_add_code_line("s_d2AB_pin[ci] = s_d2AB[ci];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    # ---- single-thread per-k forward-mode assembly (correctness-first; nv small) ----
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    # ---- PARALLELIZED per-k forward-mode assembly (was single-thread; ~50% runtime ----
+    # at large batch). The forward-mode over the mjx perturbation axis k is fully
+    # INDEPENDENT across k: each k reads only read-only state (s_d2AB_pin, s_dAB_pin,
+    # s_df_du, s_Minv, s_qdd, s_q/s_qd/s_u) and writes the DISJOINT s_d2AB column-slice
+    # [(o*nz + k)*nz + b] (the *nz+k middle index differs per k). No intra-loop sync.
+    # The loop-invariant helpers (R, v_lin, u_lin) are RE-MATERIALIZED into per-thread
+    # REGISTERS at the top of each k-body (a few dozen flops; byte-for-byte the same
+    # math as the original single-thread block; zero aliasing risk). The large per-k
+    # work buffers (dABd, botq..dtopu, ...) stay thread-local — now one private copy
+    # per active thread, the design intent of these "per-k thread-stack buffers".
+    _emit_integrator_hessian_mjx_perk(self, n)
+    self.gen_add_sync()
+
+
+def _emit_integrator_hessian_mjx_perk(self, n):
+    """The per-k forward-mode assembly, transcribed op-for-op from
+    proto_integ_hess_mjx.py. Builds the dot of every first-order-transform input
+    along mjx axis k, then propagates through a forward-mode clone of
+    integrator_gradient_pin_to_mjx, writing the result column-slice into s_d2AB.
+
+    PARALLELIZED over the mjx axis k (the natural independent axis): the for-k loop
+    is emitted as a block-parallel loop; the loop-invariant R / v_lin / u_lin helpers
+    are re-materialized into per-thread registers at the top of each k-body and the
+    large work buffers are per-thread thread-local arrays.
+
+    Index conventions: pin hessian s_d2AB_pin row-major [o*nz*nz + a*nz + b]; pin
+    dAB s_dAB_pin COLUMN-major [col*2n + row]; matrices below COLUMN-major X[c*n+r];
+    s_Minv SYMMETRIC_UPPER; s_df_du col-major (fd_dq at [c*n+r], fd_dqd at
+    [n*n + c*n+r]). The mjx output cell [o, k, b] = out_dot[o, b]."""
+    N = str(n)
+    nz = 3 * n
+    NZ = str(nz)
+    twoN = 2 * n
+    # Parallel over k in [0, nz); each k owns one disjoint output column-slice of s_d2AB.
+    self.gen_add_parallel_loop("k", NZ)
+    # Loop-invariant helpers re-materialized into per-thread REGISTERS (verbatim math
+    # from the original single-thread block; no aliasing). si_mjx mirrors `si`.
     self.gen_add_code_lines([
         "const bool si_mjx = si;",
         # R (row-major R[3r+c]) from the xyzw base quaternion s_q[3..6].
@@ -1422,25 +1456,6 @@ def _emit_integrator_hessian_mjx_output(self):
         "T u_lin[3] = {s_u[0],  s_u[1],  s_u[2]};",
         "T qdd_v[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
     ])
-    _emit_integrator_hessian_mjx_perk(self, n)
-    self.gen_add_end_control_flow()  # threadIdx == 0
-    self.gen_add_sync()
-
-
-def _emit_integrator_hessian_mjx_perk(self, n):
-    """The per-k forward-mode assembly, transcribed op-for-op from
-    proto_integ_hess_mjx.py. Builds the dot of every first-order-transform input
-    along mjx axis k, then propagates through a forward-mode clone of
-    integrator_gradient_pin_to_mjx, writing the result column-slice into s_d2AB.
-
-    Index conventions: pin hessian s_d2AB_pin row-major [o*nz*nz + a*nz + b]; pin
-    dAB s_dAB_pin COLUMN-major [col*2n + row]; matrices below COLUMN-major X[c*n+r];
-    s_Minv SYMMETRIC_UPPER; s_df_du col-major (fd_dq at [c*n+r], fd_dqd at
-    [n*n + c*n+r]). The mjx output cell [o, k, b] = out_dot[o, b]."""
-    N = str(n)
-    nz = 3 * n
-    NZ = str(nz)
-    twoN = 2 * n
     # Per-k thread-stack buffers. dAB / its dot (col-major 2n x 3n); the forward-mode
     # work blocks (col-major n x n) for the 6 dAB sub-blocks + their dots; Jz vectors.
     self.gen_add_code_lines([
@@ -1456,7 +1471,6 @@ def _emit_integrator_hessian_mjx_perk(self, n):
     # Helper index lambdas emitted as macros-free inline (kept simple): pin dAB block
     # accessors P_xx(r,c) read s_dAB_pin (col-major, full 2n x 3n). Bottom rows live
     # at row n+.. ; top rows at row 0.. . Column blocks q:[0,n) qd:[n,2n) u:[2n,3n).
-    self.gen_add_code_line("for (int k = 0; k < " + NZ + "; k++) {", True)
     # ---- build jqk / jvk / juk and the Rd (= R@skew(e_a)) for this axis ----
     self.gen_add_code_lines([
         "for (int q_ = 0; q_ < " + N + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); juk[q_] = static_cast<T>(0); }",

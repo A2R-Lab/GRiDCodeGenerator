@@ -3819,6 +3819,42 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     self.gen_add_end_function()
 
 
+def _emit_idsva_so_mjx_locals_lines(nv, nv3, fb):
+    """Register-/stack-local recompute of the loop-invariant helpers, emitted at
+    the TOP of every parallel-loop body so the verbatim formula lines downstream
+    keep working unchanged. SAFE by construction: R is rebuilt from the base
+    quaternion in s_q, the base source vectors from s_qd/s_qdd/s_vaf, and the
+    tensor pointers are plain offsets into s_idsva_so/s_mjx_out — NOTHING is
+    staged into shared scratch (no aliasing risk vs the spilled buffers). A few
+    dozen flops per thread. The R-build math is copied verbatim from the
+    single-thread original / the id-gradient reference."""
+    return [
+        # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6] — matches
+        # mujoco_convention.rotation_from_quat_xyzw / _gen_mjx_build_R_lines exactly.
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+        "T v_lin[3]   = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T omega[3]   = {s_qd[3], s_qd[4], s_qd[5]};",
+        "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
+        "T tau_lin[3] = {s_vaf[" + str(fb + 3) + "], s_vaf[" + str(fb + 4) + "], s_vaf[" + str(fb + 5) + "]};",
+        "// pin tensor blocks in s_idsva_so (row-major tensors):",
+        "T *T_d2q   = s_idsva_so + " + str(0 * nv3) + ";",
+        "T *T_d2qd  = s_idsva_so + " + str(1 * nv3) + ";",
+        "T *T_cross = s_idsva_so + " + str(2 * nv3) + ";",
+        "T *T_dM    = s_idsva_so + " + str(3 * nv3) + ";",
+        "// mjx output blocks in s_mjx_out (same layout):",
+        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
+        "T *O_d2qd  = s_mjx_out + " + str(1 * nv3) + ";",
+        "T *O_cross = s_mjx_out + " + str(2 * nv3) + ";",
+        "T *O_dM    = s_mjx_out + " + str(3 * nv3) + ";",
+    ]
+
+
 def _emit_idsva_so_mjx_output(self):
     """Emit the MuJoCo (mjx) output-convention epilogue for idsva_so, transforming
     the 4 pin second-order tensors held in ``s_idsva_so`` to the mjx convention IN
@@ -3883,39 +3919,20 @@ def _emit_idsva_so_mjx_output(self):
              d_temp_spill_name="nullptr", temp_spill_flag_name="false"))
     self.gen_add_sync()
 
-    # ---- single-thread assembly (correctness-first; nv small) ----
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
-    # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6] — matches
-    # mujoco_convention.rotation_from_quat_xyzw / _gen_mjx_build_R_lines exactly.
-    self.gen_add_code_lines([
-        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
-        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
-        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
-        "T R[9];",
-        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
-        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
-        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
-    ])
-    self.gen_add_code_lines([
-        "T v_lin[3]   = {s_qd[0], s_qd[1], s_qd[2]};",
-        "T omega[3]   = {s_qd[3], s_qd[4], s_qd[5]};",
-        "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
-        "T tau_lin[3] = {s_vaf[" + str(_fb + 3) + "], s_vaf[" + str(_fb + 4) + "], s_vaf[" + str(_fb + 5) + "]};",
-        "// flat index helpers (row-major tensors, col-major matrices)",
-        "// pin tensor blocks in s_idsva_so:",
-        "T *T_d2q   = s_idsva_so + " + str(0 * nv3) + ";",
-        "T *T_d2qd  = s_idsva_so + " + str(1 * nv3) + ";",
-        "T *T_cross = s_idsva_so + " + str(2 * nv3) + ";",
-        "T *T_dM    = s_idsva_so + " + str(3 * nv3) + ";",
-        "// mjx output blocks in s_mjx_out (same layout):",
-        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
-        "T *O_d2qd  = s_mjx_out + " + str(1 * nv3) + ";",
-        "T *O_cross = s_mjx_out + " + str(2 * nv3) + ";",
-        "T *O_dM    = s_mjx_out + " + str(3 * nv3) + ";",
-    ])
-    _emit_idsva_so_mjx_perk_assembly(self, nv)
-    _emit_idsva_so_mjx_dM_closed_form(self, nv)
-    self.gen_add_end_control_flow()  # if threadIdx == 0
+    # ---- block-parallel assembly (was single-thread; ~50% overhead at batch) ----
+    # The natural parallel axis is k, the OUTER tensor-slab index: each k owns its
+    # own thread-stack scratch (work1/work2/d_*), reads only shared read-only
+    # inputs (T_*, s_dc_du, s_M, R/v/omega/...), and writes ONLY O_*[...,k]. So the
+    # per-k assembly (d2q/cross/d2qd) and dM Step1+2 are embarrassingly parallel
+    # over k. Loop-invariant helpers (R + base vectors + tensor ptrs) are recomputed
+    # REGISTER-/STACK-LOCAL at the top of every loop body (see _emit_idsva_so_mjx
+    # _locals_lines) — NOTHING staged to shared scratch, so zero aliasing risk vs
+    # the spilled buffers (cf. the fdsva_so spill bug). The dM Step3 base-rot frame
+    # term (+= into O_dM[...,3+c]) reads O_dM written by Step1+2, so it follows a
+    # sync and is parallelized over c in [0,3).
+    _emit_idsva_so_mjx_perk_assembly(self, nv)        # parallel over k
+    self.gen_add_sync()
+    _emit_idsva_so_mjx_dM_closed_form(self, nv)       # parallel over k, then over c (sync between)
     self.gen_add_sync()
     # ---- copy the mjx output band back over s_idsva_so (block-parallel) ----
     self.gen_add_parallel_loop("ci", str(4 * nv3))
@@ -3929,21 +3946,28 @@ def _emit_idsva_so_mjx_perk_assembly(self, nv):
     Transcribed op-for-op from proto_idsva_so_emit_spec.py. Matrices are flat
     col-major X[c*nv + r]; tensors row-major T[(i*nv + j)*nv + k]."""
     n = nv
+    nv3 = n * n * n
+    _fb = 12 * self.robot.get_num_joints()
     def t3(i, j, k):  # python ints
         return "((" + i + ")*" + str(n) + " + (" + j + "))*" + str(n) + " + (" + k + ")"
-    # Scratch matrices on the thread stack (col-major nv*nv) for one k:
-    #   sd_dtdq, sd_dtdqd, sd_M (sensitivities); A/inner_v/B reuse; corr/g0 accum.
-    # nv is small (<=~40); nv*nv floats on the stack per buffer. We need:
-    #   d_dtdq, d_dtdqd, d_M  (sensitivities, persisted across the slab build)
-    #   work1, work2          (A / inner_v / B reuse)
-    # plus d_tau[nv]. Declare once outside the k-loop.
+    # PARALLEL over k (the outer tensor-slab index): each k-iteration is fully
+    # independent — its scratch is thread-stack-local, it reads only shared
+    # read-only inputs, and writes only O_*[...,k]. The strided parallel loop
+    # gives each thread a disjoint set of k slabs.
+    self.gen_add_parallel_loop("k", str(n))
+    # Loop-invariant helpers recomputed register-/stack-local at the top of the
+    # body (R + base vectors + tensor ptrs) — nothing staged to shared scratch.
+    self.gen_add_code_lines(_emit_idsva_so_mjx_locals_lines(n, nv3, _fb))
+    # Per-k thread-stack scratch (col-major nv*nv): sensitivities d_dtdq/d_dtdqd/
+    # d_Msens (persisted across the slab build), work1/work2 (A/inner_v/B reuse),
+    # d_tau[nv], and the jqk/jvk/jak base-block columns. Declared per-iteration —
+    # one private copy per thread, no cross-k sharing.
     self.gen_add_code_lines([
         "T d_dtdq[" + str(n * n) + "], d_dtdqd[" + str(n * n) + "], d_Msens[" + str(n * n) + "];",
         "T work1[" + str(n * n) + "], work2[" + str(n * n) + "];",
         "T d_tau[" + str(n) + "];",
         "T jqk[" + str(n) + "], jvk[" + str(n) + "], jak[" + str(n) + "];",
     ])
-    self.gen_add_code_line("for (int k = 0; k < " + str(n) + "; k++) {", True)
     # ---- jqk / jvk / jak (base-block sparse) ----
     self.gen_add_code_lines([
         "for (int q_ = 0; q_ < " + str(n) + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); jak[q_] = static_cast<T>(0); }",
@@ -4022,7 +4046,7 @@ def _emit_idsva_so_mjx_perk_assembly(self, nv):
     _emit_idsva_so_mjx_slab_d2q(self, n)
     _emit_idsva_so_mjx_slab_cross(self, n)
     _emit_idsva_so_mjx_slab_d2qd(self, n)
-    self.gen_add_end_control_flow()  # k loop
+    self.gen_add_end_control_flow()  # parallel k
 
 
 # ----------------------------------------------------------------------------
@@ -4393,9 +4417,15 @@ def _emit_idsva_so_mjx_dM_closed_form(self, n):
     """dM_dq (block3) closed form (congruence + base-rot frame), scalar transcription.
     Reads T_dM, writes O_dM. Uses s_M for the frame terms."""
     N = str(n)
+    nv3 = n * n * n
+    _fb = 12 * self.robot.get_num_joints()
     self.gen_add_code_line("// --- dM_dq (block3) closed form: Step1 reframe q-tangent, Step2 congruence, Step3 frame ---")
-    # Step1+2 fused per k: tmp[i,l] then congruence rows(i<3) & cols(l<3).
-    self.gen_add_code_line("for (int k = 0; k < " + N + "; k++) {", True)
+    # Step1+2 fused per k — PARALLEL over k (each writes only O_dM[...,k], reads
+    # only T_dM/R, uses private work1/work2). Locals + work1/work2 are recomputed/
+    # declared register-/stack-local at the top of the body (no shared scratch).
+    self.gen_add_parallel_loop("k", N)
+    self.gen_add_code_lines(_emit_idsva_so_mjx_locals_lines(n, nv3, _fb))
+    self.gen_add_code_line("T work1[" + str(n * n) + "], work2[" + str(n * n) + "];")
     # Build tmp[i*nv+l] (row i, col l) for this k into work1 (col-major: work1[l*nv+i]).
     self.gen_add_code_lines([
         "for (int i = 0; i < " + N + "; i++) for (int l = 0; l < " + N + "; l++) {",
@@ -4422,10 +4452,17 @@ def _emit_idsva_so_mjx_dM_closed_form(self, n):
         "for (int i = 0; i < " + N + "; i++) for (int l = 0; l < " + N + "; l++)",
         "  O_dM[(i*" + N + " + l)*" + N + " + k] = work1[l*" + N + " + i];",
     ])
-    self.gen_add_end_control_flow()  # k loop
-    # Step3: base-rot frame for c in 0..2, kk=3+c: O_dM[:,:,kk] += Gd@M@G^T + G@M@Gd^T
+    self.gen_add_end_control_flow()  # parallel k
+    # Step3 reads O_dM[...,3+c] WRITTEN by Step1+2 at k=3+c, so it must follow a
+    # block sync (the parallel k-loop above may run those k on a DIFFERENT thread).
+    self.gen_add_sync()
+    # Step3: base-rot frame for c in 0..2, kk=3+c: O_dM[:,:,kk] += Gd@M@G^T + G@M@Gd^T.
+    # PARALLEL over c in [0,3): each writes only O_dM[...,3+c], uses private
+    # work1/work2 + register-local R. (Only 3 active threads — but it's a tiny tail.)
     self.gen_add_code_line("// Step3: base-rot frame term added to columns kk=3+c")
-    self.gen_add_code_line("for (int c = 0; c < 3; c++) {", True)
+    self.gen_add_parallel_loop("c", "3")
+    self.gen_add_code_lines(_emit_idsva_so_mjx_locals_lines(n, nv3, _fb))
+    self.gen_add_code_line("T work1[" + str(n * n) + "], work2[" + str(n * n) + "];")
     self.gen_add_code_lines([
         "int kk = 3 + c;",
         "T Rdc[9]; for (int ii=0; ii<9; ii++) Rdc[ii]=static_cast<T>(0);",
@@ -4473,7 +4510,7 @@ def _emit_idsva_so_mjx_dM_closed_form(self, n):
         "for (int a = 0; a < " + N + "; a++) for (int l = 0; l < " + N + "; l++)",
         "  O_dM[(a*" + N + " + l)*" + N + " + kk] += work2[l*" + N + " + a];",
     ])
-    self.gen_add_end_control_flow()  # c loop
+    self.gen_add_end_control_flow()  # parallel c
 
 
 def gen_idsva_so_world_frame_inner_function_call(self, scratch_in_smem_expr = "true",

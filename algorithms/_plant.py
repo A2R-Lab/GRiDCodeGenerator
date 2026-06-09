@@ -149,22 +149,37 @@ def _gen_cost_congruence_at_offset(self, mat, n, off, q_name="s_q"):
     ``off:off+3`` of an ``n x n`` COLUMN-MAJOR matrix ``mat`` (element (r,c) at
     ``mat[r + n*c]``). Mirrors :func:`gen_mjx_congruence` EXACTLY except the base
     block is at ``off`` rather than 0 (for the momentum-cost qd-block at offset nq).
-    R is built row-major from the xyzw quaternion at ``q_name[3..6]``. Single
-    thread + sync."""
-    self.gen_add_code_lines([
-        "// mjx output: congruence G " + mat + " G^T on the base block at offset " + str(off) + " (rows then cols)",
-        "if (threadIdx.x == 0 && threadIdx.y == 0) {", True,
-    ])
+    R is built row-major from the xyzw quaternion at ``q_name[3..6]``.
+
+    BLOCK-PARALLEL (the two sweeps each touch all ``n`` columns/rows — O(nv) serial
+    work). Phase 1 reframes the base ROWS over every column ``c`` (independent across
+    c); phase 2 reframes the base COLS over every row ``r`` (independent across r).
+    A sync separates them: phase 2 reads the ``off:off+3`` x ``off:off+3`` corner
+    that phase 1 wrote. R is recomputed register-local per thread from the read-only
+    smem quaternion (no shared scratch) — math is byte-identical to the serial form."""
+    self.gen_add_code_line(
+        "// mjx output: congruence G " + mat + " G^T on the base block at offset " + str(off) + " (rows then cols)")
+    # Phase 1: rows off:off+3 <- R . rows, one thread per column c.
+    self.gen_add_parallel_loop("c", str(n))
     self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
     self.gen_add_code_lines([
-        # rows off:off+3 <- R . rows, for every column c
-        "for (int c = 0; c < " + str(n) + "; c++) {{ T m0 = {m}[{o0} + {n}*c], m1 = {m}[{o1} + {n}*c], m2 = {m}[{o2} + {n}*c];"
-        " {m}[{o0} + {n}*c] = R[0]*m0 + R[1]*m1 + R[2]*m2; {m}[{o1} + {n}*c] = R[3]*m0 + R[4]*m1 + R[5]*m2; {m}[{o2} + {n}*c] = R[6]*m0 + R[7]*m1 + R[8]*m2; }}".format(
+        "T m0 = {m}[{o0} + {n}*c], m1 = {m}[{o1} + {n}*c], m2 = {m}[{o2} + {n}*c];".format(
             m=mat, n=n, o0=off + 0, o1=off + 1, o2=off + 2),
-        # cols off:off+3 <- cols . R^T, for every row r:  newcol[j] = sum_k M[r,k] R[j][k]
-        "for (int r = 0; r < " + str(n) + "; r++) {{ T m0 = {m}[r + {n}*{o0}], m1 = {m}[r + {n}*{o1}], m2 = {m}[r + {n}*{o2}];"
-        " {m}[r + {n}*{o0}] = m0*R[0] + m1*R[1] + m2*R[2]; {m}[r + {n}*{o1}] = m0*R[3] + m1*R[4] + m2*R[5]; {m}[r + {n}*{o2}] = m0*R[6] + m1*R[7] + m2*R[8]; }}".format(
+        "{m}[{o0} + {n}*c] = R[0]*m0 + R[1]*m1 + R[2]*m2;".format(m=mat, n=n, o0=off + 0),
+        "{m}[{o1} + {n}*c] = R[3]*m0 + R[4]*m1 + R[5]*m2;".format(m=mat, n=n, o1=off + 1),
+        "{m}[{o2} + {n}*c] = R[6]*m0 + R[7]*m1 + R[8]*m2;".format(m=mat, n=n, o2=off + 2),
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # Phase 2: cols off:off+3 <- cols . R^T, one thread per row r.
+    self.gen_add_parallel_loop("r", str(n))
+    self.gen_add_code_lines(_gen_mjx_build_R_lines(q_name))
+    self.gen_add_code_lines([
+        "T m0 = {m}[r + {n}*{o0}], m1 = {m}[r + {n}*{o1}], m2 = {m}[r + {n}*{o2}];".format(
             m=mat, n=n, o0=off + 0, o1=off + 1, o2=off + 2),
+        "{m}[r + {n}*{o0}] = m0*R[0] + m1*R[1] + m2*R[2];".format(m=mat, n=n, o0=off + 0),
+        "{m}[r + {n}*{o1}] = m0*R[3] + m1*R[4] + m2*R[5];".format(m=mat, n=n, o1=off + 1),
+        "{m}[r + {n}*{o2}] = m0*R[6] + m1*R[7] + m2*R[8];".format(m=mat, n=n, o2=off + 2),
     ])
     self.gen_add_end_control_flow()
     self.gen_add_sync()

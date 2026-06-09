@@ -2338,16 +2338,24 @@ def _emit_d2ee_mjx_epilogue(self, hess_buf, grad_buf, nv, num_ees):
       hess_buf[i,a,k] at  ee*6*nv*nv + i*nv*nv + a*nv + k   (i=out 0..5, a,k=tangent)
       grad_buf[i,m]   at  ee*6*nv + 6*m + i                 (6 x nv col-major)
 
-    Runs on a single base-block thread (matches the gen_mjx_* helper doctrine; the
-    work is the small <=6x6 base coupling broadcast over the 6 output rows) and ends
-    with a sync. ang_start = 3 (free-flyer tangent [lin(0:3), ang(3:6)])."""
+    PARALLELIZED across the block (was single-thread; ~50% runtime overhead at large
+    batch). The independent axis is the flattened (ee, slab) index over the 6 output
+    rows of every ee: Phase A reframes each of the 6*num_ees output-row slabs (one
+    slab per thread, pass1 then pass2 sequentially so the in-slab read-after-write
+    is naturally ordered); a sync; Phase B then adds the symmetrized frame term to
+    each (ee, out-row) slab (read-after-write on A's reframed base block). R is
+    recomputed REGISTER-LOCAL at the top of each loop body (a few dozen flops, zero
+    aliasing risk), and the dlin snapshot of grad_buf is taken register-local per
+    out-row inside Phase B (each thread reads only its own row's 3 base-linear cols,
+    BEFORE the caller's gradient reframe runs). Ends with a sync. ang_start = 3
+    (free-flyer tangent [lin(0:3), ang(3:6)])."""
     nn = nv * nv
-    self.gen_add_code_line("// mjx output: EE-pose Hessian convention transform (double col-reframe + sym frame term)")
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
-    # Build the 3x3 row-major rotation R (R[3*r+c] = R(r,c)) from the xyzw base
-    # quaternion s_q[3..6] -- transcribed from helpers _gen_mjx_build_R_lines /
+    # Register-local R build (row-major R[3*r+c]) from the xyzw base quaternion
+    # s_q[3..6] -- transcribed from helpers _gen_mjx_build_R_lines /
     # mujoco_convention.rotation_from_quat_xyzw exactly (mirrors id-grad / fd-grad).
-    self.gen_add_code_lines([
+    # Re-materialized at the TOP of each parallel-loop body (a few dozen flops,
+    # ZERO aliasing risk -- no shared scratch). Byte-identical to the prior build.
+    R_LINES = [
         "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
         "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
         "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
@@ -2355,57 +2363,61 @@ def _emit_d2ee_mjx_epilogue(self, hess_buf, grad_buf, nv, num_ees):
         "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
         "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
         "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
-    ])
-    for ee in range(num_ees):
-        hbase = ee * 6 * nn
-        gbase = ee * 6 * nv
-        self.gen_add_code_line("{ // ee " + str(ee))
-        hb = "(" + hess_buf + " + " + str(hbase) + ")" if hbase else hess_buf
-        gb = "(" + grad_buf + " + " + str(gbase) + ")" if gbase else grad_buf
-        # --- (B-snapshot) pin pose-gradient base-linear tangent cols, all 6 out-rows ---
-        #     dlin[i*3 + m] = grad_buf[gbase + 6*m + i]  (BEFORE the gradient reframe)
-        self.gen_add_code_line("  T dlin[18];  // 6 out-rows x 3 base-linear tangent cols (pin, pre-reframe)")
-        self.gen_add_code_line("  for (int i = 0; i < 6; i++) { dlin[3*i+0] = " + gb + "[6*0 + i]; dlin[3*i+1] = " + gb + "[6*1 + i]; dlin[3*i+2] = " + gb + "[6*2 + i]; }")
-        # --- (A) double base-congruence of each of the 6 output-row slabs ---
-        self.gen_add_code_line("  // (A) double column-reframe Rb H[i] Rb^T on the base-linear 3-block, per out-row")
-        self.gen_add_code_line("  for (int c = 0; c < 6; c++) {", True)
-        self.gen_add_code_line("  T *Hc = " + hb + " + c * " + str(nn) + ";")
-        # pass 1: left index (rows 0..2 <- R . rows) for every column k
-        self.gen_add_code_line("  for (int k = 0; k < " + str(nv) + "; k++) { T m0 = Hc[0*" + str(nv) + " + k], m1 = Hc[1*" + str(nv) + " + k], m2 = Hc[2*" + str(nv) + " + k];")
-        self.gen_add_code_line("    Hc[0*" + str(nv) + " + k] = R[0]*m0 + R[1]*m1 + R[2]*m2; Hc[1*" + str(nv) + " + k] = R[3]*m0 + R[4]*m1 + R[5]*m2; Hc[2*" + str(nv) + " + k] = R[6]*m0 + R[7]*m1 + R[8]*m2; }")
-        # pass 2: right index (cols 0..2 <- cols . R^T) for every row a
-        self.gen_add_code_line("  for (int a = 0; a < " + str(nv) + "; a++) { T m0 = Hc[a*" + str(nv) + " + 0], m1 = Hc[a*" + str(nv) + " + 1], m2 = Hc[a*" + str(nv) + " + 2];")
-        self.gen_add_code_line("    Hc[a*" + str(nv) + " + 0] = m0*R[0] + m1*R[1] + m2*R[2]; Hc[a*" + str(nv) + " + 1] = m0*R[3] + m1*R[4] + m2*R[5]; Hc[a*" + str(nv) + " + 2] = m0*R[6] + m1*R[7] + m2*R[8]; }")
-        self.gen_add_end_control_flow()
-        # --- (B) frame term + symmetrize, added to the reframed slab ---
-        # D_a = -[e_a]_x R^T : (transcribed exactly, R row-major R[3r+c])
-        #   a=0: rows m=(1,2): D[1,:]=( R[2], R[5], R[8]); D[2,:]=(-R[1],-R[4],-R[7])
-        #   a=1: rows m=(0,2): D[0,:]=(-R[2],-R[5],-R[8]); D[2,:]=( R[0], R[3], R[6])
-        #   a=2: rows m=(0,1): D[0,:]=( R[1], R[4], R[7]); D[1,:]=(-R[0],-R[3],-R[6])
-        # term[i,l,k=3+a] = sum_m dlin[i,m] * D_a[m,l]; H += 0.5*(term + term^T_{a,k}).
-        self.gen_add_code_line("  // (B) frame term term[i,l,3+a] = dpose[i,0:3] . (-[e_a]x R^T), then 0.5*(term+term^T) into H")
-        self.gen_add_code_line("  for (int i = 0; i < 6; i++) {", True)
-        self.gen_add_code_line("  T di0 = dlin[3*i+0], di1 = dlin[3*i+1], di2 = dlin[3*i+2];")
-        # per a: build the 3 l-components of term[i,:,k]
-        # a=0 (k=3): D rows m1,m2 -> term_l = di1*D[1,l] + di2*D[2,l]
-        self.gen_add_code_line("  T t0_0 = di1*( R[2]) + di2*(-R[1]); T t0_1 = di1*( R[5]) + di2*(-R[4]); T t0_2 = di1*( R[8]) + di2*(-R[7]);  // k=3")
-        # a=1 (k=4): D rows m0,m2 -> di0*D[0,l] + di2*D[2,l]
-        self.gen_add_code_line("  T t1_0 = di0*(-R[2]) + di2*( R[0]); T t1_1 = di0*(-R[5]) + di2*( R[3]); T t1_2 = di0*(-R[8]) + di2*( R[6]);  // k=4")
-        # a=2 (k=5): D rows m0,m1 -> di0*D[0,l] + di1*D[1,l]
-        self.gen_add_code_line("  T t2_0 = di0*( R[1]) + di1*(-R[0]); T t2_1 = di0*( R[4]) + di1*(-R[3]); T t2_2 = di0*( R[7]) + di1*(-R[6]);  // k=5")
-        self.gen_add_code_line("  T *Hi = " + hb + " + i * " + str(nn) + ";")
-        # symmetrized add: H[i, l, k] += 0.5*term[i,l,k] ; H[i, k, l] += 0.5*term[i,l,k]
-        # (k=3+a, l in {0,1,2}); H[i,a,k] index = a*nv + k.
-        for a in range(3):
-            k = 3 + a
-            for l in range(3):
-                tvar = "t" + str(a) + "_" + str(l)
-                idx_lk = l * nv + k   # H[i, l, k]
-                idx_kl = k * nv + l   # H[i, k, l]
-                self.gen_add_code_line("  Hi[" + str(idx_lk) + "] += static_cast<T>(0.5)*" + tvar + "; Hi[" + str(idx_kl) + "] += static_cast<T>(0.5)*" + tvar + ";")
-        self.gen_add_end_control_flow()  # for i
-        self.gen_add_code_line("} // ee " + str(ee))
-    self.gen_add_end_control_flow()  # single thread
+    ]
+    self.gen_add_code_line("// mjx output: EE-pose Hessian convention transform (double col-reframe + sym frame term)")
+    # The independent axis is the flattened (ee, out-row) slab index s in
+    # [0, 6*num_ees): ee = s / 6, c = s % 6. Each slab is one nv x nv Hessian
+    # output-row block; the two phases are over the SAME flattened axis.
+    n_slabs = 6 * num_ees
+    # --- Phase A: double base-congruence of each output-row slab (one per thread) ---
+    # pass1 (left index) then pass2 (right index) run sequentially within a slab, so
+    # the in-slab read-after-write (pass2 reads cols 0..2 that pass1 wrote on rows
+    # 0..2) is naturally ordered with no sync.
+    self.gen_add_code_line("// (A) double column-reframe Rb H Rb^T on the base-linear 3-block, per (ee,out-row) slab")
+    self.gen_add_parallel_loop("s", str(n_slabs))
+    self.gen_add_code_lines(R_LINES)
+    self.gen_add_code_line("int ee = s / 6; int c = s - 6*ee;")
+    self.gen_add_code_line("T *Hc = " + hess_buf + " + ee * " + str(6 * nn) + " + c * " + str(nn) + ";")
+    # pass 1: left index (rows 0..2 <- R . rows) for every column k
+    self.gen_add_code_line("for (int k = 0; k < " + str(nv) + "; k++) { T m0 = Hc[0*" + str(nv) + " + k], m1 = Hc[1*" + str(nv) + " + k], m2 = Hc[2*" + str(nv) + " + k];")
+    self.gen_add_code_line("  Hc[0*" + str(nv) + " + k] = R[0]*m0 + R[1]*m1 + R[2]*m2; Hc[1*" + str(nv) + " + k] = R[3]*m0 + R[4]*m1 + R[5]*m2; Hc[2*" + str(nv) + " + k] = R[6]*m0 + R[7]*m1 + R[8]*m2; }")
+    # pass 2: right index (cols 0..2 <- cols . R^T) for every row a
+    self.gen_add_code_line("for (int a = 0; a < " + str(nv) + "; a++) { T m0 = Hc[a*" + str(nv) + " + 0], m1 = Hc[a*" + str(nv) + " + 1], m2 = Hc[a*" + str(nv) + " + 2];")
+    self.gen_add_code_line("  Hc[a*" + str(nv) + " + 0] = m0*R[0] + m1*R[1] + m2*R[2]; Hc[a*" + str(nv) + " + 1] = m0*R[3] + m1*R[4] + m2*R[5]; Hc[a*" + str(nv) + " + 2] = m0*R[6] + m1*R[7] + m2*R[8]; }")
+    self.gen_add_end_control_flow()  # parallel s
+    self.gen_add_sync()
+    # --- Phase B: frame term + symmetrize, added to each reframed slab ---
+    # Read-after-write on Phase A's reframed base block (the +=), hence the sync.
+    # dlin snapshot (grad_buf base-linear tangent cols, PRE the caller's gradient
+    # reframe) is taken register-local per out-row: each thread reads only its own
+    # out-row's 3 base-linear columns. dlin[i,m] = grad_buf[gbase + 6*m + i].
+    # D_a = -[e_a]_x R^T : (transcribed exactly, R row-major R[3r+c])
+    #   a=0: rows m=(1,2): D[1,:]=( R[2], R[5], R[8]); D[2,:]=(-R[1],-R[4],-R[7])
+    #   a=1: rows m=(0,2): D[0,:]=(-R[2],-R[5],-R[8]); D[2,:]=( R[0], R[3], R[6])
+    #   a=2: rows m=(0,1): D[0,:]=( R[1], R[4], R[7]); D[1,:]=(-R[0],-R[3],-R[6])
+    # term[i,l,k=3+a] = sum_m dlin[i,m] * D_a[m,l]; H += 0.5*(term + term^T_{a,k}).
+    self.gen_add_code_line("// (B) frame term term[i,l,3+a] = dpose[i,0:3] . (-[e_a]x R^T), then 0.5*(term+term^T) into H, per (ee,out-row)")
+    self.gen_add_parallel_loop("s", str(n_slabs))
+    self.gen_add_code_lines(R_LINES)
+    self.gen_add_code_line("int ee = s / 6; int i = s - 6*ee;")
+    # register-local dlin snapshot for THIS out-row i (3 base-linear cols)
+    self.gen_add_code_line("T *gb = " + grad_buf + " + ee * " + str(6 * nv) + ";")
+    self.gen_add_code_line("T di0 = gb[6*0 + i], di1 = gb[6*1 + i], di2 = gb[6*2 + i];")
+    # per a: build the 3 l-components of term[i,:,k]
+    self.gen_add_code_line("T t0_0 = di1*( R[2]) + di2*(-R[1]); T t0_1 = di1*( R[5]) + di2*(-R[4]); T t0_2 = di1*( R[8]) + di2*(-R[7]);  // k=3")
+    self.gen_add_code_line("T t1_0 = di0*(-R[2]) + di2*( R[0]); T t1_1 = di0*(-R[5]) + di2*( R[3]); T t1_2 = di0*(-R[8]) + di2*( R[6]);  // k=4")
+    self.gen_add_code_line("T t2_0 = di0*( R[1]) + di1*(-R[0]); T t2_1 = di0*( R[4]) + di1*(-R[3]); T t2_2 = di0*( R[7]) + di1*(-R[6]);  // k=5")
+    self.gen_add_code_line("T *Hi = " + hess_buf + " + ee * " + str(6 * nn) + " + i * " + str(nn) + ";")
+    # symmetrized add: H[i, l, k] += 0.5*term[i,l,k] ; H[i, k, l] += 0.5*term[i,l,k]
+    # (k=3+a, l in {0,1,2}); H[i,a,k] index = a*nv + k.
+    for a in range(3):
+        k = 3 + a
+        for l in range(3):
+            tvar = "t" + str(a) + "_" + str(l)
+            idx_lk = l * nv + k   # H[i, l, k]
+            idx_kl = k * nv + l   # H[i, k, l]
+            self.gen_add_code_line("Hi[" + str(idx_lk) + "] += static_cast<T>(0.5)*" + tvar + "; Hi[" + str(idx_kl) + "] += static_cast<T>(0.5)*" + tvar + ";")
+    self.gen_add_end_control_flow()  # parallel s
     self.gen_add_sync()
 
 
