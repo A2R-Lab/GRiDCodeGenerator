@@ -2312,6 +2312,103 @@ def _emit_d2M_mimic_vslot_pair_block(self, ee_idx, ee_jid, vi, vj, nv, num_ees,
     self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
 
 
+def _emit_d2ee_mjx_epilogue(self, hess_buf, grad_buf, nv, num_ees):
+    """Emit the mjx output-convention epilogue for the EE-pose HESSIAN.
+
+    Transforms the pin coordinate Hessian H_pin[i,a,k] = d2 pose_i/dxi_a dxi_k to
+    the mjx frame, matching ``mujoco_convention.ee_pose_hessian_pin_to_mjx``
+    (arithmetic-validated to 4.4e-16). Two parts, per ee:
+
+      (A) DOUBLE column-reframe: H[i] -> base-block congruence Rb H[i] Rb^T, i.e.
+          out[i,a,k] = sum_{b,c} H_pin[i,b,c] G^{-1}[b,a] G^{-1}[c,k] with
+          G^{-1}[b,a] = R[a,b] on the base-linear 3-block. Implemented per out-row
+          slab as a left-index base reframe (rows 0..2 of the nv x nv slab <- R . rows)
+          then a right-index base reframe (cols 0..2 <- cols . R^T) -- identical
+          structure to gen_mjx_congruence, applied to all 6 output-row slabs.
+      (B) FRAME term + SYMMETRIZE: term[i, l, k=ang_start+a] = dpose_pin[i, 0:3] @ D_a,
+          D_a = -[e_a]_x R^T (base-linear block of d(G^{-1})/dtheta_k). The pin pose
+          VALUE gradient dpose_pin lives in ``grad_buf`` (6 x nv col-major per ee:
+          dpose[i,m] = grad_buf[6*m + i]); it must be SNAPSHOT here BEFORE the
+          gradient's own mjx column-reframe runs (the caller reframes grad_buf AFTER
+          this epilogue). Then H_mjx = out + 0.5*(term + term^T over the two tangent
+          axes). term is nonzero only for tangent col k in {ang..ang+2} and tangent
+          row/col l in {0..2}.
+
+    Layouts (column/row order discovered in this file):
+      hess_buf[i,a,k] at  ee*6*nv*nv + i*nv*nv + a*nv + k   (i=out 0..5, a,k=tangent)
+      grad_buf[i,m]   at  ee*6*nv + 6*m + i                 (6 x nv col-major)
+
+    Runs on a single base-block thread (matches the gen_mjx_* helper doctrine; the
+    work is the small <=6x6 base coupling broadcast over the 6 output rows) and ends
+    with a sync. ang_start = 3 (free-flyer tangent [lin(0:3), ang(3:6)])."""
+    nn = nv * nv
+    self.gen_add_code_line("// mjx output: EE-pose Hessian convention transform (double col-reframe + sym frame term)")
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    # Build the 3x3 row-major rotation R (R[3*r+c] = R(r,c)) from the xyzw base
+    # quaternion s_q[3..6] -- transcribed from helpers _gen_mjx_build_R_lines /
+    # mujoco_convention.rotation_from_quat_xyzw exactly (mirrors id-grad / fd-grad).
+    self.gen_add_code_lines([
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+    ])
+    for ee in range(num_ees):
+        hbase = ee * 6 * nn
+        gbase = ee * 6 * nv
+        self.gen_add_code_line("{ // ee " + str(ee))
+        hb = "(" + hess_buf + " + " + str(hbase) + ")" if hbase else hess_buf
+        gb = "(" + grad_buf + " + " + str(gbase) + ")" if gbase else grad_buf
+        # --- (B-snapshot) pin pose-gradient base-linear tangent cols, all 6 out-rows ---
+        #     dlin[i*3 + m] = grad_buf[gbase + 6*m + i]  (BEFORE the gradient reframe)
+        self.gen_add_code_line("  T dlin[18];  // 6 out-rows x 3 base-linear tangent cols (pin, pre-reframe)")
+        self.gen_add_code_line("  for (int i = 0; i < 6; i++) { dlin[3*i+0] = " + gb + "[6*0 + i]; dlin[3*i+1] = " + gb + "[6*1 + i]; dlin[3*i+2] = " + gb + "[6*2 + i]; }")
+        # --- (A) double base-congruence of each of the 6 output-row slabs ---
+        self.gen_add_code_line("  // (A) double column-reframe Rb H[i] Rb^T on the base-linear 3-block, per out-row")
+        self.gen_add_code_line("  for (int c = 0; c < 6; c++) {", True)
+        self.gen_add_code_line("  T *Hc = " + hb + " + c * " + str(nn) + ";")
+        # pass 1: left index (rows 0..2 <- R . rows) for every column k
+        self.gen_add_code_line("  for (int k = 0; k < " + str(nv) + "; k++) { T m0 = Hc[0*" + str(nv) + " + k], m1 = Hc[1*" + str(nv) + " + k], m2 = Hc[2*" + str(nv) + " + k];")
+        self.gen_add_code_line("    Hc[0*" + str(nv) + " + k] = R[0]*m0 + R[1]*m1 + R[2]*m2; Hc[1*" + str(nv) + " + k] = R[3]*m0 + R[4]*m1 + R[5]*m2; Hc[2*" + str(nv) + " + k] = R[6]*m0 + R[7]*m1 + R[8]*m2; }")
+        # pass 2: right index (cols 0..2 <- cols . R^T) for every row a
+        self.gen_add_code_line("  for (int a = 0; a < " + str(nv) + "; a++) { T m0 = Hc[a*" + str(nv) + " + 0], m1 = Hc[a*" + str(nv) + " + 1], m2 = Hc[a*" + str(nv) + " + 2];")
+        self.gen_add_code_line("    Hc[a*" + str(nv) + " + 0] = m0*R[0] + m1*R[1] + m2*R[2]; Hc[a*" + str(nv) + " + 1] = m0*R[3] + m1*R[4] + m2*R[5]; Hc[a*" + str(nv) + " + 2] = m0*R[6] + m1*R[7] + m2*R[8]; }")
+        self.gen_add_end_control_flow()
+        # --- (B) frame term + symmetrize, added to the reframed slab ---
+        # D_a = -[e_a]_x R^T : (transcribed exactly, R row-major R[3r+c])
+        #   a=0: rows m=(1,2): D[1,:]=( R[2], R[5], R[8]); D[2,:]=(-R[1],-R[4],-R[7])
+        #   a=1: rows m=(0,2): D[0,:]=(-R[2],-R[5],-R[8]); D[2,:]=( R[0], R[3], R[6])
+        #   a=2: rows m=(0,1): D[0,:]=( R[1], R[4], R[7]); D[1,:]=(-R[0],-R[3],-R[6])
+        # term[i,l,k=3+a] = sum_m dlin[i,m] * D_a[m,l]; H += 0.5*(term + term^T_{a,k}).
+        self.gen_add_code_line("  // (B) frame term term[i,l,3+a] = dpose[i,0:3] . (-[e_a]x R^T), then 0.5*(term+term^T) into H")
+        self.gen_add_code_line("  for (int i = 0; i < 6; i++) {", True)
+        self.gen_add_code_line("  T di0 = dlin[3*i+0], di1 = dlin[3*i+1], di2 = dlin[3*i+2];")
+        # per a: build the 3 l-components of term[i,:,k]
+        # a=0 (k=3): D rows m1,m2 -> term_l = di1*D[1,l] + di2*D[2,l]
+        self.gen_add_code_line("  T t0_0 = di1*( R[2]) + di2*(-R[1]); T t0_1 = di1*( R[5]) + di2*(-R[4]); T t0_2 = di1*( R[8]) + di2*(-R[7]);  // k=3")
+        # a=1 (k=4): D rows m0,m2 -> di0*D[0,l] + di2*D[2,l]
+        self.gen_add_code_line("  T t1_0 = di0*(-R[2]) + di2*( R[0]); T t1_1 = di0*(-R[5]) + di2*( R[3]); T t1_2 = di0*(-R[8]) + di2*( R[6]);  // k=4")
+        # a=2 (k=5): D rows m0,m1 -> di0*D[0,l] + di1*D[1,l]
+        self.gen_add_code_line("  T t2_0 = di0*( R[1]) + di1*(-R[0]); T t2_1 = di0*( R[4]) + di1*(-R[3]); T t2_2 = di0*( R[7]) + di1*(-R[6]);  // k=5")
+        self.gen_add_code_line("  T *Hi = " + hb + " + i * " + str(nn) + ";")
+        # symmetrized add: H[i, l, k] += 0.5*term[i,l,k] ; H[i, k, l] += 0.5*term[i,l,k]
+        # (k=3+a, l in {0,1,2}); H[i,a,k] index = a*nv + k.
+        for a in range(3):
+            k = 3 + a
+            for l in range(3):
+                tvar = "t" + str(a) + "_" + str(l)
+                idx_lk = l * nv + k   # H[i, l, k]
+                idx_kl = k * nv + l   # H[i, k, l]
+                self.gen_add_code_line("  Hi[" + str(idx_lk) + "] += static_cast<T>(0.5)*" + tvar + "; Hi[" + str(idx_kl) + "] += static_cast<T>(0.5)*" + tvar + ";")
+        self.gen_add_end_control_flow()  # for i
+        self.gen_add_code_line("} // ee " + str(ee))
+    self.gen_add_end_control_flow()  # single thread
+    self.gen_add_sync()
+
+
 def gen_end_effector_pose_hessian_device(self):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -2365,11 +2462,19 @@ _D2EE_PICK_FLAGS = [
 ]
 
 def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
-                                     single_call_timing):
+                                     single_call_timing, mjx=False):
     """Emit the d2ee kernel body specialized for one tier's spill flags.
     Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
     Used by gen_end_effector_pose_hessian_kernel to emit either a
-    single body (collapsed picks) or three branched bodies (divergent picks)."""
+    single body (collapsed picks) or three branched bodies (divergent picks).
+
+    When ``mjx`` (floating-base only), emit the mjx convention under
+    ``if constexpr (MUJOCO_OUTPUT)``: a q-quaternion reorder before the XmatsHom
+    build, and AFTER the inner (which fills BOTH the pose Hessian and gradient) the
+    Hessian convention epilogue (double col-reframe + symmetrized frame term, which
+    reads the pin pose-gradient) FOLLOWED BY the gradient's own column-reframe (J
+    G^{-1}). Order matters: the Hessian frame term consumes the PIN gradient, so it
+    must run before the gradient buffer is reframed to the mjx convention."""
     nv = self.robot.get_num_vel()
     output_count = self.gen_end_effector_pose_hessian_output_count()
     inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
@@ -2379,9 +2484,19 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
                                                       include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()")
     out_in_smem_expr = "false" if use_workspace_output else "true"
+    # The Hessian output buffer the inner actually fills: smem `s_end_effector_pose_hessian`
+    # at TIER_SHARED, or the spilled `s_end_effector_pose_hessian_ws` (== the global output
+    # slice) at LITE/MINIMAL. The mjx epilogue transforms whichever one holds the data.
+    hess_buf = "s_end_effector_pose_hessian_ws" if use_workspace_output else "s_end_effector_pose_hessian"
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         self.gen_kernel_load_inputs("q",str(n),stride="stride_q")
+        # mjx input convert (quaternion only): reorder base quaternion wxyz->xyzw
+        # before XmatsHom builds X[0]; the Hessian + gradient mjx epilogues run below.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         if use_workspace_output:
             self.gen_add_code_line("T *s_end_effector_pose_hessian = nullptr;  // inner repoints at d_workspace slice")
             self.gen_add_code_line("T *s_end_effector_pose_gradient = &d_end_effector_pose_gradient[k*" + str(6*nv*num_ees) + "];")
@@ -2397,6 +2512,14 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         self.gen_end_effector_pose_hessian_inner_function_call(
             updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
         self.gen_add_sync()
+        # mjx output: (1) Hessian convention transform (reads the PIN pose-gradient),
+        # then (2) the pose-gradient's own column reframe J G^{-1}. Order is load-bearing
+        # -- the Hessian frame term consumes the un-reframed pin gradient.
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            _emit_d2ee_mjx_epilogue(self, hess_buf, "s_end_effector_pose_gradient", nv, num_ees)
+            _emit_eepose_grad_mjx_reframe(self, "s_end_effector_pose_gradient", nv, num_ees)
+            self.gen_add_end_control_flow()
         if not use_workspace_output:
             self.gen_kernel_save_result("end_effector_pose_hessian",str(output_count),stride=str(output_count))
             self.gen_kernel_save_result("end_effector_pose_gradient",str(6*nv*num_ees),stride=str(6*nv*num_ees))
@@ -2406,6 +2529,14 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q",str(n))
+        # mjx input convert (quaternion only): see batch branch. The timing kernel
+        # gets the MUJOCO_OUTPUT template param (so the host overload compiles) and
+        # the input quaternion reorder, but NOT the output epilogue (a correct mjx
+        # timing path is a perf-phase follow-up, per the master plan).
+        if mjx:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_quat_reorder("s_q")
+            self.gen_add_end_control_flow()
         if use_workspace_output:
             self.gen_add_code_line("T *s_end_effector_pose_hessian = nullptr;  // inner repoints at d_workspace")
             self.gen_add_code_line("T *s_end_effector_pose_gradient = d_end_effector_pose_gradient;")
@@ -2448,7 +2579,17 @@ def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
         func_def = func_def.replace("(", "_single_timing(")
     self.gen_add_func_doc("Computes the Hessian (and Jacobian) of the End Effector Pose with respect to generalized velocity (d^2/dv^2 tangent, pinocchio convention)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected.
+    # The pin coordinate Hessian transforms by a double column-reframe + a symmetrized
+    # base-rotation frame term (and the bundled pose-gradient column-reframes); the
+    # epilogues + q-quaternion reorder are emitted per-tier inside the body. Default
+    # false -> byte-identical pin codegen.
+    mjx = self.robot.floating_base
+    if mjx:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -2459,7 +2600,7 @@ def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
     picks = getattr(self, "d2ee_spill_tier_3way", (0, 0, 0))
     def _emit_d2ee_body(pick):
         uwo = _D2EE_PICK_FLAGS[pick]
-        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing)
+        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing, mjx=mjx)
     self.gen_tier_dispatch(picks, _emit_d2ee_body)
     self.gen_add_end_function()
 
@@ -2485,15 +2626,28 @@ def gen_end_effector_pose_hessian_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Computes the Hessian (and Jacobian) of the End Effector Pose with respect to generalized velocity (d^2/dv^2 tangent, pinocchio convention)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating only) host flag, LAST: forwarded to the kernel launch
+    # (naming the tier positionally to reach the trailing flag). The pin Hessian +
+    # bundled pose-gradient transform to the mjx convention under the flag. Default
+    # false -> byte-identical pin codegen.
+    mjx_host = self.robot.floating_base
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_hessian requires all-data or kinematics gridData\");")
-    func_call_start = "end_effector_pose_hessian_kernel<T><<<block_dimms,thread_dimms,END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_end_effector_pose_hessian,hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
+    eeph_kernel_tmpl = ("end_effector_pose_hessian_kernel" +
+                        ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
+    func_call_start = eeph_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_end_effector_pose_hessian,hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        if mjx_host:
+            func_call_start = func_call_start.replace("end_effector_pose_hessian_kernel<", "end_effector_pose_hessian_kernel_single_timing<")
+        else:
+            func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
