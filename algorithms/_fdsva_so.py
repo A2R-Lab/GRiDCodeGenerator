@@ -228,11 +228,15 @@ def gen_fdsva_so_device_function_call(self,
                                           contract_in_smem_expr = "true",
                                           d_workspace_pool_name = "nullptr",
                                           d_fd_grad_spill_name = "nullptr",
-                                          s_fdsva_temp_name = "nullptr"):
+                                          s_fdsva_temp_name = "nullptr",
+                                          mujoco_output_expr = None):
     """Emit the call to `fdsva_so_device`. Arg order MUST match the def in
     gen_fdsva_so_device. Pool/spill regions default to nullptr (unused under
-    the matching if-constexpr); the kernel passes real pointers per tier."""
-    tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + ">"
+    the matching if-constexpr); the kernel passes real pointers per tier.
+    mujoco_output_expr (floating non-mimic/skew): the trailing MUJOCO_OUTPUT
+    template arg; None -> 4-arg template (byte-identical for non-mjx kernels)."""
+    mjx_tmpl = ("" if mujoco_output_expr is None else ", " + mujoco_output_expr)
+    tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + mjx_tmpl + ">"
     start = "fdsva_so_device" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
@@ -279,7 +283,15 @@ def gen_fdsva_so_device(self):
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
                           [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): compile-time mjx output-convention
+    # flag, appended LAST so existing positional <T,SCRATCH,SPILL,CONTRACT> call
+    # sites are unaffected; default false -> the epilogue if-constexpr-elides to
+    # byte-identical PTX. Mirrors the idsva_so flag exactly.
+    mjx_inner = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_inner:
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc (single-call/anti-LICM build) a separate __device__ wrapper keeps
     # its callees (e.g. minv_inner, ~108 regs) as distinct functions whose
@@ -312,7 +324,83 @@ def gen_fdsva_so_device(self):
     self.gen_fdsva_so_contract_function_call(
         updated_var_names = dict(d_workspace_name = "s_fdsva_temp"),
         scratch_in_smem_expr = "CONTRACT_IN_SMEM")
+    # ---- mjx output-convention epilogue (floating non-mimic/skew only) ----
+    # Runs at the very END, where the contract scratch (s_temp pool when
+    # CONTRACT_IN_SMEM, else s_fdsva_temp) is DEAD and s_df2 holds the finalized
+    # pin SO tensors. s_Minv / s_qdd / s_df_du / s_q / s_qd / s_u are all live, so
+    # — unlike idsva_so — NO inner recompute is needed: the fd value (s_qdd),
+    # Minv (s_Minv) and the first-order fd gradient (s_df_du) are already in-flight.
+    if mjx_inner:
+        self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+        self.gen_add_code_line("T *s_mjx_scratch = CONTRACT_IN_SMEM ? s_temp : s_fdsva_temp;")
+        _emit_fdsva_so_mjx_output(self)
+        self.gen_add_end_control_flow()
     self.gen_add_end_function()
+
+
+def _emit_fdsva_so_mjx_output(self):
+    """Emit the MuJoCo (mjx) output-convention epilogue for fdsva_so, transforming
+    the 4 pin second-order tensors held in ``s_df2`` to the mjx convention IN PLACE.
+    Floating-base (non-mimic/skew) only; runs at the END of ``fdsva_so_device``
+    where the contract scratch (``s_mjx_scratch``) is dead.
+
+    ``s_df2`` is 4 contiguous NV^3 ROW-major blocks ``[i*NV*NV + j*NV + k]``:
+      [0] daba_dqdq[i,j,k]  [1] daba_dvdq[i,qd,q] (=cross)  [2] daba_dvdv[i,j,k]
+      [3] daba_dtdq[i,u,q]  (= dMinv[i,u]/dq, since dqdd/du = Minv).
+    Matches the RBDReference.fdsva_so tuple order EXACTLY.
+
+    The explicit per-k form is the forward-dynamics analog of idsva_so's: it
+    complex-step-equivalently differentiates the first-order transform
+    ``fd_gradient_pin_to_mjx``. Transcribed verbatim from
+    docs/open-tasks/mjx_proto/proto_fdsva_so_emit_spec.py (validated <1e-13 vs
+    second_order_fd_pin_to_mjx). In-kernel quantities (all live):
+      s_Minv (dense, SYMMETRIC; read [(r<=c)?c*n+r:r*n+c]), s_qdd (fd value qdd),
+      s_df_du = dqdd_dq | dqdd_dqd (col-major, two NV*NV blocks), s_q/s_qd/s_u.
+    The mjx output band lives in s_mjx_scratch (4*NV^3, contract scratch; dead);
+    copied back over s_df2 at the end."""
+    nv = self.robot.get_num_vel()
+    nv2 = nv * nv
+    nv3 = nv * nv * nv
+    self.gen_add_code_line("// === mjx output convention (floating-base fdsva_so) ===")
+    self.gen_add_code_lines([
+        "T *s_dqdd_dq  = s_df_du;                 // col-major dqdd_dq  [c*NV+r]",
+        "T *s_dqdd_dqd = s_df_du + " + str(nv2) + ";   // col-major dqdd_dqd [c*NV+r]",
+        "T *s_mjx_out  = s_mjx_scratch;           // 4*NV^3 mjx output band",
+        "// pin tensor blocks in s_df2 (row-major [(i*NV+j)*NV+k]):",
+        "T *T_d2q   = s_df2 + " + str(0 * nv3) + ";   // daba_dqdq",
+        "T *T_cross = s_df2 + " + str(1 * nv3) + ";   // daba_dvdq [i,qd,q]",
+        "T *T_d2qd  = s_df2 + " + str(2 * nv3) + ";   // daba_dvdv",
+        "T *T_dtdq  = s_df2 + " + str(3 * nv3) + ";   // daba_dtdq = dMinv/dq [i,u,q]",
+        "// mjx output blocks (same layout/order):",
+        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
+        "T *O_cross = s_mjx_out + " + str(1 * nv3) + ";",
+        "T *O_d2qd  = s_mjx_out + " + str(2 * nv3) + ";",
+        "T *O_dtdq  = s_mjx_out + " + str(3 * nv3) + ";",
+    ])
+    # ---- single-thread assembly (correctness-first; nv small) ----
+    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
+    # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6].
+    self.gen_add_code_lines([
+        "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
+        "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
+        "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
+        "T R[9];",
+        "R[0] = static_cast<T>(1) - static_cast<T>(2)*(yy+zz); R[1] = static_cast<T>(2)*(xy-wz);                    R[2] = static_cast<T>(2)*(xz+wy);",
+        "R[3] = static_cast<T>(2)*(xy+wz);                    R[4] = static_cast<T>(1) - static_cast<T>(2)*(xx+zz); R[5] = static_cast<T>(2)*(yz-wx);",
+        "R[6] = static_cast<T>(2)*(xz-wy);                    R[7] = static_cast<T>(2)*(yz+wx);                    R[8] = static_cast<T>(1) - static_cast<T>(2)*(xx+yy);",
+        "T v_lin[3]   = {s_qd[0], s_qd[1], s_qd[2]};",
+        "T omega[3]   = {s_qd[3], s_qd[4], s_qd[5]};",
+        "T u_lin[3]   = {s_u[0], s_u[1], s_u[2]};",
+        "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
+    ])
+    _emit_fdsva_so_mjx_perk_assembly(self, nv)
+    self.gen_add_end_control_flow()  # if threadIdx == 0
+    self.gen_add_sync()
+    # ---- copy the mjx output band back over s_df2 (block-parallel) ----
+    self.gen_add_parallel_loop("ci", str(4 * nv3))
+    self.gen_add_code_line("s_df2[ci] = s_mjx_out[ci];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
 _FDSVA_SO_PICK_FLAGS = [
     # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv, use_workspace_idsva_temp)
@@ -338,6 +426,9 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     fallback composes uniformly. (Earlier revisions of this comment said
     floating-only because the body inner had not yet migrated; that has since
     landed — see docs/idsva_so_inner_refactor_notes.md.)"""
+    # MUJOCO_OUTPUT (floating non-mimic/skew): the kernel template flag in scope;
+    # gates the mjx input-convert + the trailing device-template arg.
+    mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base
         else self.gen_idsva_so_body_frame_inner_temp_mem_size()
@@ -426,11 +517,22 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             contract_in_smem_expr = "false" if use_workspace_temp else "true",
             d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
             d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
-            s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr")
+            s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr",
+            mujoco_output_expr = "MUJOCO_OUTPUT" if mjx_kernel else None)
+
+    # MUJOCO_OUTPUT: convert the mjx-frame inputs (quat wxyz->xyzw, base-linear
+    # qd/u -> pin frame) in place BEFORE the device inner runs (XImats build from
+    # s_q). qdd is NOT converted (it is computed internally by forward_dynamics).
+    def _emit_mjx_input_convert():
+        if mjx_kernel:
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", u_name="s_u")
+            self.gen_add_end_control_flow()
 
     if not single_call_timing:
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
         self.gen_kernel_load_inputs("q_qd_u",str(3*NUM_POS),stride="stride_q_qd_u")
+        _emit_mjx_input_convert()
         _emit_fdsva_so_compute_pointers_and_call(timing=False)
         self.gen_add_sync()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n),stride=f"{4*n**3}")
@@ -440,6 +542,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd_u",str(3*NUM_POS))
+        _emit_mjx_input_convert()
         _emit_fdsva_so_compute_pointers_and_call(timing=True)
         self.gen_add_end_control_flow()
         if not use_global_tensors: self.gen_kernel_save_result("df2",str(4*n*n*n))
@@ -464,7 +567,14 @@ def gen_fdsva_so_kernel(self, single_call_timing = False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): kernel template flag appended LAST
+    # after RESOURCE_TIER so the host forwards it positionally; default false ->
+    # if-constexpr-elided to byte-identical PTX. Fixed-base keeps the 2-arg template.
+    mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_kernel:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -500,17 +610,25 @@ def gen_fdsva_so_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute the FDSVA_SO (Second Order of Forward Dynamics with Spacial Vector Algebra)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): host template flag appended LAST;
+    # forwarded positionally to fdsva_so_kernel<T, TIER, MUJOCO_OUTPUT>. Binding
+    # calls grid::fdsva_so<T, KIND, /*MUJOCO_OUTPUT=*/true>. Fixed-base unchanged.
+    mjx_host = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_host:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+    else:
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fdsva_so requires all-data or dynamics gridData\");")
 
-    func_call_start = "fdsva_so_kernel<T><<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_idsva_so,"
+    kernel_tmpl = "fdsva_so_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "fdsva_so_kernel<T>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_idsva_so,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd_qdd = Q_QD_U_STRIDE;")
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("fdsva_so_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>","fdsva_so_kernel_single_timing<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>").replace("fdsva_so_kernel<T>","fdsva_so_kernel_single_timing<T>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -542,6 +660,403 @@ def gen_fdsva_so_host(self, mode = 0):
         from ..algo_registry import single_call_printf_line
         self.gen_add_code_line(single_call_printf_line("fdsva_so"))
     self.gen_add_end_function()
+
+def _emit_fdsva_so_mjx_perk_assembly(self, n):
+    """Per-k assembly of all 4 fdsva_so mjx tensors (d2q / cross / d2qd / dtdq),
+    transcribed op-for-op from proto_fdsva_so_emit_spec.py. Matrices are flat
+    col-major X[c*n + r]; tensors row-major T[(i*n + j)*n + k]. s_Minv is dense and
+    SYMMETRIC (read [(r<=c)? c*n+r : r*n+c]); s_dqdd_dq / s_dqdd_dqd are col-major."""
+    N = str(n)
+    def t3(i, j, k):
+        return "((" + i + ")*" + N + " + (" + j + "))*" + N + " + (" + k + ")"
+    # Thread-stack work buffers (col-major n*n) + sensitivities + jacobians.
+    self.gen_add_code_lines([
+        "T work1[" + str(n * n) + "], work2[" + str(n * n) + "], inner_u[" + str(n * n) + "];",
+        "T d_dq[" + str(n * n) + "], d_dqd[" + str(n * n) + "], d_Mi[" + str(n * n) + "];",
+        "T d_qd[" + str(n) + "];",
+        "T jqk[" + str(n) + "], jvk[" + str(n) + "], juk[" + str(n) + "];",
+        "T jvvk[" + str(n) + "], juuk[" + str(n) + "];",
+    ])
+    self.gen_add_code_line("for (int k = 0; k < " + N + "; k++) {", True)
+    # ---- jqk / jvk / juk (base-block sparse); jvvk/juuk == jqk-form (G^T col k) ----
+    self.gen_add_code_lines([
+        "for (int q_ = 0; q_ < " + N + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); juk[q_] = static_cast<T>(0); jvvk[q_] = static_cast<T>(0); juuk[q_] = static_cast<T>(0); }",
+        "bool is_rot = (k >= 3 && k < 6);",
+        "int a_rot = k - 3;",
+        "if (k < 3) { jqk[0] = R[3*k+0]; jqk[1] = R[3*k+1]; jqk[2] = R[3*k+2]; }",
+        "else { jqk[k] = static_cast<T>(1); }",
+        # jvvk = juuk = G^T col k == jqk-form
+        "for (int q_ = 0; q_ < " + N + "; q_++) { jvvk[q_] = jqk[q_]; juuk[q_] = jqk[q_]; }",
+        "if (is_rot) {",
+        "  // jvk[0:3] = -(e_a x v_lin) ; juk[0:3] = -(e_a x u_lin)",
+        "  T evx = (a_rot==1)*( v_lin[2]) + (a_rot==2)*(-v_lin[1]);",
+        "  T evy = (a_rot==0)*(-v_lin[2]) + (a_rot==2)*( v_lin[0]);",
+        "  T evz = (a_rot==0)*( v_lin[1]) + (a_rot==1)*(-v_lin[0]);",
+        "  jvk[0] = -evx; jvk[1] = -evy; jvk[2] = -evz;",
+        "  T eux = (a_rot==1)*( u_lin[2]) + (a_rot==2)*(-u_lin[1]);",
+        "  T euy = (a_rot==0)*(-u_lin[2]) + (a_rot==2)*( u_lin[0]);",
+        "  T euz = (a_rot==0)*( u_lin[1]) + (a_rot==1)*(-u_lin[0]);",
+        "  juk[0] = -eux; juk[1] = -euy; juk[2] = -euz;",
+        "}",
+    ])
+    # Rd = R @ skew(e_{a_rot}) (row-major), only when is_rot.
+    self.gen_add_code_lines([
+        "T Rd[9];",
+        "for (int ii = 0; ii < 9; ii++) Rd[ii] = static_cast<T>(0);",
+        "if (is_rot) {",
+        "  T sk[9]; for (int ii=0; ii<9; ii++) sk[ii]=static_cast<T>(0);",
+        "  if (a_rot==0){ sk[1*3+2] = static_cast<T>(-1); sk[2*3+1] = static_cast<T>(1); }",
+        "  if (a_rot==1){ sk[2*3+0] = static_cast<T>(-1); sk[0*3+2] = static_cast<T>(1); }",
+        "  if (a_rot==2){ sk[0*3+1] = static_cast<T>(-1); sk[1*3+0] = static_cast<T>(1); }",
+        "  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {",
+        "    T acc = static_cast<T>(0);",
+        "    for (int p = 0; p < 3; p++) acc += R[3*r+p]*sk[3*p+c];",
+        "    Rd[3*r+c] = acc;",
+        "  }",
+        "}",
+    ])
+    # ---- sensitivities d_dq, d_dqd, d_Mi (col-major), d_qd (value) ----
+    self.gen_add_code_line("// sensitivities along xi_k (q-perturbation): d_dq, d_dqd, d_Mi, d_qd(value)")
+    self.gen_add_code_line("for (int i = 0; i < " + N + "; i++) {", True)
+    self.gen_add_code_line("for (int j = 0; j < " + N + "; j++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int m = 0; m < " + N + "; m++) s += T_d2q[" + t3("i", "j", "m") + "]*jqk[m];",
+        "for (int nn = 0; nn < " + N + "; nn++) s += T_cross[" + t3("i", "nn", "j") + "]*jvk[nn];",
+        "for (int l = 0; l < " + N + "; l++) s += T_dtdq[" + t3("i", "l", "j") + "]*juk[l];",
+        "d_dq[j*" + N + " + i] = s;",
+        "T s2 = static_cast<T>(0);",
+        "for (int m = 0; m < " + N + "; m++) s2 += T_cross[" + t3("i", "j", "m") + "]*jqk[m];",
+        "for (int nn = 0; nn < " + N + "; nn++) s2 += T_d2qd[" + t3("i", "j", "nn") + "]*jvk[nn];",
+        "d_dqd[j*" + N + " + i] = s2;",
+        "T s3 = static_cast<T>(0);",
+        "for (int m = 0; m < " + N + "; m++) s3 += T_dtdq[" + t3("i", "j", "m") + "]*jqk[m];",
+        "d_Mi[j*" + N + " + i] = s3;",
+    ])
+    self.gen_add_end_control_flow()  # j
+    self.gen_add_code_lines([
+        "// d_qd[i] = dqdd_dq[i,:]@jqk + dqdd_dqd[i,:]@jvk + Minv[i,:]@juk   (Minv symmetric)",
+        "T st = static_cast<T>(0);",
+        "for (int j = 0; j < " + N + "; j++) {",
+        "  T mij = s_Minv[(i<=j) ? (j*" + N + "+i) : (i*" + N + "+j)];",
+        "  st += s_dqdd_dq[j*" + N + "+i]*jqk[j] + s_dqdd_dqd[j*" + N + "+i]*jvk[j] + mij*juk[j];",
+        "}",
+        "d_qd[i] = st;",
+    ])
+    self.gen_add_end_control_flow()  # i
+    # ---- assemble the four slabs ----
+    _emit_fdsva_so_mjx_slab_d2q(self, n)
+    _emit_fdsva_so_mjx_slab_cross(self, n)
+    _emit_fdsva_so_mjx_slab_d2qd(self, n)
+    _emit_fdsva_so_mjx_slab_dtdq(self, n)
+    self.gen_add_end_control_flow()  # k loop
+
+
+# ----------------------------------------------------------------------------
+# fdsva_so mjx per-tensor slab assemblers (single-thread, one k). Flat col-major
+# matrices X[c*n + r]; output row-major [(i*n + j)*n + k]. Transcribed from
+# proto_fdsva_so_emit_spec.py. Reusable inline blocks are defined below.
+# ----------------------------------------------------------------------------
+def _fdsva_reframe_cols(n, src, dst):
+    """dst = src then cols c<3 <- sum_{cp<3} src[:,cp]*R[c,cp] (R[3c+cp]).  (X@Ginv)"""
+    N = str(n)
+    return [
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = " + src + "[0*" + N + "+r], c1 = " + src + "[1*" + N + "+r], c2 = " + src + "[2*" + N + "+r];",
+        "  " + dst + "[0*" + N + "+r] = c0*R[0] + c1*R[1] + c2*R[2];",
+        "  " + dst + "[1*" + N + "+r] = c0*R[3] + c1*R[4] + c2*R[5];",
+        "  " + dst + "[2*" + N + "+r] = c0*R[6] + c1*R[7] + c2*R[8];",
+        "  for (int c = 3; c < " + N + "; c++) " + dst + "[c*" + N + "+r] = " + src + "[c*" + N + "+r];",
+        "}",
+    ]
+
+
+def _fdsva_add_Rd_reframe(n, src, dst):
+    """dst[0:3,:] += src[:,0:3] @ Rd^T  (Rd^T[cp,c]=Rd[c,cp]=Rd[3c+cp]). Rd=0 unless is_rot."""
+    N = str(n)
+    return [
+        "for (int r = 0; r < " + N + "; r++) {",
+        "  T c0 = " + src + "[0*" + N + "+r], c1 = " + src + "[1*" + N + "+r], c2 = " + src + "[2*" + N + "+r];",
+        "  " + dst + "[0*" + N + "+r] += c0*Rd[0] + c1*Rd[1] + c2*Rd[2];",
+        "  " + dst + "[1*" + N + "+r] += c0*Rd[3] + c1*Rd[4] + c2*Rd[5];",
+        "  " + dst + "[2*" + N + "+r] += c0*Rd[6] + c1*Rd[7] + c2*Rd[8];",
+        "}",
+    ]
+
+
+def _fdsva_add_XJvq(n, X, vecname, dst):
+    """dst[:,3+a] += X[:,0:3] @ (-(e_a x vecname[3]))   (Jvq / Juq column-couple)."""
+    N = str(n)
+    Xc = (lambda c: X + "[" + str(c) + "*" + N + "+r]")
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T evx = (a==1)*( " + vecname + "[2]) + (a==2)*(-" + vecname + "[1]);",
+        "  T evy = (a==0)*(-" + vecname + "[2]) + (a==2)*( " + vecname + "[0]);",
+        "  T evz = (a==0)*( " + vecname + "[1]) + (a==1)*(-" + vecname + "[0]);",
+        "  T jc0 = -evx, jc1 = -evy, jc2 = -evz;",
+        "  for (int r = 0; r < " + N + "; r++) " + dst + "[(3+a)*" + N + "+r] += "
+        + Xc(0) + "*jc0 + " + Xc(1) + "*jc1 + " + Xc(2) + "*jc2;",
+        "}",
+    ]
+
+
+def _fdsva_add_MinvJvq(n, vecname, dst):
+    """dst[:,3+a] += Minv[:,0:3] @ (-(e_a x vecname[3]))  (Minv symmetric read)."""
+    N = str(n)
+    mc = (lambda c: "s_Minv[(r<=" + str(c) + ") ? (" + str(c) + "*" + N + "+r) : (r*" + N + "+" + str(c) + ")]")
+    return [
+        "for (int a = 0; a < 3; a++) {",
+        "  T evx = (a==1)*( " + vecname + "[2]) + (a==2)*(-" + vecname + "[1]);",
+        "  T evy = (a==0)*(-" + vecname + "[2]) + (a==2)*( " + vecname + "[0]);",
+        "  T evz = (a==0)*( " + vecname + "[1]) + (a==1)*(-" + vecname + "[0]);",
+        "  T jc0 = -evx, jc1 = -evy, jc2 = -evz;",
+        "  for (int r = 0; r < " + N + "; r++) {",
+        "    T m0 = " + mc(0) + ", m1 = " + mc(1) + ", m2 = " + mc(2) + ";",
+        "    " + dst + "[(3+a)*" + N + "+r] += m0*jc0 + m1*jc1 + m2*jc2;",
+        "  }",
+        "}",
+    ]
+
+
+def _fdsva_rot_rows(n, src, dst):
+    """dst = src then rows r<3 <- R @ rows0:3  (G @ X)."""
+    N = str(n)
+    return [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T m0 = " + src + "[c*" + N + "+0], m1 = " + src + "[c*" + N + "+1], m2 = " + src + "[c*" + N + "+2];",
+        "  " + dst + "[c*" + N + "+0] = R[0]*m0 + R[1]*m1 + R[2]*m2;",
+        "  " + dst + "[c*" + N + "+1] = R[3]*m0 + R[4]*m1 + R[5]*m2;",
+        "  " + dst + "[c*" + N + "+2] = R[6]*m0 + R[7]*m1 + R[8]*m2;",
+        "  for (int r = 3; r < " + N + "; r++) " + dst + "[c*" + N + "+r] = " + src + "[c*" + N + "+r];",
+        "}",
+    ]
+
+
+def _fdsva_add_Gd(n, src, dst):
+    """dst += Gd @ src : rows0:3 += Rd @ src[0:3,:]."""
+    N = str(n)
+    return [
+        "for (int c = 0; c < " + N + "; c++) {",
+        "  T r0 = " + src + "[c*" + N + "+0], r1 = " + src + "[c*" + N + "+1], r2 = " + src + "[c*" + N + "+2];",
+        "  " + dst + "[c*" + N + "+0] += Rd[0]*r0 + Rd[1]*r1 + Rd[2]*r2;",
+        "  " + dst + "[c*" + N + "+1] += Rd[3]*r0 + Rd[4]*r1 + Rd[5]*r2;",
+        "  " + dst + "[c*" + N + "+2] += Rd[6]*r0 + Rd[7]*r1 + Rd[8]*r2;",
+        "}",
+    ]
+
+
+def _emit_fdsva_so_slab_writeback(self, n, src, Oname):
+    N = str(n)
+    self.gen_add_code_lines([
+        "for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++)",
+        "  " + Oname + "[(i*" + N + " + j)*" + N + " + k] = " + src + "[j*" + N + " + i];",
+    ])
+
+
+def _emit_fdsva_so_mjx_slab_d2q(self, n):
+    """d2qdd/dq2[:,:,k] = d(g0)/dxi_k. g0 = rot_rows(dP) + Gd@P + d(out_R) + d(out_vq).
+    P = reframe_cols(dqdd_dq) + dqdd_dqd@Jvq(v) + Minv@Juq(u);  dP = its derivative."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2qdd/dq2 slab[:,:,k] ---")
+    # P (value of the inner pin-accel gradient) into work1
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "s_dqdd_dq", "work1"))
+    self.gen_add_code_lines(_fdsva_add_XJvq(n, "s_dqdd_dqd", "v_lin", "work1"))
+    self.gen_add_code_lines(_fdsva_add_MinvJvq(n, "u_lin", "work1"))  # Minv @ Juq(u_lin)
+    # dP into work2
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "d_dq", "work2"))
+    self.gen_add_code_lines(_fdsva_add_Rd_reframe(n, "s_dqdd_dq", "work2"))   # d(reframe) R-term
+    self.gen_add_code_lines(_fdsva_add_XJvq(n, "d_dqd", "v_lin", "work2"))    # d_dqd @ Jvq(v)
+    self.gen_add_code_lines(_fdsva_add_XJvq(n, "s_dqdd_dqd", "jvk", "work2")) # dqdd_dqd @ Jvq(d_v)
+    self.gen_add_code_lines(_fdsva_add_XJvq(n, "d_Mi", "u_lin", "work2"))     # d_Mi @ Juq(u)
+    self.gen_add_code_lines(_fdsva_add_MinvJvq(n, "juk", "work2"))            # Minv @ Juq(d_u)
+    # g0 = rot_rows(dP=work2) -> reuse inner_u as g0 accumulator
+    self.gen_add_code_lines(_fdsva_rot_rows(n, "work2", "inner_u"))
+    self.gen_add_code_lines(_fdsva_add_Gd(n, "work1", "inner_u"))             # + Gd @ P
+    # d(out_R) + d(out_vq) into the [lin, ang] block of inner_u.
+    self.gen_add_code_lines([
+        "// d(out_R): base = qdd_lin + omega x v_lin ; dbase = d_qd[0:3] + d_om x v_lin + omega x d_v",
+        "T ov0 = omega[1]*v_lin[2] - omega[2]*v_lin[1];",
+        "T ov1 = omega[2]*v_lin[0] - omega[0]*v_lin[2];",
+        "T ov2 = omega[0]*v_lin[1] - omega[1]*v_lin[0];",
+        "T base0 = qdd_lin[0]+ov0, base1 = qdd_lin[1]+ov1, base2 = qdd_lin[2]+ov2;",
+        "T dvx = jvk[0], dvy = jvk[1], dvz = jvk[2];",      # d_v
+        "T domx = jvk[3], domy = jvk[4], domz = jvk[5];",   # d_om
+        "T dob0 = (domy*v_lin[2]-domz*v_lin[1]) + (omega[1]*dvz-omega[2]*dvy);",
+        "T dob1 = (domz*v_lin[0]-domx*v_lin[2]) + (omega[2]*dvx-omega[0]*dvz);",
+        "T dob2 = (domx*v_lin[1]-domy*v_lin[0]) + (omega[0]*dvy-omega[1]*dvx);",
+        "T dbase0 = d_qd[0]+dob0, dbase1 = d_qd[1]+dob1, dbase2 = d_qd[2]+dob2;",
+        "for (int a = 0; a < 3; a++) {",
+        "  T wb0 = (a==1)*( dbase2) + (a==2)*(-dbase1);",   # e_a x dbase
+        "  T wb1 = (a==0)*(-dbase2) + (a==2)*( dbase0);",
+        "  T wb2 = (a==0)*( dbase1) + (a==1)*(-dbase0);",
+        "  inner_u[(3+a)*" + N + "+0] += R[0]*wb0 + R[1]*wb1 + R[2]*wb2;",
+        "  inner_u[(3+a)*" + N + "+1] += R[3]*wb0 + R[4]*wb1 + R[5]*wb2;",
+        "  inner_u[(3+a)*" + N + "+2] += R[6]*wb0 + R[7]*wb1 + R[8]*wb2;",
+        "  T rb0 = (a==1)*( base2) + (a==2)*(-base1);",     # e_a x base (Rd term)
+        "  T rb1 = (a==0)*(-base2) + (a==2)*( base0);",
+        "  T rb2 = (a==0)*( base1) + (a==1)*(-base0);",
+        "  inner_u[(3+a)*" + N + "+0] += Rd[0]*rb0 + Rd[1]*rb1 + Rd[2]*rb2;",
+        "  inner_u[(3+a)*" + N + "+1] += Rd[3]*rb0 + Rd[4]*rb1 + Rd[5]*rb2;",
+        "  inner_u[(3+a)*" + N + "+2] += Rd[6]*rb0 + Rd[7]*rb1 + Rd[8]*rb2;",
+        "}",
+        "// d(out_vq): out_vq[:,3+a] = R (omega x (-(e_a x v_lin)))",
+        "for (int a = 0; a < 3; a++) {",
+        "  T evx = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",   # e_a x v_lin
+        "  T evy = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "  T evz = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "  T dvqx = -evx, dvqy = -evy, dvqz = -evz;",          # dvq = -(e_a x v_lin)
+        "  T edvx = (a==1)*( dvz) + (a==2)*(-dvy);",           # e_a x d_v
+        "  T edvy = (a==0)*(-dvz) + (a==2)*( dvx);",
+        "  T edvz = (a==0)*( dvy) + (a==1)*(-dvx);",
+        "  T ddvqx = -edvx, ddvqy = -edvy, ddvqz = -edvz;",    # ddvq = -(e_a x d_v)
+        # w = d_om x dvq + omega x ddvq
+        "  T w0 = (domy*dvqz-domz*dvqy) + (omega[1]*ddvqz-omega[2]*ddvqy);",
+        "  T w1 = (domz*dvqx-domx*dvqz) + (omega[2]*ddvqx-omega[0]*ddvqz);",
+        "  T w2 = (domx*dvqy-domy*dvqx) + (omega[0]*ddvqy-omega[1]*ddvqx);",
+        "  inner_u[(3+a)*" + N + "+0] += R[0]*w0 + R[1]*w1 + R[2]*w2;",
+        "  inner_u[(3+a)*" + N + "+1] += R[3]*w0 + R[4]*w1 + R[5]*w2;",
+        "  inner_u[(3+a)*" + N + "+2] += R[6]*w0 + R[7]*w1 + R[8]*w2;",
+        # Rd term: omega x dvq
+        "  T wr0 = omega[1]*dvqz - omega[2]*dvqy;",
+        "  T wr1 = omega[2]*dvqx - omega[0]*dvqz;",
+        "  T wr2 = omega[0]*dvqy - omega[1]*dvqx;",
+        "  inner_u[(3+a)*" + N + "+0] += Rd[0]*wr0 + Rd[1]*wr1 + Rd[2]*wr2;",
+        "  inner_u[(3+a)*" + N + "+1] += Rd[3]*wr0 + Rd[4]*wr1 + Rd[5]*wr2;",
+        "  inner_u[(3+a)*" + N + "+2] += Rd[6]*wr0 + Rd[7]*wr1 + Rd[8]*wr2;",
+        "}",
+    ])
+    _emit_fdsva_so_slab_writeback(self, n, "inner_u", "O_d2q")
+
+
+def _emit_fdsva_so_mjx_slab_cross(self, n):
+    """cross = d2qdd/dqd dq[:,:,k] = d(g1)/dxi_k (q-perturb).
+    g1 = rot_rows(reframe_cols(dqdd_dqd)) + out_vd ;
+    d(g1) = rot_rows(dQ) + Gd@Q + d(out_vd)."""
+    N = str(n)
+    self.gen_add_code_line("// --- cross (d2qdd/dqd dq) slab[:,:,k] ---")
+    # Q = reframe_cols(dqdd_dqd) into work1
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "s_dqdd_dqd", "work1"))
+    # dQ = reframe_cols(d_dqd) + Rd-reframe(dqdd_dqd) into work2
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "d_dqd", "work2"))
+    self.gen_add_code_lines(_fdsva_add_Rd_reframe(n, "s_dqdd_dqd", "work2"))
+    # g1 = rot_rows(work2) -> inner_u ; + Gd@Q(work1)
+    self.gen_add_code_lines(_fdsva_rot_rows(n, "work2", "inner_u"))
+    self.gen_add_code_lines(_fdsva_add_Gd(n, "work1", "inner_u"))
+    # d(out_vd): lin-col a = R(omega x R^T e_a); ang-col a = R(e_a x v_lin).
+    self.gen_add_code_lines([
+        "T dvx = jvk[0], dvy = jvk[1], dvz = jvk[2];",
+        "T domx = jvk[3], domy = jvk[4], domz = jvk[5];",
+        "for (int a = 0; a < 3; a++) {",
+        "  T rte0 = R[3*a+0], rte1 = R[3*a+1], rte2 = R[3*a+2];",     # R^T e_a = row a of R
+        "  T rdte0 = Rd[3*a+0], rdte1 = Rd[3*a+1], rdte2 = Rd[3*a+2];",
+        # d(lin a) = R(d_om x R^T e_a + omega x Rd^T e_a) + Rd(omega x R^T e_a)
+        "  T wl0 = (domy*rte2-domz*rte1) + (omega[1]*rdte2-omega[2]*rdte1);",
+        "  T wl1 = (domz*rte0-domx*rte2) + (omega[2]*rdte0-omega[0]*rdte2);",
+        "  T wl2 = (domx*rte1-domy*rte0) + (omega[0]*rdte1-omega[1]*rdte0);",
+        "  inner_u[(0+a)*" + N + "+0] += R[0]*wl0 + R[1]*wl1 + R[2]*wl2;",
+        "  inner_u[(0+a)*" + N + "+1] += R[3]*wl0 + R[4]*wl1 + R[5]*wl2;",
+        "  inner_u[(0+a)*" + N + "+2] += R[6]*wl0 + R[7]*wl1 + R[8]*wl2;",
+        "  T wlr0 = omega[1]*rte2 - omega[2]*rte1;",                  # omega x R^T e_a
+        "  T wlr1 = omega[2]*rte0 - omega[0]*rte2;",
+        "  T wlr2 = omega[0]*rte1 - omega[1]*rte0;",
+        "  inner_u[(0+a)*" + N + "+0] += Rd[0]*wlr0 + Rd[1]*wlr1 + Rd[2]*wlr2;",
+        "  inner_u[(0+a)*" + N + "+1] += Rd[3]*wlr0 + Rd[4]*wlr1 + Rd[5]*wlr2;",
+        "  inner_u[(0+a)*" + N + "+2] += Rd[6]*wlr0 + Rd[7]*wlr1 + Rd[8]*wlr2;",
+        # d(ang a) = R(e_a x d_v) + Rd(e_a x v_lin)
+        "  T wn0 = (a==1)*( dvz) + (a==2)*(-dvy);",                   # e_a x d_v
+        "  T wn1 = (a==0)*(-dvz) + (a==2)*( dvx);",
+        "  T wn2 = (a==0)*( dvy) + (a==1)*(-dvx);",
+        "  inner_u[(3+a)*" + N + "+0] += R[0]*wn0 + R[1]*wn1 + R[2]*wn2;",
+        "  inner_u[(3+a)*" + N + "+1] += R[3]*wn0 + R[4]*wn1 + R[5]*wn2;",
+        "  inner_u[(3+a)*" + N + "+2] += R[6]*wn0 + R[7]*wn1 + R[8]*wn2;",
+        "  T wnr0 = (a==1)*( v_lin[2]) + (a==2)*(-v_lin[1]);",        # e_a x v_lin
+        "  T wnr1 = (a==0)*(-v_lin[2]) + (a==2)*( v_lin[0]);",
+        "  T wnr2 = (a==0)*( v_lin[1]) + (a==1)*(-v_lin[0]);",
+        "  inner_u[(3+a)*" + N + "+0] += Rd[0]*wnr0 + Rd[1]*wnr1 + Rd[2]*wnr2;",
+        "  inner_u[(3+a)*" + N + "+1] += Rd[3]*wnr0 + Rd[4]*wnr1 + Rd[5]*wnr2;",
+        "  inner_u[(3+a)*" + N + "+2] += Rd[6]*wnr0 + Rd[7]*wnr1 + Rd[8]*wnr2;",
+        "}",
+    ])
+    _emit_fdsva_so_slab_writeback(self, n, "inner_u", "O_cross")
+
+
+def _emit_fdsva_so_mjx_slab_d2qd(self, n):
+    """d2qdd/dqd2[:,:,k] = d(g1)/d v_mjx_k (qvel perturb, R FIXED -> Gd=0).
+    g1v = rot_rows(reframe_cols(dv_dqddqd)) + d(out_vd along jvvk)."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2qdd/dqd2 slab[:,:,k] (qvel perturb, R fixed) ---")
+    # dvQ[i,j] = sum_n d2qd[i,j,n]*jvvk[n] -> work1 (col-major)
+    self.gen_add_code_line("for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int nn = 0; nn < " + N + "; nn++) s += T_d2qd[(i*" + N + " + j)*" + N + " + nn]*jvvk[nn];",
+        "work1[j*" + N + " + i] = s;",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "work1", "work2"))
+    self.gen_add_code_lines(_fdsva_rot_rows(n, "work2", "inner_u"))
+    # d(out_vd) along qd_pin=jvvk (R fixed): lin a = R(dvv_om x R^T e_a); ang a = R(e_a x dvv_v).
+    self.gen_add_code_lines([
+        "T dvvv0 = jvvk[0], dvvv1 = jvvk[1], dvvv2 = jvvk[2];",
+        "T dvvo0 = jvvk[3], dvvo1 = jvvk[4], dvvo2 = jvvk[5];",
+        "for (int a = 0; a < 3; a++) {",
+        "  T rte0 = R[3*a+0], rte1 = R[3*a+1], rte2 = R[3*a+2];",
+        "  T wl0 = dvvo1*rte2 - dvvo2*rte1;",
+        "  T wl1 = dvvo2*rte0 - dvvo0*rte2;",
+        "  T wl2 = dvvo0*rte1 - dvvo1*rte0;",
+        "  inner_u[(0+a)*" + N + "+0] += R[0]*wl0 + R[1]*wl1 + R[2]*wl2;",
+        "  inner_u[(0+a)*" + N + "+1] += R[3]*wl0 + R[4]*wl1 + R[5]*wl2;",
+        "  inner_u[(0+a)*" + N + "+2] += R[6]*wl0 + R[7]*wl1 + R[8]*wl2;",
+        "  T wn0 = (a==1)*( dvvv2) + (a==2)*(-dvvv1);",
+        "  T wn1 = (a==0)*(-dvvv2) + (a==2)*( dvvv0);",
+        "  T wn2 = (a==0)*( dvvv1) + (a==1)*(-dvvv0);",
+        "  inner_u[(3+a)*" + N + "+0] += R[0]*wn0 + R[1]*wn1 + R[2]*wn2;",
+        "  inner_u[(3+a)*" + N + "+1] += R[3]*wn0 + R[4]*wn1 + R[5]*wn2;",
+        "  inner_u[(3+a)*" + N + "+2] += R[6]*wn0 + R[7]*wn1 + R[8]*wn2;",
+        "}",
+    ])
+    _emit_fdsva_so_slab_writeback(self, n, "inner_u", "O_d2qd")
+
+
+def _emit_fdsva_so_mjx_slab_dtdq(self, n):
+    """d2qdd/du dq[:,:,k] = d(g0)/d u_mjx_k (force perturb, R FIXED -> Gd=0).
+    du_dq[i,j] = sum_l dMinv[i,l,j]*juuk[l] ; du_qdd = Minv @ juuk (value).
+    g0u = rot_rows(reframe_cols(du_dq) + Minv@Juq(d_u)) + d(out_R)|qdd-only."""
+    N = str(n)
+    self.gen_add_code_line("// --- d2qdd/du dq slab[:,:,k] (force perturb, R fixed) ---")
+    # du_dq[i,j] = sum_l T_dtdq[i,l,j]*juuk[l] -> work1 (col-major)
+    self.gen_add_code_line("for (int i = 0; i < " + N + "; i++) for (int j = 0; j < " + N + "; j++) {", True)
+    self.gen_add_code_lines([
+        "T s = static_cast<T>(0);",
+        "for (int l = 0; l < " + N + "; l++) s += T_dtdq[(i*" + N + " + l)*" + N + " + j]*juuk[l];",
+        "work1[j*" + N + " + i] = s;",
+    ])
+    self.gen_add_end_control_flow()
+    # inner_u = reframe_cols(du_dq) + Minv@Juq(d_u), d_u = juuk[0:3]
+    self.gen_add_code_lines(_fdsva_reframe_cols(n, "work1", "inner_u"))
+    self.gen_add_code_lines(_fdsva_add_MinvJvq(n, "juuk", "inner_u"))
+    self.gen_add_code_lines(_fdsva_rot_rows(n, "inner_u", "work2"))
+    # du_qdd[i] = Minv[i,:] @ juuk (value sensitivity), need only lin 0:3 for out_R
+    self.gen_add_code_lines([
+        "// du_qdd[0:3] = Minv[0:3,:] @ juuk  (Minv symmetric)",
+        "T duq0 = static_cast<T>(0), duq1 = static_cast<T>(0), duq2 = static_cast<T>(0);",
+        "for (int j = 0; j < " + N + "; j++) {",
+        "  duq0 += s_Minv[(0<=j) ? (j*" + N + "+0) : (0*" + N + "+j)]*juuk[j];",
+        "  duq1 += s_Minv[(1<=j) ? (j*" + N + "+1) : (1*" + N + "+j)]*juuk[j];",
+        "  duq2 += s_Minv[(2<=j) ? (j*" + N + "+2) : (2*" + N + "+j)]*juuk[j];",
+        "}",
+        "// d(out_R)/du = R (e_a x du_qdd_lin)",
+        "for (int a = 0; a < 3; a++) {",
+        "  T w0 = (a==1)*( duq2) + (a==2)*(-duq1);",
+        "  T w1 = (a==0)*(-duq2) + (a==2)*( duq0);",
+        "  T w2 = (a==0)*( duq1) + (a==1)*(-duq0);",
+        "  work2[(3+a)*" + N + "+0] += R[0]*w0 + R[1]*w1 + R[2]*w2;",
+        "  work2[(3+a)*" + N + "+1] += R[3]*w0 + R[4]*w1 + R[5]*w2;",
+        "  work2[(3+a)*" + N + "+2] += R[6]*w0 + R[7]*w1 + R[8]*w2;",
+        "}",
+    ])
+    _emit_fdsva_so_slab_writeback(self, n, "work2", "O_dtdq")
+
 
 def gen_fdsva_so(self):
     # first the contraction sub-inner used by the orchestration _device
