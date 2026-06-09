@@ -745,10 +745,13 @@ def _emit_fdsva_so_mjx_perk_assembly(self, n):
     ])
     self.gen_add_end_control_flow()  # i
     # ---- assemble the four slabs ----
-    _emit_fdsva_so_mjx_slab_d2q(self, n)
-    _emit_fdsva_so_mjx_slab_cross(self, n)
-    _emit_fdsva_so_mjx_slab_d2qd(self, n)
-    _emit_fdsva_so_mjx_slab_dtdq(self, n)
+    # each slab declares its own local temporaries (dvx/base0/...); wrap each in a
+    # fresh brace scope so the names don't redeclare in the shared per-k loop body.
+    for _slab in (_emit_fdsva_so_mjx_slab_d2q, _emit_fdsva_so_mjx_slab_cross,
+                  _emit_fdsva_so_mjx_slab_d2qd, _emit_fdsva_so_mjx_slab_dtdq):
+        self.gen_add_code_line("{", True)
+        _slab(self, n)
+        self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # k loop
 
 
