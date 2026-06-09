@@ -69,6 +69,12 @@ def gen_id_bias_device(self, gravity_only):
     extra = [("s_vaf", 18 * nb_vaf)]
     if gravity_only:
         extra.append(("s_qd0", nv))
+    # nonlinear_effects floating-base mjx path: a zeroed qdd buffer (nv). Occupies
+    # the SAME arena slack as gravity's s_qd0 band (the host arena macro budgets +nv
+    # for the bias kernels either way), so no GRiDCodeGenerator.py arena change.
+    use_qdd = self.robot.floating_base and not gravity_only
+    if use_qdd:
+        extra.append(("s_qdd", nv))
 
     def _inner():
         if gravity_only:
@@ -76,10 +82,19 @@ def gen_id_bias_device(self, gravity_only):
             self.gen_add_code_line("s_qd0[i] = static_cast<T>(0);")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
+        if use_qdd:
+            # s_qdd = 0 so ID(q,qd,0) = nle (value identical to the use_qdd_input=False
+            # path). The device wrapper carries no MUJOCO_OUTPUT epilogue (host-template
+            # mjx convert is kernel-only), so s_qdd stays all-zero here.
+            self.gen_add_parallel_loop("i", str(nv))
+            self.gen_add_code_line("s_qdd[i] = static_cast<T>(0);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
         qd_arg = "s_qd0" if gravity_only else "s_qd"
         self.gen_inverse_dynamics_inner_function_call(
-            compute_c=True, use_qdd_input=False,
-            updated_var_names=dict(s_c_name="s_out", s_qd_name=qd_arg, d_f_ext_name="nullptr"))
+            compute_c=True, use_qdd_input=use_qdd,
+            updated_var_names=dict(s_c_name="s_out", s_qd_name=qd_arg,
+                                   s_qdd_name="s_qdd", d_f_ext_name="nullptr"))
 
     self.gen_device_wrapper(
         desc, func_def, _id_bias_inner_temp_mem_size(self), _inner,
@@ -94,14 +109,32 @@ def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing, mjx_kernel
     # NB (get_num_joints) for mimic robots (NB > NV) so the high-body f-writes never
     # overflow into the next arena region. Non-mimic keeps 18*n byte-identical.
     nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
+    # nonlinear_effects floating-base mjx path: zeroed qdd buffer (nv) sized into the
+    # same arena slack as gravity's s_qd0 band (the host arena macro budgets +nv for
+    # the bias kernels regardless), so NO GRiDCodeGenerator.py arena change is needed.
+    use_qdd = self.robot.floating_base and not gravity_only
     extra = [("s_q_qd", input_count), ("s_out", nv), ("s_vaf", 18 * nb_vaf)]
     if gravity_only:
         extra.append(("s_qd0", nv))
+    if use_qdd:
+        extra.append(("s_qdd", nv))
     self.gen_XImats_helpers_temp_shared_memory_code(
         _id_bias_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
     if gravity_only:
         self.gen_add_code_line("(void)s_qd;")
+
+    def _zero_qdd():
+        # Zero the WHOLE s_qdd (nv) FIRST, unconditionally (both pin + mjx
+        # instantiations). For the default (pin) instantiation s_qdd stays all-zero
+        # -> ID(q,qd,0) = nle, value identical to the historical use_qdd_input=False
+        # path. For the mjx instantiation the input-convert (emitted right after this,
+        # before the compute) overwrites only s_qdd[0:3] = delta_a = -(omega x v); the
+        # non-base entries [3:] stay 0.
+        self.gen_add_parallel_loop("i", str(nv))
+        self.gen_add_code_line("s_qdd[i] = static_cast<T>(0);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
 
     def _compute():
         self.gen_load_update_XImats_helpers_function_call()
@@ -112,24 +145,36 @@ def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing, mjx_kernel
             self.gen_add_sync()
         qd_arg = "s_qd0" if gravity_only else "s_qd"
         self.gen_inverse_dynamics_inner_function_call(
-            compute_c=True, use_qdd_input=False,
-            updated_var_names=dict(s_c_name="s_out", s_qd_name=qd_arg, d_f_ext_name="nullptr"))
+            compute_c=True, use_qdd_input=use_qdd,
+            updated_var_names=dict(s_c_name="s_out", s_qd_name=qd_arg,
+                                   s_qdd_name="s_qdd", d_f_ext_name="nullptr"))
 
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(input_count), stride="stride_q_qd")
-        # mjx input convert: q only (g depends on q; qd is zeroed internally so no qd
-        # convert). Reorder the base quaternion wxyz->xyzw BEFORE the XImats build so
-        # X[0] uses the correctly-ordered quaternion.
+        # nonlinear_effects floating mjx: zero s_qdd (all instantiations) BEFORE the
+        # input-convert, which writes s_qdd[0:3] = delta_a for the mjx case.
+        if use_qdd:
+            _zero_qdd()
         if mjx_kernel:
+            # gravity (qd=0): q-only convert (reorder quaternion). nonlinear_effects:
+            # FULL input-convert -- reorders quat, qd->pin frame, AND writes
+            # s_qdd[0:3] = -(omega x v) = delta_a (mjx input qdd is 0; the helper's
+            # accel-couple term produces delta_a). Emitted BEFORE the XImats build so
+            # X[0] uses the correctly-ordered quaternion.
             self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
-            self.gen_mjx_quat_reorder(q_name="s_q")
+            if use_qdd:
+                self.gen_mjx_input_convert(q_name="s_q", qd_name="s_qd", qdd_name="s_qdd")
+            else:
+                self.gen_mjx_quat_reorder(q_name="s_q")
             self.gen_add_end_control_flow()
         self.gen_add_code_line("// compute")
         _compute()
         self.gen_add_sync()
-        # mjx output: g is a covector -> base-linear rows rotate by R (base_rotate).
-        # No omega x v term: gravity is evaluated at qd=0.
+        # mjx output: the bias is a covector -> base-linear rows rotate by R
+        # (base_rotate). For nonlinear_effects the omega x v acceleration coupling is
+        # already folded in via s_qdd (ID is affine in qacc), so the output map is the
+        # same trivial base_rotate as gravity. base_rotate(ID(q,qd,delta_a)) = mjx nle.
         if mjx_kernel:
             self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
             self.gen_mjx_base_rotate("s_out")
@@ -138,6 +183,10 @@ def _emit_id_bias_kernel_body(self, gravity_only, single_call_timing, mjx_kernel
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q_qd", str(input_count))
+        # single_timing: no mjx epilogue (timing path). Zero s_qdd once so the pin
+        # use_qdd_input=True call still evaluates ID(q,qd,0) = nle.
+        if use_qdd:
+            _zero_qdd()
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q_qd", str(input_count), feedback_from="out")
         _compute()
@@ -154,14 +203,16 @@ def gen_id_bias_kernel(self, gravity_only, single_call_timing=False):
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
     self.gen_add_func_doc("Compute " + name + " (RNEA bias) per timestep", [], [], None)
-    # MUJOCO_OUTPUT (floating-base generalized_gravity only): compile-time mjx
-    # output-convention flag. gravity is evaluated at qd=0 so there is NO omega x v
+    # MUJOCO_OUTPUT (floating-base both bias kernels): compile-time mjx
+    # output-convention flag. For generalized_gravity (qd=0) there is NO omega x v
     # acceleration coupling -- the transform is the trivial base_rotate (G.g): only
-    # the base-linear rows of the covector output g rotate by R. Added LAST so the
-    # existing positional <T,TIER> call sites are unaffected; the default (false)
-    # instantiation if-constexpr-elides the epilogue -> byte-identical PTX. Never
-    # emitted for nonlinear_effects (separate omega x v task) or fixed-base.
-    mjx_kernel = self.robot.floating_base and gravity_only
+    # the base-linear rows of the covector output g rotate by R. For nonlinear_effects
+    # the omega x v coupling is folded in via the input-convert (qdd[0:3] = delta_a;
+    # ID is affine in qacc so base_rotate(ID(q,qd,delta_a)) = mjx nle), so the OUTPUT
+    # map is the SAME base_rotate. Added LAST so the existing positional <T,TIER> call
+    # sites are unaffected; the default (false) instantiation if-constexpr-elides the
+    # epilogue -> byte-identical PTX. Never emitted for fixed-base.
+    mjx_kernel = self.robot.floating_base
     if mjx_kernel:
         self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     else:
@@ -189,11 +240,11 @@ def gen_id_bias_host(self, gravity_only, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute " + name + " (RNEA bias)", [], [], None)
-    # MUJOCO_OUTPUT (floating-base generalized_gravity only) host template flag:
+    # MUJOCO_OUTPUT (floating-base both bias kernels) host template flag:
     # forwarded to the kernel launch. The kernel template is <T, RESOURCE_TIER, MUJOCO_OUTPUT>
     # so the flag must be named positionally (tier defaulted explicitly). Added LAST so
     # existing positional template args are unaffected; default false -> byte-identical.
-    mjx_host = self.robot.floating_base and gravity_only
+    mjx_host = self.robot.floating_base
     if mjx_host:
         self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
     else:
