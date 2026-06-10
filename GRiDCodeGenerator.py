@@ -2672,14 +2672,19 @@ class GRiDCodeGenerator:
             "#define GRID_HAS_INTEGRATOR " + str(int("integrator" in algorithms)))
         self.gen_add_code_line(
             "#define GRID_HAS_INTEGRATOR_GRADIENT " + str(int("integrator_gradient" in algorithms)))
-        # GRID_FLOATING_BASE gates the binding's mjx (MuJoCo output-convention)
-        # C-ABI entry points: the `grid::*<...,MUJOCO_OUTPUT>` template overloads
-        # only EXIST on a floating-base header (the trailing bool template param is
-        # emitted only when floating), so the wrapper's mjx symbols must compile
-        # ONLY for floating robots. Defined (to 1) iff floating; absent otherwise so
-        # `#ifdef GRID_FLOATING_BASE` is a clean no-op on fixed-base headers.
-        if self.robot.floating_base:
-            self.gen_add_code_line("#define GRID_FLOATING_BASE 1")
+        # GRID_RBD_WITH_MUJOCO gates the binding's mjx (MuJoCo output-convention)
+        # C-ABI entry points: the `grid::*<...,MUJOCO_OUTPUT=true>` template overloads
+        # are EMITTED only for a floating-base robot WITHOUT mimic joints or skew
+        # axes (a mimic/skew robot skips the mjx variants — see the `mjx_*`/`mjx_inner`
+        # gates in the algorithm emitters, all `floating and not (mimic or skew)`).
+        # So the wrapper's mjx symbols must compile ONLY when those overloads exist;
+        # otherwise a floating+mimic robot (e.g. h1_2, 12 mimic joints) fails to build
+        # on `grid::*<...,true>` "no matching function". Defined (to 1) iff the mjx
+        # overloads were emitted; absent otherwise so `#ifdef GRID_RBD_WITH_MUJOCO`
+        # is a clean no-op on fixed-base AND mimic/skew headers.
+        if self.robot.floating_base and not (
+                self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()):
+            self.gen_add_code_line("#define GRID_RBD_WITH_MUJOCO 1")
         self.gen_add_code_line("")
         # then open our namespace
         self.gen_add_func_doc("All functions are kept in this namespace")
