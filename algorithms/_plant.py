@@ -247,10 +247,7 @@ def gen_plant_step(self):
     # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
     # sites are unaffected; default false if-constexpr-elides the mjx retract ->
     # byte-identical pin codegen. Fixed-base never emits it (no base block).
-    if fb:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void plant_step(T *s_x_kp1, const T *s_x, const T *s_u, "
                            "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {", True)
@@ -1102,10 +1099,7 @@ def gen_plant_step_kernel(self):
                            "NUM_TIMESTEPS is the batch size"], None)
     # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
     # sites are unaffected; default false -> byte-identical pin codegen.
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void plant_step_kernel(T *d_x_kp1, const T *d_x, const T *d_u, "
                            "const int stride_x, const int stride_u, "
@@ -1180,10 +1174,7 @@ def gen_plant_step_gradient_kernel(self):
     # the input convert + forwarded to plant_step_gradient (whose dAB epilogue is the
     # validated grid::integrator_gradient_device mjx transform).
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line("void plant_step_gradient_kernel(T *d_dAB, const T *d_x, const T *d_u, "

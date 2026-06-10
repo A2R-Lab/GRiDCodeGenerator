@@ -294,10 +294,7 @@ def gen_frame_jacobian_kernel(self, single_call_timing=False):
     # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
     # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
     # default false if-constexpr-elides the epilogue -> byte-identical PTX.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -542,10 +539,7 @@ def gen_frame_jacobian_dot_kernel(self, single_call_timing=False):
     # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
     # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
     # default false if-constexpr-elides the epilogue -> byte-identical PTX.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -817,10 +811,7 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
     # so there is NO output epilogue; only the q quaternion is reordered so the
     # internal J/Minv build from the correct base orientation. Default false ->
     # byte-identical pin codegen.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

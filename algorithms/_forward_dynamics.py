@@ -271,10 +271,7 @@ def gen_forward_dynamics_kernel(self, single_call_timing = False):
     # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
     # default false if-constexpr-elides the epilogue -> byte-identical PTX. The
     # epilogue (in _emit_fd_kernel_body_for_flags) sees MUJOCO_OUTPUT in scope.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

@@ -222,10 +222,7 @@ def gen_end_effector_pose_kernel(self, single_call_timing = False, fixed_target_
     # epilogue; only the base quaternion is reordered (mjx wxyz -> pin xyzw) so the
     # XmatsHom build forms X[0] from the correct orientation. Default false ->
     # byte-identical pin codegen.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -925,10 +922,7 @@ def gen_end_effector_pose_gradient_kernel(self, single_call_timing = False, fixe
     # epilogue + q-quaternion reorder are emitted per-tier inside the body. Default
     # false -> byte-identical pin codegen.
     mjx = self.robot.floating_base
-    if mjx:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -2598,10 +2592,7 @@ def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
     # epilogues + q-quaternion reorder are emitted per-tier inside the body. Default
     # false -> byte-identical pin codegen.
     mjx = self.robot.floating_base
-    if mjx:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

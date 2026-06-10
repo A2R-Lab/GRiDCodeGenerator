@@ -683,10 +683,7 @@ def gen_fdsva_so_kernel(self, single_call_timing = False):
     # after RESOURCE_TIER so the host forwards it positionally; default false ->
     # if-constexpr-elided to byte-identical PTX. Fixed-base keeps the 2-arg template.
     mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

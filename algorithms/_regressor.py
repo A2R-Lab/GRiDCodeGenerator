@@ -370,10 +370,7 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     # base-linear ROWS rotate like the ID torque covector (G.Y); inputs q,qd,qdd
     # are mjx -> convert in (qdd: regressor is the full id regressor with a qdd input).
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_func_doc("Compute the joint-torque regressor", [], func_params, None)
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
@@ -690,10 +687,7 @@ def gen_forward_dynamics_parameter_gradient_kernel(self, single_call_timing=Fals
     # rotate. Flag added LAST (after RESOURCE_TIER); default false if-constexpr-
     # elides both -> byte-identical PTX.
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_func_doc("Compute the FD param gradient dqdd/dpi = -Minv . Y", [], func_params, None)
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
@@ -998,10 +992,7 @@ def gen_kinetic_energy_regressor_kernel(self, single_call_timing=False):
     # sweep): input_convert q,qd. Flag added LAST so positional call sites are safe;
     # default false if-constexpr-elides the input convert -> byte-identical PTX.
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_func_doc("Compute the kinetic-energy regressor", [], func_params, None)
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
@@ -1260,10 +1251,7 @@ def gen_potential_energy_regressor_kernel(self, single_call_timing=False):
     # quat_reorder BEFORE the XmatsHom build. Flag added LAST; default false
     # if-constexpr-elides the reorder -> byte-identical PTX.
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_func_doc("Compute the potential-energy regressor", [], func_params, None)
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")

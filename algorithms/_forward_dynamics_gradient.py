@@ -563,10 +563,7 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     # qdd-Minv-input kernel never carries it (mjx computes qdd/Minv internally).
     mjx_kernel = (self.robot.floating_base and not use_qdd_Minv_input
                   and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)

@@ -213,10 +213,7 @@ def gen_id_bias_kernel(self, gravity_only, single_call_timing=False):
     # sites are unaffected; the default (false) instantiation if-constexpr-elides the
     # epilogue -> byte-identical PTX. Never emitted for fixed-base.
     mjx_kernel = self.robot.floating_base
-    if mjx_kernel:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
@@ -735,10 +732,7 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
     # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
     # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
     # default false if-constexpr-elides the epilogues -> byte-identical pin PTX.
-    if self.robot.floating_base:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
