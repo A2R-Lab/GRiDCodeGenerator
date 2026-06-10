@@ -250,7 +250,7 @@ def gen_plant_step(self):
     if fb:
         self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void plant_step(T *s_x_kp1, const T *s_x, const T *s_u, "
                            "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {", True)
@@ -465,7 +465,7 @@ def _gen_quadratic_cost_family(self, which):
     # base block. The grad/hess device fns take an extra `s_q` (xyzw quaternion, the
     # kernel-reordered config) used ONLY to build R for the epilogue.
     mjx = (which == "state" and self.robot.floating_base)
-    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if mjx else ""
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     mjx_qarg = ", const T *s_q" if mjx else ""
 
     # ---- value: cost = 1/2 sum W_i (var_i - des_i)^2, accumulated into s_out[0] ----
@@ -641,7 +641,7 @@ def gen_ee_pos_cost(self):
          "s_q / s_p_des / s_W / d_robotModel as above",
          "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_end_effector_pose, T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
@@ -684,7 +684,7 @@ def gen_ee_pos_cost(self):
         ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
          "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
                            "T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
@@ -761,7 +761,7 @@ def gen_com_cost(self):
         ["J_com = rows of s_com starting at offset 3, layout s_com[3 + 3*vi + r] (3 x NUM_VEL column-major)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_p_des / s_W / d_robotModel as above",
          "s_com scratch (3 + 3*NUM_VEL)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
@@ -798,7 +798,7 @@ def gen_com_cost(self):
         ["Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_W / d_robotModel as above",
          "s_com scratch (3 + 3*NUM_VEL)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
                            "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
@@ -863,7 +863,7 @@ def gen_momentum_cost(self):
         ["A = s_ccrba[r + 6*vi] (6 x NUM_VEL column-major); h = s_ccrba[6*NUM_VEL + r]."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_qd / s_h_des / s_W / d_robotModel as above",
          "s_ccrba scratch (6*NUM_VEL + 6)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
                            "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
@@ -896,7 +896,7 @@ def gen_momentum_cost(self):
         ["Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_qd / s_W / d_robotModel as above",
          "s_ccrba scratch (6*NUM_VEL + 6)"], None)
-    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + (", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else "") + ">")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
                            "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
@@ -1105,7 +1105,7 @@ def gen_plant_step_kernel(self):
     if mjx_kernel:
         self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void plant_step_kernel(T *d_x_kp1, const T *d_x, const T *d_u, "
                            "const int stride_x, const int stride_u, "
@@ -1183,7 +1183,7 @@ def gen_plant_step_gradient_kernel(self):
     if mjx_kernel:
         self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER>")
+        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line("void plant_step_gradient_kernel(T *d_dAB, const T *d_x, const T *d_u, "
@@ -1437,7 +1437,7 @@ def gen_plant_step_hessian_kernel(self):
                                "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     else:
         self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER>")
+                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, unsigned char *d_workspace, const T *d_x, const T *d_u, "
@@ -1506,7 +1506,7 @@ def gen_com_cost_kernel(self):
                                "d_W per-axis weight (3 per timestep)",
                                "d_com global scratch (3 + 3*NUM_VEL per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
@@ -1558,7 +1558,7 @@ def gen_momentum_cost_kernel(self):
                                "d_W per-component weight (6 per timestep)",
                                "d_ccrba global scratch (6*NUM_VEL + 6 per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
@@ -1616,7 +1616,7 @@ def gen_quadratic_cost_kernel(self, which):
                                "d_" + var + " / d_" + des + " / d_" + w + " inputs (" + N + " per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     mjx = (which == "state" and self.robot.floating_base)
-    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if mjx else ""
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void " + base + "_kernel(T *d_out, T *d_grad, T *d_hess, "
@@ -1665,7 +1665,7 @@ def gen_ee_pos_cost_kernel(self):
                                "d_W per-axis weight (3 per timestep)",
                                "d_end_effector_pose / d_end_effector_pose_gradient global scratch (6*NUM_EES / 6*NUM_VEL*NUM_EES per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
-    mjx_tmpl = ", bool MUJOCO_OUTPUT = false" if self.robot.floating_base else ""
+    mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T, int EE = 0" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "

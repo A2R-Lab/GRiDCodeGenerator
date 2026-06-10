@@ -908,7 +908,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     if mjx_kernel:
         self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     else:
-        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (PERF cap), NOT tier_max_threads: the
     # integrator gradient is register-bound by its RBD callees, so the LITE/MINIMAL

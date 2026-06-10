@@ -816,7 +816,7 @@ def gen_integrator_kernel(self, single_call_timing=False):
     if self.robot.floating_base:
         self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     else:
-        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     # Pin launch_bounds to MAX_PERF_LEVEL_THREADS (the PERF cap), NOT tier_max_threads:
     # the integrator is register-bound by its RBD callees (load_update_XImats ~86,
