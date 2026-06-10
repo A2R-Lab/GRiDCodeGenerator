@@ -4,6 +4,31 @@ def _idg_Svec_cpp(S_vec):
     return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in S_vec) + "}"
 
 
+def _idg_debug_body_buffer(self, jid, base_offset, n, running_sum_cols_per_jid, cols_per_jid):
+    """Resolve the (column-block offset, column count) for the per-BODY dv/da/df
+    debug printf of body `jid`, on BOTH fixed and floating base.
+
+    DEBUG-ONLY helper. The dv/da/df scratch buffers are laid out per body
+    (joint) id, NOT per velocity DOF, so the debug printf must iterate body ids
+    (`range(NUM_JOINTS)`), never `range(NUM_VEL)`: on a floating-base robot a
+    velocity-DOF index is not a body id (the 6-DoF floating root maps to a single
+    body), so indexing a per-jid structure or calling `get_*_by_id` with a
+    velocity index returns None / overflows and crashes codegen.
+
+    The buffer layout itself differs by base, mirroring the non-debug emit:
+    - FLOATING base: dense per-jid blocks of width `n` (= NUM_VEL) columns at
+      `base_offset + 6*n*jid` (matches the `{6*n}*{jid}` addressing the floating
+      forward/backward sweeps use).
+    - FIXED base: sparsity-compressed blocks at
+      `base_offset + 6*running_sum_cols_per_jid[jid]`, each `cols_per_jid[jid]`
+      columns wide.
+    Returns (offset:int, num_cols:int).
+    """
+    if self.robot.floating_base:
+        return base_offset + 6 * n * jid, n
+    return base_offset + 6 * running_sum_cols_per_jid[jid], cols_per_jid[jid]
+
+
 def _emit_fb_bfs_level_indexing(self, inds, n, dq_flag_line = None):
     """Emit the shared floating-base per-BFS-level index decode used by the
     dv/du, da/du and df/du sweeps, and return the (jid_cpp, parent_jid_cpp)
@@ -563,14 +588,15 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"da/du part 1 = MxS(dv/du)*qd + {MxXa, Mxf}\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+        for ind in range(NJ):
+            off_dq, num_cols = _idg_debug_body_buffer(self, ind, Offset_da_dq, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
+            off_dqd, _ = _idg_debug_body_buffer(self, ind, Offset_da_dqd, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"da[%d]/dq\\n\"," + str(ind) + ");", \
                                      "printMat<T,6," + str(num_cols) + ">(&s_temp[" + \
-                                            str(Offset_da_dq + 6*running_sum_dva_cols_per_jid[ind]) + "],6);", \
+                                            str(off_dq) + "],6);", \
                                      "printf(\"da[%d]/dqd\\n\"," + str(ind) + ");", \
                                      "printMat<T,6," + str(num_cols) + ">(&s_temp[" + \
-                                            str(Offset_da_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
+                                            str(off_dqd) + "],6);"])
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -684,12 +710,13 @@ def gen_inverse_dynamics_gradient_inner(self):
                                  "printf(\"df/du part 1 = fx(dv/du)*Iv\\n\");", \
                                  "printf(\"     and Temp = Fx(v)*I\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
-        for ind in range(n):
-            num_cols = df_cols_per_jid[ind]
+        for ind in range(NJ):
+            off_dq, num_cols = _idg_debug_body_buffer(self, ind, Offset_df_dq, n, running_sum_df_cols_per_jid, df_cols_per_jid)
+            off_dqd, _ = _idg_debug_body_buffer(self, ind, Offset_df_dqd, n, running_sum_df_cols_per_jid, df_cols_per_jid)
             self.gen_add_code_lines(["printf(\"df[%d]/dq\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dq + 6*running_sum_df_cols_per_jid[ind]) + "],6);", \
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off_dq) + "],6);", \
                                      "printf(\"df[%d]/dqd\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dqd + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off_dqd) + "],6);"])
             self.gen_add_code_lines(["printf(\"Fx(v)*I[%d]\\n\"," + str(ind) + ");", \
                                      "printMat<T,6,6>(&s_temp[" + str(Offset_FxvI) + " + 36*" + str(ind) + "],6);"])
         self.gen_add_end_control_flow()
@@ -727,12 +754,13 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"df/du += I*da/du + FxvI*dv/du\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
-        for ind in range(n):
-            num_cols = df_cols_per_jid[ind]
+        for ind in range(NJ):
+            off_dq, num_cols = _idg_debug_body_buffer(self, ind, Offset_df_dq, n, running_sum_df_cols_per_jid, df_cols_per_jid)
+            off_dqd, _ = _idg_debug_body_buffer(self, ind, Offset_df_dqd, n, running_sum_df_cols_per_jid, df_cols_per_jid)
             self.gen_add_code_lines(["printf(\"df[%d]/dq\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dq + 6*running_sum_df_cols_per_jid[ind]) + "],6);", \
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off_dq) + "],6);", \
                                      "printf(\"df[%d]/dqd\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dqd + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off_dqd) + "],6);"])
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -758,7 +786,7 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Temp = -X^T * mx(f)\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
-        for ind in range(n):
+        for ind in range(NJ):
             self.gen_add_code_lines(["printf(\"-X^T*mx(f)[%d]\\n\"," + str(ind) + ");", \
                                      "printMat<T,1,6>(&s_temp[" + str(Offset_MxXv) + " + 6*" + str(ind) + "],1);"])
         self.gen_add_end_control_flow()
@@ -874,30 +902,34 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_code_lines(["printf(\"-------------------------\\n\");", \
                                  "printf(\"Final dvaf/du\\n\");", \
                                  "printf(\"-------------------------\\n\");"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+        for ind in range(NJ):
+            off, num_cols = _idg_debug_body_buffer(self, ind, Offset_dv_dq, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"dv[%d]/dq\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_dv_dq + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
+        for ind in range(NJ):
+            off, num_cols = _idg_debug_body_buffer(self, ind, Offset_dv_dqd, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"dv[%d]/dqd\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_dv_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
+        for ind in range(NJ):
+            off, num_cols = _idg_debug_body_buffer(self, ind, Offset_da_dq, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"da[%d]/dq\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_da_dq + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
+        for ind in range(NJ):
+            off, num_cols = _idg_debug_body_buffer(self, ind, Offset_da_dqd, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"da[%d]/dqd\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_da_dqd + 6*running_sum_dva_cols_per_jid[ind]) + "],6);"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
+        # df num_cols intentionally uses the dva-width (get_bfs_level_by_id+1) as
+        # the original fixed-base emit did; only the offset uses the df running-sum.
+        for ind in range(NJ):
+            off, _ = _idg_debug_body_buffer(self, ind, Offset_df_dq, n, running_sum_df_cols_per_jid, df_cols_per_jid)
+            _, num_cols = _idg_debug_body_buffer(self, ind, 0, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"df[%d]/dq\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dq + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
-        for ind in range(n):
-            num_cols = self.robot.get_bfs_level_by_id(ind) + 1
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
+        for ind in range(NJ):
+            off, _ = _idg_debug_body_buffer(self, ind, Offset_df_dqd, n, running_sum_df_cols_per_jid, df_cols_per_jid)
+            _, num_cols = _idg_debug_body_buffer(self, ind, 0, n, running_sum_dva_cols_per_jid, dva_cols_per_jid)
             self.gen_add_code_lines(["printf(\"df[%d]/dqd\\n\"," + str(ind) + ");", \
-                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(Offset_df_dqd + 6*running_sum_df_cols_per_jid[ind]) + "],6);"])
+                                     "printMat<T,6," + str(num_cols) + ">(&s_temp[" + str(off) + "],6);"])
         self.gen_add_end_control_flow()
 
     # extract dc/du
