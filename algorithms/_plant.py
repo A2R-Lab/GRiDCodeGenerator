@@ -380,8 +380,9 @@ def gen_plant_step_hessian(self):
     z = [dq(nv); dqd(nv); du(nv)], output rows = [position-tangent(nv); velocity(nv)].
     The emitted s_d2AB IS grid::integrator_hessian_device's output (this is what
     the equivalence test asserts vs the RBDReference oracle). Scope: EULER /
-    SI-EULER on a FIXED base; floating-base + multi-stage RK static_assert out in
-    the composed device fn (clean-break). See f1_plant_step_hessian_plan.md.
+    SI-EULER on BOTH fixed and floating base (floating via the SE(3)-retract Hessian
+    in integrator_hessian_device); only multi-stage RK static_asserts out in the
+    composed device fn (clean-break). See f1_plant_step_hessian_plan.md.
 
     The caller supplies the fdsva_so scratch buffers (s_df2/s_idsva_so/s_Minv/
     s_df_du/s_qdd) the inner needs (it is an inner-owns-placement orchestrator);

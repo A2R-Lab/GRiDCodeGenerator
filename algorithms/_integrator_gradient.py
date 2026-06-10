@@ -1767,9 +1767,11 @@ def gen_integrator_hessian_device(self):
     Velocity rows (bottom nv) = dt*D2 (both Euler and SI-Euler). Position rows
     (top nv) = 0 (Euler) or dt*dt*D2 (SI-Euler, q_{k+1}=q+dt*v_{k+1}).
 
-    Scope: EULER + SEMI_IMPLICIT_EULER, fixed-base. Multi-stage RK (the 2nd-order
-    chain rule) and floating-base (the SE(3) retract Hessian) static_assert out
-    (clean-break: no silently-wrong tensor). SCRATCH_IN_SMEM=true is the SHARED
+    Scope: EULER + SEMI_IMPLICIT_EULER, BOTH fixed and floating base (floating is
+    routed to gen_integrator_hessian_device_floating, the SE(3)-retract Hessian, at
+    the top of this function; the body below is the fixed-base composition). Only
+    multi-stage RK (the 2nd-order chain rule) static_asserts out (clean-break: no
+    silently-wrong tensor). SCRATCH_IN_SMEM=true is the SHARED
     (full-smem PERF) tier; the fdsva_so spill flags are threaded through for
     later tier work but default to the all-smem placement."""
     n = self.robot.get_num_vel()
@@ -1810,7 +1812,8 @@ def gen_integrator_hessian_device(self):
                                "bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
-    # Clean-break deferrals: only single-stage Euler / SI-Euler on a fixed base.
+    # Clean-break deferral: only single-stage Euler / SI-Euler (multi-stage RK out).
+    # Floating base IS supported (routed to gen_integrator_hessian_device_floating below).
     self.gen_add_code_line("static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER,")
     self.gen_add_code_line("    \"integrator_hessian_device: only EULER / SEMI_IMPLICIT_EULER are supported \"")
     self.gen_add_code_line("    \"(multi-stage RK 2nd-order chain rule is deferred; see f1_plant_step_hessian_plan.md).\");")
