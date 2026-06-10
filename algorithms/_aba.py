@@ -4,6 +4,54 @@ def _aba_Svec_cpp(robot, jid):
     return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in robot._get_flat_S_by_id(jid)) + "}"
 
 
+def _aba_jd_bias_term_cpp(self, jid):
+    """C++ subexpression for body ``jid``'s joint-local damping + Coulomb friction
+    bias, or "" when there is none to apply.
+
+    The ABA available-torque accumulation is ``u = tau - S^T*pA - U^T*c`` (matches
+    RBDReference.aba: ``u[inds_v] = tau - dyn_bias - ...``), where ``dyn_bias`` is
+    the SAME joint-local bias that gen_inverse_dynamics_joint_dynamics_bias folds
+    into ``s_c``. The articulated inertia ``d``/``IA`` is left untouched (the
+    explicit-value path puts damping only in the bias, exactly as the oracle does).
+    Returned string is ``alpha*(b*qd + f*sign(qd))`` (reading ``s_qd[vs]``); callers
+    subtract it from the per-joint ``s_tau`` read at each ``u`` site.
+
+    EMITTED ONLY when USE_JOINT_DYNAMICS is enabled AND the robot declares nonzero
+    damping/friction (both decided at codegen time). With the flag off (the DEFAULT)
+    this returns "" for every joint, so the u-sites are byte-identical to the
+    historical emit -- damped or not. Mirrors the ID emitter's gate, mimic alpha-fold,
+    np.sign((qd>0)-(qd<0)), and literal-baked coefficients exactly.
+    """
+    if not getattr(self, "USE_JOINT_DYNAMICS", False):
+        return ""
+    if not (self.robot.robot_has_joint_damping() or self.robot.robot_has_joint_friction()):
+        return ""
+    if self.robot.floating_base and jid == 0:
+        return ""  # floating root carries no damping/friction
+    HAS_DAMP = self.robot.robot_has_joint_damping()
+    HAS_FRIC = self.robot.robot_has_joint_friction()
+    b = float(self.robot.get_damping_by_id(jid)) if HAS_DAMP else 0.0
+    fr = float(self.robot.get_friction_by_id(jid)) if HAS_FRIC else 0.0
+    if b == 0.0 and fr == 0.0:
+        return ""
+    if self.robot_has_mimic_joints():
+        vs = self._v_slot_cpp(jid)
+        alpha = float(self._alpha_for_jid(jid))
+    else:
+        vs = self.robot.get_joint_index_v(jid)
+        alpha = 1.0
+    qd = "s_qd[" + str(vs) + "]"
+    terms = []
+    if b != 0.0:
+        terms.append("static_cast<T>(" + repr(alpha * b) + ") * " + qd)
+    if fr != 0.0:
+        # exact sign matching np.sign (0 at qd==0): (qd>0) - (qd<0).
+        terms.append("static_cast<T>(" + repr(alpha * fr)
+                     + ") * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
+                     + qd + " < static_cast<T>(0)))")
+    return " + ".join(terms)
+
+
 def gen_aba_inner_floating(self):
     NJ = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
@@ -222,7 +270,9 @@ def gen_aba_inner_floating(self):
         self.gen_add_sync()
         self.gen_add_serial_ops()
         self.gen_add_code_line("s_temp[" + str(dOffset + jid) + "] = static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(UOffset + jid6 + S_ind) + "];")
-        self.gen_add_code_line("s_temp[" + str(uOffset + jid) + "] = s_tau[" + str(dof) + "] - static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(pAOffset + jid6 + S_ind) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(UOffset + jid6) + "], &s_temp[" + str(cOffset + jid6) + "]);")
+        _jd_bias = _aba_jd_bias_term_cpp(self, jid)
+        _jd_sub = (" - (" + _jd_bias + ")") if _jd_bias else ""
+        self.gen_add_code_line("s_temp[" + str(uOffset + jid) + "] = s_tau[" + str(dof) + "]" + _jd_sub + " - static_cast<T>(" + str(S_sign) + ") * s_temp[" + str(pAOffset + jid6 + S_ind) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(UOffset + jid6) + "], &s_temp[" + str(cOffset + jid6) + "]);")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -641,7 +691,9 @@ def gen_aba_inner(self):
                 self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_temp[36*" + str(jid) + " + r + 6*p] * S_skew[p]; } s_temp[" + str(84*n + jid6) + " + r] = acc; }")
                 # d = S^T U ; u = tau - S^T pA
                 self.gen_add_code_line("  s_temp[" + str(96*n + jid) + "] = dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(84*n + jid6) + "]);")
-                self.gen_add_code_line("  s_temp[" + str(97*n + jid) + "] = s_tau[" + str(jid) + "] - dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(78*n + jid6) + "]); }")
+                _jd_bias = _aba_jd_bias_term_cpp(self, jid)
+                _jd_sub = (" - (" + _jd_bias + ")") if _jd_bias else ""
+                self.gen_add_code_line("  s_temp[" + str(97*n + jid) + "] = s_tau[" + str(jid) + "]" + _jd_sub + " - dot_prod<T,6,1,1>(S_skew, &s_temp[" + str(78*n + jid6) + "]); }")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
         else:
@@ -675,6 +727,13 @@ def gen_aba_inner(self):
 
             self.gen_add_code_line("T tempval = (" + S_sign_cpp + ") * s_temp[78 * " + str(n) + " + jid6 + " + S_ind_cpp +"];")
             self.gen_add_code_line("s_temp[97 * " + str(n) + " + jid] = s_tau[jid] - tempval;")
+            # joint-local damping + Coulomb friction bias: u -= alpha*(b*qd+f*sign(qd)).
+            # Gated/byte-neutral; per-python-jid since the bias coeffs (and mimic
+            # v-slot) differ across the joints multiplexed onto this level's `jid`.
+            for _pyjid in inds:
+                _jd_bias = _aba_jd_bias_term_cpp(self, _pyjid)
+                if _jd_bias:
+                    self.gen_add_code_line("if (jid == " + str(_pyjid) + ") { s_temp[97 * " + str(n) + " + jid] -= (" + _jd_bias + "); }")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
         
