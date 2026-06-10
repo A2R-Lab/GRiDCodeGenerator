@@ -229,18 +229,22 @@ def gen_fdsva_so_device_function_call(self,
                                           d_workspace_pool_name = "nullptr",
                                           d_fd_grad_spill_name = "nullptr",
                                           s_fdsva_temp_name = "nullptr",
-                                          mujoco_output_expr = None):
+                                          mujoco_output_expr = None,
+                                          d_mjx_scratch_name = "nullptr"):
     """Emit the call to `fdsva_so_device`. Arg order MUST match the def in
     gen_fdsva_so_device. Pool/spill regions default to nullptr (unused under
     the matching if-constexpr); the kernel passes real pointers per tier.
     mujoco_output_expr (floating non-mimic/skew): the trailing MUJOCO_OUTPUT
-    template arg; None -> 4-arg template (byte-identical for non-mjx kernels)."""
+    template arg; None -> 4-arg template (byte-identical for non-mjx kernels).
+    d_mjx_scratch_name: the mjx-epilogue scratch arena (only forwarded when the
+    mjx template arg is present so the non-mjx signature stays byte-identical)."""
     mjx_tmpl = ("" if mujoco_output_expr is None else ", " + mujoco_output_expr)
     tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + mjx_tmpl + ">"
     start = "fdsva_so_device" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
     middle = self.gen_insert_helpers_function_call()
+    mjx_arg = (", " + d_mjx_scratch_name) if mujoco_output_expr is not None else ""
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
-           + s_fdsva_temp_name + ", d_robotModel, gravity);")
+           + s_fdsva_temp_name + ", d_robotModel, gravity" + mjx_arg + ");")
     self.gen_add_code_line(start + middle + end)
 
 def gen_fdsva_so_device(self):
@@ -277,8 +281,19 @@ def gen_fdsva_so_device(self):
     func_def_start = "void fdsva_so_device("
     func_def_middle = ("T *s_df2, T *s_idsva_so, T *s_Minv, T *s_df_du, T *s_qdd, "
                        "const T *s_q, const T *s_qd, const T *s_u, ")
-    func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
-                    "const robotModel<T> *d_robotModel, const T gravity) {")
+    # MUJOCO_OUTPUT (floating non-mimic/skew): the mjx epilogue recomputes Minv /
+    # qdd / the fd gradient FRESH into d_mjx_scratch (a carve of the SO-temp region
+    # of d_workspace, dead post-contract) so it NEVER reads the possibly-spilled
+    # s_Minv / s_df_du / s_qdd (the §1g/§1h liveness bug). Defaulted nullptr; only
+    # read under if constexpr(MUJOCO_OUTPUT). Mirrors idsva_so's d_mjx_scratch.
+    mjx_inner_sig = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    if mjx_inner_sig:
+        func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
+                        "const robotModel<T> *d_robotModel, const T gravity, T *d_mjx_scratch = nullptr) {")
+        func_params.append("d_mjx_scratch is the mjx-epilogue scratch arena (SO-temp region of d_workspace; only read when MUJOCO_OUTPUT)")
+    else:
+        func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
+                        "const robotModel<T> *d_robotModel, const T gravity) {")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
@@ -327,66 +342,34 @@ def gen_fdsva_so_device(self):
     # ---- mjx output-convention epilogue (floating non-mimic/skew only) ----
     # Runs at the very END, where the contract scratch (s_temp pool when
     # CONTRACT_IN_SMEM, else s_fdsva_temp) is DEAD and s_df2 holds the finalized
-    # pin SO tensors. s_Minv / s_qdd / s_df_du / s_q / s_qd / s_u are all live, so
-    # — unlike idsva_so — NO inner recompute is needed: the fd value (s_qdd),
-    # Minv (s_Minv) and the first-order fd gradient (s_df_du) are already in-flight.
+    # pin SO tensors. The epilogue must NOT read s_Minv / s_df_du / s_qdd directly:
+    # on spill tiers those live in d_workspace and may be CLOBBERED before the
+    # epilogue runs (the §1g/§1h liveness bug — fdsva_so was guarded for it). Mirror
+    # idsva_so EXACTLY: recompute Minv / qdd / dqdd_dq|dqdd_dqd FRESH into a disjoint
+    # d_mjx_scratch band (carve of d_workspace's SO-temp region, dead post-contract),
+    # then run the per-k assembly register-locally (R + base vectors rebuilt per loop
+    # body, nothing staged to shared scratch) parallel over k, and copy the mjx band
+    # back over s_df2 block-parallel.
     if mjx_inner:
         self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
-        # The mjx output band (4*NV^3) reuses s_idsva_so: it is DEAD after the contract
-        # consumed it into s_df2, is exactly 4*NV^3, and is a DISTINCT buffer disjoint
-        # from every live source the assembly reads (s_df2 / s_df_du / s_Minv / s_q/qd/u/qdd).
-        # The previous choice (s_temp / s_fdsva_temp) ALIASES the spilled s_df_du / s_Minv
-        # in d_workspace on robots where fdsva_so spills (e.g. go2), corrupting the
-        # transform with prior-call workspace state. s_idsva_so is never read by the epilogue.
-        self.gen_add_code_line("T *s_mjx_scratch = s_idsva_so;")
         _emit_fdsva_so_mjx_output(self)
         self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 
-def _emit_fdsva_so_mjx_output(self):
-    """Emit the MuJoCo (mjx) output-convention epilogue for fdsva_so, transforming
-    the 4 pin second-order tensors held in ``s_df2`` to the mjx convention IN PLACE.
-    Floating-base (non-mimic/skew) only; runs at the END of ``fdsva_so_device``
-    where the contract scratch (``s_mjx_scratch``) is dead.
-
-    ``s_df2`` is 4 contiguous NV^3 ROW-major blocks ``[i*NV*NV + j*NV + k]``:
-      [0] daba_dqdq[i,j,k]  [1] daba_dvdq[i,qd,q] (=cross)  [2] daba_dvdv[i,j,k]
-      [3] daba_dtdq[i,u,q]  (= dMinv[i,u]/dq, since dqdd/du = Minv).
-    Matches the RBDReference.fdsva_so tuple order EXACTLY.
-
-    The explicit per-k form is the forward-dynamics analog of idsva_so's: it
-    complex-step-equivalently differentiates the first-order transform
-    ``fd_gradient_pin_to_mjx``. Transcribed verbatim from
-    docs/open-tasks/mjx_proto/proto_fdsva_so_emit_spec.py (validated <1e-13 vs
-    second_order_fd_pin_to_mjx). In-kernel quantities (all live):
-      s_Minv (dense, SYMMETRIC; read [(r<=c)?c*n+r:r*n+c]), s_qdd (fd value qdd),
-      s_df_du = dqdd_dq | dqdd_dqd (col-major, two NV*NV blocks), s_q/s_qd/s_u.
-    The mjx output band lives in s_mjx_scratch (4*NV^3; bound to s_idsva_so, which is
-    dead after the contract and disjoint from every live source); copied back over s_df2."""
-    nv = self.robot.get_num_vel()
+def _emit_fdsva_so_mjx_locals_lines(self, nv, nv3):
+    """Register-/stack-local recompute of the loop-invariant helpers, emitted at
+    the TOP of every parallel-loop body (mirrors _emit_idsva_so_mjx_locals_lines).
+    SAFE by construction: R is rebuilt from the base quaternion in s_q; the base
+    source vectors from s_qd/s_u and the FRESH fd value qdd in s_mjx_qdd; the
+    tensor + matrix pointers are plain offsets into s_df2 / s_mjx_* — NOTHING is
+    staged into shared scratch (no aliasing risk vs the spilled buffers). A few
+    dozen flops per thread. The R-build math is copied verbatim from the idsva_so
+    epilogue / the id-gradient reference."""
     nv2 = nv * nv
-    nv3 = nv * nv * nv
-    self.gen_add_code_line("// === mjx output convention (floating-base fdsva_so) ===")
-    self.gen_add_code_lines([
-        "T *s_dqdd_dq  = s_df_du;                 // col-major dqdd_dq  [c*NV+r]",
-        "T *s_dqdd_dqd = s_df_du + " + str(nv2) + ";   // col-major dqdd_dqd [c*NV+r]",
-        "T *s_mjx_out  = s_mjx_scratch;           // 4*NV^3 mjx output band",
-        "// pin tensor blocks in s_df2 (row-major [(i*NV+j)*NV+k]):",
-        "T *T_d2q   = s_df2 + " + str(0 * nv3) + ";   // daba_dqdq",
-        "T *T_cross = s_df2 + " + str(1 * nv3) + ";   // daba_dvdq [i,qd,q]",
-        "T *T_d2qd  = s_df2 + " + str(2 * nv3) + ";   // daba_dvdv",
-        "T *T_dtdq  = s_df2 + " + str(3 * nv3) + ";   // daba_dtdq = dMinv/dq [i,u,q]",
-        "// mjx output blocks (same layout/order):",
-        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
-        "T *O_cross = s_mjx_out + " + str(1 * nv3) + ";",
-        "T *O_d2qd  = s_mjx_out + " + str(2 * nv3) + ";",
-        "T *O_dtdq  = s_mjx_out + " + str(3 * nv3) + ";",
-    ])
-    # ---- single-thread assembly (correctness-first; nv small) ----
-    self.gen_add_code_line("if (threadIdx.x == 0 && threadIdx.y == 0) {", True)
-    # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6].
-    self.gen_add_code_lines([
+    return [
+        # R (row-major R[3*i+j]) from the xyzw base quaternion s_q[3..6] — matches
+        # the idsva_so epilogue / mujoco_convention.rotation_from_quat_xyzw exactly.
         "T qx = s_q[3], qy = s_q[4], qz = s_q[5], qw = s_q[6];",
         "T xx = qx*qx, yy = qy*qy, zz = qz*qz;",
         "T xy = qx*qy, xz = qx*qz, yz = qy*qz, wx = qw*qx, wy = qw*qy, wz = qw*qz;",
@@ -397,12 +380,127 @@ def _emit_fdsva_so_mjx_output(self):
         "T v_lin[3]   = {s_qd[0], s_qd[1], s_qd[2]};",
         "T omega[3]   = {s_qd[3], s_qd[4], s_qd[5]};",
         "T u_lin[3]   = {s_u[0], s_u[1], s_u[2]};",
-        "T qdd_lin[3] = {s_qdd[0], s_qdd[1], s_qdd[2]};",
+        # FRESH fd value qdd (recomputed into s_mjx_qdd; NOT the possibly-spilled s_qdd).
+        "T qdd_lin[3] = {s_mjx_qdd[0], s_mjx_qdd[1], s_mjx_qdd[2]};",
+        # FRESH fd gradient (col-major) + FRESH dense symmetric Minv — all in the
+        # disjoint d_mjx_scratch band, never the spilled s_df_du / s_Minv. The slab
+        # formulas read these by the names s_dqdd_dq / s_dqdd_dqd / s_Minv, so alias.
+        "T *s_dqdd_dq  = s_mjx_dfdu;                 // col-major dqdd_dq  [c*NV+r]",
+        "T *s_dqdd_dqd = s_mjx_dfdu + " + str(nv2) + ";   // col-major dqdd_dqd [c*NV+r]",
+        "T *s_Minv     = s_mjx_Minv;                 // dense symmetric Minv (fresh)",
+        "// pin tensor blocks in s_df2 (row-major [(i*NV+j)*NV+k]):",
+        "T *T_d2q   = s_df2 + " + str(0 * nv3) + ";   // daba_dqdq",
+        "T *T_cross = s_df2 + " + str(1 * nv3) + ";   // daba_dvdq [i,qd,q]",
+        "T *T_d2qd  = s_df2 + " + str(2 * nv3) + ";   // daba_dvdv",
+        "T *T_dtdq  = s_df2 + " + str(3 * nv3) + ";   // daba_dtdq = dMinv/dq [i,u,q]",
+        "// mjx output blocks (same layout/order):",
+        "T *O_d2q   = s_mjx_out + " + str(0 * nv3) + ";",
+        "T *O_cross = s_mjx_out + " + str(1 * nv3) + ";",
+        "T *O_d2qd  = s_mjx_out + " + str(2 * nv3) + ";",
+        "T *O_dtdq  = s_mjx_out + " + str(3 * nv3) + ";",
+    ]
+
+
+def _emit_fdsva_so_mjx_output(self):
+    """Emit the MuJoCo (mjx) output-convention epilogue for fdsva_so, transforming
+    the 4 pin second-order tensors held in ``s_df2`` to the mjx convention IN PLACE.
+    Floating-base (non-mimic/skew) only; runs at the END of ``fdsva_so_device``
+    where the contract scratch is dead.
+
+    ``s_df2`` is 4 contiguous NV^3 ROW-major blocks ``[i*NV*NV + j*NV + k]``:
+      [0] daba_dqdq[i,j,k]  [1] daba_dvdq[i,qd,q] (=cross)  [2] daba_dvdv[i,j,k]
+      [3] daba_dtdq[i,u,q]  (= dMinv[i,u]/dq, since dqdd/du = Minv).
+    Matches the RBDReference.fdsva_so tuple order EXACTLY.
+
+    LIVENESS (the §1g/§1h fix — mirrors idsva_so EXACTLY): the assembly needs the
+    fd value qdd, the dense symmetric Minv, and the fd gradient dqdd_dq|dqdd_dqd.
+    On spill tiers the in-flight s_qdd / s_Minv / s_df_du live in d_workspace and
+    may be CLOBBERED before this runs, so we RECOMPUTE all three FRESH into a
+    disjoint ``d_mjx_scratch`` band (a carve of d_workspace's SO-temp region, dead
+    after the contract) and read ONLY from there. s_XImats/s_q/s_qd/s_u are live.
+
+    d_mjx_scratch layout (all dead post-assembly):
+      [0,         NV*NV)        s_M       (dense mass matrix, crba_inner)
+      [NV*NV,   3*NV*NV)        s_dc_du   (pin dtau_dq | dtau_dqd, col-major)
+      [3*NV*NV, 4*NV*NV)        s_mjx_Minv(dense symmetric Minv, inverse of s_M)
+      [4*NV*NV, 6*NV*NV)        s_mjx_dfdu(fd gradient dqdd_dq | dqdd_dqd, col-major)
+      [6*NV*NV, 6*NV*NV+NV)     s_mjx_qdd (fd value qdd)
+      [VAFOFF,  VAFOFF+18*NJ)   s_vaf     (id-value intermediate band)
+      [INNERTMP,INNERTMP+IDG)   reused-inner scratch (id/crba/id-grad/invert temps)
+      [OUT,     OUT+4*NV^3)     mjx output band (copied back over s_df2 at the end)
+
+    The per-k assembly (explicit form, forward-dynamics analog of idsva_so's) is
+    transcribed verbatim from docs/open-tasks/mjx_proto/proto_fdsva_so_emit_spec.py
+    (validated <1e-13 vs second_order_fd_pin_to_mjx)."""
+    nv = self.robot.get_num_vel()
+    NJ = self.robot.get_num_joints()
+    nv2 = nv * nv
+    nv3 = nv * nv * nv
+    M_off       = 0
+    DCDU_off    = nv2            # dtau_dq at [DCDU_off + c*nv + r]; dtau_dqd at [DCDU_off + nv2 + ...]
+    MINV_off    = 3 * nv2
+    DFDU_off    = 4 * nv2        # fd gradient dqdd_dq | dqdd_dqd (col-major)
+    QDD_off     = 6 * nv2        # fd value qdd (nv)
+    VAF_off     = 6 * nv2 + nv
+    vaf_band    = 18 * NJ
+    INNERTMP_off = VAF_off + vaf_band
+    idgrad_temp = self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
+    OUT_off     = INNERTMP_off + idgrad_temp
+
+    self.gen_add_code_line("// === mjx output convention (floating-base fdsva_so) ===")
+    self.gen_add_code_lines([
+        "T *s_M        = d_mjx_scratch + " + str(M_off) + ";       // dense mass matrix (crba_inner)",
+        "T *s_dc_du    = d_mjx_scratch + " + str(DCDU_off) + ";    // pin dtau_dq | dtau_dqd",
+        "T *s_mjx_Minv = d_mjx_scratch + " + str(MINV_off) + ";    // dense symmetric Minv = inv(M)",
+        "T *s_mjx_dfdu = d_mjx_scratch + " + str(DFDU_off) + ";    // fd gradient dqdd_dq | dqdd_dqd (col-major)",
+        "T *s_mjx_qdd  = d_mjx_scratch + " + str(QDD_off) + ";     // fd value qdd",
+        "T *s_vaf      = d_mjx_scratch + " + str(VAF_off) + ";     // id-value band",
+        "T *s_mjx_tmp  = d_mjx_scratch + " + str(INNERTMP_off) + ";    // reused-inner scratch (one at a time)",
+        "T *s_mjx_out  = d_mjx_scratch + " + str(OUT_off) + ";     // 4*NV^3 mjx output band",
     ])
-    _emit_fdsva_so_mjx_perk_assembly(self, nv)
-    self.gen_add_end_control_flow()  # if threadIdx == 0
+    # ---- 1) recompute the fd VALUE qdd FRESH (forward_dynamics_inner) ----
+    # Uses the live s_XImats (built for the converted q). s_mjx_tmp is its scratch.
+    self.gen_add_code_line("// recompute Minv / qdd / dqdd_dq|dqdd_dqd FRESH (the spilled in-flight copies may be clobbered)")
+    self.gen_forward_dynamics_inner_function_call(
+        updated_var_names=dict(s_qdd_name="s_mjx_qdd", s_temp_name="s_mjx_tmp",
+                               d_workspace_name="nullptr", d_f_ext_name="nullptr"))
     self.gen_add_sync()
-    # ---- copy the mjx output band back over s_df2 (block-parallel) ----
+    # ---- 2) recompute dense M (crba_inner), then Minv = inv(M) (dense symmetric) ----
+    self.gen_crba_inner_function_call(
+        updated_var_names=dict(s_M_name="s_M", s_temp_name="s_mjx_tmp", d_workspace_name="nullptr"),
+        temp_in_smem_expr="true")
+    self.gen_add_sync()
+    # invert_matrix(n, in, out, scratch) -> dense symmetric Minv. Scratch >= NV in
+    # s_mjx_tmp (disjoint from s_M / s_mjx_Minv).
+    self.gen_add_code_line("invert_matrix(" + str(nv) + ", s_M, s_mjx_Minv, s_mjx_tmp);")
+    self.gen_add_sync()
+    # ---- 3) recompute pin id-value band (vaf) then dtau_dq|dtau_dqd (id-gradient) ----
+    self.gen_inverse_dynamics_inner_function_call(
+        compute_c=False, use_qdd_input=True,
+        updated_var_names=dict(s_vaf_name="s_vaf", s_qdd_name="s_mjx_qdd",
+                               s_temp_name="s_mjx_tmp", d_f_ext_name="nullptr"))
+    self.gen_add_sync()
+    self.gen_inverse_dynamics_gradient_inner_function_call(
+        dict(s_dc_du_name="s_dc_du", s_vaf_name="s_vaf", s_temp_name="s_mjx_tmp",
+             d_temp_spill_name="nullptr", temp_spill_flag_name="false"))
+    self.gen_add_sync()
+    # ---- 4) fd gradient s_mjx_dfdu = -Minv @ dc_du (col-major), block-parallel ----
+    # Mirrors gen_fdsva_so_fd_gradient_inline's final reduction but reads the FRESH
+    # s_mjx_Minv / s_dc_du and writes the FRESH s_mjx_dfdu.
+    self.gen_add_parallel_loop("ind", str(2 * nv2))
+    self.gen_add_code_line(f"int row = ind % {nv}; int dc_col_offset = ind - row;")
+    self.gen_add_code_line("T val = static_cast<T>(0);")
+    self.gen_add_code_line(f"for(int col = 0; col < {nv}; col++) {{", True)
+    self.gen_add_code_line(f"int index = (row <= col) * (col * {nv} + row) + (row > col) * (row * {nv} + col);")
+    self.gen_add_code_line("val += s_mjx_Minv[index] * s_dc_du[dc_col_offset + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("s_mjx_dfdu[ind] = -val;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    # ---- 5) per-k assembly (parallel over k; register-local R + base vectors) ----
+    _emit_fdsva_so_mjx_perk_assembly(self, nv)
+    self.gen_add_sync()
+    # ---- 6) copy the mjx output band back over s_df2 (block-parallel) ----
     self.gen_add_parallel_loop("ci", str(4 * nv3))
     self.gen_add_code_line("s_df2[ci] = s_mjx_out[ci];")
     self.gen_add_end_control_flow()
@@ -513,6 +611,13 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if use_workspace_Minv:
             # Phase 3e: s_Minv lives just past s_df_du in the FDSVA_SO spill section.
             self.gen_add_code_line('T *s_Minv = reinterpret_cast<T *>(&d_workspace[' + ws_k + 'GRID_FDSVA_SO_SPILL_OFFSET_BYTES<T>() + ' + str(2*n*n) + '*sizeof(T)]);')
+        # MUJOCO_OUTPUT: carve d_mjx_scratch from the SO-temp region of d_workspace.
+        # That region holds the contract scratch (s_fdsva_temp), which is DEAD by the
+        # time the epilogue runs, so the reuse is safe and DISJOINT from the fd_grad /
+        # s_df_du / s_Minv spill bands the epilogue must not read. Mirrors idsva_so.
+        if mjx_kernel:
+            self.gen_add_code_line("T *d_mjx_scratch = nullptr; (void)d_mjx_scratch;")
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) { d_mjx_scratch = reinterpret_cast<T *>(&d_workspace[" + ws_k + "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]); }")
         if not timing:
             self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
             # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
@@ -524,7 +629,8 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             d_workspace_pool_name = "s_fdsva_temp" if use_workspace_idsva_temp else "nullptr",
             d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
             s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr",
-            mujoco_output_expr = "MUJOCO_OUTPUT" if mjx_kernel else None)
+            mujoco_output_expr = "MUJOCO_OUTPUT" if mjx_kernel else None,
+            d_mjx_scratch_name = "d_mjx_scratch" if mjx_kernel else "nullptr")
 
     # MUJOCO_OUTPUT: convert the mjx-frame inputs (quat wxyz->xyzw, base-linear
     # qd/u -> pin frame) in place BEFORE the device inner runs (XImats build from
@@ -671,11 +777,25 @@ def _emit_fdsva_so_mjx_perk_assembly(self, n):
     """Per-k assembly of all 4 fdsva_so mjx tensors (d2q / cross / d2qd / dtdq),
     transcribed op-for-op from proto_fdsva_so_emit_spec.py. Matrices are flat
     col-major X[c*n + r]; tensors row-major T[(i*n + j)*n + k]. s_Minv is dense and
-    SYMMETRIC (read [(r<=c)? c*n+r : r*n+c]); s_dqdd_dq / s_dqdd_dqd are col-major."""
+    SYMMETRIC (read [(r<=c)? c*n+r : r*n+c]); s_dqdd_dq / s_dqdd_dqd are col-major.
+
+    PARALLEL over k (the outer tensor-slab index — mirrors _emit_idsva_so_mjx_perk
+    _assembly): each k-iteration is fully independent — its scratch is thread-stack
+    -local, it reads only shared read-only inputs (T_*, the FRESH s_mjx_* buffers,
+    R/v/omega/...), and writes ONLY O_*[...,k]. The loop-invariant helpers (R + base
+    vectors + tensor/matrix ptrs) are recomputed REGISTER-/STACK-LOCAL at the top of
+    every loop body (nothing staged to shared scratch -> zero aliasing risk vs the
+    spilled buffers; cf. the fdsva_so spill bug §1g)."""
+    nv3 = n * n * n
     N = str(n)
     def t3(i, j, k):
         return "((" + i + ")*" + N + " + (" + j + "))*" + N + " + (" + k + ")"
-    # Thread-stack work buffers (col-major n*n) + sensitivities + jacobians.
+    self.gen_add_parallel_loop("k", N)
+    # Loop-invariant helpers recomputed register-/stack-local at the top of the body
+    # (R + base vectors + tensor/matrix ptrs) — nothing staged to shared scratch.
+    self.gen_add_code_lines(_emit_fdsva_so_mjx_locals_lines(self, n, nv3))
+    # Per-k thread-stack work buffers (col-major n*n) + sensitivities + jacobians —
+    # declared per-iteration: one private copy per thread, no cross-k sharing.
     self.gen_add_code_lines([
         "T work1[" + str(n * n) + "], work2[" + str(n * n) + "], inner_u[" + str(n * n) + "];",
         "T d_dq[" + str(n * n) + "], d_dqd[" + str(n * n) + "], d_Mi[" + str(n * n) + "];",
@@ -683,7 +803,6 @@ def _emit_fdsva_so_mjx_perk_assembly(self, n):
         "T jqk[" + str(n) + "], jvk[" + str(n) + "], juk[" + str(n) + "];",
         "T jvvk[" + str(n) + "], juuk[" + str(n) + "];",
     ])
-    self.gen_add_code_line("for (int k = 0; k < " + N + "; k++) {", True)
     # ---- jqk / jvk / juk (base-block sparse); jvvk/juuk == jqk-form (G^T col k) ----
     self.gen_add_code_lines([
         "for (int q_ = 0; q_ < " + N + "; q_++) { jqk[q_] = static_cast<T>(0); jvk[q_] = static_cast<T>(0); juk[q_] = static_cast<T>(0); jvvk[q_] = static_cast<T>(0); juuk[q_] = static_cast<T>(0); }",
