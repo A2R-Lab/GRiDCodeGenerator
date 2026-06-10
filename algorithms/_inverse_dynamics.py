@@ -170,10 +170,26 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         self.gen_add_code_line("const T s_mimic_alpha[" + str(n) + "] = {" + alpha_arr + "};")
         self.gen_add_code_line("(void)s_mimic_vslot; (void)s_mimic_alpha;")
 
+    HAS_SPHERICAL = self.robot.robot_has_spherical()
+
+    def _v_idx(jid):
+        # Scalar reduced v-slot for a single-DoF body `jid` (compile-time int).
+        # On a robot with a spherical joint, downstream joints are shifted off
+        # `jid` (the spherical consumes 3 v-slots while it is 1 body), so read
+        # the parser's dense v-map instead of the raw jid. Byte-identical on
+        # all-cardinal robots (v-slot == jid there).
+        v = self.robot.get_joint_index_v(jid)
+        if isinstance(v, (list, tuple)):
+            v = v[0]
+        return v
+
     def _id_qd(jid_expr, qd_name="s_qd"):
         # Read body `jid_expr`'s joint velocity/accel, mimic-folded.
         if HAS_MIMIC:
             return "s_mimic_alpha[" + str(jid_expr) + "] * " + qd_name + "[s_mimic_vslot[" + str(jid_expr) + "]]"
+        # Spherical-shifted v-slot for a compile-time-int body id (single-DoF).
+        if HAS_SPHERICAL and isinstance(jid_expr, int):
+            return qd_name + "[" + str(_v_idx(jid_expr)) + "]"
         return qd_name + "[" + str(jid_expr) + "]"
     #
     # Initial Debug Prints if Requested
@@ -203,12 +219,24 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         inds = self.robot.get_ids_by_bfs_level(bfs_level)
         joint_names = [self.robot.get_joint_by_id(ind).get_name() for ind in inds]
         link_names = [self.robot.get_link_by_id(ind).get_name() for ind in inds]
+        # Tier-C spherical (ball) joints: a 3-DoF angular-identity S (cols 0,1,2 =
+        # rows 0,1,2). They are NOT skew (the skew path's signed-index helpers
+        # raise on multi-DoF), so they get their OWN serial per-joint emit. Each
+        # column behaves like a cardinal angular axis reading its v-block slot.
+        def _is_spherical(j):
+            return getattr(self.robot.get_joint_by_id(j), "jtype", None) == "spherical"
+        level_has_spherical = any(_is_spherical(j) for j in inds)
         # Tier-B (skew axis): any joint at this level whose single-column S is
         # non-cardinal. The signed-index topology helpers raise on such joints,
         # so we route the whole level through the dense-6-vector emit. Cardinal-
         # only levels (every current robot) take the byte-identical fast path.
-        level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
-        if not level_has_skew:
+        # Spherical joints are multi-column (not cardinal) but handled above, so
+        # exclude them from the skew classification.
+        level_has_skew = any(
+            (not _is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
+            for j in inds
+        )
+        if not level_has_skew and not level_has_spherical:
             parent_ind_cpp, S_ind_cpp = self.gen_topology_helpers_pointers_for_cpp(inds, NO_GRAD_FLAG = True)
             S_sign_cpp = self.gen_topology_S_sign_for_cpp(inds)
         else:
@@ -226,6 +254,40 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line(comment)
             # load in 0 to v and X*gravity to a in parallel
             # note that depending on S we need to add qd/qdd to one entry
+            if level_has_spherical:
+                # Tier-C spherical at level 0: v[k]=S*qd (angular rows 0..2 read
+                # the joint's 3-wide v-block), a = X*gravity (+ S*qdd). The mxS(v)*v
+                # Coriolis term vanishes at level 0 (parent v=0 => v=vJ pure-angular
+                # => crm(w)*[w;0]=0), so it is intentionally omitted here. Serial
+                # per-joint (correctness-first; spherical robots are rare).
+                self.gen_add_serial_ops()
+                for jid_val in inds:
+                    jid6 = 6 * jid_val
+                    if _is_spherical(jid_val):
+                        vblk = self.robot.get_joint_index_v(jid_val)
+                        for r in range(6):
+                            self.gen_add_code_line("s_vaf[" + str(jid6 + r) + "] = static_cast<T>(0);")
+                            self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + r) + "] = -s_XImats[" + str(6*jid6 + 30 + r) + "]*gravity;")
+                        for k in range(3):  # angular-identity columns -> rows 0,1,2
+                            self.gen_add_code_line("s_vaf[" + str(jid6 + k) + "] += s_qd[" + str(vblk[k]) + "];")
+                            if use_qdd_input:
+                                self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + k) + "] += s_qdd[" + str(vblk[k]) + "];")
+                    else:
+                        # cardinal single-DoF joint sharing this level with a spherical
+                        S_desc = self._id_S_desc(jid_val)
+                        qd_term = _id_qd(jid_val)
+                        for r in range(6):
+                            self.gen_add_code_line("s_vaf[" + str(jid6 + r) + "] = static_cast<T>(0);")
+                            self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + r) + "] = -s_XImats[" + str(6*jid6 + 30 + r) + "]*gravity;")
+                        for r in range(6):
+                            coeff = _id_S_row_coeff(S_desc, r)
+                            if coeff is not None:
+                                self.gen_add_code_line("s_vaf[" + str(jid6 + r) + "] += (" + coeff + ") * " + qd_term + ";")
+                                if use_qdd_input:
+                                    self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + r) + "] += (" + coeff + ") * " + _id_qd(jid_val, "s_qdd") + ";")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+                continue
             if level_has_skew:
                 # Tier B (skew): each joint has a dense S column. Parallelize over
                 # the 6*len(inds) rows and dispatch by compile-time jid (mirrors
@@ -303,6 +365,52 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             comment = "// s_v[k] = X[k]*v[parent_k] + S[k]*qd[k] and s_a[k] = X[k]*a[parent_k]"
             comment += " + S[k]*qdd[k] + mxS[k](v[k])*qd[k]" if use_qdd_input else " + mxS[k](v[k])*qd[k]"
             self.gen_add_code_line(comment)
+            if level_has_spherical:
+                # Tier-C spherical mid-chain: v[jid]=X*v[parent]+S*qd, a[jid]=X*a[parent]
+                # (+S*qdd) + crm(v[jid])*vJ, with vJ=S*qd (pure-angular). Serial per
+                # joint (correctness-first; thread-invariant via single-thread dot rows).
+                self.gen_add_serial_ops()
+                for jid_val in inds:
+                    jid6 = 6 * jid_val
+                    parent6 = 6 * self.robot.get_parent_id(jid_val)
+                    xoff = 36 * jid_val
+                    # v[jid] = X * v[parent]  (column-major 6x6: X[xoff + 6*c + r])
+                    for r in range(6):
+                        self.gen_add_code_line("s_vaf[" + str(jid6 + r) + "] = dot_prod<T,6,6,1>(&s_XImats[" + str(xoff + r) + "], &s_vaf[" + str(parent6) + "]);")
+                    # a[jid] = X * a[parent]
+                    for r in range(6):
+                        self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + r) + "] = dot_prod<T,6,6,1>(&s_XImats[" + str(xoff + r) + "], &s_vaf[" + str(n*6 + parent6) + "]);")
+                    if _is_spherical(jid_val):
+                        vblk = self.robot.get_joint_index_v(jid_val)
+                        # vJ = S*qd (angular rows 0..2); add to v, build the local vJ
+                        self.gen_add_code_line("{ T vJ[6] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)};")
+                        for k in range(3):
+                            self.gen_add_code_line("  vJ[" + str(k) + "] = s_qd[" + str(vblk[k]) + "];")
+                            self.gen_add_code_line("  s_vaf[" + str(jid6 + k) + "] += vJ[" + str(k) + "];")
+                            if use_qdd_input:
+                                self.gen_add_code_line("  s_vaf[" + str(n*6 + jid6 + k) + "] += s_qdd[" + str(vblk[k]) + "];")
+                        # a[jid] += crm(v[jid]) * vJ
+                        for r in range(6):
+                            close = " }" if r == 5 else ""
+                            self.gen_add_code_line("  s_vaf[" + str(n*6 + jid6 + r) + "] += crm_mul<T>(" + str(r) + ", &s_vaf[" + str(jid6) + "], vJ);" + close)
+                    else:
+                        # cardinal single-DoF joint sharing this level with a spherical
+                        S_desc = self._id_S_desc(jid_val)
+                        qd_term = _id_qd(jid_val)
+                        self.gen_add_code_line("{ T vJ[6] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)};")
+                        for r in range(6):
+                            coeff = _id_S_row_coeff(S_desc, r)
+                            if coeff is not None:
+                                self.gen_add_code_line("  vJ[" + str(r) + "] = (" + coeff + ") * " + qd_term + ";")
+                                self.gen_add_code_line("  s_vaf[" + str(jid6 + r) + "] += vJ[" + str(r) + "];")
+                                if use_qdd_input:
+                                    self.gen_add_code_line("  s_vaf[" + str(n*6 + jid6 + r) + "] += (" + coeff + ") * " + _id_qd(jid_val, "s_qdd") + ";")
+                        for r in range(6):
+                            close = " }" if r == 5 else ""
+                            self.gen_add_code_line("  s_vaf[" + str(n*6 + jid6 + r) + "] += crm_mul<T>(" + str(r) + ", &s_vaf[" + str(jid6) + "], vJ);" + close)
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+                continue
             # Sibling joints at the SAME bfs level are independent (disjoint, already-computed
             # parents), so we fuse all of this level's per-joint 6x6 row-strided GEMVs into ONE
             # block-cooperative grid_linalg_segmented_row_strided_gemv call instead of a serial
@@ -317,7 +425,14 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             # carry a dense 6-vector S filled directly into the selector below.
             # _id_S_cols returns either ("A", s_ind, s_sign) or ("B", S_vec).
             s_descs = [self._id_S_desc(jid_val) for jid_val in inds]
-            qd_idxs = [str(jid_val + 5) if self.robot.floating_base else str(jid_val) for jid_val in inds]
+            # v-slot for each level joint's qd read. Floating: jid+5 (root offset).
+            # Spherical robots: the dense v-map (downstream joints shifted off jid).
+            # All-cardinal fixed base: jid (byte-identical).
+            qd_idxs = [
+                str(jid_val + 5) if self.robot.floating_base
+                else (str(_v_idx(jid_val)) if HAS_SPHERICAL else str(jid_val))
+                for jid_val in inds
+            ]
             tag = "lvl" + str(bfs_level)
             # compile-time descriptor / selector arrays for this level (element offsets)
             a_off = ", ".join(str(36*jid_val) for jid_val in inds)
@@ -423,6 +538,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 src_name = "&s_vaf[" + str(6*jid) + "]"
                 if self.robot.floating_base: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid + 5) + "]" # dof offset due to fb
                 elif HAS_MIMIC: scale_name = "(" + S_sign_cpp + ") * " + _id_qd(jid)
+                elif HAS_SPHERICAL: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(_v_idx(jid)) + "]"
                 else: scale_name = "(" + S_sign_cpp + ") * s_qd[" + str(jid) + "]"
             updated_var_names = dict(S_ind_name = S_ind_cpp, s_dst_name = dst_name, s_src_name = src_name, s_scale_name = scale_name)
             self.gen_mx_func_call_for_cpp(inds, PEQ_FLAG = True, SCALE_FLAG = True, updated_var_names = updated_var_names)
@@ -556,6 +672,37 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
             self.gen_add_code_line(
                 "s_c[" + str(vs) + "] += static_cast<T>(" + repr(coeff) + ") * s_vaf["
                 + str(12*n + 6*jid + s_ind) + "];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_inverse_dynamics_joint_dynamics_bias()
+        self.gen_add_end_function()
+        return
+    if compute_c and self.robot.robot_has_spherical():
+        # Tier-C spherical (non-mimic): c[inds_v] = S^T f. Spherical's S is the
+        # angular identity (cols 0..2 = rows 0..2), so c[v_block[k]] = f[k] for
+        # k=0,1,2; cardinal single-DoF bodies use their signed unit row. Serial
+        # per joint into the joint's reduced v-slot(s) (correctness-first).
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// s_c extracted serially (Tier-C spherical S^T f)")
+        self.gen_add_code_line("//")
+        self.gen_add_sync()
+        self.gen_add_serial_ops()
+        for jid in range(n):
+            j = self.robot.get_joint_by_id(jid)
+            if getattr(j, "jtype", None) == "spherical":
+                vblk = self.robot.get_joint_index_v(jid)
+                for k in range(3):  # angular-identity columns -> rows 0,1,2 of f
+                    self.gen_add_code_line(
+                        "s_c[" + str(vblk[k]) + "] = s_vaf[" + str(12*n + 6*jid + k) + "];")
+            else:
+                vs = self.robot.get_joint_index_v(jid)
+                if isinstance(vs, (list, tuple)):
+                    vs = vs[0]
+                s_ind = self.robot.get_S_index_by_id(jid)
+                s_sign = self.robot.get_S_sign_by_id(jid)
+                self.gen_add_code_line(
+                    "s_c[" + str(vs) + "] = static_cast<T>(" + repr(float(s_sign))
+                    + ") * s_vaf[" + str(12*n + 6*jid + s_ind) + "];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
         self.gen_inverse_dynamics_joint_dynamics_bias()

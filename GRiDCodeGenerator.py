@@ -141,13 +141,17 @@ class GRiDCodeGenerator:
         # historical emit. Pair with RBDReference(use_joint_dynamics=True) to get
         # a matching oracle when the term is enabled.
         self.USE_JOINT_DYNAMICS = USE_JOINT_DYNAMICS
-        # planar/spherical joints PARSE (URDFParser groundwork) but the CUDA
-        # codegen transform chain does not yet emit them and RBDReference does
-        # not model them — fail loudly here rather than silently mis-generating.
+        # planar joints PARSE (URDFParser groundwork) but the CUDA codegen
+        # transform chain does not yet emit them — fail loudly here rather than
+        # silently mis-generating. (Planar is decomposed into cardinal sub-joints
+        # at parse time, so a surviving type=="planar" means the decomposition
+        # was bypassed.) SPHERICAL is now supported for inverse_dynamics ONLY
+        # (Tier-C, first slice); the per-algorithm guard in gen_all_code rejects
+        # spherical for not-yet-ported algorithms (crba/aba/fd/gradients/SO/...).
         # See docs/open-tasks/joint_types_plan.md (backlog A2).
         _unsupported = {
             jt for jt in robotObj.get_joint_types_by_id().values()
-            if jt in ("planar", "spherical")
+            if jt in ("planar",)
         }
         if _unsupported:
             raise NotImplementedError(
@@ -2513,6 +2517,19 @@ class GRiDCodeGenerator:
         # (where the kwarg default is False). Resolve the algorithm set up front
         # so the request can be OR'd into enable_idsva_so_world_frame below.
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
+        # SPHERICAL (Tier-C) first slice: only inverse_dynamics is ported. Reject
+        # any other requested algorithm for a robot with a spherical joint so we
+        # fail loudly instead of emitting a wrong crba/aba/gradient/SO kernel.
+        if self.robot.robot_has_spherical():
+            _SPHERICAL_OK = {"inverse_dynamics"}
+            _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
+            if _unported:
+                raise NotImplementedError(
+                    "Spherical (ball) joint CUDA codegen currently supports only "
+                    f"inverse_dynamics; requested unsupported algorithm(s) {_unported}. "
+                    "Remaining algorithms (crba/aba/fd/gradients/SO/integrator/kinematics) "
+                    "are follow-on slices (see docs/open-tasks/joint_types_plan.md)."
+                )
         if "idsva_so_world_frame" in algorithms:
             enable_idsva_so_world_frame = True
         self.include_fixed_kinematic_targets = fixed_target_name != ""

@@ -361,17 +361,63 @@ def _xi_fixed_sincos_subst(self, str_val, ind):
     cell. Mimic-aware: on a model with mimic joints, body `ind` reads its
     folded angle and per-body sin/cos from the s_q_eff layout
     (s_q_eff[NB] | sin[NB] | cos[NB]); otherwise it reads the legacy
-    s_temp[ind]/s_temp[ind+nq]/s_q[ind] (byte-identical to pre-mimic)."""
+    s_temp[ind]/s_temp[ind+nq]/s_q[ind] (byte-identical to pre-mimic).
+
+    Tier-C spherical bodies carry quaternion symbols (q1_sph..q4_sph) instead of
+    a single `theta`; they're substituted via _xi_spherical_quat_subst (ccode form
+    for the homogeneous-transform consumer) BEFORE the theta passes, which then
+    no-op (no `theta` token remains). Byte-identical for non-spherical robots."""
+    if getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical":
+        return _xi_spherical_quat_subst(self, str_val, ind, ccode=True)
     if self.robot_has_mimic_joints():
         NB = self.robot.get_num_joints()
         str_val = str_val.replace("sin(theta)", "s_temp[" + str(ind + NB) + "]")
         str_val = str_val.replace("cos(theta)", "s_temp[" + str(ind + 2*NB) + "]")
         str_val = str_val.replace("theta", "s_temp[" + str(ind) + "]")
         return str_val
-    n = self.robot.get_num_joints()
-    str_val = str_val.replace("sin(theta)", "s_temp[" + str(ind) + "]")
-    str_val = str_val.replace("cos(theta)", "s_temp[" + str(ind + n) + "]")
-    str_val = str_val.replace("theta", "s_q[" + str(ind) + "]")
+    # sincos fill is over q in [0,nq); read this body's OWN q-slot (== ind on an
+    # all-cardinal fixed robot, where nq==NB -> byte-identical; shifted when a
+    # multi-DoF spherical joint precedes this body).
+    nq = self.robot.get_num_pos()
+    qslot = self.robot.get_joint_index_q(ind)
+    if isinstance(qslot, (list, tuple)):
+        qslot = qslot[0]
+    str_val = str_val.replace("sin(theta)", "s_temp[" + str(qslot) + "]")
+    str_val = str_val.replace("cos(theta)", "s_temp[" + str(qslot + nq) + "]")
+    str_val = str_val.replace("theta", "s_q[" + str(qslot) + "]")
+    return str_val
+
+def _xi_spherical_quat_subst(self, str_val, ind, ccode=False):
+    """Substitute a SPHERICAL (ball) joint's unit-quaternion symbols
+    (q1_sph..q4_sph = x,y,z,w) into a transform cell for body `ind`.
+
+    A spherical joint owns a CONTIGUOUS 4-wide q-block at `get_joint_index_q(ind)`
+    (e.g. spherical_arm's joint_1 owns s_q[0..3]); a mid-chain spherical shifts
+    every downstream joint's q-offset by +1 vs its v-offset (nq>nv), so we read
+    the offset from the parser's dense q-map rather than from `ind`. This mirrors
+    the floating-root q1_fb..q4_fb substitution but parameterized on the joint's
+    own q-block start (the root is hardcoded to s_q[3..6]).
+
+    `ccode=True` selects the C `pow(q, 2)` squared form emitted by `sp.ccode`
+    (homogeneous transforms); the default handles the Python `q**2` repr used by
+    the spatial X block (`str(val)`). The substitution is q-normalized in the
+    symbolic transform itself, so no separate normalization is needed here."""
+    qoff = self.robot.get_joint_index_q(ind)
+    if isinstance(qoff, (list, tuple)):
+        qoff = qoff[0]
+    syms = ["q1_sph", "q2_sph", "q3_sph", "q4_sph"]
+    if ccode:
+        # sp.ccode emits pow(qk_sph, 2); replace the squared form first so the
+        # bare-symbol pass below doesn't corrupt the `pow(` argument.
+        for k, s in enumerate(syms):
+            slot = "s_q[" + str(qoff + k) + "]"
+            str_val = str_val.replace("pow(" + s + ", 2)", slot + "*" + slot)
+    else:
+        for k, s in enumerate(syms):
+            slot = "s_q[" + str(qoff + k) + "]"
+            str_val = str_val.replace(s + "**2", slot + "*" + slot)
+    for k, s in enumerate(syms):
+        str_val = str_val.replace(s, "s_q[" + str(qoff + k) + "]")
     return str_val
 
 def _emit_runtime_inertia_rebuild(self, n):
@@ -553,8 +599,16 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                 if not self.custom_is_constant(val):
                     # parse the symbolic value into the appropriate array access
                     str_val = str(val)
-                   
-                    if self.robot.floating_base: # extra dof offset due to floating base
+
+                    _jt = getattr(self.robot.get_joint_by_id(ind), "jtype", None)
+                    if _jt == "spherical":
+                        # Tier-C spherical (ball) joint: its transform cell holds
+                        # the q1_sph..q4_sph unit-quaternion symbols; substitute the
+                        # joint's own 4-wide q-block (NOT the floating-root s_q[3..6]
+                        # and NOT a sin/cos fold). A mid-chain spherical shifts every
+                        # downstream q-offset, handled inside the helper.
+                        str_val = _xi_spherical_quat_subst(self, str_val, ind)
+                    elif self.robot.floating_base: # extra dof offset due to floating base
                         num_dof = self.robot.get_num_pos()
                         if self.robot_has_mimic_joints():
                             # Floating + mimic: body `ind`'s joint angle is the
@@ -602,11 +656,23 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                         str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
                         str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
                     else:
-                        # first check for sin/cos (revolute)
-                        str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-                        str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
+                        # Single-DoF revolute/prismatic. The sincos fill loop
+                        # builds s_temp[q]=sin(s_q[q]), s_temp[q+nq]=cos(s_q[q])
+                        # over q in [0,nq) (nq = get_num_pos()), so a joint reads
+                        # its sin/cos at its OWN q-slot, NOT at `ind`. On an
+                        # all-cardinal fixed robot q-slot==ind and nq==n, so this
+                        # is byte-identical to the legacy s_temp[ind]/s_temp[ind+n].
+                        # On a robot with a multi-DoF (spherical) joint, downstream
+                        # single-DoF joints are shifted (nq>NB), so reading `ind`
+                        # would grab the wrong angle's sin/cos (the §1e q-slot bug).
+                        nq = self.robot.get_num_pos()
+                        qslot = self.robot.get_joint_index_q(ind)
+                        if isinstance(qslot, (list, tuple)):
+                            qslot = qslot[0]
+                        str_val = str_val.replace("sin(theta)","s_temp[" + str(qslot) + "]")
+                        str_val = str_val.replace("cos(theta)","s_temp[" + str(qslot + nq) + "]")
                         # then just the variable (prismatic)
-                        str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+                        str_val = str_val.replace("theta","s_q[" + str(qslot) + "]")
                     # then output the code
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row))
                     self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
