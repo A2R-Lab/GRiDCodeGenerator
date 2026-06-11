@@ -4,6 +4,76 @@ def _idg_Svec_cpp(S_vec):
     return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in S_vec) + "}"
 
 
+def _idg_damping_diag_cpp(self, n):
+    """Emit the gated joint-local DAMPING contribution to the velocity gradient.
+
+    The ID value path folds ``c += damping*qd + friction*sign(qd)`` into s_c
+    (gen_inverse_dynamics_joint_dynamics_bias). Differentiating that bias:
+      * ``d(damping*qd)/dqd = damping`` -> a DIAGONAL term on the dqd half of
+        s_dc_du (the dc_dqd block); damping is q-INDEPENDENT so there is NO
+        dc_dq term.
+      * ``d(friction*sign(qd))/dqd = 0`` a.e. (subgradient 0 at qd==0) -> NO
+        contribution. Hence this is gated on robot_has_joint_damping() ONLY,
+        independent of friction.
+    s_dc_du is two nv x nv col-major halves (dc_dq at [0,nv*nv), dc_dqd at
+    [nv*nv, 2*nv*nv)); the dqd diagonal cell for v-slot vs is
+    ``s_dc_du[nv*nv + nv*vs + vs]``. We ``+=`` so multiple joints sharing a
+    v-slot (mimic) sum, matching the value path's per-v-slot accumulate.
+
+    Mimic alpha-fold: ONE power of alpha (k^1) -- the value bias scales by
+    alpha*damping, so its qd-derivative w.r.t. the SHARED reduced coordinate is
+    likewise alpha*damping (d(alpha*b*(alpha*qd_v))/dqd_v would be alpha^2, but
+    the bias reads s_qd[vs] (the reduced coord) scaled once by alpha and writes
+    once, exactly as gen_inverse_dynamics_joint_dynamics_bias does -> the
+    derivative carries a single alpha, matching the value emit's literal
+    alpha*b coefficient). The floating root carries no damping (skipped).
+
+    EMITTED ONLY when USE_JOINT_DYNAMICS is enabled AND the robot declares
+    nonzero damping. With the flag off (the DEFAULT) this is a pure no-op, so
+    every robot stays byte-identical to the historical emit (Gate-A). This sits
+    PAST the serial/mimic/spherical/branched extraction forks and operates on
+    the FINAL s_dc_du regardless of extraction path.
+    """
+    if not getattr(self, "USE_JOINT_DYNAMICS", False):
+        return
+    if not self.robot.robot_has_joint_damping():
+        return
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    fb = self.robot.floating_base
+    # collect (v_slot -> summed alpha*damping) so mimic joints sharing a slot
+    # fold to a single += into the diagonal cell.
+    diag = {}
+    for jid in range(self.robot.get_num_joints()):
+        if fb and jid == 0:
+            continue  # floating root carries no damping
+        b = float(self.robot.get_damping_by_id(jid))
+        if b == 0.0:
+            continue
+        if HAS_MIMIC:
+            vs = self._v_slot_cpp(jid)
+            alpha = float(self._alpha_for_jid(jid))
+        else:
+            vs = self.robot.get_joint_index_v(jid)
+            alpha = 1.0
+        diag[vs] = diag.get(vs, 0.0) + alpha * b
+    if not diag:
+        return
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// joint-local viscous damping gradient: dc_dqd diagonal += damping (friction -> 0)")
+    self.gen_add_code_line("//")
+    self.gen_add_sync()
+    # one thread per damped v-slot (parallel; each writes a distinct diagonal cell)
+    slots = sorted(diag.keys())
+    self.gen_add_parallel_loop("ind", str(len(slots)))
+    for k, vs in enumerate(slots):
+        # diagonal cell of the dc_dqd half: base nv*nv, col vs, row vs
+        cell = n * n + n * vs + vs
+        self.gen_add_code_line(("if (ind == " + str(k) + ") " if len(slots) > 1 else "")
+                               + "s_dc_du[" + str(cell) + "] += static_cast<T>(" + repr(diag[vs]) + ");")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def _idg_debug_body_buffer(self, jid, base_offset, n, running_sum_cols_per_jid, cols_per_jid):
     """Resolve the (column-block offset, column count) for the per-BODY dv/da/df
     debug printf of body `jid`, on BOTH fixed and floating base.
@@ -212,6 +282,10 @@ def gen_inverse_dynamics_gradient_inner(self):
         # dense per-body buffers spill to d_temp_spill / d_workspace via the
         # inner's mimic temp-size; see gen_inverse_dynamics_gradient_inner_temp_mem_size.
         _gen_inverse_dynamics_gradient_mimic_inner(self, n, NJ)
+        # gated joint-damping gradient (dc_dqd diagonal += damping); no-op when
+        # USE_JOINT_DYNAMICS is off. Operates on the final s_dc_du, so it is
+        # orthogonal to the mimic/spherical/skew extraction above.
+        _idg_damping_diag_cpp(self, n)
         self.gen_add_end_function()
         return
 
@@ -1027,6 +1101,11 @@ def gen_inverse_dynamics_gradient_inner(self):
         self.gen_add_code_line("s_dc_du[Offset_dst] = flag * (" + S_sign_cpp + ") * s_temp[Offset_src];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+
+    # gated joint-damping gradient (dc_dqd diagonal += damping); no-op when
+    # USE_JOINT_DYNAMICS is off (Gate-A byte-identical). Sits PAST every
+    # extraction fork, so it operates on the final s_dc_du regardless of path.
+    _idg_damping_diag_cpp(self, n)
 
     if self.DEBUG_MODE:
         self.gen_add_sync()
