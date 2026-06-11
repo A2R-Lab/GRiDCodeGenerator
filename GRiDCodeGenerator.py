@@ -2729,6 +2729,47 @@ class GRiDCodeGenerator:
             "#define GRID_HAS_INTEGRATOR " + str(int("integrator" in algorithms)))
         self.gen_add_code_line(
             "#define GRID_HAS_INTEGRATOR_GRADIENT " + str(int("integrator_gradient" in algorithms)))
+        # Subset-build (rc=3 model): per-CORE-algo availability macros. These gate the
+        # binding wrapper's currently-UNGATED `extern "C"` core bodies so a reduced
+        # codegen profile (subset algorithm_list) ships a clean rc=3 stub for the
+        # un-requested cores instead of failing to link on a missing grid:: inner.
+        # The set read is the POST-dep-expansion `algorithms`, so a transitively-pulled
+        # dep (e.g. minv via forward_dynamics) gets macro=1 and its real body. For the
+        # default "all" profile every one of these is 1 (every core requested), so the
+        # wrapper's `#if GRID_HAS_X` selects the real body verbatim and the header diff
+        # vs a pre-subset build is EXACTLY these added `#define`s (no body change).
+        # The wrapper uses `#if GRID_HAS_X` (not `#ifdef`), so an UNDEFINED macro reads
+        # as 0 and fails LOUD (rc=3) rather than silently shipping a stub — but we emit
+        # every core macro unconditionally here so "undefined" can only happen if this
+        # list and the wrapper's `#if` sites ever drift.
+        #
+        # `end_effector_pose` is a transitive dep of nearly everything kinematic; its
+        # gradient/hessian are the algorithm keys that map to the
+        # grid_rbd_end_effector_pose{,_gradient,_hessian} wrapper symbols.
+        _core_has = {
+            "INVERSE_DYNAMICS": "inverse_dynamics",
+            "MINV": "minv",
+            "FORWARD_DYNAMICS": "forward_dynamics",
+            "ABA": "aba",
+            "CRBA": "crba",
+            "INVERSE_DYNAMICS_GRADIENT": "inverse_dynamics_gradient",
+            "FORWARD_DYNAMICS_GRADIENT": "forward_dynamics_gradient",
+            "INVERSE_DYNAMICS_REGRESSOR": "inverse_dynamics_regressor",
+            "END_EFFECTOR_POSE": "end_effector_pose",
+            "END_EFFECTOR_POSE_GRADIENT": "end_effector_pose_gradient",
+            "END_EFFECTOR_POSE_HESSIAN": "end_effector_pose_hessian",
+            # RNEA-bias + PS5 surfaces whose wrapper bodies were also UNgated and
+            # call grid::<fn> directly (so a subset that omits them must rc=3-stub).
+            "GENERALIZED_GRAVITY": "generalized_gravity",
+            "NONLINEAR_EFFECTS": "nonlinear_effects",
+            "CORIOLIS_MATRIX": "coriolis_matrix",
+            "KINETIC_ENERGY_REGRESSOR": "kinetic_energy_regressor",
+            "POTENTIAL_ENERGY_REGRESSOR": "potential_energy_regressor",
+        }
+        for macro_suffix, algo_key in _core_has.items():
+            self.gen_add_code_line(
+                "#define GRID_HAS_" + macro_suffix + " "
+                + str(int(algo_key in self.generated_algorithms)))
         # GRID_RBD_WITH_MUJOCO gates the binding's mjx (MuJoCo output-convention)
         # C-ABI entry points: the `grid::*<...,MUJOCO_OUTPUT=true>` template overloads
         # are EMITTED only for a floating-base robot WITHOUT mimic joints or skew
