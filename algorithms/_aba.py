@@ -4,6 +4,67 @@ def _aba_Svec_cpp(robot, jid):
     return "{" + ", ".join("static_cast<T>(" + repr(float(c)) + ")" for c in robot._get_flat_S_by_id(jid)) + "}"
 
 
+# Tier-C spherical (ball) joint support for the standalone fixed-base ABA.
+#
+# A ball joint has a 3-DoF angular-identity motion subspace S (6x3: cols 0,1,2
+# pick rows 0,1,2, sign +1), so the per-joint articulated-inertia D = S^T*IA*S
+# becomes a 3x3 matrix that must be matrix-INVERTED (the scalar 1/d path does not
+# generalize). It is NOT a skew joint (the signed-index helpers raise on multi-
+# DoF), so it gets its own per-joint serial emit inside `level_has_spherical`
+# branches; cardinal joints sharing the robot keep the scalar fast path but read
+# their qd/tau/qdd through the spherical-shifted v/f maps (downstream of a ball
+# joint every single-DoF body is shifted off `jid`; the §1e bug class).
+#
+# Per spherical joint we carve a contiguous scratch block out of a dedicated
+# arena that sits ABOVE the cardinal 140*NJ band (so the cold-spill ladder
+# offsets stay byte-identical for cardinal robots). Layout (offsets within the
+# per-joint block, `_ABA_SPH_STRIDE` floats wide):
+_ABA_SPH_D_OFF      = 0      # D = S^T*U (3x3, col-major)            [9]
+_ABA_SPH_DINV_OFF   = 9      # D^-1 (3x3)                            [9]
+_ABA_SPH_U_OFF      = 18     # U = IA*S (6x3, col-major: U[6*c + r]) [18]
+_ABA_SPH_UDINV_OFF  = 36     # U*D^-1 (6x3, col-major)               [18]
+_ABA_SPH_U3_OFF     = 54     # available joint torque u (3-vec)      [3]
+_ABA_SPH_TMP3_OFF   = 57     # scratch 3-vec (u - U^T*a, etc.)       [3]
+_ABA_SPH_INVTMP_OFF = 60     # invert_matrix scratch (>= 3*dimA=9)   [12]
+_ABA_SPH_STRIDE     = 72     # total floats per spherical joint
+
+
+def _aba_is_spherical(self, jid):
+    return getattr(self.robot.get_joint_by_id(jid), "jtype", None) == "spherical"
+
+
+def _aba_sph_arena_base(self):
+    """First float offset of the spherical scratch arena (above the cardinal
+    140*NJ hot band). Only meaningful when the robot has a spherical joint."""
+    return 140 * self.robot.get_num_joints()
+
+
+def _aba_sph_block_off(self, jid, sph_order):
+    """Float offset of body `jid`'s spherical scratch block. `sph_order` is the
+    0-based rank of this joint among the robot's spherical joints (each gets its
+    own _ABA_SPH_STRIDE-wide block)."""
+    return _aba_sph_arena_base(self) + sph_order * _ABA_SPH_STRIDE
+
+
+def _aba_sph_orders(self):
+    """Map joint id -> 0-based spherical-rank for every spherical joint."""
+    order = {}
+    for jid in range(self.robot.get_num_joints()):
+        if _aba_is_spherical(self, jid):
+            order[jid] = len(order)
+    return order
+
+
+def _aba_vslot(self, jid):
+    """Single scalar reduced v/f-slot for a cardinal body `jid` (shifted past
+    any upstream spherical joint). Byte-identical to `jid` on all-cardinal
+    fixed-base robots (v-slot == jid there)."""
+    v = self.robot.get_joint_index_v(jid)
+    if isinstance(v, (list, tuple)):
+        v = v[0]
+    return v
+
+
 def _aba_jd_bias_term_cpp(self, jid):
     """C++ subexpression for body ``jid``'s joint-local damping + Coulomb friction
     bias, or "" when there is none to apply.
@@ -467,6 +528,24 @@ def gen_aba_inner(self):
         self.gen_add_end_function()
         return
 
+    # Tier-C spherical (ball) joint support. When the robot carries a ball joint
+    # the per-joint D becomes 3x3 (matrix-inverted), and every single-DoF body
+    # downstream of the ball is shifted off `jid` in the reduced q/v/f vectors
+    # (the §1e bug class) -- so cardinal joints read their qd/tau/qdd through the
+    # parser's v/f maps, not the raw `jid`. All spherical-specific emit lives
+    # inside `HAS_SPHERICAL` / `level_has_spherical` branches so cardinal robots
+    # stay byte-identical.
+    HAS_SPHERICAL = self.robot.robot_has_spherical()
+    _sph_order = _aba_sph_orders(self) if HAS_SPHERICAL else {}
+
+    def _qd_idx(jid):
+        # reduced qd/qdd v-slot for a single-DoF body (spherical-shifted).
+        return _aba_vslot(self, jid) if HAS_SPHERICAL else jid
+
+    def _tau_idx(jid):
+        # reduced tau/f-slot for a single-DoF body (== v-slot; see get_joint_index_f).
+        return _aba_vslot(self, jid) if HAS_SPHERICAL else jid
+
     #
     # Initial Debug Prints if Requested
     #
@@ -501,8 +580,32 @@ def gen_aba_inner(self):
             self.gen_add_code_line("//     links are: " + ", ".join(link_names))
             # compute the initial v which is just S*qd
             self.gen_add_code_line("// s_v[k] = S[k]*qd[k]")
-            level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
-            if level_has_skew:
+            level_has_spherical = any(_aba_is_spherical(self, j) for j in inds)
+            level_has_skew = any(
+                (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+                for j in inds)
+            if HAS_SPHERICAL:
+                # Tier-C spherical at level 0: v[k] = S*qd reads the joint's 3-wide
+                # angular v-block (rows 0..2). Cardinal joints (incl. cardinal-only
+                # levels on a spherical robot) add their single SHIFTED v-slot.
+                # Serial per-joint (spherical robots are rare; thread-invariant
+                # single-thread writes).
+                self.gen_add_serial_ops()
+                for jid_val in inds:
+                    jid6 = 6 * jid_val
+                    for r in range(6):
+                        self.gen_add_code_line("s_va[" + str(jid6 + r) + "] = static_cast<T>(0);")
+                    if _aba_is_spherical(self, jid_val):
+                        vblk = self.robot.get_joint_index_v(jid_val)
+                        for k in range(3):  # angular-identity columns -> rows 0,1,2
+                            self.gen_add_code_line("s_va[" + str(jid6 + k) + "] += s_qd[" + str(vblk[k]) + "];")
+                    else:
+                        s_ind_val = self.robot.get_S_index_by_id(jid_val)
+                        s_sign_val = self.robot.get_S_sign_by_id(jid_val)
+                        self.gen_add_code_line("s_va[" + str(jid6 + s_ind_val) + "] += (" + str(s_sign_val) + ") * s_qd[" + str(_qd_idx(jid_val)) + "];")
+                self.gen_add_end_control_flow()
+                self.gen_add_sync()
+            elif level_has_skew:
                 # Tier B (skew): each joint has a dense S column. Parallelize the
                 # zero+column-add over the 6*len(inds) rows; per-thread dispatch
                 # is by compile-time jid so each jid uses its own S constant.
@@ -560,14 +663,20 @@ def gen_aba_inner(self):
                 parent_val = self.robot.get_parent_id(jid_val)
                 self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*parent_val}], &s_va[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
                 self.gen_add_serial_ops()
-                if self.robot.S_is_cardinal_by_id(jid_val):
+                if _aba_is_spherical(self, jid_val):
+                    # Tier-C spherical: v[jid] += S*qd over the 3 angular columns
+                    # (rows 0..2), reading the joint's 3-wide v-block.
+                    vblk = self.robot.get_joint_index_v(jid_val)
+                    for k in range(3):
+                        self.gen_add_code_line(f"s_va[{6*jid_val + k}] += s_qd[{vblk[k]}];")
+                elif self.robot.S_is_cardinal_by_id(jid_val):
                     s_ind_val = self.robot.get_S_index_by_id(jid_val)
                     s_sign_val = self.robot.get_S_sign_by_id(jid_val)
-                    self.gen_add_code_line(f"s_va[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{jid_val}];")
+                    self.gen_add_code_line(f"s_va[{6*jid_val + s_ind_val}] += ({s_sign_val}) * s_qd[{_qd_idx(jid_val)}];")
                 else:
                     # Tier B: += S_col * qd (dense)
                     Svec = _aba_Svec_cpp(self.robot, jid_val)
-                    self.gen_add_code_line("{ const T S_skew[6] = " + Svec + "; for (int r = 0; r < 6; r++) { s_va[" + str(6*jid_val) + " + r] += S_skew[r] * s_qd[" + str(jid_val) + "]; } }")
+                    self.gen_add_code_line("{ const T S_skew[6] = " + Svec + "; for (int r = 0; r < 6; r++) { s_va[" + str(6*jid_val) + " + r] += S_skew[r] * s_qd[" + str(_qd_idx(jid_val)) + "]; } }")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
 
@@ -584,7 +693,24 @@ def gen_aba_inner(self):
     # calculate c
     self.gen_add_code_line("// c[k] = mxS(v[k])*qd[k]")
     HAS_SKEW = self.robot.robot_has_skew_axis()
-    if HAS_SKEW:
+    if HAS_SPHERICAL:
+        # Tier-C: c[k] = crm(v[k]) * S[k] * qd[k]. A spherical joint sums its 3
+        # angular-identity columns: c = mx0(v)*qd[v0] + mx1(v)*qd[v1] +
+        # mx2(v)*qd[v2] (== crm(v)*(S*qd), pure-angular vJ). Cardinal joints use
+        # their single mx column with the SHIFTED v-slot. Serial per-joint.
+        self.gen_add_serial_ops()
+        for jid in range(n):
+            jid6 = 6 * jid
+            self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_temp[" + str(72*n + jid6) + " + r] = static_cast<T>(0); }")
+            if _aba_is_spherical(self, jid):
+                vblk = self.robot.get_joint_index_v(jid)
+                for k in range(3):
+                    self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(72*n + jid6) + "], &s_va[" + str(jid6) + "], s_qd[" + str(vblk[k]) + "]);")
+            else:
+                s_ind = self.robot.get_S_index_by_id(jid); s_sign = self.robot.get_S_sign_by_id(jid)
+                self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(72*n + jid6) + "], &s_va[" + str(jid6) + "], static_cast<T>(" + str(s_sign) + ") * s_qd[" + str(_qd_idx(jid)) + "]);")
+        self.gen_add_end_control_flow()
+    elif HAS_SKEW:
         # Tier B: c[k] = crm(v[k]) * S[k] * qd[k] with a dense S column. Serial
         # per-joint dispatch (skew robots are rare); cardinal joints keep the
         # precomputed mx column, skew joints use the generic crm*S helper.
@@ -677,8 +803,110 @@ def gen_aba_inner(self):
         self.gen_add_code_line("//     links are: " + ", ".join(link_names))
         # caclulate U, which is just IA*S
         self.gen_add_code_line("// U[k] = IA[k]*S[k]")
-        level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
-        if level_has_skew:
+        level_has_skew = any(
+            (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+            for j in inds)
+        if HAS_SPHERICAL:
+            # Tier-C backward pass (U/D/u, Ia, pa) for the whole level, serial per
+            # joint. A spherical joint's D = S^T*IA*S is a 3x3 matrix that is
+            # MATRIX-INVERTED (invert_matrix dimA=3); cardinal joints keep the
+            # scalar-D path with SHIFTED tau/qd slots. The X^T*Ia*X back-prop below
+            # is S-agnostic (operates on the full 6x6 Ia / 6-vec pa) -> unchanged.
+            for jid in inds:
+                jid6 = 6 * jid
+                if _aba_is_spherical(self, jid):
+                    so = _aba_sph_block_off(self, jid, _sph_order[jid])
+                    D_off, Dinv_off = so + _ABA_SPH_D_OFF, so + _ABA_SPH_DINV_OFF
+                    U_off, UD_off = so + _ABA_SPH_U_OFF, so + _ABA_SPH_UDINV_OFF
+                    u3_off, tmp3_off = so + _ABA_SPH_U3_OFF, so + _ABA_SPH_TMP3_OFF
+                    invtmp_off = so + _ABA_SPH_INVTMP_OFF
+                    fblk = self.robot.get_joint_index_f(jid)
+                    vblk = self.robot.get_joint_index_v(jid)
+                    # §1j: zero the whole spherical block before any beta=0/read-
+                    # before-write use (D, U, UDinv, u3, tmp3, invert scratch).
+                    self.gen_add_serial_ops()
+                    self.gen_add_code_line("for (int z = 0; z < " + str(_ABA_SPH_STRIDE) + "; z++) { s_temp[" + str(so) + " + z] = static_cast<T>(0); }")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    # U = IA*S : 6x3, col c = IA[:, c] (S picks cols 0,1,2). Store
+                    # col-major U[6*c + r].
+                    self.gen_add_parallel_loop("ind", "18")
+                    self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+                    self.gen_add_code_line("s_temp[" + str(U_off) + " + 6*col + row] = s_temp[" + str(36*jid) + " + row + 6*col];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    # D = S^T*U : top-left 3x3, D[a,b] = U[6*b + a]
+                    self.gen_add_parallel_loop("ind", "9")
+                    self.gen_add_code_line("int a = ind % 3; int b = ind / 3;")
+                    self.gen_add_code_line("s_temp[" + str(D_off) + " + 3*b + a] = s_temp[" + str(U_off) + " + 6*b + a];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    self.gen_add_code_line("invert_matrix(3, &s_temp[" + str(D_off) + "], &s_temp[" + str(Dinv_off) + "], &s_temp[" + str(invtmp_off) + "]);")
+                    self.gen_add_sync()
+                    # u[k] = tau[fblk[k]] - S^T*pA  (- damping bias). S picks the
+                    # angular rows, so S^T*pA = pA[jid6 + k] for k in 0..2. The
+                    # Coriolis c enters the pa term below (pa += Ia*c), NOT u
+                    # (matches the scalar-D path and the canonical Featherstone ABA).
+                    self.gen_add_serial_ops()
+                    for k in range(3):
+                        _jd_bias = _aba_jd_bias_term_cpp(self, jid)
+                        _jd_sub = (" - (" + _jd_bias + ")") if _jd_bias else ""
+                        self.gen_add_code_line("s_temp[" + str(u3_off + k) + "] = s_tau[" + str(fblk[k]) + "]" + _jd_sub
+                                               + " - s_temp[" + str(78*n + jid6 + k) + "];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    # UDinv = U(6x3) * Dinv(3x3) : col-major UDinv[6*c + r]
+                    self.gen_add_parallel_loop("ind", "18")
+                    self.gen_add_code_line("int row = ind % 6; int c = ind / 6;")
+                    self.gen_add_code_line("T acc = static_cast<T>(0);")
+                    self.gen_add_code_line("for (int b = 0; b < 3; b++) { acc += s_temp[" + str(U_off) + " + 6*b + row] * s_temp[" + str(Dinv_off) + " + 3*c + b]; }")
+                    self.gen_add_code_line("s_temp[" + str(UD_off) + " + 6*c + row] = acc;")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    # Ia = IA - U*Dinv*U^T : Ia[r,c] = IA[r,c] - sum_b UDinv[6*b+r]*U[6*b+c]
+                    self.gen_add_parallel_loop("ind", "36")
+                    self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+                    self.gen_add_code_line("T acc = static_cast<T>(0);")
+                    self.gen_add_code_line("for (int b = 0; b < 3; b++) { acc += s_temp[" + str(UD_off) + " + 6*b + row] * s_temp[" + str(U_off) + " + 6*b + col]; }")
+                    self.gen_add_code_line("s_temp[" + str(36*(n+jid)) + " + row + 6*col] = s_temp[" + str(36*jid) + " + row + 6*col] - acc;")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    # pa = pA + Ia*c + U*Dinv*u : pa[r] = pA[r] + Ia[:,r]^T... =
+                    #   pA[r] + dot(Ia row r, c) + sum_b UDinv[6*b+r]*u[b]
+                    self.gen_add_parallel_loop("row", "6")
+                    self.gen_add_code_line("T acc = s_temp[" + str(78*n + jid6) + " + row] + dot_prod<T,6,6,1>(&s_temp[" + str(36*(n+jid)) + " + row], &s_temp[" + str(72*n + jid6) + "]);")
+                    self.gen_add_code_line("for (int b = 0; b < 3; b++) { acc += s_temp[" + str(UD_off) + " + 6*b + row] * s_temp[" + str(u3_off) + " + b]; }")
+                    self.gen_add_code_line("s_temp[" + str(90*n + jid6) + " + row] = acc;")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                else:
+                    # cardinal single-DoF joint (possibly downstream of a spherical):
+                    # scalar D path with SHIFTED tau slot. U = IA*S, d = S^T*U,
+                    # u = tau - S^T*pA, Ia = IA - U U^T/d, pa = pA + Ia*c + U*u/d.
+                    s_ind = self.robot.get_S_index_by_id(jid)
+                    s_sign = self.robot.get_S_sign_by_id(jid)
+                    _jd_bias = _aba_jd_bias_term_cpp(self, jid)
+                    _jd_sub = (" - (" + _jd_bias + ")") if _jd_bias else ""
+                    self.gen_add_parallel_loop("row", "6")
+                    self.gen_add_code_line("s_temp[" + str(84*n + jid6) + " + row] = (" + str(s_sign) + ") * s_temp[" + str(36*jid) + " + row + 6*" + str(s_ind) + "];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    self.gen_add_serial_ops()
+                    self.gen_add_code_line("s_temp[" + str(96*n + jid) + "] = (" + str(s_sign) + ") * s_temp[" + str(84*n + jid6 + s_ind) + "];")
+                    self.gen_add_code_line("s_temp[" + str(97*n + jid) + "] = s_tau[" + str(_tau_idx(jid)) + "]" + _jd_sub + " - (" + str(s_sign) + ") * s_temp[" + str(78*n + jid6 + s_ind) + "];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    self.gen_add_parallel_loop("ind", "36")
+                    self.gen_add_code_line("int row = ind % 6; int col = ind / 6;")
+                    self.gen_add_code_line("s_temp[" + str(36*(n+jid)) + " + row + 6*col] = s_temp[" + str(36*jid) + " + row + 6*col] - s_temp[" + str(84*n + jid6) + " + row]*s_temp[" + str(84*n + jid6) + " + col]/s_temp[" + str(96*n + jid) + "];")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+                    self.gen_add_parallel_loop("row", "6")
+                    self.gen_add_code_line("T Uval = s_temp[" + str(84*n + jid6) + " + row]*s_temp[" + str(97*n + jid) + "]/s_temp[" + str(96*n + jid) + "];")
+                    self.gen_add_code_line("s_temp[" + str(90*n + jid6) + " + row] = s_temp[" + str(78*n + jid6) + " + row] + dot_prod<T,6,6,1>(&s_temp[" + str(36*(n+jid)) + " + row], &s_temp[" + str(72*n + jid6) + "]) + Uval;")
+                    self.gen_add_end_control_flow()
+                    self.gen_add_sync()
+        elif level_has_skew:
             # Tier B (skew): U = IA*S_dense (full 6x6 * 6 matvec); d = S^T*U;
             # u = tau - S^T*pA. Loop over every joint in the level (branching ok);
             # each joint with its own dense (or unit) S column.
@@ -737,41 +965,43 @@ def gen_aba_inner(self):
             self.gen_add_end_control_flow()
             self.gen_add_sync()
         
-        # calculate Ia from IA, U, and d
-        self.gen_add_code_line("// Ia[k] = IA[k] - U[k]*U[k].T/d[k]")
-        self.gen_add_parallel_loop("ind", str(36 * len(inds)))
-        self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) %6;")
-        if len(inds) > 1:
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            self.gen_add_multi_threaded_select("ind", "<", [str(36*(i+1)) for i in range(len(inds))], select_var_vals)
-            jid = "jid"
-        else:
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + jid + ";")
-        self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
+        # calculate Ia from IA, U, and d (cardinal/skew scalar-D path; the
+        # spherical branch above already computed Ia + pa with its 3x3 Dinv).
+        if not HAS_SPHERICAL:
+            self.gen_add_code_line("// Ia[k] = IA[k] - U[k]*U[k].T/d[k]")
+            self.gen_add_parallel_loop("ind", str(36 * len(inds)))
+            self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) %6;")
+            if len(inds) > 1:
+                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
+                self.gen_add_multi_threaded_select("ind", "<", [str(36*(i+1)) for i in range(len(inds))], select_var_vals)
+                jid = "jid"
+            else:
+                jid = str(inds[0])
+                self.gen_add_code_line("int jid = " + jid + ";")
+            self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
 
-        self.gen_add_code_line("s_temp[36 * "+str(n)+"+6*jid6+row+6*col] = s_temp[84*"+str(n)+"+jid6+row]*s_temp[84*"+str(n)+"+jid6+col]/s_temp[96 *"+str(n)+"+jid];")
+            self.gen_add_code_line("s_temp[36 * "+str(n)+"+6*jid6+row+6*col] = s_temp[84*"+str(n)+"+jid6+row]*s_temp[84*"+str(n)+"+jid6+col]/s_temp[96 *"+str(n)+"+jid];")
 
-        self.gen_add_code_line("s_temp[36 * "+str(n)+"+6*jid6+row+6*col] = s_temp[6*jid6+row+6*col] - s_temp[36 * "+str(n)+"+6*jid6+row+6*col];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
+            self.gen_add_code_line("s_temp[36 * "+str(n)+"+6*jid6+row+6*col] = s_temp[6*jid6+row+6*col] - s_temp[36 * "+str(n)+"+6*jid6+row+6*col];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
 
-        # caclulate pa
-        self.gen_add_code_line("// pa[k] = pA[k] + Ia[k]*c[k]+U[k]*u[k]/d[k]")
-        self.gen_add_parallel_loop("ind", str(6*len(inds)))
-        self.gen_add_code_line("int row = ind % 6;")
-        if len(inds) > 1:
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
-            jid = "jid"
-        else:
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + jid + ";")
-        self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
+            # caclulate pa
+            self.gen_add_code_line("// pa[k] = pA[k] + Ia[k]*c[k]+U[k]*u[k]/d[k]")
+            self.gen_add_parallel_loop("ind", str(6*len(inds)))
+            self.gen_add_code_line("int row = ind % 6;")
+            if len(inds) > 1:
+                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
+                self.gen_add_multi_threaded_select("ind", "<", [str(6*(i+1)) for i in range(len(inds))], select_var_vals)
+                jid = "jid"
+            else:
+                jid = str(inds[0])
+                self.gen_add_code_line("int jid = " + jid + ";")
+            self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
 
-        self.gen_add_code_line("T Uval = s_temp[84 * "+str(n)+"+jid6+row]*s_temp[97*"+str(n)+"+jid]/s_temp[96*"+str(n)+"+jid];")
-        self.gen_add_code_line("s_temp[90 * "+str(n)+" + jid6 + row] = s_temp[78 * "+str(n)+" + jid6+row] + dot_prod<T,6,6,1>(&s_temp[36*("+str(n)+"+jid)+row], &s_temp[72*"+str(n)+"+jid6]) + Uval;")
-        self.gen_add_end_control_flow()
+            self.gen_add_code_line("T Uval = s_temp[84 * "+str(n)+"+jid6+row]*s_temp[97*"+str(n)+"+jid]/s_temp[96*"+str(n)+"+jid];")
+            self.gen_add_code_line("s_temp[90 * "+str(n)+" + jid6 + row] = s_temp[78 * "+str(n)+" + jid6+row] + dot_prod<T,6,6,1>(&s_temp[36*("+str(n)+"+jid)+row], &s_temp[72*"+str(n)+"+jid6]) + Uval;")
+            self.gen_add_end_control_flow()
         
         if bfs_level != 0:
             if len(inds) > 1 and self.robot.has_repeated_parents(inds):
@@ -869,26 +1099,67 @@ def gen_aba_inner(self):
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
         
-        # calculate qdd which is (u - U*a)/d 
+        # calculate qdd which is (u - U*a)/d
         self.gen_add_code_line("// qdd[k] = (u[k] - U[k].T*a[k])/d[k]")
-        self.gen_add_parallel_loop("ind",str(len(inds)))
-        if len(inds) > 1:
-            self.gen_add_code_line("int comp_mod = ind % "+ str(len(inds)) + ";")
-            select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-            jid = "jid"
-            self.gen_add_multi_threaded_select("comp_mod", "==", [str(i) for i in range(len(inds))], select_var_vals)
+        if HAS_SPHERICAL:
+            # Tier-C: spherical qdd = Dinv*(u - U^T*a) (3-vec, written to the f-block);
+            # cardinal joints use the scalar (u - U^T a)/d with the SHIFTED qdd slot.
+            self.gen_add_serial_ops()
+            for jid in inds:
+                jid6 = 6 * jid
+                if _aba_is_spherical(self, jid):
+                    so = _aba_sph_block_off(self, jid, _sph_order[jid])
+                    U_off, Dinv_off = so + _ABA_SPH_U_OFF, so + _ABA_SPH_DINV_OFF
+                    u3_off, tmp3_off = so + _ABA_SPH_U3_OFF, so + _ABA_SPH_TMP3_OFF
+                    fblk = self.robot.get_joint_index_f(jid)
+                    # tmp[k] = u[k] - U[:,k]^T * a[jid]
+                    for k in range(3):
+                        self.gen_add_code_line("s_temp[" + str(tmp3_off + k) + "] = s_temp[" + str(u3_off + k) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(U_off + 6*k) + "], &s_va[" + str(6*n + jid6) + "]);")
+                    # qdd_blk = Dinv * tmp  -> write the f-block of s_qdd
+                    for k in range(3):
+                        self.gen_add_code_line("s_qdd[" + str(fblk[k]) + "] = dot_prod<T,3,3,1>(&s_temp[" + str(Dinv_off + k) + "], &s_temp[" + str(tmp3_off) + "]);")
+                else:
+                    self.gen_add_code_line("s_qdd[" + str(_qd_idx(jid)) + "] = (s_temp[" + str(97*n + jid) + "] - dot_prod<T,6,1,1>(&s_temp[" + str(84*n + jid6) + "], &s_va[" + str(6*n + jid6) + "])) / s_temp[" + str(96*n + jid) + "];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
         else:
-            jid = str(inds[0])
-            self.gen_add_code_line("int jid = " + jid + ";")
-        self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
-        self.gen_add_code_line("T tempval = s_temp[97 * "+str(n)+"+jid] - dot_prod<T,6,1,1>(&s_temp[84*"+str(n)+"+jid6], &s_va[6*"+str(n)+"+jid6]);")
-        self.gen_add_code_line("s_qdd[jid] = tempval / s_temp[96*"+str(n)+"+jid];")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
+            self.gen_add_parallel_loop("ind",str(len(inds)))
+            if len(inds) > 1:
+                self.gen_add_code_line("int comp_mod = ind % "+ str(len(inds)) + ";")
+                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
+                jid = "jid"
+                self.gen_add_multi_threaded_select("comp_mod", "==", [str(i) for i in range(len(inds))], select_var_vals)
+            else:
+                jid = str(inds[0])
+                self.gen_add_code_line("int jid = " + jid + ";")
+            self.gen_add_code_line("int jid6 = 6 * " + jid + ";")
+            self.gen_add_code_line("T tempval = s_temp[97 * "+str(n)+"+jid] - dot_prod<T,6,1,1>(&s_temp[84*"+str(n)+"+jid6], &s_va[6*"+str(n)+"+jid6]);")
+            self.gen_add_code_line("s_qdd[jid] = tempval / s_temp[96*"+str(n)+"+jid];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
 
         # update a by adding qdd*S
         self.gen_add_code_line("// a[k] += qdd[k]*S[k]")
-        level_has_skew = any(not self.robot.S_is_cardinal_by_id(j) for j in inds)
+        level_has_skew = any(
+            (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+            for j in inds)
+        if HAS_SPHERICAL:
+            # Tier-C: a[jid] += S*qdd. Spherical adds its 3 angular columns (rows
+            # 0..2) from its f-block; cardinal joints add their single SHIFTED slot.
+            self.gen_add_serial_ops()
+            for jid in inds:
+                jid6 = 6 * jid
+                if _aba_is_spherical(self, jid):
+                    fblk = self.robot.get_joint_index_f(jid)
+                    for k in range(3):
+                        self.gen_add_code_line("s_va[" + str(6*n + jid6 + k) + "] += s_qdd[" + str(fblk[k]) + "];")
+                else:
+                    s_ind_val = self.robot.get_S_index_by_id(jid)
+                    s_sign_val = self.robot.get_S_sign_by_id(jid)
+                    self.gen_add_code_line("s_va[" + str(6*n + jid6 + s_ind_val) + "] += (" + str(s_sign_val) + ") * s_qdd[" + str(_qd_idx(jid)) + "];")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            continue
         self.gen_add_parallel_loop("ind",str(6*len(inds)))
         if level_has_skew:
             # Tier B (skew): a[:,jid] += S_dense * qdd[jid]. Per-jid dispatch by
@@ -948,6 +1219,13 @@ def gen_aba_inner_temp_mem_size(self):
         return nv + 18 * n + nv * nv + work
     if self.robot.floating_base:
         return max(140 * n + 138, self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
+    if self.robot.robot_has_spherical():
+        # Tier-C: a dedicated spherical scratch arena (Dinv/U/UDinv/u/tmp/invert
+        # per ball joint) sits ABOVE the cardinal 140*n hot band so the cold-spill
+        # ladder offsets stay byte-identical for cardinal robots. Gated on
+        # robot_has_spherical() so non-spherical sizing is untouched.
+        n_sph = sum(1 for j in range(n) if _aba_is_spherical(self, j))
+        return 140 * n + _ABA_SPH_STRIDE * n_sph
     return 140 * n
 
 def gen_aba_inner_cold_mem_size(self):
@@ -1024,6 +1302,12 @@ def _aba_surgical_inner_smem_size(self):
     n = self.robot.get_num_joints()
     if self.robot.floating_base:
         return self.gen_aba_inner_temp_mem_size() - 138
+    if self.robot.robot_has_spherical():
+        # Spherical arena lives ABOVE the cold band [98n,140n); spilling the cold
+        # band leaves an interior hole that cannot be compacted byte-identically,
+        # so keep the full hot arena in smem at the surgical rung (spherical
+        # robots are tiny and never actually reach this spill tier).
+        return self.gen_aba_inner_temp_mem_size()
     return 98 * n
 
 def _emit_aba_kernel_body_for_flags(self, nq, nv, n, input_count, level, single_call_timing, mjx_kernel=False):
