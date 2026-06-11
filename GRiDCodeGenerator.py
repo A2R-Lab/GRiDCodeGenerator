@@ -310,13 +310,17 @@ class GRiDCodeGenerator:
             algorithms.update({"fdsva_so", "integrator"})
         if "fdsva_so" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient", "idsva_so_body_frame"})
-        # Mimic Minv routes through crba_inner (see _minv.py: the reduced-space
-        # M is built via CRBA then inverted), so any mimic robot emitting `minv` has a
-        # hidden dependency on `crba` for the crba_inner definition. Declare it so the
-        # forward-decl'd crba_inner is actually emitted (else nvlink: unresolved extern
-        # crba_inner). Non-mimic minv doesn't touch crba, so this is additive — FLAG for
-        # main reconcile (shared GCG.py edit; unblocks floating-mimic fdsva_so).
-        if "minv" in algorithms and self.robot_has_mimic_joints():
+        # Mimic AND spherical (Tier-C) Minv route through crba_inner (see _minv.py:
+        # the reduced-space M is built via CRBA then inverted — the per-body scalar
+        # ABA-recursion minv does not generalize to multi-DoF / folded joints), so a
+        # mimic OR spherical robot emitting `minv` has a hidden dependency on `crba`
+        # for the crba_inner definition. Declare it so the forward-decl'd crba_inner is
+        # actually emitted (else nvlink: unresolved extern crba_inner). This matters in
+        # particular when `minv` is pulled in transitively (e.g. by frame_jacobian)
+        # WITHOUT `crba` being requested directly. Non-mimic/non-spherical minv doesn't
+        # touch crba, so this is additive — byte-identical for cardinal robots.
+        if "minv" in algorithms and (self.robot_has_mimic_joints()
+                                     or self.robot.robot_has_spherical()):
             algorithms.add("crba")
         # idsva_so_world_frame is emitted alongside idsva_so_body_frame (it
         # reuses the body-frame inner scaffolding + dispatcher); requesting it
@@ -2518,20 +2522,25 @@ class GRiDCodeGenerator:
         # so the request can be OR'd into enable_idsva_so_world_frame below.
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
         # SPHERICAL (Tier-C) slices: inverse_dynamics + crba + minv + forward_dynamics
-        # are ported. forward_dynamics routes through minv (= inv(CRBA(q))) + the
-        # compute_c RNEA, not the standalone ABA (which keeps its scalar single-DoF
-        # articulated-body recursion — a separate later slice). Reject any other
-        # requested algorithm for a robot with a spherical joint so we fail loudly
-        # instead of emitting a wrong aba/gradient/SO kernel.
+        # (dynamics) plus end_effector_pose + frame_jacobian (kinematics) are ported.
+        # forward_dynamics routes through minv (= inv(CRBA(q))) + the compute_c RNEA,
+        # not the standalone ABA (which keeps its scalar single-DoF articulated-body
+        # recursion — a separate later slice). The EE-pose / frame-jacobian FK chain-up
+        # consumes the joint's HOMOGENEOUS quaternion transform (R, not Rᵀ), built via
+        # the shared quaternion XmatsHom substitution on the joint's own 4-wide q-block.
+        # Reject any other requested algorithm for a robot with a spherical joint so we
+        # fail loudly instead of emitting a wrong aba/gradient/SO kernel.
         if self.robot.robot_has_spherical():
-            _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics"}
+            _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics",
+                             "end_effector_pose", "frame_jacobian"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
                     "Spherical (ball) joint CUDA codegen currently supports "
-                    f"inverse_dynamics + crba + minv + forward_dynamics; requested "
-                    f"unsupported algorithm(s) {_unported}. Remaining algorithms "
-                    "(aba/gradients/SO/integrator/kinematics) are follow-on slices "
+                    "inverse_dynamics + crba + minv + forward_dynamics + "
+                    f"end_effector_pose + frame_jacobian; requested unsupported "
+                    f"algorithm(s) {_unported}. Remaining algorithms "
+                    "(aba/gradients/SO/integrator) are follow-on slices "
                     "(see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:

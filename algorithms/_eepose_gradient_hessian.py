@@ -3113,10 +3113,13 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
 
     if include_pose or include_gradient or include_hessian:
         # standalone warp/thread FK inners + batched convenience path.
-        # Skip ENTIRELY for floating-base / mimic robots: the standalone inner
-        # does not support those (it raises) — they route through
-        # end_effector_pose instead.
-        if not self.robot.floating_base and not self.robot_has_mimic_joints():
+        # Skip ENTIRELY for floating-base / mimic / spherical robots: the
+        # standalone inner bakes a single-DoF sin/cos(theta) angle per joint and
+        # does not support those multi-DoF / folded cases (it raises for
+        # floating/mimic, and would emit a wrong sin/cos of a quaternion q-slot
+        # for spherical) — they route through end_effector_pose instead.
+        if (not self.robot.floating_base and not self.robot_has_mimic_joints()
+                and not self.robot.robot_has_spherical()):
             self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_fk_batched_kernel()

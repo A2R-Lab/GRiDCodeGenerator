@@ -875,6 +875,13 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
         self.gen_add_sync()
     # loop through Xmats and update all non-constant values serially
     def replace_hom_config_symbols(str_val, ind):
+        # Tier-C spherical (ball) joint: its homogeneous-transform cell holds the
+        # q1_sph..q4_sph unit-quaternion symbols (sp.ccode `pow(qk_sph,2)` form).
+        # Substitute the joint's OWN 4-wide q-block (a mid-chain spherical shifts
+        # downstream q-offsets, handled inside the helper) -- NOT a sin/cos fold.
+        # Byte-identical for non-spherical robots (branch never taken).
+        if getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical":
+            return _xi_spherical_quat_subst(self, str_val, ind, ccode=True)
         if self.robot.floating_base:
             if self.robot_has_mimic_joints():
                 # Floating + mimic: read the folded effective angle/sincos from
@@ -910,9 +917,21 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
             str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + 2*NB) + "]")
             str_val = str_val.replace("theta","s_temp[" + str(ind) + "]")
         else:
-            str_val = str_val.replace("sin(theta)","s_temp[" + str(ind) + "]")
-            str_val = str_val.replace("cos(theta)","s_temp[" + str(ind + n) + "]")
-            str_val = str_val.replace("theta","s_q[" + str(ind) + "]")
+            # Single-DoF revolute/prismatic. The hom sincos fill loop builds
+            # s_temp[q]=sin(s_q[q]), s_temp[q+nq]=cos(s_q[q]) over q in [0,nq)
+            # (nq = get_num_pos()), so a joint reads its sin/cos at its OWN
+            # q-slot, NOT at `ind`. On an all-cardinal fixed robot q-slot==ind
+            # and nq==n -> byte-identical to the legacy s_temp[ind]/s_temp[ind+n].
+            # On a robot with a multi-DoF (spherical) joint, downstream single-DoF
+            # joints are shifted (nq>NJ), so reading `ind` would grab the wrong
+            # angle's sin/cos (the §1e q-slot bug; mirrors the XImats fix).
+            nq = self.robot.get_num_pos()
+            qslot = self.robot.get_joint_index_q(ind)
+            if isinstance(qslot, (list, tuple)):
+                qslot = qslot[0]
+            str_val = str_val.replace("sin(theta)","s_temp[" + str(qslot) + "]")
+            str_val = str_val.replace("cos(theta)","s_temp[" + str(qslot + nq) + "]")
+            str_val = str_val.replace("theta","s_q[" + str(qslot) + "]")
         return str_val
 
     # Split the per-matrix updates into separate serial sections (one each
