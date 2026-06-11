@@ -83,6 +83,7 @@ class GRiDCodeGenerator:
                             gen_fdsva_so, gen_fdsva_so_contract_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size, gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled, gen_fdsva_so_fd_gradient_inline, gen_fdsva_so_contract_function_call, gen_fdsva_so_contract, \
                             gen_fdsva_so_device, gen_fdsva_so_device_function_call, gen_fdsva_so_kernel, gen_fdsva_so_host, \
                             gen_integrator_inner_temp_mem_size, gen_integrator_finish_function_call, gen_integrator_finish, \
+                            _spherical_retract_index_tables, _emit_q_update, gen_integrate_spherical_helper, \
                             gen_integrator_inner_function_call, gen_integrator_inner, gen_integrator_device, \
                             gen_integrator_kernel, gen_integrator_host, gen_integrator, gen_lie_group_helpers, \
                             gen_integrator_gradient_inner_temp_mem_size, gen_integrator_gradient_dAB_assembly, \
@@ -344,6 +345,15 @@ class GRiDCodeGenerator:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient"})
+        # The minv->crba spherical/mimic expansion above runs BEFORE integrator
+        # pulls in `minv` (line ordering), so a spherical robot requesting ONLY
+        # `integrator` would add minv here WITHOUT crba_inner being emitted ->
+        # nvlink: unresolved extern crba_inner. Re-assert the crba dependency
+        # after the integrator (and any other late minv-adders) have run. Additive
+        # for cardinal robots (the guard is false), byte-identical.
+        if "minv" in algorithms and (self.robot_has_mimic_joints()
+                                     or self.robot.robot_has_spherical()):
+            algorithms.add("crba")
         # R6 centroidal deps: com/ccrba/energy reuse the ee_pose homogeneous-
         # transform world-frame machinery; generalized_gravity/nonlinear_effects
         # are RNEA-bias wrappers around the id inner. Expanding the DEP is correct;
@@ -2532,15 +2542,15 @@ class GRiDCodeGenerator:
         # fail loudly instead of emitting a wrong aba/gradient/SO kernel.
         if self.robot.robot_has_spherical():
             _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics",
-                             "end_effector_pose", "frame_jacobian"}
+                             "end_effector_pose", "frame_jacobian", "integrator"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
                     "Spherical (ball) joint CUDA codegen currently supports "
                     "inverse_dynamics + crba + minv + forward_dynamics + "
-                    f"end_effector_pose + frame_jacobian; requested unsupported "
-                    f"algorithm(s) {_unported}. Remaining algorithms "
-                    "(aba/gradients/SO/integrator) are follow-on slices "
+                    f"end_effector_pose + frame_jacobian + integrator; requested "
+                    f"unsupported algorithm(s) {_unported}. Remaining algorithms "
+                    "(aba/gradients/SO) are follow-on slices "
                     "(see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:

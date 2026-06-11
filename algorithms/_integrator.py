@@ -317,6 +317,168 @@ def gen_lie_group_helpers(self):
         "}",
         "",
     ])
+    # Spherical (ball) joint SO(3) retract helper — emitted ONLY when the robot
+    # has a spherical joint (so pure-floating robots stay byte-identical; the
+    # block is absent from their header). Block-pointer form: q_new_blk =
+    # normalize(q_blk (x) exp(half)). `half` is 0.5*scale*omega (the caller
+    # pre-scales). Reuses grid_quat_exp_half_omega + grid_quat_mul_xyzw + the
+    # renorm — the SO(3) half of grid_integrate_floating_q with no SE(3) coupling.
+    if self.robot.robot_has_spherical():
+        self.gen_add_code_lines([
+            "template <typename T> __device__ inline void grid_integrate_spherical_q(",
+            "    const T *q_blk, const T *half_omega, T *q_new_blk) {",
+            "    T dq[4]; grid_quat_exp_half_omega(half_omega, dq);",
+            "    T q_old_quat[4] = {q_blk[0], q_blk[1], q_blk[2], q_blk[3]};",
+            "    T q_new_quat[4]; grid_quat_mul_xyzw(q_old_quat, dq, q_new_quat);",
+            "    T qn = sqrt(q_new_quat[0]*q_new_quat[0] + q_new_quat[1]*q_new_quat[1] + q_new_quat[2]*q_new_quat[2] + q_new_quat[3]*q_new_quat[3]);",
+            "    T inv_qn = static_cast<T>(1) / qn;",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; ++i) q_new_blk[i] = q_new_quat[i] * inv_qn;",
+            "}",
+            "",
+        ])
+
+
+def gen_integrate_spherical_helper(self):
+    """Standalone emitter for the spherical SO(3) retract device helper, used
+    when the robot has a spherical joint but is NOT floating (so the floating
+    Lie-group helper bundle isn't otherwise emitted). Emits the small quaternion
+    primitives it depends on (grid_quat_mul_xyzw, grid_quat_exp_half_omega) plus
+    the grid_integrate_spherical_q wrapper. Pure-floating robots emit these via
+    gen_lie_group_helpers instead (and never call this)."""
+    self.gen_add_func_doc("Spherical (ball) joint SO(3) quaternion retract helper (xyzw).", [], [], None)
+    self.gen_add_code_lines([
+        "template <typename T> __device__ inline void grid_quat_mul_xyzw(const T a[4], const T b[4], T out[4]) {",
+        "    out[0] = a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1];",
+        "    out[1] = a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0];",
+        "    out[2] = a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3];",
+        "    out[3] = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];",
+        "}",
+        "",
+        "template <typename T> __device__ inline void grid_quat_exp_half_omega(const T half_omega[3], T out[4]) {",
+        "    T theta = sqrt(half_omega[0]*half_omega[0] + half_omega[1]*half_omega[1] + half_omega[2]*half_omega[2]);",
+        "    T sinc, cos_t;",
+        "    if (theta < static_cast<T>(1e-12)) { sinc = static_cast<T>(1) - theta*theta/static_cast<T>(6); cos_t = static_cast<T>(1) - static_cast<T>(0.5)*theta*theta; }",
+        "    else { sinc = sin(theta)/theta; cos_t = cos(theta); }",
+        "    out[0] = sinc * half_omega[0]; out[1] = sinc * half_omega[1]; out[2] = sinc * half_omega[2]; out[3] = cos_t;",
+        "}",
+        "",
+        "template <typename T> __device__ inline void grid_integrate_spherical_q(",
+        "    const T *q_blk, const T *half_omega, T *q_new_blk) {",
+        "    T dq[4]; grid_quat_exp_half_omega(half_omega, dq);",
+        "    T q_old_quat[4] = {q_blk[0], q_blk[1], q_blk[2], q_blk[3]};",
+        "    T q_new_quat[4]; grid_quat_mul_xyzw(q_old_quat, dq, q_new_quat);",
+        "    T qn = sqrt(q_new_quat[0]*q_new_quat[0] + q_new_quat[1]*q_new_quat[1] + q_new_quat[2]*q_new_quat[2] + q_new_quat[3]*q_new_quat[3]);",
+        "    T inv_qn = static_cast<T>(1) / qn;",
+        "    #pragma unroll",
+        "    for (int i = 0; i < 4; ++i) q_new_blk[i] = q_new_quat[i] * inv_qn;",
+        "}",
+        "",
+    ])
+
+
+def _spherical_retract_index_tables(self):
+    """Return (add_q, add_v, spherical_blocks) for the q-update on a robot that
+    has spherical joints (fixed-base; spherical robots are not floating here).
+
+    - add_q / add_v : matched index lists for the NON-spherical joint q/v slots
+      that retract by plain vector add (s_x_kp1[add_q[i]] = s_q[add_q[i]] +
+      scale*s_src_v[add_v[i]]). Built from get_joint_index_q/v so every slot
+      DOWNSTREAM of a spherical joint gets the correct shifted q-offset (§1e).
+    - spherical_blocks : list of (q4, v3) index lists, one per spherical joint,
+      each driving an SO(3) quaternion retract via grid_integrate_spherical_q.
+    """
+    add_q = []
+    add_v = []
+    spherical_blocks = []
+    for joint in self.robot.get_joints_ordered_by_id():
+        jid = joint.get_id()
+        jtype = getattr(joint, "jtype", None)
+        iq = self.robot.get_joint_index_q(jid)
+        iv = self.robot.get_joint_index_v(jid)
+        iq = list(iq) if isinstance(iq, (list, tuple)) else [iq]
+        iv = list(iv) if isinstance(iv, (list, tuple)) else [iv]
+        if jtype == "spherical" and not getattr(joint, "is_mimic", False):
+            spherical_blocks.append((iq, iv))
+        else:
+            # plain vector-add joint(s): pair q-slots with v-slots 1:1.
+            for qi, vi in zip(iq, iv):
+                add_q.append(qi)
+                add_v.append(vi)
+    return add_q, add_v, spherical_blocks
+
+
+def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_src_v",
+                   cardinal_line=None):
+    """Emit the q-side update q_new = q (+) scale*src_v for one stage, branching
+    on base type:
+      - fb            : SE(3) Lie retract (grid_integrate_floating_q), verbatim.
+      - spherical     : baked additive index-table parallel loop for the
+                        non-spherical joint slots + a serial SO(3) quaternion
+                        retract per spherical joint (grid_integrate_spherical_q).
+      - else (cardinal): plain parallel Euler add over nq positions, verbatim.
+    `scale_expr` is the C++ scalar multiplying src_v (e.g. "dt", "c1 * dt").
+    `cardinal_line` (optional) is the EXACT cardinal-branch loop-body line to
+    emit; supplied by callers that need to preserve the historical column
+    alignment so cardinal-robot codegen stays byte-identical. Defaults to the
+    canonical single-space form when not given.
+    """
+    nv = self.robot.get_num_vel()
+    nq = self.robot.get_num_pos()
+    fb = self.robot.floating_base
+    if fb:
+        self.gen_add_serial_ops()
+        self.gen_add_code_line(f"T v_scaled[{nv}];")
+        self.gen_add_code_line(f"for (int i = 0; i < {nv}; ++i) v_scaled[i] = {scale_expr} * {src_v_name}[i];")
+        self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>({src_q_name}, v_scaled, {dst_name});")
+        self.gen_add_end_control_flow()
+    elif self.robot.robot_has_spherical():
+        add_q, add_v, spherical_blocks = self._spherical_retract_index_tables()
+        # Non-spherical joint slots: baked additive index tables (downstream-of-
+        # spherical q-offsets are already shifted by get_joint_index_q). Parallel.
+        n_add = len(add_q)
+        if n_add:
+            # Wrap in an explicit C++ block so the baked add_q/add_v tables are
+            # scoped: integrator_inner emits several q-update sites (stages 2-4 +
+            # final assembly) into ONE function scope, so unscoped decls collide.
+            self.gen_add_code_line("{", True)
+            self.gen_add_code_line(
+                "const int add_q[" + str(n_add) + "] = {" + ", ".join(str(i) for i in add_q) + "};")
+            self.gen_add_code_line(
+                "const int add_v[" + str(n_add) + "] = {" + ", ".join(str(i) for i in add_v) + "};")
+            self.gen_add_parallel_loop("ind", str(n_add))
+            self.gen_add_code_line(
+                f"{dst_name}[add_q[ind]] = {src_q_name}[add_q[ind]] + {scale_expr} * {src_v_name}[add_v[ind]];")
+            self.gen_add_end_control_flow()
+            self.gen_add_end_control_flow()
+        # Spherical joints: serial SO(3) quaternion retract (one thread).
+        self.gen_add_serial_ops()
+        for blk_i, (q4, v3) in enumerate(spherical_blocks):
+            self.gen_add_code_line(
+                "const int sph_q_" + str(blk_i) + "[4] = {" + ", ".join(str(i) for i in q4) + "};")
+            self.gen_add_code_line(
+                "const int sph_v_" + str(blk_i) + "[3] = {" + ", ".join(str(i) for i in v3) + "};")
+            self.gen_add_code_line(f"T sph_qblk_{blk_i}[4] = {{"
+                                   f"{src_q_name}[sph_q_{blk_i}[0]], {src_q_name}[sph_q_{blk_i}[1]], "
+                                   f"{src_q_name}[sph_q_{blk_i}[2]], {src_q_name}[sph_q_{blk_i}[3]]}};")
+            # half = 0.5 * scale * omega
+            self.gen_add_code_line(f"T sph_half_{blk_i}[3] = {{"
+                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[0]], "
+                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[1]], "
+                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[2]]}};")
+            self.gen_add_code_line(f"T sph_qnew_{blk_i}[4];")
+            self.gen_add_code_line(
+                f"grid_integrate_spherical_q<T>(sph_qblk_{blk_i}, sph_half_{blk_i}, sph_qnew_{blk_i});")
+            self.gen_add_code_line("#pragma unroll")
+            self.gen_add_code_line(
+                f"for (int i = 0; i < 4; ++i) {dst_name}[sph_q_{blk_i}[i]] = sph_qnew_{blk_i}[i];")
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_add_parallel_loop("ind", str(nq))
+        if cardinal_line is None:
+            cardinal_line = f"{dst_name}[ind] = {src_q_name}[ind] + {scale_expr} * {src_v_name}[ind];"
+        self.gen_add_code_line(cardinal_line)
+        self.gen_add_end_control_flow()
 
 
 def gen_integrator_finish_function_call(self, integrator_type="IT", updated_var_names=None):
@@ -377,19 +539,9 @@ def gen_integrator_finish(self):
     # it back from s_x_kp1[nq:nq+nv] when IT == SEMI_IMPLICIT_EULER.
     self.gen_add_code_line("// pick the source velocity for the q-update")
     self.gen_add_code_line(f"const T *s_src_v = (IT == IntegratorType::EULER) ? s_qd : &s_x_kp1[{nq}];")
-    if fb:
-        # Floating-base: one thread does the Lie-group retract (size nq, includes
-        # the 7-element pose prefix + n_joints revolute add).
-        self.gen_add_serial_ops()
-        self.gen_add_code_line(f"T v_scaled[{nv}];")
-        self.gen_add_code_line(f"for (int i = 0; i < {nv}; ++i) v_scaled[i] = dt * s_src_v[i];")
-        self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q, v_scaled, s_x_kp1);")
-        self.gen_add_end_control_flow()
-    else:
-        # Fixed-base: parallel Euler add over nq (== nv) positions.
-        self.gen_add_parallel_loop("ind", str(nq))
-        self.gen_add_code_line("s_x_kp1[ind] = s_q[ind] + dt * s_src_v[ind];")
-        self.gen_add_end_control_flow()
+    # q-update: fb -> SE(3) Lie retract; spherical -> SO(3) per-ball retract +
+    # additive table for the rest; cardinal -> parallel Euler add. (size nq.)
+    self._emit_q_update("dt", "s_x_kp1", src_q_name="s_q", src_v_name="s_src_v")
 
     # ---- Multi-stage IT values are not supposed to hit this function ----
     # Compile-time sentinel: emit a static_assert that fires if someone tries
@@ -542,16 +694,8 @@ def gen_integrator_inner(self):
     self.gen_add_code_line("s_p1_qd[ind] = s_qd[ind] + c1 * dt * s_qdd[ind];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-    if fb:
-        self.gen_add_serial_ops()
-        self.gen_add_code_line(f"T v_scaled[{n}];")
-        self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = c1 * dt * s_qd[i];")
-        self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q, v_scaled, s_p1_q);")
-        self.gen_add_end_control_flow()
-    else:
-        self.gen_add_parallel_loop("ind", str(nq))
-        self.gen_add_code_line("s_p1_q[ind]  = s_q[ind]  + c1 * dt * s_qd[ind];")
-        self.gen_add_end_control_flow()
+    self._emit_q_update("c1 * dt", "s_p1_q", src_q_name="s_q", src_v_name="s_qd",
+                        cardinal_line="s_p1_q[ind]  = s_q[ind]  + c1 * dt * s_qd[ind];")
     self.gen_add_sync()
     # IMPORTANT: re-derive s_XImats for the stage-2 configuration before
     # invoking FD — the helper was last populated for s_q (stage 1).
@@ -576,16 +720,8 @@ def gen_integrator_inner(self):
         self.gen_add_code_line("s_p2_qd[ind] = s_qd[ind] + c2 * dt * s_qdd_2[ind];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
-        if fb:
-            self.gen_add_serial_ops()
-            self.gen_add_code_line(f"T v_scaled[{n}];")
-            self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = c2 * dt * s_qd[i];")
-            self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q, v_scaled, s_p2_q);")
-            self.gen_add_end_control_flow()
-        else:
-            self.gen_add_parallel_loop("ind", str(nq))
-            self.gen_add_code_line("s_p2_q[ind]  = s_q[ind]  + c2 * dt * s_qd[ind];")
-            self.gen_add_end_control_flow()
+        self._emit_q_update("c2 * dt", "s_p2_q", src_q_name="s_q", src_v_name="s_qd",
+                            cardinal_line="s_p2_q[ind]  = s_q[ind]  + c2 * dt * s_qd[ind];")
         self.gen_add_sync()
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p2_q"))
         self.gen_add_sync()
@@ -603,16 +739,8 @@ def gen_integrator_inner(self):
         self.gen_add_code_line("s_p3_qd[ind] = s_qd[ind] + c3 * dt * s_qdd_3[ind];")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
-        if fb:
-            self.gen_add_serial_ops()
-            self.gen_add_code_line(f"T v_scaled[{n}];")
-            self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = c3 * dt * s_qd[i];")
-            self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q, v_scaled, s_p3_q);")
-            self.gen_add_end_control_flow()
-        else:
-            self.gen_add_parallel_loop("ind", str(nq))
-            self.gen_add_code_line("s_p3_q[ind]  = s_q[ind]  + c3 * dt * s_qd[ind];")
-            self.gen_add_end_control_flow()
+        self._emit_q_update("c3 * dt", "s_p3_q", src_q_name="s_q", src_v_name="s_qd",
+                            cardinal_line="s_p3_q[ind]  = s_q[ind]  + c3 * dt * s_qd[ind];")
         self.gen_add_sync()
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p3_q"))
         self.gen_add_sync()
@@ -649,16 +777,7 @@ def gen_integrator_inner(self):
     self.gen_add_sync()
     # q_{k+1} part: same as Euler since the q-source is always the original qd
     self.gen_add_code_line("// q_{k+1} part — Euler-style integrate(q, dt*qd) (TrajoptPlant convention)")
-    if fb:
-        self.gen_add_serial_ops()
-        self.gen_add_code_line(f"T v_scaled[{n}];")
-        self.gen_add_code_line(f"for (int i = 0; i < {n}; ++i) v_scaled[i] = dt * s_qd[i];")
-        self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>(s_q, v_scaled, s_x_kp1);")
-        self.gen_add_end_control_flow()
-    else:
-        self.gen_add_parallel_loop("ind", str(nq))
-        self.gen_add_code_line("s_x_kp1[ind] = s_q[ind] + dt * s_qd[ind];")
-        self.gen_add_end_control_flow()
+    self._emit_q_update("dt", "s_x_kp1", src_q_name="s_q", src_v_name="s_qd")
     self.gen_add_end_control_flow()  # end else (multi-stage)
     self.gen_add_end_function()
 
@@ -908,7 +1027,18 @@ def gen_integrator(self):
     # The d2ee kinematic codegen may also emit these helpers; only emit here
     # if they weren't already emitted (avoid C++ redefinition).
     if self.robot.floating_base and not getattr(self, "_lie_helpers_emitted", False):
+        # Floating-base: emit the full SE(3) Lie bundle (the q-update Lie retract
+        # + dIntegrate/d2Integrate blocks). For a floating robot that ALSO has a
+        # spherical joint, gen_lie_group_helpers additionally emits the spherical
+        # SO(3) wrapper (gated inside it on robot_has_spherical()).
         self.gen_lie_group_helpers()
+        self._lie_helpers_emitted = True
+    elif (not self.robot.floating_base) and self.robot.robot_has_spherical() \
+            and not getattr(self, "_lie_helpers_emitted", False):
+        # Fixed-base spherical robot: it never references the SE(3) bundle, only
+        # the SO(3) quaternion retract. Emit JUST that (+ its quaternion deps) so
+        # the header stays lean and pure-floating codegen is unaffected.
+        self.gen_integrate_spherical_helper()
         self._lie_helpers_emitted = True
     self.gen_integrator_finish()
     self.gen_integrator_inner()

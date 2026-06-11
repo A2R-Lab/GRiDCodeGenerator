@@ -14,6 +14,9 @@ from ._crba import *
 from ._idsva_so import *
 from ._fdsva_so import *
 from ._integrator import *
+# `import *` skips underscore-prefixed names; export the spherical-retract
+# q-update emit helpers explicitly so GRiDCodeGenerator can bind them as methods.
+from ._integrator import _spherical_retract_index_tables, _emit_q_update
 from ._integrator_gradient import *
 from ._plant import *
 from ._centroidal import *
