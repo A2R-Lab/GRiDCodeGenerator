@@ -2557,7 +2557,8 @@ class GRiDCodeGenerator:
             _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics",
                              "end_effector_pose", "frame_jacobian", "integrator",
                              "inverse_dynamics_gradient", "forward_dynamics_gradient",
-                             "aba", "idsva_so_body_frame", "idsva_so_world_frame"}
+                             "aba", "idsva_so_body_frame", "idsva_so_world_frame",
+                             "fdsva_so"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
@@ -2565,8 +2566,8 @@ class GRiDCodeGenerator:
                     "inverse_dynamics + crba + minv + forward_dynamics + "
                     f"end_effector_pose + frame_jacobian + integrator + "
                     f"inverse_dynamics_gradient + forward_dynamics_gradient + aba + "
-                    f"idsva_so; requested unsupported algorithm(s) {_unported}. "
-                    "Remaining algorithms (fdsva_so) are follow-on slices "
+                    f"idsva_so + fdsva_so; requested unsupported algorithm(s) "
+                    f"{_unported}. Remaining algorithms are follow-on slices "
                     "(see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:
