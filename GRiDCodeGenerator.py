@@ -797,7 +797,14 @@ class GRiDCodeGenerator:
         # Per-tier t_counts exposed for tier-aware constexpr metadata.
         self.inverse_dynamics_gradient_t_count_per_tier = tuple(_inverse_dynamics_gradient_arenas[i] for i in self.inverse_dynamics_gradient_spill_tier_3way)
         self.forward_dynamics_gradient_t_count_per_tier = tuple(_forward_dynamics_gradient_arenas[i] for i in self.forward_dynamics_gradient_spill_tier_3way)
-        aba_input_t_count = n + 2*nv
+        # §1e: the aba kernel body reserves a 3*nq-wide per-timestep input slot
+        # ("s_q_qd_tau", 3*nq in _emit_aba_kernel_body_for_flags; n == get_num_pos()
+        # == nq here); the matching ABA_DYNAMIC_SHARED_MEM_BYTES arena count must use
+        # the SAME 3*n, not n+2*nv. For a fixed-base cardinal robot nq==nv==n so
+        # 3*n == n+2*nv (byte-identical), but on a spherical/floating (nq>nv) base the
+        # n+2*nv form under-sizes the launch smem by 3*(nq-nv) floats -> the aba batch
+        # kernel OOBs in load_update_XImats_helpers. Mirrors the fd/minv 3*n input slots.
+        aba_input_t_count = 3 * n
         crba_input_t_count = n + nv
         # ABA surgical-spill ladder, 3 rungs. The 140*NJ+138 inner scratch band
         # keeps its hot recursion in smem and spills only the cold sub-band when
