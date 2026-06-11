@@ -31,6 +31,11 @@ def gen_crba_inner_temp_mem_size(self):
     # (h1_2-fixed: num_pos=39, NJ=51 -> 42*39=1638 < 36*51=1836 = OOB). 42*NJ
     # covers both paths (42*NJ >= 36*NJ).
     NJ = self.robot.get_num_joints()
+    if self.robot.robot_has_spherical():
+        # Tier-C spherical fixed-base: IC band (36*NJ) + a 36-float per-level
+        # GEMM temp (s_temp[36*NJ ...]) used by Phase-1's X^T IC X. 36*NJ+36
+        # can exceed 42*NJ for small NJ (e.g. NJ=2 -> 108 > 84), so size for it.
+        return 36*NJ + 36
     return 42*NJ
 
 def gen_crba_inner_function_call(self, updated_var_names = None,
@@ -136,10 +141,122 @@ def _gen_crba_inner_mimic_fixed(self, NB):
     self.gen_add_sync()
 
 
+def _gen_crba_inner_spherical_fixed(self, NB, n_bfs_levels):
+    """Tier-C spherical (ball) fixed-base CRBA inner.
+
+    Mirrors RBDReference.crba (fixed-base, non-mimic) generalized-block path:
+      Phase 1 (composite inertia, S-INDEPENDENT): IC[parent] += X^T IC X up the
+        chain — identical to the cardinal Phase-1 GEMM emit, kept inline here so
+        the cardinal fast path stays byte-identical.
+      Phase 2 (S projection): for each body `ind` with v-block vi and motion
+        subspace S (3-wide for the ball joint, 1-wide signed-unit for cardinals):
+          fh   = IC[ind] S                 (6 x |vi|)
+          diag = S^T fh                    (|vi| x |vi|)  -> M[vi, vi]
+        then walk ancestors j (fh <- X[j]^T fh; block = S_j^T fh) writing the
+        symmetric M[vj, vi] / M[vi, vj] blocks.
+    s_M is NV x NV column-major (nv != NB on a spherical robot). Serial per body
+    (correctness-first; spherical robots are rare). The spherical S is the
+    angular identity (cols k = rows k, k in 0..2), so its projections are plain
+    row picks; cardinal joints use their signed unit row.
+    """
+    nv = self.robot.get_num_vel()
+    ImatOffset = 36 * NB  # Imats start here in s_XImats
+
+    # Per-joint motion-subspace columns, each a flat 6-vector. get_S_by_id is a
+    # 6 x ncols numpy matrix (spherical -> 3 angular-identity cols; cardinal -> 1
+    # signed-unit col); a 1-DoF joint may come back 1-D (shape (6,)).
+    def _S_cols(jid):
+        S = np.asarray(self.robot.get_S_by_id(jid), dtype=np.float64)
+        if S.ndim == 1:
+            S = S.reshape(6, 1)
+        ncols = S.shape[1]
+        return [[float(S[r, c]) for r in range(6)] for c in range(ncols)]
+
+    def _Scol_cpp(col):
+        return "{" + ", ".join("static_cast<T>(" + repr(v) + ")" for v in col) + "}"
+
+    # IC band lives in s_temp[0, 36*NB) — same as the cardinal `alpha` buffer.
+    self.gen_add_code_line("// === Tier-C spherical CRBA (serial generalized-block fold) ===")
+    self.gen_add_code_line("// Clear reduced mass matrix M (NV x NV)")
+    self.gen_add_parallel_loop("i", str(nv * nv))
+    self.gen_add_code_line("s_M[i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_code_line("T *alpha = &s_temp[0];   // [0, 36*NB) composite inertia IC")
+    self.gen_add_code_line("// IC[ind] = I[ind] (column-major 6x6 per body)")
+    self.gen_add_parallel_loop("i", str(36 * NB))
+    self.gen_add_code_line("alpha[i] = s_XImats[" + str(ImatOffset) + " + i];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # Phase 1 — composite inertia up the chain (S-independent), BFS level loop.
+    # IC[parent] += X[ind]^T IC[ind] X[ind]. Reuse the cardinal GEMM emit pattern
+    # (writes only the IC band, never M), but route the IC scratch through the
+    # `alpha` band declared above.
+    for bfs_level in range(n_bfs_levels - 1, 0, -1):
+        inds = self.robot.get_ids_by_bfs_level(bfs_level)
+        joint_names = [self.robot.get_joint_by_id(j).get_name() for j in inds]
+        self.gen_add_code_line("// CRBA Phase 1 BFS level " + str(bfs_level) + " (jids " + str(inds) + ")")
+        self.gen_add_code_line("//     joints: " + ", ".join(joint_names))
+        for jid in inds:
+            parent_ind = self.robot.get_parent_id(jid)
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6,false,true>(&s_XImats[{36*jid}], &alpha[{36*jid}], &s_temp[{36*NB}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
+            self.gen_add_code_line(f"grid_linalg_gemm<T,6,6,6>(&s_temp[{36*NB}], &s_XImats[{36*jid}], &alpha[{36*parent_ind}], static_cast<T>(1), static_cast<T>(1), s_linalg_smem);")
+
+    # Phase 2 — S projection, serial per body. fh / fh2 hold up to 3 columns.
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Calculation of M (Tier-C generalized-block S^T (IC chain) S)")
+    self.gen_add_code_line("//")
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T s_fh[18]; T s_fh2[18];   // up to 6x3 per joint")
+    for ind in range(NB):
+        vi = self.robot.get_joint_index_v(ind)
+        if not isinstance(vi, (list, tuple)):
+            vi = [vi]
+        cols_i = _S_cols(ind)
+        nci = len(cols_i)
+        self.gen_add_code_line("// body " + str(ind) + " -> v-block " + str(list(vi)))
+        self.gen_add_code_line("{")
+        # fh[:, c] = IC[ind] * S_i[:, c]   (column-major 6x6 * 6-vec)
+        for c in range(nci):
+            self.gen_add_code_line("  { const T Sc[6] = " + _Scol_cpp(cols_i[c]) + ";")
+            self.gen_add_code_line("    for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += alpha[" + str(36*ind) + " + r + 6*p] * Sc[p]; } s_fh[r + 6*" + str(c) + "] = acc; } }")
+        # diag[a,b] = S_i[:,a]^T fh[:,b] -> M[vi[a], vi[b]]
+        for a in range(nci):
+            for b in range(nci):
+                self.gen_add_code_line("  { const T Sa[6] = " + _Scol_cpp(cols_i[a]) + ";")
+                self.gen_add_code_line("    s_M[" + str(vi[a] + nv*vi[b]) + "] += dot_prod<T,6,1,1>(Sa, &s_fh[6*" + str(b) + "]); }")
+        # walk ancestors: fh <- X[j]^T fh (per column), block = S_j^T fh
+        chain = self.robot.get_ancestors_by_id(ind)
+        cur, nxt = "s_fh", "s_fh2"
+        X_ind = ind
+        for parent_ind in chain:
+            for c in range(nci):
+                self.gen_add_code_line("  for (int r = 0; r < 6; r++) { T acc = static_cast<T>(0); for (int p = 0; p < 6; p++) { acc += s_XImats[36*" + str(X_ind) + " + p + 6*r] * " + cur + "[p + 6*" + str(c) + "]; } " + nxt + "[r + 6*" + str(c) + "] = acc; }")
+            vj = self.robot.get_joint_index_v(parent_ind)
+            if not isinstance(vj, (list, tuple)):
+                vj = [vj]
+            cols_j = _S_cols(parent_ind)
+            ncj = len(cols_j)
+            # block[bj, bi] = S_j[:,bj]^T fh[:,bi]; M[vj[bj], vi[bi]] += block,
+            # M[vi[bi], vj[bj]] += block (symmetric).
+            for bj in range(ncj):
+                self.gen_add_code_line("  { const T Sp[6] = " + _Scol_cpp(cols_j[bj]) + ";")
+                for bi in range(nci):
+                    self.gen_add_code_line("    { T mij = dot_prod<T,6,1,1>(Sp, &" + nxt + "[6*" + str(bi) + "]);")
+                    self.gen_add_code_line("      s_M[" + str(vj[bj] + nv*vi[bi]) + "] += mij; s_M[" + str(vi[bi] + nv*vj[bj]) + "] += mij; }")
+                self.gen_add_code_line("  }")  # close Sp scope
+            cur, nxt = nxt, cur
+            X_ind = parent_ind
+        self.gen_add_code_line("}")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 def gen_crba_inner(self):
     if self.robot.floating_base:
         return gen_crba_inner_floating(self)
-    
+
     n = self.robot.get_num_joints()
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
     HAS_SKEW = self.robot.robot_has_skew_axis()
@@ -181,6 +298,11 @@ def gen_crba_inner(self):
 
     if self.robot_has_mimic_joints():
         _gen_crba_inner_mimic_fixed(self, n)
+        self.gen_add_end_function()
+        return
+
+    if self.robot.robot_has_spherical():
+        _gen_crba_inner_spherical_fixed(self, n, n_bfs_levels)
         self.gen_add_end_function()
         return
 

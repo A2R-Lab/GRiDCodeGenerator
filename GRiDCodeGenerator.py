@@ -2517,17 +2517,17 @@ class GRiDCodeGenerator:
         # (where the kwarg default is False). Resolve the algorithm set up front
         # so the request can be OR'd into enable_idsva_so_world_frame below.
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
-        # SPHERICAL (Tier-C) first slice: only inverse_dynamics is ported. Reject
+        # SPHERICAL (Tier-C) slices: inverse_dynamics + crba are ported. Reject
         # any other requested algorithm for a robot with a spherical joint so we
-        # fail loudly instead of emitting a wrong crba/aba/gradient/SO kernel.
+        # fail loudly instead of emitting a wrong aba/fd/gradient/SO kernel.
         if self.robot.robot_has_spherical():
-            _SPHERICAL_OK = {"inverse_dynamics"}
+            _SPHERICAL_OK = {"inverse_dynamics", "crba"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
                     "Spherical (ball) joint CUDA codegen currently supports only "
-                    f"inverse_dynamics; requested unsupported algorithm(s) {_unported}. "
-                    "Remaining algorithms (crba/aba/fd/gradients/SO/integrator/kinematics) "
+                    f"inverse_dynamics + crba; requested unsupported algorithm(s) {_unported}. "
+                    "Remaining algorithms (aba/fd/gradients/SO/integrator/kinematics) "
                     "are follow-on slices (see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:
