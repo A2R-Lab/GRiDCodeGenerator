@@ -2542,7 +2542,8 @@ class GRiDCodeGenerator:
         # fail loudly instead of emitting a wrong aba/gradient/SO kernel.
         if self.robot.robot_has_spherical():
             _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics",
-                             "end_effector_pose", "frame_jacobian", "integrator"}
+                             "end_effector_pose", "frame_jacobian", "integrator",
+                             "inverse_dynamics_gradient"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(

@@ -64,8 +64,8 @@ def _emit_fb_bfs_level_indexing(self, inds, n, dq_flag_line = None):
     return inds[0], self.robot.get_parent_id(inds[0])
 
 def gen_inverse_dynamics_gradient_inner_temp_mem_size(self):
-        if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis():
-            # The mimic AND skew (Tier-B) paths emit the DENSE serial fold (6 dense
+        if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical():
+            # The mimic AND skew (Tier-B) AND spherical (Tier-C) paths emit the DENSE serial fold (6 dense
             # per-body buffers + Iv) rather than the sparse-compressed band, so they
             # need its own (larger) scratch. Big-NB humanoids route this whole pool
             # to d_workspace at the global-temp tier (SCRATCH_IN_SMEM=false).
@@ -189,11 +189,17 @@ def gen_inverse_dynamics_gradient_inner(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis():
+    if self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical():
         # MIMIC (T3-finisher P3): the sparse NJ-indexed gradient assembly below
         # writes s_dc_du by raw body id and assumes NJ == NV, so it can't fold a
         # mimic model (NB > NV, shared v-slots). Emit instead a DENSE serial
         # reduced-space fold that mirrors RBDReference.rnea_grad exactly:
+        #
+        # SPHERICAL (Tier C): the sparse single-DoF band ALSO cannot represent a
+        # mid-chain multi-column (3-DoF) joint (NJ != NV, a body owning a 3-wide
+        # v-block), so the dense serial inner carries the spherical case too. A
+        # spherical body's columns are CARDINAL (angular-identity S), so it reuses
+        # the mx0/mx1/mx2 cardinal helpers per column (col k -> angular row k).
         #
         # SKEW (Tier B): the same dense serial inner ALSO carries the general
         # motion-subspace (skew) case — the scalar (s_ind, s_sign) sites below
@@ -1346,7 +1352,7 @@ def gen_inverse_dynamics_gradient_device(self, use_qdd_input = False):
     # default (false) instantiation if-constexpr-elides the epilogue -> byte-
     # identical. The epilogue runs HERE (not in the kernel body) because it needs
     # the live s_XImats (crba M) + s_vaf (tau) that only exist inside this fn.
-    mjx_device = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+    mjx_device = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical())
     if mjx_device:
         # Forward-declare crba_inner: the mjx epilogue reuses it to build M, but crba
         # is emitted LATER in grid.cuh than this gradient. A declaration before the
@@ -1435,7 +1441,7 @@ def _emit_inverse_dynamics_gradient_kernel_body_for_flags(self, NUM_POS, n, use_
     # ignores d_temp_spill and reads the whole dense pool from s_temp/workspace).
     _selective_shared = (
         self.gen_inverse_dynamics_gradient_inner_temp_mem_size()
-        if (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
+        if (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical())
         else self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]
     )
     shared_mem_size = 0 if use_global_temp else (
@@ -1531,7 +1537,7 @@ def gen_inverse_dynamics_gradient_kernel(self, use_qdd_input = False, single_cal
     # convert + output epilogue if-constexpr-elide to byte-identical PTX. The
     # qdd=0 (bias) kernel never carries it (mjx needs the with-qdd surface).
     mjx_kernel = (self.robot.floating_base and use_qdd_input
-                  and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
+                  and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical()))
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
@@ -1573,7 +1579,7 @@ def gen_inverse_dynamics_gradient_host(self, mode = 0):
     # existing positional template args are unaffected; default false -> byte-
     # identical. The qdd=0 launch never carries it (mjx needs the with-qdd surface).
     mjx_host = (self.robot.floating_base
-                and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
+                and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis() or self.robot.robot_has_spherical()))
     if mjx_host:
         self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
     else:
@@ -1746,9 +1752,28 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         # (alpha == 1). Non-root bodies stay on the proven scalar path.
         is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
-        is_skew = (not is_float_root) and (not self.robot.S_is_cardinal_by_id(ind))
-        S_vec = None if is_float_root else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
+        # SPHERICAL (Tier-C): a mid-chain (or fixed-root) 3-DoF ball joint. Its S
+        # is the 6x3 ANGULAR-IDENTITY (rows 0,1,2 = I3), so each of its 3 columns k
+        # is a CARDINAL angular axis (mxS(S[:,k], .) == mx<k>(.), sign +1) over the
+        # contiguous v-block vblk = get_joint_index_v(ind). It is never mimic
+        # (alpha == 1). All single-DoF `idx` folds below become 3-column folds and
+        # the da += mxS(dv)*qd term sums over the 3 columns (the multi-column term).
+        is_spherical = (not is_float_root) and (
+            getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical")
+        is_skew = (not is_float_root) and (not is_spherical) and (not self.robot.S_is_cardinal_by_id(ind))
+        S_vec = None if (is_float_root or is_spherical) else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
+        vblk = None
         if is_float_root:
+            idx = None; s_ind = None; s_sign = None
+        elif is_spherical:
+            # 3-wide v-block; §1e: ALWAYS via get_joint_index_v (downstream-shifted).
+            vblk = self.robot.get_joint_index_v(ind)
+            assert isinstance(vblk, (list, tuple)) and len(vblk) == 3, \
+                "spherical body %d expected a 3-wide v-block, got %r" % (ind, vblk)
+            # Robustness: confirm S is the angular-identity (col k -> axis k, +1).
+            _Ssph = _np.asarray(self.robot.get_S_by_id(ind), dtype=float).reshape(6, 3)
+            assert _np.allclose(_Ssph, _np.vstack([_np.eye(3), _np.zeros((3, 3))])), \
+                "spherical body %d S is not the angular-identity: %r" % (ind, _Ssph)
             idx = None; s_ind = None; s_sign = None
         elif is_skew:
             idx = self._v_slot_cpp(ind); s_ind = None; s_sign = None
@@ -1762,6 +1787,9 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         Ioff = 36 * NB + 36 * ind       # I[ind]
         if is_float_root:
             self.gen_add_code_line("// --- body 0 (FLOATING ROOT, v-slots 0..5, S=I6) ---")
+        elif is_spherical:
+            self.gen_add_code_line("// --- body " + str(ind) + " (SPHERICAL, v-slots " +
+                                   str(list(vblk)) + ", S=angular-identity) ---")
         else:
             self.gen_add_code_line("// --- body " + str(ind) + " (v-slot " + str(idx) +
                                    ", alpha=" + repr(alpha) + ", S_ind=" + str(s_ind) +
@@ -1809,6 +1837,8 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             # dv_dq[:,idx,ind]  += alpha * mxS(S, X*v_parent)  = alpha*s_sign*mx_Sind(X v_parent)
             # X*v_parent: dv contribution uses v[parent]. Single reduced-column (idx)
             # fold -> ONE lane (cross-body v-slot accumulate stays unsplit, bit-exact).
+            # SPHERICAL: 3 single-column folds, one per v-block slot vblk[k], using
+            # mx<k> (S col k = angular axis k, sign +1). Each is a single-lane write.
             self.gen_add_serial_ops()
             self.gen_add_code_line("// dv_dq[:,idx] += alpha*mxS(S, X*v_parent); dv_dqd[:,idx] += alpha*S")
             self.gen_add_code_line("T s_mtmp[6];")
@@ -1817,7 +1847,10 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             # mx<s_ind>_peq_scaled into dv_dq[:,idx,ind]. mxS(S,.) carries the
             # joint sign (S = s_sign*e_{s_ind}); mx<ind>_peq_scaled only applies
             # the UNIT-axis column, so fold s_sign into the scale (alpha*s_sign).
-            if is_skew:
+            if is_spherical:
+                for k in range(3):
+                    self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(vblk[k]) + "], s_mtmp, static_cast<T>(1.0));")
+            elif is_skew:
                 self.gen_add_code_line("{ const T S_skew[6] = " + _idg_Svec_cpp(S_vec) + "; mxS_general_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, S_skew, static_cast<T>(" + repr(alpha) + ")); }")
             else:
                 self.gen_add_code_line("mx" + str(s_ind) + "_peq_scaled<T>(&s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*" + str(idx) + "], s_mtmp, static_cast<T>(" + repr(alpha * s_sign) + "));")
@@ -1873,6 +1906,50 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
                 self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, ii)) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(" + repr(sgn) + "));")
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # all da cols (incl per-DoF ii) before df reads them
+        elif is_spherical:
+            # ===== SPHERICAL own-DoF terms (3-DoF angular-identity S) =====
+            # Mirrors the oracle's multi-column form over the 3 v-block slots
+            # vblk[0..2]: S col k = angular axis k (mx<k>, sign +1), alpha == 1.
+            # dv_dqd[:,vblk[k],ind] += S[:,k]  sets entry [k, vblk[k]] = 1 (all
+            # bodies incl. a fixed-base root spherical). Single-lane writes.
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("// SPHERICAL: dv_dqd[:,vblk[k]] += S[:,k] (entry [k, vblk[k]] = 1)")
+            for k in range(3):
+                self.gen_add_code_line("s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*" + str(vblk[k]) + " + " + str(k) + "] += static_cast<T>(1.0);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # dv_dqd[:,vblk[k]] visible to the da += mxS(dv_dqd) reader
+
+            # da_du[:,c,ind] += sum_k mx<k>(dv_du[:,c,ind]) * qd[vblk[k]]  (BOTH dq
+            # and dqd). For a root spherical dv_dq[:,c] is all-zero so its dq term
+            # vanishes — emitting it uniformly is correct (no-op for the root).
+            # WIN B: one lane per gradient column c.
+            self.gen_add_code_line("// SPHERICAL: da_du[:,c] += sum_k mx_k(dv_du[:,c]) * qd[vblk[k]]")
+            self.gen_add_parallel_loop("c", str(nv))
+            for k in range(3):
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dq, ind, 0)) + " + 6*c], s_qd[" + str(vblk[k]) + "]);")
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*c], &s_temp[" + str(cell(off_dv_dqd, ind, 0)) + " + 6*c], s_qd[" + str(vblk[k]) + "]);")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # all da cols before the single-column (vblk) da folds below
+
+            # da_dq[:,vblk[k],ind]  += mx<k>(X*a_parent)  (or X*gravity at a fixed root)
+            # da_dqd[:,vblk[k],ind] += mx<k>(v[ind]). Single-lane per-slot folds.
+            self.gen_add_serial_ops()
+            self.gen_add_code_line("T s_mtmp[6];")
+            self.gen_add_code_line("// SPHERICAL: da_dq[:,vblk[k]] += mx_k(X*a_parent); da_dqd[:,vblk[k]] += mx_k(v[ind])")
+            if parent != -1:
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_mtmp[r] = static_cast<T>(0);")
+                self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_mtmp[r] += s_XImats[" + str(Xoff) + " + r + 6*p] * s_vaf[" + str(6*NB + 6*parent) + " + p]; }")
+            else:
+                # fixed-base root spherical: base accel is PURE gravity (X*gravity,
+                # col 5 of X scaled by gravity), NOT the body's own a (which would
+                # carry S*qdd under use_qdd_input and corrupt fd_gradient).
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) s_mtmp[r] = -s_XImats[" + str(Xoff) + " + 30 + r] * gravity;")
+            for k in range(3):
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dq, ind, 0)) + " + 6*" + str(vblk[k]) + "], s_mtmp, static_cast<T>(1.0));")
+            for k in range(3):
+                self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(cell(off_da_dqd, ind, 0)) + " + 6*" + str(vblk[k]) + "], &s_vaf[" + str(v_ind) + "], static_cast<T>(1.0));")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()  # all da cols (incl vblk cols) before df reads them
         else:
             # dv_dqd[:,idx,ind] += alpha*S  (S = s_sign*e_{s_ind}). NOTE: the oracle
             # adds this for EVERY body including the root (it sits OUTSIDE the
@@ -1980,9 +2057,15 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         parent = self.robot.get_parent_id(ind)
         is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
-        is_skew = (not is_float_root) and (not self.robot.S_is_cardinal_by_id(ind))
-        S_vec = None if is_float_root else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
+        is_spherical = (not is_float_root) and (
+            getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical")
+        is_skew = (not is_float_root) and (not is_spherical) and (not self.robot.S_is_cardinal_by_id(ind))
+        S_vec = None if (is_float_root or is_spherical) else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
+        vblk = None
         if is_float_root:
+            idx = None; s_ind = None; s_sign = None
+        elif is_spherical:
+            vblk = self.robot.get_joint_index_v(ind)  # 3-wide v-block (§1e)
             idx = None; s_ind = None; s_sign = None
         elif is_skew:
             idx = self._v_slot_cpp(ind); s_ind = None; s_sign = None
@@ -2007,6 +2090,53 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
             self.gen_add_end_control_flow()
             self.gen_add_sync()  # finish this body's dc_du fold before the (earlier) walk ends
             # root has no parent -> no df propagation; backward pass done for root.
+            continue
+        if is_spherical:
+            # SPHERICAL backward: dc_du[vblk[k], c] += (S^T df_du)[k, c] = df_du[k,
+            # c, ind] (S^T row k = e_k^T, alpha == 1) for k in 0..2; then propagate
+            # df to the parent (X^T df, plus the per-column X^T fxS(S[:,k], f) term
+            # scattered into the parent's vblk[k] columns).
+            self.gen_add_code_line("// --- bpass body " + str(ind) + " (SPHERICAL, v-slots " + str(list(vblk)) + ", S^T df_du) ---")
+            # WIN B: one lane per gradient column c (distinct dc_du entries; the
+            # cross-body accumulate at rows vblk[k] is serialized by the walk).
+            self.gen_add_parallel_loop("c", str(nv))
+            for k in range(3):
+                self.gen_add_code_line("s_dc_du[c*" + str(nv) + " + " + str(vblk[k]) + "] += s_temp[" + str(cell(off_df_dq, ind, 0)) + " + 6*c + " + str(k) + "];")
+                self.gen_add_code_line("s_dc_du[" + str(nv*nv) + " + c*" + str(nv) + " + " + str(vblk[k]) + "] += s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + " + str(k) + "];")
+            self.gen_add_end_control_flow()
+            if parent != -1:
+                self.gen_add_sync()  # dc_du fold reads df[ind]; df[parent] += below must wait
+                # df_dq[:,vblk[k],parent] += X^T * fxS(S[:,k], f[ind]) for each k.
+                # fxS(S[:,k], f) = fx_times_v(e_k, f); S col k = angular axis k.
+                # Single-lane per-slot folds (cross-body accumulate stays unsplit).
+                self.gen_add_serial_ops()
+                self.gen_add_code_line("T s_fxs[6]; T s_xtfxs[6]; T s_Svec[6];")
+                for k in range(3):
+                    self.gen_add_code_line("for (int r = 0; r < 6; r++) s_Svec[r] = static_cast<T>(0);")
+                    self.gen_add_code_line("s_Svec[" + str(k) + "] = static_cast<T>(1.0);")
+                    self.gen_add_code_line("fx_times_v<T>(s_fxs, s_Svec, &s_vaf[" + str(f_ind) + "]);")
+                    # X^T * s_fxs : (X^T)[r,p] = X[p,r] = s_XImats[Xoff + p + 6*r]
+                    self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_xtfxs[r] = static_cast<T>(0);")
+                    self.gen_add_code_line("  for (int p = 0; p < 6; p++) s_xtfxs[r] += s_XImats[" + str(Xoff) + " + p + 6*r] * s_fxs[p]; }")
+                    self.gen_add_code_line("for (int r = 0; r < 6; r++) s_temp[" + str(cell(off_df_dq, parent, 0)) + " + 6*" + str(vblk[k]) + " + r] += s_xtfxs[r];")
+                self.gen_add_end_control_flow()
+                # The single-column df_dq[:,vblk[k],parent] += (above) must land
+                # BEFORE the X^T propagation below touches those same parent columns.
+                self.gen_add_sync()
+                # df_du[:,:,parent] += X^T * df_du[:,:,ind]   (both dq and dqd).
+                self.gen_add_parallel_loop("c", str(nv))
+                self.gen_add_code_line("for (int r = 0; r < 6; r++) {", True)
+                self.gen_add_code_line("T acc_q=static_cast<T>(0), acc_qd=static_cast<T>(0);")
+                self.gen_add_code_line("for (int p = 0; p < 6; p++) {", True)
+                self.gen_add_code_line("T xtr = s_XImats[" + str(Xoff) + " + p + 6*r];")
+                self.gen_add_code_line("acc_q  += xtr * s_temp[" + str(cell(off_df_dq,  ind, 0)) + " + 6*c + p];")
+                self.gen_add_code_line("acc_qd += xtr * s_temp[" + str(cell(off_df_dqd, ind, 0)) + " + 6*c + p];")
+                self.gen_add_end_control_flow()
+                self.gen_add_code_line("s_temp[" + str(cell(off_df_dq,  parent, 0)) + " + 6*c + r] += acc_q;")
+                self.gen_add_code_line("s_temp[" + str(cell(off_df_dqd, parent, 0)) + " + 6*c + r] += acc_qd;")
+                self.gen_add_end_control_flow()
+                self.gen_add_end_control_flow()
+            self.gen_add_sync()  # this body's writes visible before the next (shallower) body
             continue
         self.gen_add_code_line("// --- bpass body " + str(ind) + " (v-slot " + str(idx) + ") ---")
         # dc_dq[idx, c]  += alpha * s_sign * df_dq[s_ind, c, ind]
