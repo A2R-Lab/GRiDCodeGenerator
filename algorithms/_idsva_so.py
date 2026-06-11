@@ -1,5 +1,25 @@
 SHARED_MEMORY_JOINT_THRESHOLD = 10 # Max shared memory threshold => Write directly to RAM
 
+def _idsva_so_use_world_frame(self):
+    """Codegen-time frame selection for the dispatching `idsva_so` entry points.
+
+    Route to the WORLD-frame inner for floating-base OR spherical-joint robots;
+    body-frame for cardinal fixed-base robots.
+
+    Why spherical -> world: the body-frame inner uses single-DoF contractions that
+    are WRONG for a 6x3 spherical motion subspace, while the world-frame inner is
+    already per-velocity-column multi-DoF-aware (built for floating/mimic). Its
+    metadata helper `_idsva_so_floating_velocity_metadata` iterates each S column,
+    maps it to its reduced v-slot via `get_joint_index_v`, and the triple-ancestor
+    walk contracts column-agnostically keyed on `wf_body_v_start`/`wf_body_v_index`.
+    For a (non-mimic) spherical robot that table is the identity per-column map with
+    alpha == 1 and n_int == NV, so the existing non-mimic world path is already
+    exactly correct (no internal slab / fold needed). Mirrors how floating/mimic
+    already route here. Byte-identical for cardinal fixed-base robots (predicate
+    false). See docs/idsva_so_inner_refactor_notes.md + the spherical progress memo.
+    """
+    return self.robot.floating_base or self.robot.robot_has_spherical()
+
 def _idsva_so_as_index_list(index):
     if isinstance(index, list):
         return [int(v) for v in index]
@@ -4768,10 +4788,11 @@ def gen_idsva_so_device(self, use_qdd_input = True):
     at TIER_SHARED it is unused and can be nullptr (default).
     """
     NV = self.robot.get_num_vel()
+    use_world = _idsva_so_use_world_frame(self)
     inner_temp_size = (self.gen_idsva_so_world_frame_temp_mem_size()
-                       if self.robot.floating_base
+                       if use_world
                        else self.gen_idsva_so_body_frame_inner_temp_mem_size())
-    frame_label = "world_frame" if self.robot.floating_base else "body_frame"
+    frame_label = "world_frame" if use_world else "body_frame"
     func_params = ["s_idsva_so is a pointer to memory for the final result of size 4*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS*SECOND_ORDER_COORDS = " + str(4*NV**3), \
                    "s_q is the vector of joint positions", \
                    "s_qd is the vector of joint velocities", \
@@ -4781,7 +4802,11 @@ def gen_idsva_so_device(self, use_qdd_input = True):
                    "d_workspace is the global scratch buffer; size IDSVA_SO_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_SHARED, " + str(inner_temp_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_def_start = "void idsva_so_device(T *s_idsva_so, const T *s_q, const T *s_qd, const T *s_qdd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, T *d_workspace = nullptr) {"
-    func_notes = ["Dispatches to " + frame_label + "_inner at codegen time (" + ("world for floating-base" if self.robot.floating_base else "body for fixed-base") + ").",
+    if use_world:
+        _frame_reason = "world for floating-base" if self.robot.floating_base else "world for spherical"
+    else:
+        _frame_reason = "body for fixed-base"
+    func_notes = ["Dispatches to " + frame_label + "_inner at codegen time (" + _frame_reason + ").",
                   "Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the inner scratch moves from s_temp to d_workspace, freeing shared memory for the caller's outer kernel"]
     func_def = func_def_start + func_def_end
     # shared device-wrapper skeleton (B+C §1.1); s_temp routes to d_workspace at
@@ -4790,7 +4815,7 @@ def gen_idsva_so_device(self, use_qdd_input = True):
         # Inline entry spills the WHOLE s_temp arena via tier_workspace_expr, so the
         # inner's per-buffer spill pointer is unused here (pass nullptr).
         self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
-        if self.robot.floating_base:
+        if use_world:
             self.gen_idsva_so_world_frame_inner_function_call()
         else:
             self.gen_idsva_so_body_frame_inner_function_call()
@@ -4835,7 +4860,7 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
 
-    frame_suffix = "world_frame" if self.robot.floating_base else "body_frame"
+    frame_suffix = "world_frame" if _idsva_so_use_world_frame(self) else "body_frame"
     smem_macro = f"IDSVA_SO_{frame_suffix.upper()}_DYNAMIC_SHARED_MEM_BYTES<T>()"
 
     func_def_start = "void idsva_so(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const T gravity, const int num_timesteps,"

@@ -333,6 +333,12 @@ class GRiDCodeGenerator:
             algorithms.add("inverse_dynamics")
             if self.robot.floating_base:
                 algorithms.add("inverse_dynamics_gradient")
+            # Spherical (ball) joints route the idsva_so dispatcher to the WORLD
+            # frame (the body-frame inner's single-DoF S contractions are wrong
+            # for a 3-DoF joint). Force the world-frame emit so the routed
+            # dispatcher call links. Gated on spherical => cardinal byte-identical.
+            if self.robot.robot_has_spherical():
+                algorithms.add("idsva_so_world_frame")
         # integrator value needs forward dynamics; gradient needs FD + FD-gradient.
         # Floating-base integrator gradients are emitted for all five types
         # (Euler / SI-Euler / Midpoint / RK3 / RK4) and validated against
