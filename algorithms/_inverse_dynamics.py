@@ -223,9 +223,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         # rows 0,1,2). They are NOT skew (the skew path's signed-index helpers
         # raise on multi-DoF), so they get their OWN serial per-joint emit. Each
         # column behaves like a cardinal angular axis reading its v-block slot.
-        def _is_spherical(j):
-            return getattr(self.robot.get_joint_by_id(j), "jtype", None) == "spherical"
-        level_has_spherical = any(_is_spherical(j) for j in inds)
+        level_has_spherical = any(self.robot.joint_is_spherical(j) for j in inds)
         # Tier-B (skew axis): any joint at this level whose single-column S is
         # non-cardinal. The signed-index topology helpers raise on such joints,
         # so we route the whole level through the dense-6-vector emit. Cardinal-
@@ -233,7 +231,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         # Spherical joints are multi-column (not cardinal) but handled above, so
         # exclude them from the skew classification.
         level_has_skew = any(
-            (not _is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
+            (not self.robot.joint_is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
             for j in inds
         )
         if not level_has_skew and not level_has_spherical:
@@ -263,7 +261,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                 self.gen_add_serial_ops()
                 for jid_val in inds:
                     jid6 = 6 * jid_val
-                    if _is_spherical(jid_val):
+                    if self.robot.joint_is_spherical(jid_val):
                         vblk = self.robot.get_joint_index_v(jid_val)
                         for r in range(6):
                             self.gen_add_code_line("s_vaf[" + str(jid6 + r) + "] = static_cast<T>(0);")
@@ -380,7 +378,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
                     # a[jid] = X * a[parent]
                     for r in range(6):
                         self.gen_add_code_line("s_vaf[" + str(n*6 + jid6 + r) + "] = dot_prod<T,6,6,1>(&s_XImats[" + str(xoff + r) + "], &s_vaf[" + str(n*6 + parent6) + "]);")
-                    if _is_spherical(jid_val):
+                    if self.robot.joint_is_spherical(jid_val):
                         vblk = self.robot.get_joint_index_v(jid_val)
                         # vJ = S*qd (angular rows 0..2); add to v, build the local vJ
                         self.gen_add_code_line("{ T vJ[6] = {static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0),static_cast<T>(0)};")
@@ -688,8 +686,7 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
         self.gen_add_sync()
         self.gen_add_serial_ops()
         for jid in range(n):
-            j = self.robot.get_joint_by_id(jid)
-            if getattr(j, "jtype", None) == "spherical":
+            if self.robot.joint_is_spherical(jid):
                 vblk = self.robot.get_joint_index_v(jid)
                 for k in range(3):  # angular-identity columns -> rows 0,1,2 of f
                     self.gen_add_code_line(

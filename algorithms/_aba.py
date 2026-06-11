@@ -29,10 +29,6 @@ _ABA_SPH_INVTMP_OFF = 60     # invert_matrix scratch (>= 3*dimA=9)   [12]
 _ABA_SPH_STRIDE     = 72     # total floats per spherical joint
 
 
-def _aba_is_spherical(self, jid):
-    return getattr(self.robot.get_joint_by_id(jid), "jtype", None) == "spherical"
-
-
 def _aba_sph_arena_base(self):
     """First float offset of the spherical scratch arena (above the cardinal
     140*NJ hot band). Only meaningful when the robot has a spherical joint."""
@@ -50,7 +46,7 @@ def _aba_sph_orders(self):
     """Map joint id -> 0-based spherical-rank for every spherical joint."""
     order = {}
     for jid in range(self.robot.get_num_joints()):
-        if _aba_is_spherical(self, jid):
+        if self.robot.joint_is_spherical(jid):
             order[jid] = len(order)
     return order
 
@@ -580,9 +576,9 @@ def gen_aba_inner(self):
             self.gen_add_code_line("//     links are: " + ", ".join(link_names))
             # compute the initial v which is just S*qd
             self.gen_add_code_line("// s_v[k] = S[k]*qd[k]")
-            level_has_spherical = any(_aba_is_spherical(self, j) for j in inds)
+            level_has_spherical = any(self.robot.joint_is_spherical(j) for j in inds)
             level_has_skew = any(
-                (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+                (not self.robot.joint_is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
                 for j in inds)
             if HAS_SPHERICAL:
                 # Tier-C spherical at level 0: v[k] = S*qd reads the joint's 3-wide
@@ -595,7 +591,7 @@ def gen_aba_inner(self):
                     jid6 = 6 * jid_val
                     for r in range(6):
                         self.gen_add_code_line("s_va[" + str(jid6 + r) + "] = static_cast<T>(0);")
-                    if _aba_is_spherical(self, jid_val):
+                    if self.robot.joint_is_spherical(jid_val):
                         vblk = self.robot.get_joint_index_v(jid_val)
                         for k in range(3):  # angular-identity columns -> rows 0,1,2
                             self.gen_add_code_line("s_va[" + str(jid6 + k) + "] += s_qd[" + str(vblk[k]) + "];")
@@ -663,7 +659,7 @@ def gen_aba_inner(self):
                 parent_val = self.robot.get_parent_id(jid_val)
                 self.gen_add_code_line(f"grid_linalg_row_strided_gemv<T,6,6,6>(&s_XImats[{36*jid_val}], &s_va[{6*parent_val}], &s_va[{6*jid_val}], static_cast<T>(1), static_cast<T>(0), s_linalg_smem);")
                 self.gen_add_serial_ops()
-                if _aba_is_spherical(self, jid_val):
+                if self.robot.joint_is_spherical(jid_val):
                     # Tier-C spherical: v[jid] += S*qd over the 3 angular columns
                     # (rows 0..2), reading the joint's 3-wide v-block.
                     vblk = self.robot.get_joint_index_v(jid_val)
@@ -702,7 +698,7 @@ def gen_aba_inner(self):
         for jid in range(n):
             jid6 = 6 * jid
             self.gen_add_code_line("for (int r = 0; r < 6; r++) { s_temp[" + str(72*n + jid6) + " + r] = static_cast<T>(0); }")
-            if _aba_is_spherical(self, jid):
+            if self.robot.joint_is_spherical(jid):
                 vblk = self.robot.get_joint_index_v(jid)
                 for k in range(3):
                     self.gen_add_code_line("mx" + str(k) + "_peq_scaled<T>(&s_temp[" + str(72*n + jid6) + "], &s_va[" + str(jid6) + "], s_qd[" + str(vblk[k]) + "]);")
@@ -804,7 +800,7 @@ def gen_aba_inner(self):
         # caclulate U, which is just IA*S
         self.gen_add_code_line("// U[k] = IA[k]*S[k]")
         level_has_skew = any(
-            (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+            (not self.robot.joint_is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
             for j in inds)
         if HAS_SPHERICAL:
             # Tier-C backward pass (U/D/u, Ia, pa) for the whole level, serial per
@@ -814,7 +810,7 @@ def gen_aba_inner(self):
             # is S-agnostic (operates on the full 6x6 Ia / 6-vec pa) -> unchanged.
             for jid in inds:
                 jid6 = 6 * jid
-                if _aba_is_spherical(self, jid):
+                if self.robot.joint_is_spherical(jid):
                     so = _aba_sph_block_off(self, jid, _sph_order[jid])
                     D_off, Dinv_off = so + _ABA_SPH_D_OFF, so + _ABA_SPH_DINV_OFF
                     U_off, UD_off = so + _ABA_SPH_U_OFF, so + _ABA_SPH_UDINV_OFF
@@ -1107,7 +1103,7 @@ def gen_aba_inner(self):
             self.gen_add_serial_ops()
             for jid in inds:
                 jid6 = 6 * jid
-                if _aba_is_spherical(self, jid):
+                if self.robot.joint_is_spherical(jid):
                     so = _aba_sph_block_off(self, jid, _sph_order[jid])
                     U_off, Dinv_off = so + _ABA_SPH_U_OFF, so + _ABA_SPH_DINV_OFF
                     u3_off, tmp3_off = so + _ABA_SPH_U3_OFF, so + _ABA_SPH_TMP3_OFF
@@ -1141,7 +1137,7 @@ def gen_aba_inner(self):
         # update a by adding qdd*S
         self.gen_add_code_line("// a[k] += qdd[k]*S[k]")
         level_has_skew = any(
-            (not _aba_is_spherical(self, j)) and (not self.robot.S_is_cardinal_by_id(j))
+            (not self.robot.joint_is_spherical(j)) and (not self.robot.S_is_cardinal_by_id(j))
             for j in inds)
         if HAS_SPHERICAL:
             # Tier-C: a[jid] += S*qdd. Spherical adds its 3 angular columns (rows
@@ -1149,7 +1145,7 @@ def gen_aba_inner(self):
             self.gen_add_serial_ops()
             for jid in inds:
                 jid6 = 6 * jid
-                if _aba_is_spherical(self, jid):
+                if self.robot.joint_is_spherical(jid):
                     fblk = self.robot.get_joint_index_f(jid)
                     for k in range(3):
                         self.gen_add_code_line("s_va[" + str(6*n + jid6 + k) + "] += s_qdd[" + str(fblk[k]) + "];")
@@ -1224,7 +1220,7 @@ def gen_aba_inner_temp_mem_size(self):
         # per ball joint) sits ABOVE the cardinal 140*n hot band so the cold-spill
         # ladder offsets stay byte-identical for cardinal robots. Gated on
         # robot_has_spherical() so non-spherical sizing is untouched.
-        n_sph = sum(1 for j in range(n) if _aba_is_spherical(self, j))
+        n_sph = sum(1 for j in range(n) if self.robot.joint_is_spherical(j))
         return 140 * n + _ABA_SPH_STRIDE * n_sph
     return 140 * n
 

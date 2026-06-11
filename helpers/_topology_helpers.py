@@ -367,7 +367,7 @@ def _xi_fixed_sincos_subst(self, str_val, ind):
     a single `theta`; they're substituted via _xi_spherical_quat_subst (ccode form
     for the homogeneous-transform consumer) BEFORE the theta passes, which then
     no-op (no `theta` token remains). Byte-identical for non-spherical robots."""
-    if getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical":
+    if self.robot.joint_is_spherical(ind):
         return _xi_spherical_quat_subst(self, str_val, ind, ccode=True)
     if self.robot_has_mimic_joints():
         NB = self.robot.get_num_joints()
@@ -880,7 +880,7 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
         # Substitute the joint's OWN 4-wide q-block (a mid-chain spherical shifts
         # downstream q-offsets, handled inside the helper) -- NOT a sin/cos fold.
         # Byte-identical for non-spherical robots (branch never taken).
-        if getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical":
+        if self.robot.joint_is_spherical(ind):
             return _xi_spherical_quat_subst(self, str_val, ind, ccode=True)
         if self.robot.floating_base:
             if self.robot_has_mimic_joints():

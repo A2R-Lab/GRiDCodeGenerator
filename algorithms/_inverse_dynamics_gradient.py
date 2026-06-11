@@ -1837,8 +1837,7 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         # contiguous v-block vblk = get_joint_index_v(ind). It is never mimic
         # (alpha == 1). All single-DoF `idx` folds below become 3-column folds and
         # the da += mxS(dv)*qd term sums over the 3 columns (the multi-column term).
-        is_spherical = (not is_float_root) and (
-            getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical")
+        is_spherical = (not is_float_root) and self.robot.joint_is_spherical(ind)
         is_skew = (not is_float_root) and (not is_spherical) and (not self.robot.S_is_cardinal_by_id(ind))
         S_vec = None if (is_float_root or is_spherical) else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
         vblk = None
@@ -2136,8 +2135,7 @@ def _gen_inverse_dynamics_gradient_mimic_inner(self, nv, NB):
         parent = self.robot.get_parent_id(ind)
         is_float_root = fb and ind == 0
         alpha = self._alpha_for_jid(ind)
-        is_spherical = (not is_float_root) and (
-            getattr(self.robot.get_joint_by_id(ind), "jtype", None) == "spherical")
+        is_spherical = (not is_float_root) and self.robot.joint_is_spherical(ind)
         is_skew = (not is_float_root) and (not is_spherical) and (not self.robot.S_is_cardinal_by_id(ind))
         S_vec = None if (is_float_root or is_spherical) else [float(v) for v in self.robot._get_flat_S_by_id(ind)]
         vblk = None
