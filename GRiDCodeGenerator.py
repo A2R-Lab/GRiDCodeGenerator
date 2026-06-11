@@ -2543,15 +2543,16 @@ class GRiDCodeGenerator:
         if self.robot.robot_has_spherical():
             _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics",
                              "end_effector_pose", "frame_jacobian", "integrator",
-                             "inverse_dynamics_gradient"}
+                             "inverse_dynamics_gradient", "forward_dynamics_gradient"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
                     "Spherical (ball) joint CUDA codegen currently supports "
                     "inverse_dynamics + crba + minv + forward_dynamics + "
-                    f"end_effector_pose + frame_jacobian + integrator; requested "
+                    f"end_effector_pose + frame_jacobian + integrator + "
+                    f"inverse_dynamics_gradient + forward_dynamics_gradient; requested "
                     f"unsupported algorithm(s) {_unported}. Remaining algorithms "
-                    "(aba/gradients/SO) are follow-on slices "
+                    "(aba/SO) are follow-on slices "
                     "(see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:
