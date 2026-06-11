@@ -2780,6 +2780,13 @@ class GRiDCodeGenerator:
             "INVERSE_DYNAMICS_GRADIENT": "inverse_dynamics_gradient",
             "FORWARD_DYNAMICS_GRADIENT": "forward_dynamics_gradient",
             "INVERSE_DYNAMICS_REGRESSOR": "inverse_dynamics_regressor",
+            # FD parameter gradient (dqdd/dpi = -Minv . Y): its grid::kernel is
+            # emitted only when 'forward_dynamics_parameter_gradient' is in the
+            # (post-dep-expansion) algorithm set, so the jax/torch handler that
+            # calls it must rc=3-stub (clean subset error) when it's omitted. In
+            # the default "all" profile it IS requested → macro=1 → real body,
+            # byte-identical to the pre-subset build.
+            "FORWARD_DYNAMICS_PARAMETER_GRADIENT": "forward_dynamics_parameter_gradient",
             "END_EFFECTOR_POSE": "end_effector_pose",
             "END_EFFECTOR_POSE_GRADIENT": "end_effector_pose_gradient",
             "END_EFFECTOR_POSE_HESSIAN": "end_effector_pose_hessian",
