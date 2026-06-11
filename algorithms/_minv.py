@@ -49,17 +49,29 @@ def gen_minv_inner_function_call(self, updated_var_names = None,
     minv_code = minv_code_start + minv_code_middle + minv_code_end
     self.gen_add_code_line(minv_code)
 
-def _gen_minv_inner_mimic(self, n, no_F_size):
-    """Emit the mimic Minv path: M = crba_inner(q); Minv = inv(M); symmetrize.
+def _gen_minv_inner_via_crba(self, n, no_F_size, label):
+    """Emit the inv(CRBA(q)) Minv path: M = crba_inner(q); Minv = inv(M).
+
+    Shared by the mimic path (per-body (S,U,d) ABA recursion does not superpose:
+    M_reduced^{-1} != G^T M_full^{-1} G) and the Tier-C SPHERICAL path (the ABA
+    minv recursion's scalar U/Dinv/F are single-DoF; a ball joint is 3-DoF, so the
+    only correct general handling is to invert the reduced CRBA M directly). CRBA
+    already emits the reduced NV x NV M for both joint structures (mimic: alpha-fold
+    +=, spherical: multi-column S^T IC S), so here we just invert it.
 
     n = NV. s_F (6*NV*NV) is the scratch arena here (F is never built on this
     path). Layout in s_F:
       [0, NV*NV)            M_buf (reduced mass matrix from crba_inner)
-      [NV*NV, NV*NV+band)   crba_inner scratch band (its IC + locals)
-    invert_matrix writes the inverse into s_Minv using its own s_temp scratch
-    (we pass the no_F s_temp region, sized >= NV for glass's dense invert).
+      [NV*NV, ...)          invert_matrix scratch (>= NV; 6*NV*NV-NV*NV always fits)
+    crba_inner's OWN scratch band reuses s_temp (the no_F region), which is
+    otherwise unused on this path and is sized >= crba_inner's temp need (the
+    mimic CRBA band is <= 42*NB; the spherical CRBA band is 36*NB+36 — both <=
+    no_F = 36*NV + 6*NV + d_inv + 36*2*max_bfs_width for these robots; verified
+    in the equivalence test). invert_matrix writes the FULL dense symmetric
+    inverse into s_Minv; forward_dynamics_finish / gen_minv_apply read only its
+    upper triangle (SYMMETRIC_UPPER), which is correct for a dense symmetric M^-1.
     """
-    self.gen_add_code_line("// mimic Minv = inv(CRBA(q))")
+    self.gen_add_code_line("// " + label + " Minv = inv(CRBA(q))")
     # M lives in s_F[0..NV*NV); the rest of s_F (6*NV*NV total) is invert scratch.
     # crba_inner's scratch band reuses s_temp (the no_F region, >= 36*NB) which is
     # otherwise unused on this path. crba is config-only: s_qd + gravity unused.
@@ -82,10 +94,11 @@ def gen_minv_inner(self):
     n = self.robot.get_num_vel()
     max_bfs_levels = self.robot.get_max_bfs_level()
     max_bfs_width = self.robot.get_max_bfs_width()
-    if self.robot_has_mimic_joints():
-        # The mimic Minv path calls crba_inner, which is emitted AFTER this
-        # function in the header. Forward-declare it (mimic robots only, so the
-        # non-mimic header stays byte-identical). Signature must match _crba.py.
+    if self.robot_has_mimic_joints() or self.robot.robot_has_spherical():
+        # The mimic AND spherical Minv paths call crba_inner, which is emitted
+        # AFTER this function in the header. Forward-declare it (only for those
+        # robots, so the cardinal non-mimic header stays byte-identical). Signature
+        # must match _crba.py.
         self.gen_add_code_line("// forward decl: mimic Minv routes through crba_inner (emitted later)")
         self.gen_add_code_line("// (no default arg here; the definition below carries TEMP_IN_SMEM = true)")
         self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM>")
@@ -140,7 +153,15 @@ def gen_minv_inner(self):
         # reduced mass matrix via crba_inner and invert it (NV x NV). s_F is large
         # (6*NV*NV) and unused on this path, so we carve M + the CRBA scratch band
         # out of it; the inverse is written straight into s_Minv.
-        _gen_minv_inner_mimic(self, n, no_F_size)
+        _gen_minv_inner_via_crba(self, n, no_F_size, "mimic")
+        return
+    if self.robot.robot_has_spherical():
+        # Tier-C SPHERICAL: the per-body ABA minv recursion (scalar U/Dinv/F) does
+        # not generalize to a 3-DoF ball joint, so — like the mimic path — invert
+        # the reduced CRBA M directly (crba_inner already emits the multi-column
+        # spherical M=S^T IC S). RBDReference.minv's ABA bpass raises on spherical
+        # for the same reason, so the verified oracle here is inv(crba(q)).
+        _gen_minv_inner_via_crba(self, n, no_F_size, "spherical")
         return
     FOffset = 0   # within s_F
     IAOffset = 0  # within s_temp

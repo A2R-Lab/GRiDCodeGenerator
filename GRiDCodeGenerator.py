@@ -2517,18 +2517,22 @@ class GRiDCodeGenerator:
         # (where the kwarg default is False). Resolve the algorithm set up front
         # so the request can be OR'd into enable_idsva_so_world_frame below.
         algorithms = self._normalize_codegen_algorithms(codegen_profile, algorithm_list)
-        # SPHERICAL (Tier-C) slices: inverse_dynamics + crba are ported. Reject
-        # any other requested algorithm for a robot with a spherical joint so we
-        # fail loudly instead of emitting a wrong aba/fd/gradient/SO kernel.
+        # SPHERICAL (Tier-C) slices: inverse_dynamics + crba + minv + forward_dynamics
+        # are ported. forward_dynamics routes through minv (= inv(CRBA(q))) + the
+        # compute_c RNEA, not the standalone ABA (which keeps its scalar single-DoF
+        # articulated-body recursion — a separate later slice). Reject any other
+        # requested algorithm for a robot with a spherical joint so we fail loudly
+        # instead of emitting a wrong aba/gradient/SO kernel.
         if self.robot.robot_has_spherical():
-            _SPHERICAL_OK = {"inverse_dynamics", "crba"}
+            _SPHERICAL_OK = {"inverse_dynamics", "crba", "minv", "forward_dynamics"}
             _unported = sorted(a for a in algorithms if a not in _SPHERICAL_OK)
             if _unported:
                 raise NotImplementedError(
-                    "Spherical (ball) joint CUDA codegen currently supports only "
-                    f"inverse_dynamics + crba; requested unsupported algorithm(s) {_unported}. "
-                    "Remaining algorithms (aba/fd/gradients/SO/integrator/kinematics) "
-                    "are follow-on slices (see docs/open-tasks/joint_types_plan.md)."
+                    "Spherical (ball) joint CUDA codegen currently supports "
+                    f"inverse_dynamics + crba + minv + forward_dynamics; requested "
+                    f"unsupported algorithm(s) {_unported}. Remaining algorithms "
+                    "(aba/gradients/SO/integrator/kinematics) are follow-on slices "
+                    "(see docs/open-tasks/joint_types_plan.md)."
                 )
         if "idsva_so_world_frame" in algorithms:
             enable_idsva_so_world_frame = True
