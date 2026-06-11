@@ -253,21 +253,40 @@ def gen_fdsva_so_device_function_call(self,
                                           d_fd_grad_spill_name = "nullptr",
                                           s_fdsva_temp_name = "nullptr",
                                           mujoco_output_expr = None,
-                                          d_mjx_scratch_name = "nullptr"):
+                                          d_mjx_scratch_name = "nullptr",
+                                          idsva_cold_in_smem_expr = "true",
+                                          d_idsva_cold_spill_name = "nullptr"):
     """Emit the call to `fdsva_so_device`. Arg order MUST match the def in
     gen_fdsva_so_device. Pool/spill regions default to nullptr (unused under
     the matching if-constexpr); the kernel passes real pointers per tier.
     mujoco_output_expr (floating non-mimic/skew): the trailing MUJOCO_OUTPUT
     template arg; None -> 4-arg template (byte-identical for non-mjx kernels).
     d_mjx_scratch_name: the mjx-epilogue scratch arena (only forwarded when the
-    mjx template arg is present so the non-mjx signature stays byte-identical)."""
+    mjx template arg is present so the non-mjx signature stays byte-identical).
+    A4 — idsva_cold_in_smem_expr: the trailing IDSVA_COLD_IN_SMEM template arg (the
+    WORLD idsva inner's cold-trio placement). Appended LAST (after MUJOCO_OUTPUT when
+    present); only emitted when != "true" so the legacy template stays byte-identical.
+    d_idsva_cold_spill_name: the SO-temp d_workspace region backing the cold trio (only
+    appended when idsva_cold_in_smem_expr != "true", to keep the legacy signature)."""
+    cold = (idsva_cold_in_smem_expr != "true")
     mjx_tmpl = ("" if mujoco_output_expr is None else ", " + mujoco_output_expr)
-    tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + mjx_tmpl + ">"
+    # IDSVA_COLD_IN_SMEM is the last template param (after MUJOCO_OUTPUT). When the cold
+    # rung is active but the kernel is NON-mjx, the template skips the (absent) MUJOCO
+    # slot entirely and IDSVA_COLD is the 5th arg; when mjx, it is the 6th — either way
+    # it is appended after whatever precedes it, matching the def's positional ordering.
+    cold_tmpl = (", " + idsva_cold_in_smem_expr) if cold else ""
+    tmpl = "<T, " + scratch_in_smem_expr + ", " + fd_grad_use_spill_expr + ", " + contract_in_smem_expr + mjx_tmpl + cold_tmpl + ">"
     start = "fdsva_so_device" + tmpl + "(s_df2, s_idsva_so, s_Minv, s_df_du, s_qdd, s_q, s_qd, s_u, "
     middle = self.gen_insert_helpers_function_call()
     mjx_arg = (", " + d_mjx_scratch_name) if mujoco_output_expr is not None else ""
+    # The cold-spill pointer is the last call arg (after d_mjx_scratch when present).
+    # When the cold rung is active on a NON-mjx kernel, d_mjx_scratch is absent from the
+    # def, so d_idsva_cold_spill is the FIRST defaulted trailing pointer -> pass it
+    # directly (positional). When mjx, it follows d_mjx_scratch (always passed by the
+    # mjx kernel). Only emit when active, so the legacy call stays byte-identical.
+    cold_arg = (", " + d_idsva_cold_spill_name) if cold else ""
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_fd_grad_spill_name + ", "
-           + s_fdsva_temp_name + ", d_robotModel, gravity" + mjx_arg + ");")
+           + s_fdsva_temp_name + ", d_robotModel, gravity" + mjx_arg + cold_arg + ");")
     self.gen_add_code_line(start + middle + end)
 
 def gen_fdsva_so_device(self):
@@ -309,14 +328,21 @@ def gen_fdsva_so_device(self):
     # of d_workspace, dead post-contract) so it NEVER reads the possibly-spilled
     # s_Minv / s_df_du / s_qdd (the §1g/§1h liveness bug). Defaulted nullptr; only
     # read under if constexpr(MUJOCO_OUTPUT). Mirrors idsva_so's d_mjx_scratch.
+    # A4: d_idsva_cold_spill is the SO-temp d_workspace sub-region that backs the
+    # composed WORLD idsva_so inner's cold trio (Xdown/v_w/a_w) when IDSVA_COLD_IN_SMEM
+    # is false (the surgical cold rung). Appended LAST + defaulted nullptr so every
+    # existing positional call site is unaffected. Only read when !IDSVA_COLD_IN_SMEM.
     mjx_inner_sig = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     if mjx_inner_sig:
         func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
-                        "const robotModel<T> *d_robotModel, const T gravity, T *d_mjx_scratch = nullptr) {")
+                        "const robotModel<T> *d_robotModel, const T gravity, T *d_mjx_scratch = nullptr, "
+                        "T *d_idsva_cold_spill = nullptr) {")
         func_params.append("d_mjx_scratch is the mjx-epilogue scratch arena (SO-temp region of d_workspace; only read when MUJOCO_OUTPUT)")
     else:
         func_def_end = ("T *s_temp, T *d_workspace, T *d_fd_grad_spill, T *s_fdsva_temp, "
-                        "const robotModel<T> *d_robotModel, const T gravity) {")
+                        "const robotModel<T> *d_robotModel, const T gravity, "
+                        "T *d_idsva_cold_spill = nullptr) {")
+    func_params.append("d_idsva_cold_spill is the SO-temp d_workspace region backing the WORLD idsva_so inner's cold trio (only read when !IDSVA_COLD_IN_SMEM)")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("fdsva_so orchestration as a single inner-owns-placement device function",
@@ -325,11 +351,16 @@ def gen_fdsva_so_device(self):
     # flag, appended LAST so existing positional <T,SCRATCH,SPILL,CONTRACT> call
     # sites are unaffected; default false -> the epilogue if-constexpr-elides to
     # byte-identical PTX. Mirrors the idsva_so flag exactly.
+    # A4: IDSVA_COLD_IN_SMEM (default true) — when false, the composed WORLD idsva_so
+    # inner spills its cold trio (Xdown/v_w/a_w) to d_idsva_cold_spill (COLD_IN_SMEM=false)
+    # while the hot pool stays in smem. Appended LAST (after MUJOCO_OUTPUT when present)
+    # so existing positional <T,SCRATCH,SPILL,CONTRACT[,MUJOCO]> call sites are unaffected;
+    # default true -> the world inner gets COLD_IN_SMEM=true (byte-identical to today).
     mjx_inner = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     if mjx_inner:
-        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool MUJOCO_OUTPUT = false, bool IDSVA_COLD_IN_SMEM = true>")
     else:
-        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true>")
+        self.gen_add_code_line("template <typename T, bool SCRATCH_IN_SMEM = true, bool FD_GRAD_USE_SPILL = false, bool CONTRACT_IN_SMEM = true, bool IDSVA_COLD_IN_SMEM = true>")
     # __forceinline__ so the whole orchestration inlines into the calling kernel.
     # Under -rdc (single-call/anti-LICM build) a separate __device__ wrapper keeps
     # its callees (e.g. minv_inner, ~108 regs) as distinct functions whose
@@ -341,7 +372,14 @@ def gen_fdsva_so_device(self):
     # Inner owns the pool placement; the repoint covers every consumer below
     # (incl. the XImats helper's sincos scratch), so no caller-side repoint.
     self.gen_add_code_line("if constexpr (!SCRATCH_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
-    self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;  // idsva uses the (placed) s_temp pool directly")
+    # A4: d_temp_spill is the WORLD idsva inner's d_workspace param for its cold trio.
+    # When IDSVA_COLD_IN_SMEM (the default + pool-in-smem rungs), the inner keeps the
+    # cold trio in smem and never touches d_temp_spill (it stays nullptr). When the
+    # surgical cold rung sets IDSVA_COLD_IN_SMEM=false, the inner repoints Xdown/v_w/a_w
+    # to d_idsva_cold_spill (a SO-temp d_workspace carve, disjoint from the contract /
+    # df_du / Minv bands — see §1g argument in the kernel body).
+    self.gen_add_code_line("T *d_temp_spill = nullptr;")
+    self.gen_add_code_line("if constexpr (!IDSVA_COLD_IN_SMEM) { d_temp_spill = d_idsva_cold_spill; } else { (void)d_idsva_cold_spill; }")
     self.gen_load_update_XImats_helpers_function_call()
     self.gen_minv_inner_function_call(f_in_smem_expr = "true")
     self.gen_add_code_line("forward_dynamics_inner<T, true>(s_qdd, s_q, s_qd, s_u, " + self.gen_insert_helpers_function_call() + "s_temp, nullptr, nullptr, gravity);")
@@ -359,8 +397,13 @@ def gen_fdsva_so_device(self):
     # exactly as the idsva_so dispatcher does for spherical. The world inner needs no
     # dvdq layout repair (that is a body-frame-only fixup).
     if _fdsva_so_use_world_idsva(self):
-        self.gen_idsva_so_world_frame_inner_function_call()
+        # A4: thread the surgical cold-trio placement to the WORLD inner. Default true
+        # (every legacy/non-cold rung) -> COLD_IN_SMEM=true (byte-identical). The cold
+        # rung passes IDSVA_COLD_IN_SMEM=false + d_temp_spill (= d_idsva_cold_spill).
+        self.gen_idsva_so_world_frame_inner_function_call(cold_in_smem_expr="IDSVA_COLD_IN_SMEM")
     else:
+        # Body-frame (fixed-base non-spherical): keep existing defaults — the body inner
+        # has no exposed cold trio (its surgical levers are BC/TP). A4 leaves it untouched.
         self.gen_idsva_so_body_frame_inner_function_call()
         self.gen_idsva_so_body_frame_public_dvdq_layout_repair()
     self.gen_fdsva_so_contract_function_call(
@@ -534,19 +577,30 @@ def _emit_fdsva_so_mjx_output(self):
     self.gen_add_sync()
 
 _FDSVA_SO_PICK_FLAGS = [
-    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv, use_workspace_idsva_temp)
-    (False, False, False, False, False, False),   # pick 0: full smem
-    (True,  False, False, False, False, False),   # pick 1: outputs to global
-    (True,  True,  False, False, False, False),   # pick 2: + inner temp to global
-    (True,  True,  True,  False, False, False),   # pick 3: + fd_grad da_df band to global
-    (True,  True,  True,  True,  False, False),   # pick 4 (Phase 3e): + s_df_du to global
-    (True,  True,  True,  True,  True,  False),   # pick 5 (Phase 3e): + s_Minv to global
-    (True,  True,  False, False, False, True),    # pick 6: pool->global (whole s_temp via full inner SCRATCH_IN_SMEM=false); df_du/Minv stay in smem (small). Works for BOTH bases because fdsva_so_device hands the placed pool to whichever idsva inner it composes (world for floating, body for fixed) and the inner does the repoint via its own SCRATCH_IN_SMEM=false.
+    # (use_global_tensors, use_workspace_temp, fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv, use_workspace_idsva_temp, idsva_cold_in_global)
+    (False, False, False, False, False, False, False),   # pick 0: full smem
+    (True,  False, False, False, False, False, False),   # pick 1: outputs to global
+    # A4: idsva_cold — outputs to global (like pick 1) AND the embedded idsva_so
+    # WORLD inner's surgical cold trio (Xdown 36*NB + v_w/a_w 12*NB, dead before the
+    # hot triple-walk) routes to d_workspace via the inner's COLD_IN_SMEM=false. The
+    # whole hot pool stays in smem (SCRATCH_IN_SMEM=true). This shaves the cold trio
+    # off the smem high-water mark BEFORE the all-or-nothing pool->global rung, so the
+    # heavy mid-chain-ball world inner (the ~20-min/7GB cicc compile) keeps its hot
+    # band in smem at a spill tier instead of dumping the whole pool to global. Only
+    # meaningful when the composed idsva inner is the WORLD frame (floating OR spherical);
+    # the body-frame inner has no exposed cold trio so the flag is a no-op there.
+    (True,  False, False, False, False, False, True),    # pick 2 (A4): + idsva cold trio to global (surgical)
+    (True,  True,  False, False, False, False, False),   # pick 3: + inner temp to global
+    (True,  True,  True,  False, False, False, False),   # pick 4: + fd_grad da_df band to global
+    (True,  True,  True,  True,  False, False, False),   # pick 5 (Phase 3e): + s_df_du to global
+    (True,  True,  True,  True,  True,  False, False),   # pick 6 (Phase 3e): + s_Minv to global
+    (True,  True,  False, False, False, True,  False),   # pick 7: pool->global (whole s_temp via full inner SCRATCH_IN_SMEM=false); df_du/Minv stay in smem (small). Works for BOTH bases because fdsva_so_device hands the placed pool to whichever idsva inner it composes (world for floating, body for fixed) and the inner does the repoint via its own SCRATCH_IN_SMEM=false.
 ]
 
 def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, use_workspace_temp,
                                          fd_grad_use_spill, use_workspace_df_du, use_workspace_Minv,
-                                         single_call_timing, use_workspace_idsva_temp=False):
+                                         single_call_timing, use_workspace_idsva_temp=False,
+                                         idsva_cold_in_global=False):
     """Emit fdsva_so kernel body for one tier's spill flags.
     use_workspace_idsva_temp: route the embedded idsva_so inner's scratch to
     d_workspace (via the inner's SCRATCH_IN_SMEM=false). The idsva inner is the
@@ -556,7 +610,20 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     placement and accept SCRATCH_IN_SMEM=false, so the whole-arena pool->global
     fallback composes uniformly. (Earlier revisions of this comment said
     floating-only because the body inner had not yet migrated; that has since
-    landed — see docs/idsva_so_inner_refactor_notes.md.)"""
+    landed — see docs/idsva_so_inner_refactor_notes.md.)
+
+    idsva_cold_in_global (A4): SURGICAL — route ONLY the embedded WORLD-frame
+    idsva_so inner's cold trio (Xdown 36*NB + v_w/a_w 12*NB, dead before the hot
+    triple-walk) to d_workspace via the inner's COLD_IN_SMEM=false, while the whole
+    hot pool stays in smem (SCRATCH_IN_SMEM=true). Mutually exclusive with
+    use_workspace_idsva_temp (which spills the WHOLE pool). Shrinks the smem arena
+    by the cold-trio span (48*NB floats) so a spilling robot keeps its hot band in
+    smem at a tier between 'outputs->global' and the all-or-nothing pool->global rung.
+    Only meaningful when the composed idsva inner is the WORLD frame (floating OR
+    spherical); for the body-frame inner there is no exposed cold trio so the inner's
+    COLD_IN_SMEM template arg is inert there (the body inner's signature carries its
+    own BC/TP levers, not COLD). The fdsva_so_device threads this through as the
+    IDSVA_COLD_IN_SMEM template flag — see gen_fdsva_so_device."""
     # MUJOCO_OUTPUT (floating non-mimic/skew): the kernel template flag in scope;
     # gates the mjx input-convert + the trailing device-template arg.
     mjx_kernel = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
@@ -571,13 +638,25 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled() if fd_grad_use_spill
         else self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
     )
+    # A4: cold-trio span (Xdown 36*NB + v_w/a_w 12*NB = 48*NB floats). Subtracted
+    # from the world-inner footprint when idsva_cold_in_global routes it to global.
+    # Mirrors the standalone idsva_so world cold rung (_idsva_wf_cold in GRiDCodeGenerator.py).
+    cold_floats = 48 * self.robot.get_num_bodies()
     if use_workspace_idsva_temp:
         # Pool -> global: fdsva_so_device runs with SCRATCH_IN_SMEM=false, so the
         # WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad + idsva) lives
         # in d_workspace. The smem s_temp slot is unused -> size 0.
         shared_temp_size = 0
     else:
-        shared_temp_size = max(inner_idsva_so_temp_size, fd_grad_temp_size)
+        idsva_temp_size = inner_idsva_so_temp_size
+        if idsva_cold_in_global:
+            # Surgical: the world inner keeps its hot band in smem but repoints the
+            # cold trio to d_workspace (COLD_IN_SMEM=false), so its smem footprint
+            # shrinks by exactly the cold-trio span. (No-op for the body inner — but
+            # this rung is only ever PICKED when the world inner is composed, see the
+            # GRiDCodeGenerator.py tier table which gates the rung's arena on world.)
+            idsva_temp_size = inner_idsva_so_temp_size - cold_floats
+        shared_temp_size = max(idsva_temp_size, fd_grad_temp_size)
         if not use_workspace_temp:
             shared_temp_size = max(shared_temp_size, self.gen_fdsva_so_contract_temp_mem_size())
     # Phase 3e: s_df_du and s_Minv can now be in workspace too. Drop them from
@@ -591,7 +670,8 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         extra_t_buffers.append(("s_idsva_so", n*n*n*4))
         extra_t_buffers.append(("s_df2", 4*n*n*n))
     self.gen_XImats_helpers_temp_shared_memory_code(shared_temp_size, extra_t_buffers = extra_t_buffers)
-    needs_d_workspace = use_workspace_temp or fd_grad_use_spill or use_workspace_df_du or use_workspace_Minv
+    needs_d_workspace = (use_workspace_temp or fd_grad_use_spill or use_workspace_df_du
+                         or use_workspace_Minv or idsva_cold_in_global)
     if not needs_d_workspace:
         self.gen_add_code_line("(void)d_workspace;")
     if not use_global_tensors:
@@ -648,6 +728,15 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         if mjx_kernel:
             self.gen_add_code_line("T *d_mjx_scratch = nullptr; (void)d_mjx_scratch;")
             self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) { d_mjx_scratch = reinterpret_cast<T *>(&d_workspace[" + ws_k + "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]); }")
+        # A4: surgical cold rung — the WORLD idsva inner's cold trio (48*NB floats) spills
+        # to the SO-temp region of d_workspace (GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES). DISJOINT
+        # by construction at THIS rung: use_workspace_temp is False (contract stays in smem -> no
+        # s_fdsva_temp carved from this region), fd_grad/df_du/Minv are NOT spilled (all in smem),
+        # so nothing else touches the SO-temp band. The cold trio is dead before the hot triple
+        # walk AND the contract runs entirely in smem after — no aliasing. (Mirrors the standalone
+        # idsva_so world cold rung, which carves the same region; the two kernels never co-run.)
+        if idsva_cold_in_global:
+            self.gen_add_code_line('T *d_idsva_cold_spill = reinterpret_cast<T *>(&d_workspace[' + ws_k + 'GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);')
         if not timing:
             self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
             # Pool->global reuses the (non-concurrent) fdsva SO-temp region; the
@@ -660,7 +749,9 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
             d_fd_grad_spill_name = "d_fd_grad_spill" if fd_grad_use_spill else "nullptr",
             s_fdsva_temp_name = "s_fdsva_temp" if use_workspace_temp else "nullptr",
             mujoco_output_expr = "MUJOCO_OUTPUT" if mjx_kernel else None,
-            d_mjx_scratch_name = "d_mjx_scratch" if mjx_kernel else "nullptr")
+            d_mjx_scratch_name = "d_mjx_scratch" if mjx_kernel else "nullptr",
+            idsva_cold_in_smem_expr = "false" if idsva_cold_in_global else "true",
+            d_idsva_cold_spill_name = "d_idsva_cold_spill" if idsva_cold_in_global else "nullptr")
 
     # MUJOCO_OUTPUT: convert the mjx-frame inputs (quat wxyz->xyzw, base-linear
     # qd/u -> pin frame) in place BEFORE the device inner runs (XImats build from
@@ -719,8 +810,8 @@ def gen_fdsva_so_kernel(self, single_call_timing = False):
     self.gen_add_code_line(func_def, True)
     picks = getattr(self, "fdsva_so_spill_tier_3way", (5, 5, 5))
     def _emit_fdsva_so_body(pick):
-        ugt, uwt, fgs, uwdfdu, uwminv, uwit = _FDSVA_SO_PICK_FLAGS[pick]
-        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, uwit)
+        ugt, uwt, fgs, uwdfdu, uwminv, uwit, uict = _FDSVA_SO_PICK_FLAGS[pick]
+        _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, ugt, uwt, fgs, uwdfdu, uwminv, single_call_timing, uwit, uict)
     self.gen_tier_dispatch(picks, _emit_fdsva_so_body)
     self.gen_add_end_function()
 

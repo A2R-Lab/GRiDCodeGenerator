@@ -1072,16 +1072,30 @@ class GRiDCodeGenerator:
         # contraction->global as in levels >=2. Works for BOTH bases because the full
         # inner repoints s_temp and hands the placed pool to the idsva inner (body or
         # world) — the sub-inner just uses the pointer it is given (inner-owns-placement).
-        # 8-tuple: (..., use_workspace_idsva_temp == pool->global). Levels 0-5 keep pool in smem.
+        # A4: idsva_cold rung (between global_tensors and workspace_temp). Keeps outputs
+        # in global (like global_tensors) but additionally spills the embedded WORLD
+        # idsva_so inner's cold trio (Xdown 36*NB + v_w/a_w 12*NB = 48*NB floats, dead
+        # before the hot triple-walk) to the SO-temp d_workspace region via the inner's
+        # COLD_IN_SMEM=false, while the hot pool stays in smem. Its smem arena = the
+        # global_tensors arena minus the cold-trio span. Only EFFECTIVE when the composed
+        # idsva inner is the WORLD frame (floating OR spherical) — the body-frame inner
+        # has no exposed cold trio, so for body-frame robots this rung's arena is set
+        # EQUAL to global_tensors (no fit advantage -> the picker never distinguishes it,
+        # and the kernel's COLD flag is inert there). The reduction matches the standalone
+        # idsva_so world cold rung (_idsva_wf_cold).
+        _fdsva_so_uses_world_idsva = self.robot.floating_base or self.robot.robot_has_spherical()
+        _fdsva_so_cold_floats = (48 * self.robot.get_num_bodies()) if _fdsva_so_uses_world_idsva else 0
+        # 9-tuple: (..., use_workspace_idsva_temp == pool->global, idsva_cold_in_global). Levels keep pool in smem except pool_global.
         _fdsva_so_tiers = [
-            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False),
-            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False, False),
-            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_contract,        True,  True,  False, False, False, False),
-            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False, False),
-            ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False, False),
-            ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True,  False),
+            ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False, False),
+            ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False, False, False),
+            ("idsva_cold",           fdsva_so_base_t_count + _temp_full - _fdsva_so_cold_floats, True, False, False, False, False, False, True),
+            ("workspace_temp",       fdsva_so_base_t_count + _temp_no_contract,        True,  True,  False, False, False, False, False),
+            ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False, False, False),
+            ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False, False, False),
+            ("spill_Minv",           fdsva_so_base_no_df_du_no_Minv + _temp_spilled,True,  True,  True,  True,  True,  False, False),
             # pool->global: smem = base (inputs + qdd + Minv + df_du + XI), no pool/outputs/contraction.
-            ("pool_global",          fdsva_so_base_t_count,                         True,  True,  False, False, False, True),
+            ("pool_global",          fdsva_so_base_t_count,                         True,  True,  False, False, False, True,  False),
         ]
         _fdsva_so_arenas = tuple(t[1] for t in _fdsva_so_tiers)
         self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
@@ -1089,7 +1103,7 @@ class GRiDCodeGenerator:
         (_, fdsva_so_t_count, self.fdsva_so_use_global_tensors,
          self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill,
          self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv,
-         self.fdsva_so_use_workspace_idsva_temp) = _chosen
+         self.fdsva_so_use_workspace_idsva_temp, self.fdsva_so_idsva_cold_in_global) = _chosen
         self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
 
         # ----- F1: plant_step_hessian shared-mem tier selection (fixed-base only) -----
@@ -1461,8 +1475,14 @@ class GRiDCodeGenerator:
                                  "// gives the placement codegen assigned to each tier for THIS robot.",
                                  "template <typename T, bool SCRATCH_IN_SMEM = true> __host__ __device__ constexpr size_t FDSVA_SO_INNER_SMEM_BYTES() { return SCRATCH_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool SCRATCH_IN_SMEM = true> __host__ __device__ constexpr size_t FDSVA_SO_INNER_WORKSPACE_BYTES() { return SCRATCH_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(4*nv**3) + "); }",
-                                 "// Per-robot tier->placement map: scratch stays in smem at spill levels < 2 (the use_workspace_temp threshold).",
-                                 "template <int TIER> __host__ __device__ constexpr bool FDSVA_SO_SCRATCH_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.fdsva_so_spill_tier_3way[0] < 2 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.fdsva_so_spill_tier_3way[1] < 2 else "false") + " : " + ("true" if self.fdsva_so_spill_tier_3way[2] < 2 else "false") + "; }",
+                                 # Per-robot tier->placement map for the fdsva_so_contract 4*NV^3 scratch:
+                                 # it stays in smem (CONTRACT_IN_SMEM=true) at every rung that does NOT
+                                 # set use_workspace_temp (the contract-spill flag). Derived from the per-rung
+                                 # use_workspace_temp flag (tuple field index 3) so the A4 idsva_cold rung
+                                 # (which keeps the contract in smem) is classified correctly without a
+                                 # hardcoded index that the rung insertion would have shifted.
+                                 "// Per-robot tier->placement map: contraction scratch stays in smem at any rung that doesn't set use_workspace_temp.",
+                                 "template <int TIER> __host__ __device__ constexpr bool FDSVA_SO_SCRATCH_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if not _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]][3] else "false") + " : (TIER == TIER_LITE) ? " + ("true" if not _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[1]][3] else "false") + " : " + ("true" if not _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[2]][3] else "false") + "; }",
                                  "// Inner-controlled placement API (design rollout): each inline inner is keyed on a",
                                  "// placement bool and decides arena pointers itself. *_INNER_{SMEM,WORKSPACE}_BYTES<T, IN_SMEM>",
                                  "// give the two arena sizes; *_<...>_IN_SMEM<TIER>() give the per-robot tier->placement",
@@ -1532,7 +1552,12 @@ class GRiDCodeGenerator:
                                  # Phase 3e: sized for MINIMAL tier's spill (max across PERF/LITE/MINIMAL).
                                  # Even if PERF doesn't spill df_du/Minv, MINIMAL might — the workspace
                                  # allocation has to cover MINIMAL's needs at all times.
-                                 "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(3*nv*nv if any(p >= 4 for p in getattr(self, 'fdsva_so_spill_tier_3way', (0, 0, 0))) else 0) + "); }",
+                                 # A4: the idsva_cold rung insertion shifted spill_df_du/spill_Minv/pool_global
+                                 # from old indices 4/5/6 to 5/6/7, so the legacy `p >= 4` threshold (= "any rung
+                                 # at or past spill_df_du") is now `p >= 5` to reproduce the EXACT same per-robot
+                                 # value (Gate-A byte-identical for cardinals). The 3*NV^2 span backs
+                                 # s_df_du(2*NV^2) + s_Minv(NV^2) at GRID_FDSVA_SO_SPILL_OFFSET_BYTES.
+                                 "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP() { return sizeof(T) * static_cast<size_t>(" + str(3*nv*nv if any(p >= 5 for p in getattr(self, 'fdsva_so_spill_tier_3way', (0, 0, 0))) else 0) + "); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_FDSVA_SO_SPILL_OFFSET_BYTES() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>(); }",
                                  "template <typename T> __host__ __device__ inline size_t GRID_WORKSPACE_BYTES_PER_TIMESTEP() { return GRID_GRAD_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_FDSVA_SO_SPILL_BYTES_PER_TIMESTEP<T>(); }",
                                  "template <typename T> __host__ __device__ inline gridSharedTier GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER() { return static_cast<gridSharedTier>(GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE); }",
