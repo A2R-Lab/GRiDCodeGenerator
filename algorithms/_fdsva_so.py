@@ -1,4 +1,21 @@
+"""Second-order forward-dynamics derivatives (∂²qdd/∂x²).
+
+NOTE: joint damping/friction contribute NOTHING to second-order derivatives, so
+this file emits no damping term. The damping bias τ_damp = b·qd is linear in qd
+(∂²/∂*∂* = 0); Coulomb friction f·sign(qd) is non-smooth (subgradient 0 a.e.).
+They appear only in the FIRST-order inverse_dynamics_gradient output, which
+fdsva_so already composes — never here.
+"""
+
 MEMORY_THRESHOLD = 8 # Max num joints for shared mem allocation of result
+
+
+def _fdsva_so_use_world_idsva(self):
+    """Route the composed idsva_so inner to the WORLD frame for floating-base OR
+    spherical-joint robots (body-frame single-DoF contractions are wrong for a
+    6×3 spherical motion subspace). Mirrors `_idsva_so_use_world_frame`. Byte-
+    identical for cardinal fixed-base robots (predicate false)."""
+    return self.robot.floating_base or self.robot.robot_has_spherical()
 
 
 def gen_fdsva_so_contract(self):
@@ -97,7 +114,7 @@ def gen_fdsva_so_contract(self):
     # stores d2tau_dqdq un-symmetrized, so spherical must use the same jk-transposed
     # index as the floating base to land in the layout the final -Minv reduction reads.
     d2tau_dqdq_term = (f'd2tau_dqdq[i*{n*n} + k*{n} + j]'
-                       if (self.robot.floating_base or self.robot.robot_has_spherical())
+                       if _fdsva_so_use_world_idsva(self)
                        else 'd2tau_dqdq[ind]')
     self.gen_add_code_line(f'if (ind < {n**3}) inner_dq[ind] += rot_dq[ind] + {d2tau_dqdq_term}; // Started with dM_dq*da_dq')
     self.gen_add_code_line(f'else if (ind < {2*n**3}) inner_cross[i*{n*n} + k*{n} + j] = dot_prod<T, {n}, {n}, 1>(&dM_dq[{n*n}*i + k], &s_df_dqd[{n}*j]) + d2tau_dvdq[i*{n*n} + j*{n} + k];')
@@ -341,7 +358,7 @@ def gen_fdsva_so_device(self):
     # (the body-frame inner's single-DoF S contractions are wrong for a 3-DoF joint),
     # exactly as the idsva_so dispatcher does for spherical. The world inner needs no
     # dvdq layout repair (that is a body-frame-only fixup).
-    if self.robot.floating_base or self.robot.robot_has_spherical():
+    if _fdsva_so_use_world_idsva(self):
         self.gen_idsva_so_world_frame_inner_function_call()
     else:
         self.gen_idsva_so_body_frame_inner_function_call()
@@ -547,7 +564,7 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
     # call routing above), so they must reserve the world-frame inner's temp memory.
     inner_idsva_so_temp_size = (
         self.gen_idsva_so_world_frame_temp_mem_size()
-        if (self.robot.floating_base or self.robot.robot_has_spherical())
+        if _fdsva_so_use_world_idsva(self)
         else self.gen_idsva_so_body_frame_inner_temp_mem_size()
     )
     fd_grad_temp_size = (

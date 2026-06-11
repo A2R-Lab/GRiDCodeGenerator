@@ -1,3 +1,11 @@
+"""Second-order inverse-dynamics derivatives (∂²τ/∂x²), body- and world-frame.
+
+NOTE: joint damping/friction contribute NOTHING to second-order derivatives, so
+this file emits no damping term. The damping bias τ_damp = b·qd is linear in qd
+(∂²/∂*∂* = 0); Coulomb friction f·sign(qd) is non-smooth (subgradient 0 a.e.).
+They appear only in the FIRST-order inverse_dynamics_gradient output, never here.
+"""
+
 SHARED_MEMORY_JOINT_THRESHOLD = 10 # Max shared memory threshold => Write directly to RAM
 
 def _idsva_so_use_world_frame(self):
