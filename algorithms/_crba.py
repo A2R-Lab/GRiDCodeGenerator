@@ -193,6 +193,14 @@ def _gen_crba_inner_spherical_fixed(self, NB, n_bfs_levels):
     # IC[parent] += X[ind]^T IC[ind] X[ind]. Reuse the cardinal GEMM emit pattern
     # (writes only the IC band, never M), but route the IC scratch through the
     # `alpha` band declared above.
+    # Zero the 6x6 GEMM temp slot first: the X^T*IC gemm below writes it with
+    # beta=0, which still READS C (C = 1*res + 0*C). On the cold first use that
+    # slot is uninitialized shared scratch, and 0*NaN == NaN would poison the
+    # whole composite-inertia fold (a load-dependent thread-invariance flake).
+    self.gen_add_parallel_loop("i", "36")
+    self.gen_add_code_line(f"s_temp[{36*NB} + i] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
     for bfs_level in range(n_bfs_levels - 1, 0, -1):
         inds = self.robot.get_ids_by_bfs_level(bfs_level)
         joint_names = [self.robot.get_joint_by_id(j).get_name() for j in inds]
