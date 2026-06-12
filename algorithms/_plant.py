@@ -1422,13 +1422,8 @@ def gen_plant_step_hessian_kernel(self):
     # <T, IT, RESOURCE_TIER> launches are unaffected; default false -> byte-identical
     # pin codegen. Threaded to the input convert + forwarded to plant_step_hessian
     # (whose d2AB epilogue is the validated grid::integrator_hessian_device mjx transform).
-    mjx_kernel_tmpl = self.robot.floating_base
-    if mjx_kernel_tmpl:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    else:
-        self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
-                               "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, "
+                           "int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line("void plant_step_hessian_kernel(T *d_d2AB, unsigned char *d_workspace, const T *d_x, const T *d_u, "
