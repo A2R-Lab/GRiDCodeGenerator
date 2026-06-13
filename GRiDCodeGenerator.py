@@ -1,5 +1,85 @@
 import os
+import json
 import numpy as np
+
+# ─── A1b launch-config bake (single source of truth) ─────────────────────────
+# The autotuned per-(robot,base,algo) {tier,threads} live in
+# launch_configs/<robot>/<DEFAULT_GPU>.json. At codegen time we read the
+# matching entry and bake it into the generated header as host-side constants
+# (grid::launch_cfg<ALGO_*>). This is purely ADDITIVE host content — kernel
+# bodies are untouched (Gate-A). A missing robot / GPU / algo falls back to the
+# conservative MAX_PERF_LEVEL_THREADS default so un-tuned robots are unaffected.
+
+# DEFAULT GPU whose autotuned config ships baked-in.
+LAUNCH_CONFIG_DEFAULT_GPU = "rtx5090_sm120"
+
+# JSON tier name -> emitted TIER_* enum symbol.
+LAUNCH_CONFIG_TIER_SYMBOL = {
+    "shared":  "TIER_SHARED",
+    "lite":    "TIER_LITE",
+    "minimal": "TIER_MINIMAL",
+}
+
+# JSON (bench-abbreviated) algo key -> canonical grid:: host-launcher symbol.
+# The launch_configs JSON inherits the autotune-sweep's short keys; map them to
+# the host-launcher / kernel base names so the baked enum is unambiguous. Algos
+# present in the registry but absent from the autotune sweep simply get no
+# baked override (they fall back to the conservative default).
+LAUNCH_CONFIG_ALGO_TO_SYMBOL = {
+    "id":                    "inverse_dynamics",
+    "minv":                  "minv",
+    "fd":                    "forward_dynamics",
+    "aba":                   "aba",
+    "crba":                  "crba",
+    "id_du":                 "inverse_dynamics_gradient",
+    "fd_du":                 "forward_dynamics_gradient",
+    "ee_pose":               "end_effector_pose",
+    "ee_pose_gradient":      "end_effector_pose_gradient",
+    "ee_pose_hessian":       "end_effector_pose_hessian",
+    "idsva_so":              "idsva_so",
+    "idsva_so_body_frame":   "idsva_so_body_frame",
+    "idsva_so_world_frame":  "idsva_so_world_frame",
+    "fdsva_so":              "fdsva_so",
+    "integrator":            "integrator",
+    "integrator_gradient":   "integrator_gradient",
+    "integrator_with_gradient": "integrator_with_gradient",
+}
+
+
+def _launch_configs_dir():
+    """Absolute path to the repo's launch_configs/ dir (sibling of GRiDCodeGenerator)."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "launch_configs")
+
+
+def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU):
+    """Return {grid_symbol: {"tier": TIER_*, "threads": int}} for (robot_id, base).
+
+    Reads launch_configs/<robot_id>/<gpu>.json and picks the matching base
+    ("floating" or "fixed"). Returns {} (-> full fallback) when the file is
+    absent / unreadable / lacks the base. Unknown algo keys / tiers are skipped
+    individually (so a partially-populated config still bakes what it can)."""
+    if not robot_id:
+        return {}
+    path = os.path.join(_launch_configs_dir(), str(robot_id), str(gpu) + ".json")
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    base = "floating" if floating_base else "fixed"
+    base_block = (doc.get("bases") or {}).get(base) or {}
+    out = {}
+    for algo_key, cfg in base_block.items():
+        symbol = LAUNCH_CONFIG_ALGO_TO_SYMBOL.get(algo_key)
+        if symbol is None:
+            continue
+        tier_sym = LAUNCH_CONFIG_TIER_SYMBOL.get(str(cfg.get("tier", "")).lower())
+        threads = cfg.get("threads")
+        if tier_sym is None or not isinstance(threads, int) or threads < 1:
+            continue
+        out[symbol] = {"tier": tier_sym, "threads": int(threads)}
+    return out
+
 
 class GRiDCodeGenerator:
     # first import helpers to write code generation, spatial algebra, and opology helpers (parent, child, Sind, XImats) and the robotModel object wrapepr
@@ -119,8 +199,18 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False, LAUNCH_CONFIG_ROBOT = None):
         self.robot = robotObj
+        # A1b launch-config bake: the robot id used to locate the autotuned
+        # launch_configs/<robot>/<DEFAULT_GPU>.json (per-algo {tier,threads}).
+        # The launch_configs dir is keyed by the URDF FILENAME stem (e.g.
+        # "iiwa14", "go2", "g1"), which does NOT always equal the URDF
+        # <robot name=...> (e.g. go2_description, g1_29dof). Callers that know
+        # the canonical robot id (the bindings + the bench/test harness) pass it
+        # explicitly; otherwise we fall back to robotObj.name. None / no match
+        # falls back to the conservative MAX_PERF_LEVEL_THREADS default so
+        # un-tuned robots keep compiling exactly as before (additive, Gate-A safe).
+        self.launch_config_robot = LAUNCH_CONFIG_ROBOT
         # MUJOCO_OUTPUT: when True AND the robot is floating-base, the generator
         # additionally INSTANTIATES the `MUJOCO_OUTPUT=true` variant of every
         # convention-sensitive floating kernel/host wrapper (the mjx output
@@ -422,6 +512,68 @@ class GRiDCodeGenerator:
             "#define time_delta_us_timespec(start,end) (1e6*static_cast<double>(end.tv_sec - start.tv_sec)+1e-3*static_cast<double>(end.tv_nsec - start.tv_nsec))"])
         self.gen_add_code_line("")
         self.gen_add_code_line("#define XIMAT_SIZE 36")
+
+    def gen_add_launch_config_helpers(self):
+        """Emit the A1b baked launch-config table (single source of truth).
+
+        Reads launch_configs/<robot>/<DEFAULT_GPU>.json for this robot+base and
+        emits per-algo `grid::launch_cfg<GRID_ALGO_*>` specializations carrying
+        the autotuned {TIER, THREADS}. The primary template falls back to the
+        conservative (GRID_DEFAULT_RESOURCE_TIER, MAX_PERF_LEVEL_THREADS) default,
+        so any algo without a baked entry — and any robot/GPU without a config —
+        compiles exactly as before. Purely additive host-side content: no kernel
+        body is emitted here (Gate-A: kernel `__global__` bodies byte-identical).
+
+        HOST launchers / bindings read grid::launch_cfg<ALGO>::{TIER,THREADS} to
+        default their launch config, fixing the FFI thread-default pathology at
+        the C++ root. Explicit caller-supplied threads still override."""
+        robot_id = self.launch_config_robot if self.launch_config_robot is not None else self.robot.get_name()
+        cfg = load_launch_config(robot_id, self.robot.floating_base)
+        # Stable, declaration-ordered list of every algo that COULD carry a config
+        # (the canonical grid:: symbols). Emit one enumerator per algo so the
+        # table is complete regardless of which algos this robot tuned.
+        algo_symbols = list(dict.fromkeys(LAUNCH_CONFIG_ALGO_TO_SYMBOL.values()))
+        enum_names = {sym: "GRID_ALGO_" + sym.upper() for sym in algo_symbols}
+        base_name = "floating" if self.robot.floating_base else "fixed"
+        if cfg:
+            src = "launch_configs/" + str(robot_id) + "/" + LAUNCH_CONFIG_DEFAULT_GPU + ".json (" + base_name + ")"
+        else:
+            src = "NONE found for robot=" + str(robot_id) + " base=" + base_name + " gpu=" + LAUNCH_CONFIG_DEFAULT_GPU + " -> conservative fallback"
+        self.gen_add_code_lines([
+            "",
+            "// ─── A1b baked launch config (single source of truth) ───────────────",
+            "// Autotuned per-algo {resource tier, threads-per-block} for THIS robot",
+            "// + base, baked from " + src + ".",
+            "// GRiD kernels are single-block + thread-count-invariant, so (tier,threads)",
+            "// is a pure PERFORMANCE choice; HOST launchers / python-jax-torch bindings",
+            "// default their launch config from grid::launch_cfg<GRID_ALGO_*>. An algo",
+            "// with no autotuned entry (or a robot/GPU with no launch_configs file)",
+            "// falls back to the conservative (GRID_DEFAULT_RESOURCE_TIER,",
+            "// MAX_PERF_LEVEL_THREADS) default -> un-tuned robots are unaffected.",
+            "enum GridAlgo {",
+        ])
+        for sym in algo_symbols:
+            self.gen_add_code_line("    " + enum_names[sym] + ",", )
+        self.gen_add_code_lines([
+            "    GRID_ALGO_COUNT",
+            "};",
+            "// Primary template = conservative fallback (matches the historical default).",
+            "template <int ALGO> struct launch_cfg {",
+            "    static constexpr int TIER    = GRID_DEFAULT_RESOURCE_TIER;",
+            "    static constexpr int THREADS = MAX_PERF_LEVEL_THREADS;",
+            "};",
+        ])
+        # Per-algo specializations (only for algos with a baked entry).
+        for sym in algo_symbols:
+            entry = cfg.get(sym)
+            if entry is None:
+                continue
+            self.gen_add_code_line(
+                "template <> struct launch_cfg<" + enum_names[sym] + "> { "
+                "static constexpr int TIER = " + entry["tier"] + "; "
+                "static constexpr int THREADS = " + str(entry["threads"]) + "; };"
+            )
+        self.gen_add_code_line("")
 
     def gen_add_constants_helpers(self, include_base_inertia = False, include_homogenous_transforms = False):
         # first add constants
@@ -1301,6 +1453,8 @@ class GRiDCodeGenerator:
                                  "         : (TIER == TIER_LITE)    ? ((MAX_PERF_LEVEL_THREADS * 2 < 768) ? MAX_PERF_LEVEL_THREADS * 2 : 768)",
                                  "         :                          MAX_PERF_LEVEL_THREADS;",
                                  "}"])
+        # A1b: baked autotuned per-algo launch config (single source of truth).
+        self.gen_add_launch_config_helpers()
         self.gen_add_code_lines([
                                  "#define GRID_GENERATED_NUM_JOINTS " + str(n),
                                  "#define GRID_GENERATED_NUM_EES " + str(self.robot.get_total_leaf_nodes()),
