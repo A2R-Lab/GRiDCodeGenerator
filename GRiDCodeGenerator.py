@@ -590,14 +590,23 @@ class GRiDCodeGenerator:
             "};",
         ])
         # Per-algo specializations (only for algos with a baked entry).
+        # THREADS is CLAMPED to the tier's __launch_bounds__ (tier_max_threads<TIER>):
+        # an autotune may report a count above the tier's launch_bounds because the
+        # jax/torch FFI path clamps at launch (grid_clamp_threads_for), but the
+        # numpy/pybind host-wrapper path passes the count RAW — an unclamped value >
+        # launch_bounds is cudaErrorInvalidValue ("invalid argument"). launch_bounds
+        # guarantees tier_max_threads threads are always launchable, so the clamp is
+        # exact for the FFI path (a no-op there) and correct for the host path.
         for sym in algo_symbols:
             entry = cfg.get(sym)
             if entry is None:
                 continue
+            n = str(entry["threads"])
+            tmax = "tier_max_threads<" + entry["tier"] + ">()"
             self.gen_add_code_line(
                 "template <> struct launch_cfg<" + enum_names[sym] + "> { "
                 "static constexpr int TIER = " + entry["tier"] + "; "
-                "static constexpr int THREADS = " + str(entry["threads"]) + "; };"
+                "static constexpr int THREADS = ((" + n + ") < " + tmax + ") ? (" + n + ") : " + tmax + "; };"
             )
         self.gen_add_code_line("")
 
