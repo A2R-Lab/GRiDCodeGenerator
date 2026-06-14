@@ -51,13 +51,24 @@ def _launch_configs_dir():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "launch_configs")
 
 
-def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU):
+def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU, profile = "host"):
     """Return {grid_symbol: {"tier": TIER_*, "threads": int}} for (robot_id, base).
 
     Reads launch_configs/<robot_id>/<gpu>.json and picks the matching base
     ("floating" or "fixed"). Returns {} (-> full fallback) when the file is
     absent / unreadable / lacks the base. Unknown algo keys / tiers are skipped
-    individually (so a partially-populated config still bakes what it can)."""
+    individually (so a partially-populated config still bakes what it can).
+
+    `profile` selects WHICH autotune the binding/build wants — the optimal
+    thread count is launch-path AND use-case dependent (see autotune_ffi.py):
+      * "host" (default): the C++/host launch path, throughput-optimal — the
+        `bases` block, baked by the C++ run.py autotune.
+      * "ffi":  the jax/torch FFI launch path, batch-to-land (single batched
+        launch, wait for all N to land) — the `ffi_bases` block, baked by
+        autotune_ffi.py. The SAME kernel has a DIFFERENT thread optimum under
+        the FFI launch path (e.g. iiwa14 fd: host best=128, FFI best=768), so a
+        binding that inherits the host pick runs ~1.6x slow. Per-algo fallback
+        to `bases` when an algo has no FFI entry (partial FFI tuning is fine)."""
     if not robot_id:
         return {}
     path = os.path.join(_launch_configs_dir(), str(robot_id), str(gpu) + ".json")
@@ -67,7 +78,14 @@ def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU)
     except (OSError, ValueError):
         return {}
     base = "floating" if floating_base else "fixed"
-    base_block = (doc.get("bases") or {}).get(base) or {}
+    host_block = (doc.get("bases") or {}).get(base) or {}
+    # FFI profile: overlay ffi_bases on top of the host bases (per-algo fallback).
+    if profile == "ffi":
+        ffi_block = (doc.get("ffi_bases") or {}).get(base) or {}
+        base_block = dict(host_block)
+        base_block.update(ffi_block)
+    else:
+        base_block = host_block
     out = {}
     for algo_key, cfg in base_block.items():
         symbol = LAUNCH_CONFIG_ALGO_TO_SYMBOL.get(algo_key)
@@ -199,8 +217,15 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False, LAUNCH_CONFIG_ROBOT = None):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False, LAUNCH_CONFIG_ROBOT = None, LAUNCH_CONFIG_PROFILE = "host"):
         self.robot = robotObj
+        # Which autotune profile to bake into launch_cfg<ALGO>::{TIER,THREADS}.
+        # "host" = the C++/host throughput-optimal `bases` (default; used by the
+        # C++ harness + numpy/pybind). "ffi" = the jax/torch FFI batch-to-land
+        # optimum `ffi_bases` (used by the python bindings — the same kernel has a
+        # different thread optimum under the FFI launch path; see autotune_ffi.py
+        # + load_launch_config). Falls back per-algo to host when ffi is absent.
+        self.launch_config_profile = LAUNCH_CONFIG_PROFILE
         # A1b launch-config bake: the robot id used to locate the autotuned
         # launch_configs/<robot>/<DEFAULT_GPU>.json (per-algo {tier,threads}).
         # The launch_configs dir is keyed by the URDF FILENAME stem (e.g.
@@ -528,7 +553,8 @@ class GRiDCodeGenerator:
         default their launch config, fixing the FFI thread-default pathology at
         the C++ root. Explicit caller-supplied threads still override."""
         robot_id = self.launch_config_robot if self.launch_config_robot is not None else self.robot.get_name()
-        cfg = load_launch_config(robot_id, self.robot.floating_base)
+        profile = getattr(self, "launch_config_profile", "host")
+        cfg = load_launch_config(robot_id, self.robot.floating_base, profile=profile)
         # Stable, declaration-ordered list of every algo that COULD carry a config
         # (the canonical grid:: symbols). Emit one enumerator per algo so the
         # table is complete regardless of which algos this robot tuned.
@@ -536,9 +562,9 @@ class GRiDCodeGenerator:
         enum_names = {sym: "GRID_ALGO_" + sym.upper() for sym in algo_symbols}
         base_name = "floating" if self.robot.floating_base else "fixed"
         if cfg:
-            src = "launch_configs/" + str(robot_id) + "/" + LAUNCH_CONFIG_DEFAULT_GPU + ".json (" + base_name + ")"
+            src = "launch_configs/" + str(robot_id) + "/" + LAUNCH_CONFIG_DEFAULT_GPU + ".json (" + base_name + ", profile=" + profile + ")"
         else:
-            src = "NONE found for robot=" + str(robot_id) + " base=" + base_name + " gpu=" + LAUNCH_CONFIG_DEFAULT_GPU + " -> conservative fallback"
+            src = "NONE found for robot=" + str(robot_id) + " base=" + base_name + " gpu=" + LAUNCH_CONFIG_DEFAULT_GPU + " profile=" + profile + " -> conservative fallback"
         self.gen_add_code_lines([
             "",
             "// ─── A1b baked launch config (single source of truth) ───────────────",
