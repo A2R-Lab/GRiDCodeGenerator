@@ -605,23 +605,23 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     mjx_host = (self.robot.floating_base
                 and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis()))
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_QDD_MINV_FLAG = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics_gradient requires all-data or dynamics gridData\");")
     # the u-input launch is the mjx-capable overload: name the tier positionally
     # to reach the trailing MUJOCO_OUTPUT flag.
-    u_kernel_tmpl = "forward_dynamics_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_gradient_kernel<T>"
-    func_call_start = u_kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
-    # the qdd-Minv launch keeps the legacy <T> template (never mjx).
-    func_call_qdd_start = "forward_dynamics_gradient_kernel<T><<<block_dimms,thread_dimms,FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
+    u_kernel_tmpl = "forward_dynamics_gradient_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_gradient_kernel<T, RESOURCE_TIER>"
+    func_call_start = u_kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
+    # the qdd-Minv launch keeps the legacy non-mjx template (never mjx) but is tiered.
+    func_call_qdd_start = "forward_dynamics_gradient_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_df_du,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("forward_dynamics_gradient_kernel<","forward_dynamics_gradient_kernel_single_timing<")
-        func_call_qdd_start = func_call_qdd_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_qdd_start = func_call_qdd_start.replace("forward_dynamics_gradient_kernel<","forward_dynamics_gradient_kernel_single_timing<")
     self.gen_add_code_line("int stride_q_qd= 3*NUM_JOINTS;")
     if not compute_only:
         # start code with memory transfer
@@ -644,7 +644,7 @@ def gen_forward_dynamics_gradient_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_gradient\", FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics_gradient\", FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
     self.gen_add_code_line("if (GRID_FORWARD_DYNAMICS_GRADIENT_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)

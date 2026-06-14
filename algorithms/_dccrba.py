@@ -673,7 +673,7 @@ def gen_cmm_time_variation_host(self, mode=0):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     out_size = 6 * nv
-    macro = "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    macro = "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()"
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
     func_def_start = ("void cmm_time_variation(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, "
@@ -691,18 +691,18 @@ def gen_cmm_time_variation_host(self, mode=0):
     # reach the trailing flag. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"cmm_time_variation requires all-data or kinematics gridData\");")
     if mjx_host:
-        ktmpl = "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
+        ktmpl = "<T, RESOURCE_TIER, MUJOCO_OUTPUT>"
         kname = "cmm_time_variation_kernel" + ("_single_timing" if single_call_timing else "") + ktmpl
     else:
-        kname = "cmm_time_variation_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+        kname = "cmm_time_variation_kernel" + ("_single_timing<T, RESOURCE_TIER>" if single_call_timing else "<T, RESOURCE_TIER>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_cmm_time_variation,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,d_robotModel,num_timesteps);")
     if not compute_only:
         self.gen_add_code_lines([
@@ -723,7 +723,7 @@ def gen_cmm_time_variation_host(self, mode=0):
     # DE-GATE #2: L2-pin d_workspace when the default tier spills the Jw band into it.
     ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
                 else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
-    self.gen_add_code_line("if (!CMM_J_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
+    self.gen_add_code_line("if (!CMM_J_IN_SMEM<RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"cmm_time_variation\", " + macro + "));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
@@ -828,7 +828,7 @@ def gen_dccrba_host(self, mode=0):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     out_size = 6 * nv * nv
-    macro = "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    macro = "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()"
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
     func_def_start = ("void dccrba(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, "
@@ -846,9 +846,9 @@ def gen_dccrba_host(self, mode=0):
     # reach the trailing flag. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
@@ -857,11 +857,11 @@ def gen_dccrba_host(self, mode=0):
     # positionally so the trailing flag binds. The single-timing kernel takes the
     # flag too (host forwarding) but elides the epilogue (perf-phase follow-up).
     if mjx_host:
-        ktmpl = ("_single_timing<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
-                 if single_call_timing else "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>")
+        ktmpl = ("_single_timing<T, RESOURCE_TIER, MUJOCO_OUTPUT>"
+                 if single_call_timing else "<T, RESOURCE_TIER, MUJOCO_OUTPUT>")
         kname = "dccrba_kernel" + ktmpl
     else:
-        kname = "dccrba_kernel" + ("_single_timing<T>" if single_call_timing else "<T>")
+        kname = "dccrba_kernel" + ("_single_timing<T, RESOURCE_TIER>" if single_call_timing else "<T, RESOURCE_TIER>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->d_dccrba,hd_data->d_workspace,hd_data->d_q,stride_q,d_robotModel,num_timesteps);")
     if not compute_only:
         self.gen_add_code_lines([
@@ -874,7 +874,7 @@ def gen_dccrba_host(self, mode=0):
     # L2-pin d_workspace when the default tier spills s_dccrba into it.
     ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
                 else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
-    self.gen_add_code_line("if ((!DCCRBA_OUTPUT_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() || !DCCRBA_J_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>()) && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
+    self.gen_add_code_line("if ((!DCCRBA_OUTPUT_IN_SMEM<RESOURCE_TIER>() || !DCCRBA_J_IN_SMEM<RESOURCE_TIER>()) && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
     func_call_code = [func_call, "gpuErrchkKernel();"]
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")

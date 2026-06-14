@@ -639,14 +639,14 @@ def gen_coriolis_matrix_host(self, mode=0):
     # byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"coriolis_matrix requires all-data or dynamics gridData\");")
-    coriolis_kernel_tmpl = "coriolis_matrix_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "coriolis_matrix_kernel<T>"
+    coriolis_kernel_tmpl = "coriolis_matrix_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "coriolis_matrix_kernel<T, RESOURCE_TIER>"
     func_call_start = coriolis_kernel_tmpl + "<<<block_dimms,thread_dimms,CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_coriolis,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:

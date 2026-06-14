@@ -1128,16 +1128,16 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     # KIND, /*MUJOCO_OUTPUT=*/true>.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, IntegratorType IT = IntegratorType::EULER, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"" + base_name + " requires all-data or dynamics gridData\");")
     kernel_args_x_kp1 = "hd_data->d_x_kp1," if compute_x_kp1 else ""
-    kernel_tmpl = ("<T, IT, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, IT>")
-    func_call_start = (base_name + "_kernel" + kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(" +
+    kernel_tmpl = ("<T, IT, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, IT, RESOURCE_TIER>")
+    func_call_start = (base_name + "_kernel" + kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(" +
                        "hd_data->d_dAB," + kernel_args_x_kp1 + "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,")
     func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
     if single_call_timing:
@@ -1156,7 +1156,7 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"" + base_name + "\", INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"" + base_name + "\", INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     workspace_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
                        else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
     self.gen_add_code_line("if (GRID_INTEGRATOR_GRADIENT_USES_WORKSPACE) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")

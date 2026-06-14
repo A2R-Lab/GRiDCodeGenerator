@@ -372,16 +372,16 @@ def gen_frame_jacobian_host(self, mode=0):
     # byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"frame_jacobian requires all-data or kinematics gridData\");")
     self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default (frame still honored)")
     self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
-    fj_kernel_tmpl = "frame_jacobian_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_kernel<T>"
+    fj_kernel_tmpl = "frame_jacobian_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_kernel<T, RESOURCE_TIER>"
     func_call_start = (fj_kernel_tmpl + "<<<block_dimms,thread_dimms,FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                        "(hd_data->d_frame_jacobian,hd_data->d_q,stride_q,target_jid,reference_frame,")
     func_call_end = "d_robotModel,num_timesteps);"
@@ -617,9 +617,9 @@ def gen_frame_jacobian_dot_host(self, mode=0):
     # byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
@@ -628,7 +628,7 @@ def gen_frame_jacobian_dot_host(self, mode=0):
     self.gen_add_code_line("if (reference_frame < 0) { reference_frame = " + str(_REF_LWA) + "; }  // -1 => LOCAL_WORLD_ALIGNED default")
     # Jdot needs qd; always source from the full q|qd|u buffer (stride 3*NUM_JOINTS),
     # the kernel reads the leading [q; qd] slice.
-    fjd_kernel_tmpl = "frame_jacobian_dot_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_dot_kernel<T>"
+    fjd_kernel_tmpl = "frame_jacobian_dot_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "frame_jacobian_dot_kernel<T, RESOURCE_TIER>"
     func_call = (fjd_kernel_tmpl + "<<<block_dimms,thread_dimms,FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                  "(hd_data->d_frame_jacobian_dot,hd_data->d_q_qd_u,stride_q_qd,target_jid,reference_frame,d_robotModel,num_timesteps);")
     if single_call_timing:
@@ -870,14 +870,14 @@ def gen_osc_inertia_host(self, mode=0):
     # quaternion under the flag. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"osc_inertia requires all-data or kinematics gridData\");")
-    osc_kernel_tmpl = "osc_inertia_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "osc_inertia_kernel<T>"
+    osc_kernel_tmpl = "osc_inertia_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "osc_inertia_kernel<T, RESOURCE_TIER>"
     func_call_start = (osc_kernel_tmpl + "<<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
                        "(hd_data->d_osc_inertia,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"

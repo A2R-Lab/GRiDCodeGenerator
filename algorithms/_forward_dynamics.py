@@ -311,15 +311,15 @@ def gen_forward_dynamics_host(self, mode = 0):
     # byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"forward_dynamics requires all-data or dynamics gridData\");")
-    fd_kernel_tmpl = "forward_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_kernel<T>"
-    func_call_start = fd_kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
+    fd_kernel_tmpl = "forward_dynamics_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "forward_dynamics_kernel<T, RESOURCE_TIER>"
+    func_call_start = fd_kernel_tmpl + "<<<block_dimms,thread_dimms,FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_qdd,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("forward_dynamics_kernel<","forward_dynamics_kernel_single_timing<")
@@ -338,7 +338,7 @@ def gen_forward_dynamics_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics\", FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"forward_dynamics\", FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back

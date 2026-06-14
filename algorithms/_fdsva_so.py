@@ -845,20 +845,20 @@ def gen_fdsva_so_host(self, mode = 0):
     # calls grid::fdsva_so<T, KIND, /*MUJOCO_OUTPUT=*/true>. Fixed-base unchanged.
     mjx_host = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     if mjx_host:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"fdsva_so requires all-data or dynamics gridData\");")
 
-    kernel_tmpl = "fdsva_so_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "fdsva_so_kernel<T>"
-    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_df2,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_idsva_so,"
+    kernel_tmpl = "fdsva_so_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "fdsva_so_kernel<T, RESOURCE_TIER>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_df2,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,hd_data->d_idsva_so,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     self.gen_add_code_line("int stride_q_qd_qdd = Q_QD_U_STRIDE;")
     if single_call_timing:
-        func_call_start = func_call_start.replace("fdsva_so_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>","fdsva_so_kernel_single_timing<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>").replace("fdsva_so_kernel<T>","fdsva_so_kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("fdsva_so_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>","fdsva_so_kernel_single_timing<T, RESOURCE_TIER, MUJOCO_OUTPUT>").replace("fdsva_so_kernel<T, RESOURCE_TIER>","fdsva_so_kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -874,7 +874,7 @@ def gen_fdsva_so_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"fdsva_so\", FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*" + ("1" if single_call_timing else "num_timesteps")
     self.gen_add_code_line("if (GRID_FDSVA_SO_USES_WORKSPACE_ANY_TIER) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + workspace_bytes + "));}")
     self.gen_add_code_lines(func_call_code)

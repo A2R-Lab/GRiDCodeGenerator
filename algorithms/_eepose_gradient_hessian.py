@@ -302,15 +302,15 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
     # quaternion under the flag. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose requires all-data or kinematics gridData\");")
     eep_kernel_tmpl = ("end_effector_pose_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) +
-                       ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
+                       ("<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, RESOURCE_TIER>"))
     func_call_start = eep_kernel_tmpl + \
                         "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_end_effector_pose,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
@@ -318,7 +318,7 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
         if mjx_host:
             func_call_start = func_call_start.replace("end_effector_pose_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<", "end_effector_pose_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "_single_timing<")
         else:
-            func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+            func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>","kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -965,22 +965,22 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     # identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_gradient requires all-data or kinematics gridData\");")
     eepg_kernel_tmpl = ("end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) +
-                        ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
-    func_call_start = eepg_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
+                        ("<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, RESOURCE_TIER>"))
+    func_call_start = eepg_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         if mjx_host:
             func_call_start = func_call_start.replace("end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<", "end_effector_pose_gradient_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "_single_timing<")
         else:
-            func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+            func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>","kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -1006,7 +1006,7 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient\", END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_gradient\", END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     workspace_bytes = "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)"
     # Per-tier gate: arm L2 persistence if ANY tier routes the chain workspace
     # through d_workspace (runtime RESOURCE_TIER may differ from the PERF pick).
@@ -2635,22 +2635,22 @@ def gen_end_effector_pose_hessian_host(self, mode = 0):
     # false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_hessian requires all-data or kinematics gridData\");")
     eeph_kernel_tmpl = ("end_effector_pose_hessian_kernel" +
-                        ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
-    func_call_start = eeph_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_end_effector_pose_hessian,hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
+                        ("<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, RESOURCE_TIER>"))
+    func_call_start = eeph_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_end_effector_pose_hessian,hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         if mjx_host:
             func_call_start = func_call_start.replace("end_effector_pose_hessian_kernel<", "end_effector_pose_hessian_kernel_single_timing<")
         else:
-            func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+            func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>","kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         # start code with memory transfer
         self.gen_add_code_lines(["// start code with memory transfer", \
@@ -2676,8 +2676,8 @@ def gen_end_effector_pose_hessian_host(self, mode = 0):
     if single_call_timing:
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("if (END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_hessian\", END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("if (END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>() > GRID_CUDA_TARGET_SHARED_MEM_BYTES) {fprintf(stderr,\"GRID end_effector_pose_hessian shared-memory request %zu exceeds compile target %d; regenerate with a deeper Hessian spill fallback or a higher GRID_CUDA_TARGET_SHARED_MEM_BYTES.\\n\", END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>(), GRID_CUDA_TARGET_SHARED_MEM_BYTES); gpuErrchk(cudaErrorInvalidConfiguration);}")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"end_effector_pose_hessian\", END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     # No L2 persistence: at LITE/MINIMAL the end_effector_pose_hessian spill target IS the output
     # buffer (d_end_effector_pose_hessian), which is written once and read once -- no benefit from
     # L2 pinning.

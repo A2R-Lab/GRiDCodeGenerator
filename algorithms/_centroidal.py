@@ -848,18 +848,18 @@ def _gen_kin_centroidal_host(self, name, out_buf, out_size, has_qd, has_gravity,
     # reach the trailing flag. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"" + name + " requires all-data or kinematics gridData\");")
     if mjx_host:
-        ktmpl = "<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>"
+        ktmpl = "<T, RESOURCE_TIER, MUJOCO_OUTPUT>"
         kname = name + ("_kernel_single_timing" if single_call_timing else "_kernel") + ktmpl
     else:
-        kname = name + ("_kernel_single_timing<T>" if single_call_timing else "_kernel<T>")
+        kname = name + ("_kernel_single_timing<T, RESOURCE_TIER>" if single_call_timing else "_kernel<T, RESOURCE_TIER>")
     func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->" + out_buf + ",hd_data->d_" + in_name +
                  ",stride_" + in_name + ",d_robotModel," + grav_arg + "num_timesteps);")
     if not compute_only:

@@ -2974,16 +2974,16 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
     # then generate the code
     self.gen_add_func_doc("Compute IDSVA-SO (Inverse Dynamics - Spatial Vector Algebra - Second Order)",\
                           func_notes,func_params,None)
-    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_body_frame requires all-data or dynamics gridData\");")
-    func_call_start = "idsva_so_body_frame_kernel<T><<<block_dimms,thread_dimms,IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
+    func_call_start = "idsva_so_body_frame_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>","kernel_single_timing<T, RESOURCE_TIER>")
 
     self.gen_add_code_line("int stride_q_qd = Q_QD_U_STRIDE;")
     if not compute_only:
@@ -3005,7 +3005,7 @@ def gen_idsva_so_body_frame_host(self, mode = 0):
         func_call_code.insert(0,"struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         # then transfer memory back
@@ -4721,15 +4721,15 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
     # forwarded positionally to the kernel (which names the tier to reach it).
     mjx_host = self.robot.floating_base and not (self.robot_has_mimic_joints() or self.robot.robot_has_skew_axis())
     if mjx_host:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"idsva_so_world_frame requires all-data or dynamics gridData\");")
-    kernel_tmpl = "idsva_so_world_frame_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "idsva_so_world_frame_kernel<T>"
-    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_idsva_so," + \
+    kernel_tmpl = "idsva_so_world_frame_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "idsva_so_world_frame_kernel<T, RESOURCE_TIER>"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_idsva_so," + \
         "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
@@ -4751,7 +4751,7 @@ def gen_idsva_so_world_frame_host(self, mode = 0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so_world_frame\", IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so_world_frame\", IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([

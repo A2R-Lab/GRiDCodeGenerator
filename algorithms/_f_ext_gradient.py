@@ -474,17 +474,17 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute -dJ^T/dq = d(inverse_dynamics_gradient)/dfext (host wrapper, fixed base)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"f_ext_gradient_dq requires all-data or dynamics gridData\");")
     out_each = "NUM_VEL*6*NUM_BODIES*NUM_VEL"
-    func_call_start = ("f_ext_gradient_dq_kernel<T><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
+    func_call_start = ("f_ext_gradient_dq_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
                        "hd_data->d_f_ext_gradient_dq,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>", "kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         self.gen_add_code_lines([
             "// start code with memory transfer",
@@ -708,7 +708,7 @@ def gen_f_ext_gradient_host(self, mode=0):
         func_def_start = func_def_start.replace("(", "_compute_only(")
         func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
     self.gen_add_func_doc("Compute the f_ext gradient (host wrapper)", [], func_params, None)
-    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
@@ -718,11 +718,11 @@ def gen_f_ext_gradient_host(self, mode=0):
     out_each = "NUM_VEL*6*NUM_BODIES"
     # g1-spill: pass hd_data->d_workspace as the kernel's 3rd arg. At the spilled
     # default tier (s_dqdd_dfext in d_workspace) it is read; at TIER_SHARED unused.
-    func_call_start = ("f_ext_gradient_kernel<T><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
+    func_call_start = ("f_ext_gradient_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>("
                        "hd_data->d_dtau_dfext,hd_data->d_dqdd_dfext,hd_data->d_workspace,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>", "kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         self.gen_add_code_lines([
             "// start code with memory transfer",
@@ -740,11 +740,11 @@ def gen_f_ext_gradient_host(self, mode=0):
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient\", F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient\", F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     # g1-spill: L2-pin d_workspace when the default tier spills s_dqdd_dfext into it.
     _feg_ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
                      else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
-    self.gen_add_code_line("if (!F_EXT_GRADIENT_DQDD_IN_SMEM<GRID_DEFAULT_RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + _feg_ws_bytes + "));}")
+    self.gen_add_code_line("if (!F_EXT_GRADIENT_DQDD_IN_SMEM<RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + _feg_ws_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([

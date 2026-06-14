@@ -231,16 +231,16 @@ def _gen_runtime_host(self, base_name, out_field, out_count, single_call_timing=
     # base-linear columns by R^T. Default false -> byte-identical pin codegen.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"" + base_name + " requires all-data or kinematics gridData\");")
     self.gen_add_code_line("if (target_jid < 0) { target_jid = " + str(default_tjid) + "; }       // -1 => leaf-EE default")
     kernel_tmpl = (base_name + "_kernel"
-                   + ("<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T>"))
+                   + ("<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, RESOURCE_TIER>"))
     func_call_start = (kernel_tmpl + "<<<block_dimms,thread_dimms," + smem + ">>>"
                        "(hd_data->d_" + out_field + ",hd_data->d_q,stride_q,target_jid,hd_data->d_eepose_runtime_offset,")
     func_call_end = "d_robotModel,num_timesteps);"
@@ -248,7 +248,7 @@ def _gen_runtime_host(self, base_name, out_field, out_count, single_call_timing=
         if mjx_host:
             func_call_start = func_call_start.replace(base_name + "_kernel<", base_name + "_kernel_single_timing<")
         else:
-            func_call_start = func_call_start.replace("kernel<T>", "kernel_single_timing<T>")
+            func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>", "kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
         self.gen_add_code_lines(["// start code with memory transfer",
                                  "int stride_q;",

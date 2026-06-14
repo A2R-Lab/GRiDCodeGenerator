@@ -919,21 +919,21 @@ def gen_inverse_dynamics_host(self, mode = 0):
     # positional template args are unaffected; default false -> byte-identical.
     mjx_host = self.robot.floating_base
     if mjx_host:
-        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false>")
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     else:
-        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL>")
+        self.gen_add_code_line("template <typename T, bool USE_QDD_FLAG = false, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__host__")
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics requires all-data or dynamics gridData\");")
-    func_call_start = "inverse_dynamics_kernel<T><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
+    func_call_start = "inverse_dynamics_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
     # the with-qdd launch is the mjx-capable overload: forward MUJOCO_OUTPUT (and
-    # the default tier, which it must name positionally to reach the trailing flag).
-    qdd_kernel_tmpl = "inverse_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_kernel<T>"
+    # the caller-chosen tier, which it must name positionally to reach the trailing flag).
+    qdd_kernel_tmpl = "inverse_dynamics_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_kernel<T, RESOURCE_TIER>"
     func_call_qdd_start = qdd_kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_c,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "hd_data->d_f_ext,d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
-        func_call_start = func_call_start.replace("kernel<T>","kernel_single_timing<T>")
+        func_call_start = func_call_start.replace("inverse_dynamics_kernel<","inverse_dynamics_kernel_single_timing<")
         func_call_qdd_start = func_call_qdd_start.replace("inverse_dynamics_kernel<","inverse_dynamics_kernel_single_timing<")
     if not compute_only:
         # start code with memory transfer
