@@ -358,15 +358,27 @@ def gen_end_effector_pose_host(self, mode = 0, fixed_target_name = ""):
         self.gen_add_code_line(single_call_printf_line("end_effector_pose"))
     self.gen_add_end_function()
 
+def _eepose_xworld_slot_count(self):
+    # World-transform scratch slot count for the gradient/hessian inners. Normally
+    # one 4x4 per movable joint; when fixed kinematic targets are baked in, the
+    # fixed joints get appended slots (their jids are NUM_JOINTS..NUM_JOINTS+NFJ-1,
+    # mirroring the s_Xhom layout) so the inner can compose + read Xworld[fixed_jid].
+    # Sizing for ALL fixed joints (not just the one requested) keeps this arena
+    # identical across every emitted ee-pose variant so the shared host smem macro
+    # never under-budgets.
+    nfj = (self.robot.get_num_fixed_joints()
+           if getattr(self, "include_fixed_kinematic_targets", False) else 0)
+    return self.robot.get_num_joints() + nfj
+
+
 def gen_end_effector_pose_gradient_inner_temp_mem_size(self, fixed_target_name = ""):
     # Scratch for the shared-chain geometric Jacobian:
-    #   s_Xworld  : 16 * NUM_JOINTS   (world transforms of every joint)
+    #   s_Xworld  : 16 * NUM_JOINTS (+ fixed targets when baked)
     #   s_Jv,s_Jw : 2 * (3 * nv * num_ees)
     #   s_E       : 4 * num_ees       (cy, sy, cp, sp per ee for E(rpy) inversion)
-    n_joints = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
     num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
-    return 16*n_joints + 2*3*nv*num_ees + 4*num_ees
+    return 16*_eepose_xworld_slot_count(self) + 2*3*nv*num_ees + 4*num_ees
 
 def gen_end_effector_pose_gradient_inner_function_call(self, updated_var_names = None, fixed_target_name = "",
                                                        temp_in_smem_expr = "true"):
@@ -393,23 +405,63 @@ def gen_end_effector_pose_gradient_inner_function_call(self, updated_var_names =
     code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
-def _eepose_grad_chain_metadata(self, all_ees, fixed_target_name):
+def _eepose_resolve_targets(self, fixed_target_name):
+    """Resolve the EE-target joints for the gradient/hessian inners.
+
+    Returns three parallel lists (one entry per requested ee):
+      chain_sources : the MOVABLE joint whose ancestor chain supplies the DOFs
+                      (for a leaf-joint EE this IS the ee; for a fixed-joint EE
+                      it is the fixed joint's parent movable joint).
+      anchors       : the joint whose WORLD transform is the EE world frame
+                      (= ee for a leaf EE; = the fixed joint id for a fixed EE,
+                      whose LOCAL parent->fixed s_Xhom slot is appended when
+                      include_fixed_kinematic_targets is on).
+      fixed_anchor  : per-ee None (leaf) or (anchor_jid, parent_jid) so Step-1
+                      can compose Xworld[anchor] = Xworld[parent] @ Xhom[anchor].
+
+    Mirrors how end_effector_pose (the value fn) resolves a fixed_target_name:
+    remove_fixed_joints has already pre-composed the fixed transform onto its
+    nearest movable parent and re-parented it, so the fixed joint's s_Xhom slot
+    is the LOCAL parent->fixed transform and its parent is a movable joint."""
+    if fixed_target_name == "":
+        ees = self.robot.get_leaf_nodes()
+        return list(ees), list(ees), [None] * len(ees)
+    fj = self.robot.get_fixed_joint_by_name(fixed_target_name)
+    if fj is None:
+        raise ValueError(
+            "gen_end_effector_pose_*: fixed_target_name='" + fixed_target_name +
+            "' is not a fixed joint of this robot.")
+    anchor_jid = fj.get_id()
+    parent_name = fj.get_parent()
+    parent_jid = (self.robot.get_joint_by_name(parent_name).get_id()
+                  if parent_name not in ("", "-1") else -1)
+    if parent_jid == -1:
+        raise NotImplementedError(
+            "gen_end_effector_pose_*: fixed target '" + fixed_target_name +
+            "' attaches to the world root (no movable parent); its pose has no "
+            "joint-velocity dependence so the gradient/hessian are identically zero.")
+    return [parent_jid], [anchor_jid], [(anchor_jid, parent_jid)]
+
+
+def _eepose_grad_chain_metadata(self, all_ees, fixed_target_name, anchor_override=None):
     """Bake out per-ee chain-joint fill jobs for the geometric-Jacobian rewrite.
 
     For each end-effector returns:
       (chain_jids, ee_anchor_jid, ee_uses_fixed_offset_chain)
       jobs: list of dicts { j, vi, ang_local (len-3), lin_local (len-3), revolute }
 
-    `ee_anchor_jid` is the joint whose world transform is the EE's world frame
-    (for a leaf-joint EE this is the leaf itself; for a fixed-joint EE this is
-    the parent joint and the fixed transform is composed in C++ separately —
-    not implemented in this first cut and is asserted out)."""
+    `ee_anchor_jid` is the joint whose world transform is the EE's world frame.
+    For a leaf-joint EE this is the leaf itself; for a fixed-joint EE the caller
+    passes `all_ees` = the fixed joint's parent movable joint (the chain DOF
+    source) and `anchor_override` = the fixed joint id (the world frame whose
+    p_ee / R_ee the geometric Jacobian reads). The fixed joint's world transform
+    is composed separately in Step 1 of the inner."""
     import numpy as _np
     chains, anchors, jobs_all = [], [], []
-    for ee in all_ees:
+    for ee_idx, ee in enumerate(all_ees):
         chain = sorted(self.robot.get_ancestors_by_id(ee)) + [ee]
         chains.append(chain)
-        anchors.append(ee)
+        anchors.append(ee if anchor_override is None else anchor_override[ee_idx])
         jobs = []
         for j in chain:
             S = _np.asarray(self.robot.get_S_by_id(j), dtype=_np.float64)
@@ -458,21 +510,17 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     """
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    n_joints = self.robot.get_num_joints()
+    n_xworld = _eepose_xworld_slot_count(self)
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
 
-    if fixed_target_name == "":
-        all_ees = self.robot.get_leaf_nodes()
-    else:
-        # The fixed-target gradient path predates this rewrite and is not
-        # exercised by the current bench/equivalence harness; flag if it
-        # ever surfaces so we know to extend the shared-chain emission.
-        raise NotImplementedError(
-            "gen_end_effector_pose_gradient_inner: fixed_target_name='" + fixed_target_name +
-            "' not yet supported by the shared-chain geometric-Jacobian rewrite."
-        )
+    # Resolve targets: leaf default => ee is its own anchor; fixed target => the
+    # chain DOFs come from the fixed joint's parent movable joint, the world-frame
+    # anchor is the fixed joint id (composed in Step 1b below).
+    chain_sources, anchors_list, fixed_anchor = _eepose_resolve_targets(self, fixed_target_name)
+    all_ees = chain_sources
     num_ees = len(all_ees)
-    chains, anchors, fill_jobs = _eepose_grad_chain_metadata(self, all_ees, fixed_target_name)
+    chains, anchors, fill_jobs = _eepose_grad_chain_metadata(
+        self, all_ees, fixed_target_name, anchor_override=anchors_list)
 
     # function header
     func_params = ["s_end_effector_pose_gradient is a pointer to shared memory of size 6*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees), \
@@ -500,7 +548,7 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
 
     # scratch layout (matches gen_end_effector_pose_gradient_inner_temp_mem_size)
     off_Xworld = 0
-    off_Jv = off_Xworld + 16 * n_joints
+    off_Jv = off_Xworld + 16 * n_xworld
     off_Jw = off_Jv + 3 * nv * num_ees
     off_E  = off_Jw + 3 * nv * num_ees   # 4 * num_ees floats: cy, sy, cp, sp per ee
     self.gen_add_code_line("// scratch layout: Xworld | Jv (3 x nv x ee) | Jw (3 x nv x ee) | E_sincos (4 x ee)")
@@ -536,6 +584,28 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
         # dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col])
         self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
         self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+    # ============ Step 1b: compose fixed-target anchor world transforms ============
+    # A fixed (welded) EE target lives off the end of the BFS-covered movable
+    # joints. Its LOCAL parent->fixed transform sits in s_Xhom[16*anchor]; compose
+    # it onto the parent's world transform so s_Xworld[16*anchor] is the fixed
+    # frame's world transform that the geometric Jacobian reads (p_ee / R_ee).
+    _fixed_anchors = [fa for fa in fixed_anchor if fa is not None]
+    if _fixed_anchors:
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Step 1b: world transform of the fixed kinematic target(s): Xworld[anchor] = Xworld[parent] @ Xhom_local[anchor]")
+        self.gen_add_code_line("//")
+        nfa = len(_fixed_anchors)
+        self.gen_add_parallel_loop("ind", str(16 * nfa))
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        anc_list = [str(a) for (a, _p) in _fixed_anchors]
+        par_list = [str(p) for (_a, p) in _fixed_anchors]
+        select_var_vals = [("int", "anc", anc_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(nfa)], select_var_vals)
+        self.gen_add_code_line("s_Xworld[16*anc + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*anc + 4*col]);")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -1025,27 +1095,28 @@ def gen_end_effector_pose_gradient_host(self, mode = 0, fixed_target_name = ""):
         self.gen_add_code_line(single_call_printf_line("end_effector_pose_gradient"))
     self.gen_add_end_function()
 
-def gen_end_effector_pose_hessian_output_count(self):
+def gen_end_effector_pose_hessian_output_count(self, fixed_target_name = ""):
     """Number of T elements in the end_effector_pose_hessian output: 6 * nv * nv * num_ees.
 
     Output is now d^2(pose)/dv^2 (TANGENT, pinocchio convention). For fixed-base
     nv == nq so the size is unchanged; for floating-base the (nv x nv) block now
     indexes spatial twist components rather than the older non-standard
-    quaternion derivatives.
+    quaternion derivatives. A named fixed target requests a single ee (num_ees=1).
     """
     nv = self.robot.get_num_vel()
-    num_ees = self.robot.get_total_leaf_nodes()
+    num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     return 6 * nv * nv * num_ees
 
-def gen_end_effector_pose_hessian_inner_temp_mem_size(self):
+def gen_end_effector_pose_hessian_inner_temp_mem_size(self, fixed_target_name = ""):
     """Size (in T elements) of the analytic d2ee inner's s_temp.
 
     The closed-form per-chain second-order Taylor algorithm (see
     docs/d2ee_analytic_derivation.md) needs:
 
-      [0 .. 16*n_joints)               s_Xworld     world transform of every joint
-                                                    (shared FK pass, identical to
-                                                    end_effector_pose_gradient_inner)
+      [0 .. 16*NUM_XWORLD)             s_Xworld     world transform of every joint
+                                                    (+ fixed kinematic targets when
+                                                    baked; shared FK pass, identical
+                                                    to end_effector_pose_gradient_inner)
       [+ 16*nv*num_ees)                s_Sworld     per-DOF world-frame 4x4 generator
                                                     L_a * A_i_local * L_a^{-1}
                                                     (top-left 3x3 = skew for revolute /
@@ -1053,13 +1124,13 @@ def gen_end_effector_pose_hessian_inner_temp_mem_size(self):
                                                     "twist origin offset" piece)
       [+ 4*num_ees)                    s_E_sc       cy, sy, cp, sp per ee for E(rpy)^-1
     """
-    n_joints = self.robot.get_num_joints()
     nv = self.robot.get_num_vel()
-    num_ees = self.robot.get_total_leaf_nodes()
-    return 16*n_joints + 16*nv*num_ees + 4*num_ees
+    num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
+    return 16*_eepose_xworld_slot_count(self) + 16*nv*num_ees + 4*num_ees
 
 def gen_end_effector_pose_hessian_inner_function_call(self, updated_var_names = None,
-                                                               out_in_smem_expr = "true"):
+                                                               out_in_smem_expr = "true",
+                                                               fixed_target_name = ""):
     var_names = dict( \
         s_Xhom_name = "s_XmatsHom", \
         s_end_effector_pose_gradient_name = "s_end_effector_pose_gradient", \
@@ -1074,7 +1145,7 @@ def gen_end_effector_pose_hessian_inner_function_call(self, updated_var_names = 
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
-    code_start = "end_effector_pose_hessian_inner<T, " + out_in_smem_expr + ">(" + var_names["s_end_effector_pose_hessian_name"] + ", " + var_names["s_end_effector_pose_gradient_name"] + ", " + var_names["s_q_name"] + ", "
+    code_start = "end_effector_pose_hessian_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<T, " + out_in_smem_expr + ">(" + var_names["s_end_effector_pose_hessian_name"] + ", " + var_names["s_end_effector_pose_gradient_name"] + ", " + var_names["s_q_name"] + ", "
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_robotModel_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
     # account for thread group
@@ -1084,12 +1155,15 @@ def gen_end_effector_pose_hessian_inner_function_call(self, updated_var_names = 
     code_middle += self.gen_insert_helpers_function_call(updated_var_names = var_names, NO_XI_FLAG = True)
     self.gen_add_code_line(code_start + code_middle + code_end)
 
-def _eepose_hessian_chain_metadata(self, all_ees):
+def _eepose_hessian_chain_metadata(self, all_ees, anchor_override=None):
     """Per-ee chain bookkeeping for the analytic d2ee inner.
 
     Returns (chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee):
       chains[ee_idx]                 = sorted list of joint ids on the chain root..ee
       anchors[ee_idx]                = the joint id whose Xworld is the EE world transform
+                                       (= ee, or anchor_override[ee_idx] for a fixed
+                                       kinematic target whose p_ee/R_ee differ from
+                                       its parent movable joint's)
       per_ee_dof_info[ee_idx]        = list of dicts:
         {vi, chain_pos, S_col, joint_jid, ang (3), lin (3), revolute (bool)}
         one entry per chain DOF; vi is the v-space index, S_col is the column of
@@ -1102,10 +1176,10 @@ def _eepose_hessian_chain_metadata(self, all_ees):
     """
     import numpy as _np
     chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee = [], [], [], []
-    for ee in all_ees:
+    for ee_idx, ee in enumerate(all_ees):
         chain = sorted(self.robot.get_ancestors_by_id(ee)) + [ee]
         chains.append(chain)
-        anchors.append(ee)
+        anchors.append(ee if anchor_override is None else anchor_override[ee_idx])
         dof_info = []
         intra_pairs = []
         for chain_pos, j in enumerate(chain):
@@ -1147,7 +1221,7 @@ def _eepose_hessian_chain_metadata(self, all_ees):
     return chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee
 
 
-def gen_end_effector_pose_hessian_inner(self):
+def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
     """Analytic d^2(pose)/dv^2 of the end-effector pose via per-chain second-
     order Taylor expansion (see docs/d2ee_analytic_derivation.md).
 
@@ -1196,16 +1270,20 @@ def gen_end_effector_pose_hessian_inner(self):
     """
     nv = self.robot.get_num_vel()
     nq = self.robot.get_num_pos()
-    n_joints = self.robot.get_num_joints()
+    n_xworld = _eepose_xworld_slot_count(self)
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
-    all_ees = self.robot.get_leaf_nodes()
+    # Resolve targets: leaf default => ee is its own anchor; fixed target => chain
+    # DOFs come from the fixed joint's parent movable joint, world-frame anchor is
+    # the fixed joint id (its Xworld is composed in Step 1b below).
+    chain_sources, anchors_list, fixed_anchor = _eepose_resolve_targets(self, fixed_target_name)
+    all_ees = chain_sources
     num_ees = len(all_ees)
     chains, anchors, per_ee_dof_info, intra_joint_pairs_per_ee = \
-        _eepose_hessian_chain_metadata(self, all_ees)
+        _eepose_hessian_chain_metadata(self, all_ees, anchor_override=anchors_list)
 
     # scratch offsets
     off_Xworld = 0
-    off_Sworld = off_Xworld + 16 * n_joints
+    off_Sworld = off_Xworld + 16 * n_xworld
     off_Esc    = off_Sworld + 16 * nv * num_ees
 
     func_params = [
@@ -1224,7 +1302,7 @@ def gen_end_effector_pose_hessian_inner(self):
         "Closed-form analytic d2(pose)/dv2; matches RBDReference.end_effector_pose_hessian_analytic (which agrees with pinocchio getJointKinematicHessian(LOCAL_WORLD_ALIGNED) to the FD floor fleet-wide; CUDA confirmed on iiwa14-fixed + go2-floating).",
         "Inner-owns scratch placement: the large nv^2 output s_end_effector_pose_hessian moves to d_workspace when !OUT_IN_SMEM. The s_Xworld+s_Sworld+s_E_sc scratch in s_temp stays in smem at every tier.",
     ]
-    func_def_start = "void end_effector_pose_hessian_inner("
+    func_def_start = "void end_effector_pose_hessian_inner" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_end_effector_pose_hessian, T *s_end_effector_pose_gradient, const T *s_q, T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, const robotModel<T> *d_robotModel, unsigned char *s_linalg_smem) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -1, NO_XI_FLAG = True)
@@ -1269,6 +1347,29 @@ def gen_end_effector_pose_hessian_inner(self):
         self.gen_add_code_line("else {", True)
         self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
         self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+    # ===== Step 1b: compose fixed-target anchor world transforms =====
+    # A fixed (welded) EE target lives off the end of the BFS-covered movable
+    # joints; its LOCAL parent->fixed transform is s_Xhom[16*anchor]. Compose it
+    # onto the parent's world transform so s_Xworld[16*anchor] is the fixed frame
+    # world transform whose p_ee / R_ee the analytic Hessian reads (the chain DOFs,
+    # S_world generators and J_w all come from the parent movable chain unchanged).
+    _fixed_anchors = [fa for fa in fixed_anchor if fa is not None]
+    if _fixed_anchors:
+        self.gen_add_code_line("//")
+        self.gen_add_code_line("// Step 1b: world transform of the fixed kinematic target(s): Xworld[anchor] = Xworld[parent] @ Xhom_local[anchor]")
+        self.gen_add_code_line("//")
+        nfa = len(_fixed_anchors)
+        self.gen_add_parallel_loop("ind", str(16 * nfa))
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        anc_list = [str(a) for (a, _p) in _fixed_anchors]
+        par_list = [str(p) for (_a, p) in _fixed_anchors]
+        select_var_vals = [("int", "anc", anc_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(nfa)], select_var_vals)
+        self.gen_add_code_line("s_Xworld[16*anc + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*anc + 4*col]);")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
 
@@ -2415,12 +2516,12 @@ def _emit_d2ee_mjx_epilogue(self, hess_buf, grad_buf, nv, num_ees):
     self.gen_add_sync()
 
 
-def gen_end_effector_pose_hessian_device(self):
+def gen_end_effector_pose_hessian_device(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    num_ees = self.robot.get_total_leaf_nodes()
-    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
-    output_count = self.gen_end_effector_pose_hessian_output_count()
+    num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
+    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size(fixed_target_name)
+    output_count = self.gen_end_effector_pose_hessian_output_count(fixed_target_name)
     # construct the boilerplate and function definition
     func_params = ["s_end_effector_pose_hessian is a pointer to shared memory of size 6*NUM_VEL*NUM_VEL*NUM_EE where NUM_VEL = " + str(nv) + " and NUM_EE = " + str(num_ees) + " (d^2/dv^2 tangent, pinocchio convention)", \
                    "s_end_effector_pose_gradient is a pointer to shared memory of size 6*NUM_VEL*NUM_EE (d/dv tangent Jacobian)", \
@@ -2428,7 +2529,7 @@ def gen_end_effector_pose_hessian_device(self):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "d_workspace is the global scratch buffer; size END_EFFECTOR_POSE_HESSIAN_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes (= 0 at TIER_SHARED, " + str(output_count) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_notes = ["Inline-CUDA users: at TIER_LITE/TIER_MINIMAL the large s_end_effector_pose_hessian output (~" + str(output_count) + "*sizeof(T) bytes) moves from shared memory to d_workspace, freeing smem for the caller's outer kernel"]
-    func_def_start = "void end_effector_pose_hessian_device("
+    func_def_start = "void end_effector_pose_hessian_device" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "("
     func_def_middle = "T *s_end_effector_pose_hessian, T *s_end_effector_pose_gradient, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
@@ -2454,7 +2555,7 @@ def gen_end_effector_pose_hessian_device(self):
     # false the inner repoints s_end_effector_pose_hessian at d_workspace.
     self.gen_end_effector_pose_hessian_inner_function_call(
         updated_var_names = {"d_workspace_name": "d_workspace", "s_Xhom_name": "s_XmatsHom", "d_robotModel_name": "d_robotModel"},
-        out_in_smem_expr = "D2EE_OUT_IN_SMEM<RESOURCE_TIER>()")
+        out_in_smem_expr = "D2EE_OUT_IN_SMEM<RESOURCE_TIER>()", fixed_target_name = fixed_target_name)
     self.gen_add_end_function()
 
 _D2EE_PICK_FLAGS = [
@@ -2468,7 +2569,7 @@ _D2EE_PICK_FLAGS = [
 ]
 
 def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
-                                     single_call_timing, mjx=False):
+                                     single_call_timing, mjx=False, fixed_target_name=""):
     """Emit the d2ee kernel body specialized for one tier's spill flags.
     Wrapped in a brace pair (caller emits the `if constexpr (...)` head).
     Used by gen_end_effector_pose_hessian_kernel to emit either a
@@ -2482,8 +2583,8 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
     G^{-1}). Order matters: the Hessian frame term consumes the PIN gradient, so it
     must run before the gradient buffer is reframed to the mjx convention."""
     nv = self.robot.get_num_vel()
-    output_count = self.gen_end_effector_pose_hessian_output_count()
-    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size()
+    output_count = self.gen_end_effector_pose_hessian_output_count(fixed_target_name)
+    inner_temp_size = self.gen_end_effector_pose_hessian_inner_temp_mem_size(fixed_target_name)
     extra_t_buffers = [("s_q", n)] if use_workspace_output else [("s_q", n), ("s_end_effector_pose_hessian", output_count), ("s_end_effector_pose_gradient", 6*nv*num_ees)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(inner_temp_size, include_gradients = False, include_hessians = False,
                                                       extra_t_buffers = extra_t_buffers,
@@ -2516,7 +2617,8 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         if use_workspace_output:
             updated["d_workspace_name"] = "s_end_effector_pose_hessian_ws"
         self.gen_end_effector_pose_hessian_inner_function_call(
-            updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
+            updated_var_names = updated, out_in_smem_expr = out_in_smem_expr,
+            fixed_target_name = fixed_target_name)
         self.gen_add_sync()
         # mjx output: (1) Hessian convention transform (reads the PIN pose-gradient),
         # then (2) the pose-gradient's own column reframe J G^{-1}. Order is load-bearing
@@ -2557,7 +2659,8 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
         if use_workspace_output:
             updated["d_workspace_name"] = "s_end_effector_pose_hessian_ws"
         self.gen_end_effector_pose_hessian_inner_function_call(
-            updated_var_names = updated, out_in_smem_expr = out_in_smem_expr)
+            updated_var_names = updated, out_in_smem_expr = out_in_smem_expr,
+            fixed_target_name = fixed_target_name)
         self.gen_anti_licm_output_write("end_effector_pose_hessian")
         self.gen_add_end_control_flow()
         if not use_workspace_output:
@@ -2567,9 +2670,9 @@ def _emit_d2ee_kernel_body_for_flags(self, n, num_ees, use_workspace_output,
             self.gen_kernel_save_result("end_effector_pose_gradient",str(6*nv*num_ees))
 
 
-def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
+def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False, fixed_target_name = ""):
     n = self.robot.get_num_pos()
-    num_ees = self.robot.get_total_leaf_nodes()
+    num_ees = self.robot.get_total_leaf_nodes() if fixed_target_name == "" else 1
     func_params = ["d_end_effector_pose_hessian is the vector of end effector pose Hessians (6 x nv x nv per ee)", \
                    "d_end_effector_pose_gradient is the vector of end effector pose Jacobians (6 x nv per ee)", \
                    "d_workspace is the generated global spill workspace", \
@@ -2578,7 +2681,7 @@ def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)", \
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
     func_notes = ["Output d^2(pose)/dv^2 is in tangent-space convention (d/dv), shape 6 x nv x nv per ee, C-order. Matches pinocchio."]
-    func_def_start = "void end_effector_pose_hessian_kernel(T *d_end_effector_pose_hessian, T *d_end_effector_pose_gradient, unsigned char *d_workspace, const T *d_q, const int stride_q, "
+    func_def_start = "void end_effector_pose_hessian_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(T *d_end_effector_pose_hessian, T *d_end_effector_pose_gradient, unsigned char *d_workspace, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -2603,11 +2706,11 @@ def gen_end_effector_pose_hessian_kernel(self, single_call_timing = False):
     picks = getattr(self, "d2ee_spill_tier_3way", (0, 0, 0))
     def _emit_d2ee_body(pick):
         uwo = _D2EE_PICK_FLAGS[pick]
-        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing, mjx=mjx)
+        _emit_d2ee_kernel_body_for_flags(self, n, num_ees, uwo, single_call_timing, mjx=mjx, fixed_target_name=fixed_target_name)
     self.gen_tier_dispatch(picks, _emit_d2ee_body)
     self.gen_add_end_function()
 
-def gen_end_effector_pose_hessian_host(self, mode = 0):
+def gen_end_effector_pose_hessian_host(self, mode = 0, fixed_target_name = ""):
     # default is to do the full kernel call -- options are for single timing or compute only kernel wrapper
     single_call_timing = True if mode == 1 else False
     compute_only = True if mode == 2 else False
@@ -2618,7 +2721,7 @@ def gen_end_effector_pose_hessian_host(self, mode = 0):
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)", \
                    "streams are pointers to CUDA streams for async memory transfers (if needed)"]
     func_notes = []
-    func_def_start = "void end_effector_pose_hessian(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_start = "void end_effector_pose_hessian" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
     func_def_end =   "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
     if single_call_timing:
         func_def_start = func_def_start.replace("(", "_single_timing(")
@@ -2642,13 +2745,13 @@ def gen_end_effector_pose_hessian_host(self, mode = 0):
     self.gen_add_code_line(func_def_start)
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"end_effector_pose_hessian requires all-data or kinematics gridData\");")
-    eeph_kernel_tmpl = ("end_effector_pose_hessian_kernel" +
+    eeph_kernel_tmpl = ("end_effector_pose_hessian_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) +
                         ("<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, RESOURCE_TIER>"))
     func_call_start = eeph_kernel_tmpl + "<<<block_dimms,thread_dimms,END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_end_effector_pose_hessian,hd_data->d_end_effector_pose_gradient,hd_data->d_workspace,hd_data->d_q,stride_q,"
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         if mjx_host:
-            func_call_start = func_call_start.replace("end_effector_pose_hessian_kernel<", "end_effector_pose_hessian_kernel_single_timing<")
+            func_call_start = func_call_start.replace("end_effector_pose_hessian_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "<", "end_effector_pose_hessian_kernel" + ("" if fixed_target_name == "" else "_" + fixed_target_name) + "_single_timing<")
         else:
             func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>","kernel_single_timing<T, RESOURCE_TIER>")
     if not compute_only:
@@ -3098,18 +3201,18 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
             self.gen_end_effector_pose_gradient_host(1, fixed_target_name = target)
             self.gen_end_effector_pose_gradient_host(2, fixed_target_name = target)
 
-    if include_hessian:
-        # then for the hessian first generate the inner helpers
-        self.gen_end_effector_pose_hessian_inner()
-        # then generate the device wrappers
-        self.gen_end_effector_pose_hessian_device()
-        # then generate the kernels
-        self.gen_end_effector_pose_hessian_kernel(True)
-        self.gen_end_effector_pose_hessian_kernel(False)
-        # then the host launch wrappers
-        self.gen_end_effector_pose_hessian_host(0)
-        self.gen_end_effector_pose_hessian_host(1)
-        self.gen_end_effector_pose_hessian_host(2)
+        if include_hessian:
+            # then for the hessian first generate the inner helpers
+            self.gen_end_effector_pose_hessian_inner(fixed_target_name = target)
+            # then generate the device wrappers
+            self.gen_end_effector_pose_hessian_device(fixed_target_name = target)
+            # then generate the kernels
+            self.gen_end_effector_pose_hessian_kernel(True, fixed_target_name = target)
+            self.gen_end_effector_pose_hessian_kernel(False, fixed_target_name = target)
+            # then the host launch wrappers
+            self.gen_end_effector_pose_hessian_host(0, fixed_target_name = target)
+            self.gen_end_effector_pose_hessian_host(1, fixed_target_name = target)
+            self.gen_end_effector_pose_hessian_host(2, fixed_target_name = target)
 
     if include_pose or include_gradient or include_hessian:
         # standalone warp/thread FK inners + batched convenience path.
