@@ -244,15 +244,142 @@ def gen_set_inertia_params(self, include_base_inertia = False):
     self.gen_add_code_line("gpuErrchk(cudaMemcpy(h_robotModel.d_inertia_params,h_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
     self.gen_add_end_function()
 
+def gen_get_transform_params_size(self):
+    # runtime_transform: 6 raw URDF origin scalars [x,y,z,roll,pitch,yaw] per
+    # JOINT (joint-indexed, ALL joints), mirroring the X-region body order.
+    return 6 * self.robot.get_num_joints()
+
+def gen_init_transform_params(self):
+    # runtime_transform (mirror of gen_init_inertia_params): host-side init of
+    # the flag-gated mutable origin-param table. Fills d_transform_params from
+    # the SAME URDF (frozen [x,y,z,r,p,y] basis) so init_robotModel reproduces
+    # the baked Xfixed bit-for-bit until set_transform_params is called.
+    self.gen_add_func_doc("Initializes the mutable joint-origin transform parameter table in GPU memory",
+            ["Memory order is op[0...NB-1], each op_i = [x, y, z, roll, pitch, yaw] (raw URDF <origin>)"],
+            [], "A pointer to the transform-params memory in the GPU")
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("T* init_transform_params() {", True)
+    size = self.gen_get_transform_params_size()
+    self.gen_add_code_line("T *h_transform_params = (T *)calloc(" + str(size) + ",sizeof(T));")
+    params = self.robot.get_origin_params_ordered_by_id()
+    for ind in range(len(params)):
+        self.gen_add_code_line("// op[" + str(ind) + "]")
+        for k in range(6):
+            self.gen_add_code_line("h_transform_params[" + str(6*ind + k) + "] = static_cast<T>(" + repr(float(params[ind][k])) + ");")
+    self.gen_add_code_line("T *d_transform_params; gpuErrchk(cudaMalloc((void**)&d_transform_params," + str(size) + "*sizeof(T)));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(d_transform_params,h_transform_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_code_line("free(h_transform_params);")
+    self.gen_add_code_line("return d_transform_params;")
+    self.gen_add_end_function()
+
+def gen_set_transform_params(self):
+    # runtime_transform (mirror of gen_set_inertia_params): public mutator. Thin
+    # cudaMemcpy of the 6*NB origin table into d_transform_params. h_params must
+    # be joint-indexed 6-vectors [x,y,z,roll,pitch,yaw] (raw URDF origin basis).
+    size = self.gen_get_transform_params_size()
+    self.gen_add_func_doc("Updates the mutable joint-origin transform table on the GPU at runtime (no recompile)",
+            ["h_params is the host array of " + str(size) + " floats, joint-indexed 6-vectors [x,y,z,roll,pitch,yaw]"],
+            [], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void set_transform_params(robotModel<T> *d_robotModel, const T *h_params) {", True)
+    self.gen_add_code_line("robotModel<T> h_robotModel;")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(&h_robotModel,d_robotModel,sizeof(robotModel<T>),cudaMemcpyDeviceToHost));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(h_robotModel.d_transform_params,h_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_end_function()
+
+def _emit_runtime_transform_rebuild(self, n):
+    """runtime_transform: rebuild each joint's constant 6x6 Xfixed scratch from
+    d_transform_params, once per launch (mirror of _emit_runtime_inertia_rebuild).
+
+    Emitted only inside the `if constexpr (RUNTIME_TRANSFORM)` path. For joint
+    `ind` the 6 raw params [x,y,z,r,p,y] recompute Xfixed = rot(E(rpy)) *
+    xlt(skew(xyz)) into s_temp[XFIXED_OFF + 36*ind + 6*col + row] (X-region
+    col-major 6x6). Xfixed has the block structure
+        [[ E,        0 ],
+         [ -E*skew(t), E ]]
+    so TL==BR==E, TR==0, BL==-E*skew(t). One thread per joint writes its 36
+    entries; n is tiny and this runs once per kernel on the cold XImats load.
+    The hot loop then loads these xf_* cells instead of inline origin literals,
+    so the rebuilt Xfixed (numerically == the baked origin) makes the runtime
+    path BIT-IDENTICAL to the baked path until set_transform_params mutates it.
+    """
+    xoff = _runtime_transform_xfixed_offset(self)
+    def off(row, col):
+        return 6 * col + row
+    self.gen_add_code_line("if constexpr (RUNTIME_TRANSFORM) {", True)
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("rtj", str(n))
+    self.gen_add_code_line("const T *op = &d_robotModel->d_transform_params[6*rtj];")
+    self.gen_add_code_line("T tx = op[0]; T ty = op[1]; T tz = op[2];")
+    self.gen_add_code_line("T cr = static_cast<T>(cos(op[3])); T sr = static_cast<T>(sin(op[3]));")
+    self.gen_add_code_line("T cp = static_cast<T>(cos(op[4])); T sp = static_cast<T>(sin(op[4]));")
+    self.gen_add_code_line("T cy = static_cast<T>(cos(op[5])); T sy = static_cast<T>(sin(op[5]));")
+    # E = rx(r)*ry(p)*rz(y), GRiD frame-rotation convention (see SpatialAlgebra
+    # Rotation.{rx,ry,rz} and the closed form derived from build_fixed_transform).
+    E = {
+        (0, 0): "cp*cy", (0, 1): "sy*cp", (0, 2): "-sp",
+        (1, 0): "sp*sr*cy - sy*cr", (1, 1): "sp*sr*sy + cr*cy", (1, 2): "sr*cp",
+        (2, 0): "sp*cr*cy + sr*sy", (2, 1): "sp*sy*cr - sr*cy", (2, 2): "cp*cr",
+    }
+    for (i, j), e in E.items():
+        self.gen_add_code_line("T E" + str(i) + str(j) + " = " + e + ";")
+    self.gen_add_code_line("int b = " + str(xoff) + " + 36*rtj;")
+    # TL = E (rows 0-2, cols 0-2), BR = E (rows 3-5, cols 3-5)
+    for i in range(3):
+        for j in range(3):
+            self.gen_add_code_line("s_temp[b + " + str(off(i, j)) + "] = E" + str(i) + str(j) + ";")          # TL
+            self.gen_add_code_line("s_temp[b + " + str(off(i + 3, j + 3)) + "] = E" + str(i) + str(j) + ";")  # BR
+    # TR = 0 (rows 0-2, cols 3-5)
+    for i in range(3):
+        for j in range(3):
+            self.gen_add_code_line("s_temp[b + " + str(off(i, j + 3)) + "] = static_cast<T>(0);")
+    # BL = -E*skew(t) (rows 3-5, cols 0-2); skew(t)=[[0,-tz,ty],[tz,0,-tx],[-ty,tx,0]]
+    # BL[i,j] = -sum_k E[i,k]*skew[k,j]
+    skew = [["0", "-tz", "ty"], ["tz", "0", "-tx"], ["-ty", "tx", "0"]]
+    for i in range(3):
+        for j in range(3):
+            terms = []
+            for k in range(3):
+                sk = skew[k][j]
+                if sk == "0":
+                    continue
+                terms.append("E" + str(i) + str(k) + "*(" + sk + ")")
+            expr = " + ".join(terms) if terms else "static_cast<T>(0)"
+            self.gen_add_code_line("s_temp[b + " + str(off(i + 3, j)) + "] = -(" + expr + ");")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_control_flow()
+
+def _runtime_transform_xfixed_offset(self):
+    # Base offset into s_temp where the per-joint Xfixed scratch (s_Xfixed)
+    # begins, i.e. the size of the existing sin/cos region. Must match the
+    # region the non-runtime path uses so the hot-loop sin/cos reads are
+    # byte-identical; s_Xfixed is appended AFTER it under runtime_transform.
+    if self.robot_has_mimic_joints():
+        return 3 * self.robot.get_num_joints()
+    return 2 * self.robot.get_num_pos()
+
 def gen_load_update_XImats_helpers_temp_mem_size(self):
+    # runtime_transform (mirror of runtime_inertia): append a per-joint Xfixed
+    # scratch (36*NB floats, X-region 6x6 col-major layout) AFTER the existing
+    # sin/cos region. The on-device prologue rebuilds each joint's constant
+    # origin transform here once per launch; the hot loop then loads origin
+    # coefficients from s_Xfixed instead of inline literals. Gated on the flag so
+    # the baked arena/header stays byte-identical.
     if self.robot_has_mimic_joints():
         # Mimic path needs per-BODY scratch: s_q_eff[NB] (the folded angle
         # alpha*q[target]+offset) plus per-body sin/cos (2*NB). Non-mimic
         # robots keep the legacy 2*nq so their arena/header stays byte-identical.
         NB = self.robot.get_num_joints()
-        return 3*NB
-    n = self.robot.get_num_pos()
-    return 2*n
+        base = 3*NB
+    else:
+        n = self.robot.get_num_pos()
+        base = 2*n
+    if getattr(self, "runtime_transform", False):
+        base += 36 * self.robot.get_num_joints()
+    return base
 
 def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None,
                                                  skip_floating_base_X = False):
@@ -283,8 +410,17 @@ def gen_load_update_XImats_helpers_function_call(self, updated_var_names = None,
     # when self.runtime_inertia. SKIP_FLOATING_BASE_X (2nd tparam) must then be
     # spelled explicitly so the 3rd can be set. Baked default keeps the legacy
     # <T> / <T,true> tparams byte-identical (the 3rd param doesn't exist).
+    # runtime_transform threads RUNTIME_TRANSFORM (4th tparam). When set it also
+    # forces RUNTIME_INERTIA (3rd) to be spelled (its actual value follows the
+    # inertia flag). All explicit-tparam spellings degrade to the legacy
+    # <T>/<T,true> when no runtime flag is active (byte-identical baked header).
     skip_val = "true" if (skip_floating_base_X and self.robot.floating_base) else "false"
-    if getattr(self, "runtime_inertia", False):
+    runtime_inertia = getattr(self, "runtime_inertia", False)
+    runtime_transform = getattr(self, "runtime_transform", False)
+    if runtime_transform:
+        ri_val = "true" if runtime_inertia else "false"
+        tparams = "<T, " + skip_val + ", " + ri_val + ", true>"
+    elif runtime_inertia:
         tparams = "<T, " + skip_val + ", true>"
     else:
         tparams = "<T, true>" if (skip_floating_base_X and self.robot.floating_base) else "<T>"
@@ -304,6 +440,22 @@ def gen_XImats_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_
     XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms)
     if extra_t_buffers is None:
         extra_t_buffers = []
+    # runtime_transform: the XImats helper rebuilds each joint's constant 6x6
+    # Xfixed into s_temp at offset _runtime_transform_xfixed_offset (= 2*num_pos
+    # non-mimic / 3*NB mimic), occupying 36*NB extra floats. That block is DEAD
+    # after the helper returns (the hot loop consumes it to build s_XImats), so
+    # the algorithm's inner scratch may reuse [0, inner) afterward. The s_temp
+    # region must hold max(inner, xfixed_offset + 36*NB) during the helper. We
+    # reserve a purely-additive 36*NB band ON TOP of the algorithm's inner scratch
+    # — [inner, inner+36*NB) — which is always >= the helper's xfixed peak because
+    # every XImats kernel's inner scratch is >= xfixed_offset (the RNEA/ABA/CRBA
+    # inners stash >= 6 floats per body >= 2*num_pos). This matches the per-algo
+    # arena t_count reserve (also +36*NB) byte-for-byte so the layout assert and
+    # the launched smem agree. Baked path keeps temp_mem_size byte-identical (no
+    # growth, no Xfixed block). The Xfixed write at offset 2*num_pos still lands
+    # inside [0, inner+36*NB) since inner >= 2*num_pos.
+    if getattr(self, "runtime_transform", False) and not include_homogenous_transforms:
+        temp_mem_size = int(temp_mem_size or 0) + 36 * self.robot.get_num_joints()
     self.gen_declare_shared_arena(extra_t_buffers, temp_mem_size,
                                   include_topology_helpers = (not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n)))),
                                   ximat_name = "s_XImats",
@@ -514,11 +666,23 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
     # baked path until set_inertia_params mutates the table. The whole template
     # param + branch is emitted ONLY under self.runtime_inertia so a baked header
     # stays byte-identical (the param doesn't even appear in the signature).
+    # RUNTIME_TRANSFORM (runtime_transform): when true the joint-origin block of
+    # each X[ind] is rebuilt on-device from the mutable d_transform_params table
+    # in a once-per-launch prologue (Xfixed scratch in s_temp) and the hot
+    # sin/cos(q) loop loads the origin coefficients from that scratch instead of
+    # inline literals (with the GENERAL-rpy DENSE pattern baked so rpy can move).
+    # Bit-identical to the baked path until set_transform_params mutates it. The
+    # template param + branches are emitted ONLY under self.runtime_transform.
     runtime_inertia = getattr(self, "runtime_inertia", False)
-    if runtime_inertia:
-        self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false, bool RUNTIME_INERTIA = false>")
-    else:
-        self.gen_add_code_line("template <typename T, bool SKIP_FLOATING_BASE_X = false>")
+    runtime_transform = getattr(self, "runtime_transform", False)
+    tparam_line = "template <typename T, bool SKIP_FLOATING_BASE_X = false"
+    if runtime_inertia or runtime_transform:
+        # RUNTIME_INERTIA must exist (3rd) so RUNTIME_TRANSFORM (4th) is reachable.
+        tparam_line += ", bool RUNTIME_INERTIA = false"
+    if runtime_transform:
+        tparam_line += ", bool RUNTIME_TRANSFORM = false"
+    tparam_line += ">"
+    self.gen_add_code_line(tparam_line)
     self.gen_add_code_line("__device__ __forceinline__")
     self.gen_add_code_line(func_def, True)
     # test to see if we need to compute any trig functions
@@ -542,6 +706,8 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
         self.gen_add_end_control_flow()
         if runtime_inertia:
             _emit_runtime_inertia_rebuild(self, n)
+        if runtime_transform:
+            _emit_runtime_transform_rebuild(self, n)
         if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
             self.gen_add_parallel_loop("ind",str(self.gen_topology_helpers_size()))
             self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
@@ -580,7 +746,19 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
         self.gen_add_code_line("cgrps::wait(tgrp);")
         if runtime_inertia:
             _emit_runtime_inertia_rebuild(self, n)
+        if runtime_transform:
+            _emit_runtime_transform_rebuild(self, n)
     # loop through Xmats and update all non-constant values serially
+    # runtime_transform: source the X cells from the symbolic-Xfixed transforms
+    # (dense rpy pattern, origin carried as xf_* symbols) so the origin literals
+    # become s_Xfixed scratch loads below; the baked path keeps the folded Xmats.
+    if runtime_transform:
+        Xmats_serial = self.robot.get_runtime_transform_mats_ordered_by_id()
+        xfixed_off = _runtime_transform_xfixed_offset(self)
+        xf_cells = self.robot.get_joint_by_id(0)._runtime_xfixed_symbol_cells() \
+            if hasattr(self.robot.get_joint_by_id(0), "_runtime_xfixed_symbol_cells") else {}
+    else:
+        Xmats_serial = Xmats
     self.gen_add_serial_ops()
     for ind in range(n):
         # A.3 lever: skip the floating-base root X[0] block under
@@ -595,7 +773,7 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
         self.gen_add_code_line("// X[" + str(ind) + "]")
         for col in range(3): # TL and BR are identical so only update TL and BL serially
             for row in range(6):
-                val = Xmats[ind][row,col]
+                val = Xmats_serial[ind][row,col]
                 if not self.custom_is_constant(val):
                     # parse the symbolic value into the appropriate array access
                     str_val = str(val)
@@ -673,6 +851,15 @@ def gen_load_update_XImats_helpers(self, include_base_inertia = False, include_h
                         str_val = str_val.replace("cos(theta)","s_temp[" + str(qslot + nq) + "]")
                         # then just the variable (prismatic)
                         str_val = str_val.replace("theta","s_q[" + str(qslot) + "]")
+                    # runtime_transform: replace the joint-origin xf_* symbols with
+                    # s_Xfixed scratch loads (rebuilt in the prologue). Only the TL
+                    # (xf_TL_*) and BL (xf_BL_*) symbols appear in cols 0-2; BR is the
+                    # TL copy below. No-op for the floating/planar/spherical root
+                    # (its runtime mat is the baked Xmat_sp, no xf_* symbols).
+                    if runtime_transform:
+                        for sym, (sr, sc) in xf_cells.items():
+                            slot = "s_temp[" + str(xfixed_off + 36*ind + 6*sc + sr) + "]"
+                            str_val = str_val.replace(sym, slot)
                     # then output the code
                     cpp_ind = str(self.gen_static_array_ind_3d(ind,col,row))
                     self.gen_add_code_line("s_XImats[" + cpp_ind + "] = static_cast<T>(" + str_val + ");")
@@ -1294,6 +1481,9 @@ def gen_init_robotModel(self):
     if getattr(self, "runtime_inertia", False):
         # D.4 / Phase 5: flag-gated mutable inertia table init.
         init_lines.append("h_robotModel.d_inertia_params = init_inertia_params<T>();")
+    if getattr(self, "runtime_transform", False):
+        # runtime_transform: flag-gated mutable joint-origin table init.
+        init_lines.append("h_robotModel.d_transform_params = init_transform_params<T>();")
     self.gen_add_code_lines(init_lines)
     # then allocate memeory and copy to device
     self.gen_add_code_lines(["robotModel<T> *d_robotModel; gpuErrchk(cudaMalloc((void**)&d_robotModel,sizeof(robotModel<T>)));",

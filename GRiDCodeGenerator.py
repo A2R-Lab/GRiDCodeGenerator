@@ -109,6 +109,7 @@ class GRiDCodeGenerator:
                          gen_mx_func_call_for_cpp, gen_add_shared_memory_helpers, gen_declare_shared_arena, \
                          gen_shared_arena_t_count, gen_device_wrapper, gen_tier_dispatch, gen_spatial_algebra_helpers, \
                          gen_get_XI_size, gen_init_XImats, gen_get_inertia_params_size, gen_init_inertia_params, gen_set_inertia_params, \
+                         gen_get_transform_params_size, gen_init_transform_params, gen_set_transform_params, \
                          gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
@@ -618,6 +619,20 @@ class GRiDCodeGenerator:
         # Dynamics kernels only need the spatial X/I storage. Homogeneous transforms
         # are accounted separately for kinematics kernels.
         XI_size = self.gen_get_XI_size(include_base_inertia,include_homogenous_transforms=False)
+        # runtime_transform: the load_update_XImats helper rebuilds each joint's
+        # constant 6x6 Xfixed into s_temp at offset _runtime_transform_xfixed_offset
+        # (= 2*num_pos non-mimic / 3*NB mimic), occupying 36*NB extra floats. That
+        # block is consumed ENTIRELY within the helper (the hot loop reads it to
+        # build s_XImats) and is DEAD after the helper returns, so each algorithm's
+        # inner-temp scratch may reuse the region afterward. A purely ADDITIVE
+        # reservation of 36*NB floats in every XImats-domain (s_temp-backed) arena
+        # t_count is therefore sufficient to stop the OOB AND keep correctness; the
+        # baked path keeps rt_xfixed_reserve == 0 so its arena/header stays
+        # byte-identical. Only the s_temp-backed (dynamics, XImats) arenas need it;
+        # the XmatsHom/kinematics arenas don't invoke the Xfixed rebuild. NOT added
+        # to XI_size itself (that sizes the s_XImats array + DYNAMICS_XI_T_COUNT and
+        # would corrupt the XImats layout) — it is appended to the temp region.
+        rt_xfixed_reserve = (36 * NJ) if getattr(self, "runtime_transform", False) else 0
         XHom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
         dva_cols_per_partial = self.robot.get_total_ancestor_count() + self.robot.get_num_joints()
         max_threads_in_comp_loop = 6*2*dva_cols_per_partial
@@ -659,18 +674,18 @@ class GRiDCodeGenerator:
         # (NJ > n) size it 18*NJ so the inner's body f-writes don't overflow into
         # the XImats region. Non-mimic keeps the legacy 18*n byte-identical.
         _id_vaf = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-        id_t_count = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
+        id_t_count = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         # joint-torque regressor (E1): kernel smem = XI + s_q_qd_qdd(NUM_POS+2nv)
         # + s_Y (nv x 10*NUM_BODIES) + s_vaf(18*NUM_POS) + RNEA forward scratch.
         # n == get_num_pos() here. Additive.
         regressor_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() + 18*n \
-            + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size
+            + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         self.regressor_t_count = regressor_t_count
         # PS5 energy regressors. Both outputs are 10*NUM_BODIES (no DoF sweep).
         # KE (spatial / XImats domain): s_q_qd(n+nv) + s_y_ke(10NB) + s_vaf(18n)
         #   + RNEA forward scratch + XI_size.
         self.kinetic_energy_regressor_t_count = (n + nv) + 10*self.robot.get_num_bodies() + 18*n \
-            + self.gen_kinetic_energy_regressor_inner_temp_mem_size() + XI_size
+            + self.gen_kinetic_energy_regressor_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         # PE (kinematics / XmatsHom domain): s_q(n) + s_y_pe(10NB)
         #   + world-transform BFS scratch (16*NUM_JOINTS) + XHom_size.
         self.potential_energy_regressor_t_count = n + 10*self.robot.get_num_bodies() \
@@ -679,7 +694,7 @@ class GRiDCodeGenerator:
         #   + the inner spatial-recursion scratch (per-body NB bands + per-column n_int bands).
         # The nv*nv output fits smem at FULL for every shipped robot -> no tier spill.
         self.coriolis_matrix_t_count = (n + nv) + nv*nv \
-            + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size
+            + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         # PS5 dCCRBA (kinematics / XmatsHom domain). The shared inner pool is the
         # SHRUNK (no-J) centroidal_inner pool + 6*n_int per-unit phi band
         # (== _dccrba_inner_temp_mem_size). The Jw sweep band (6*nv*NB) is carved as a
@@ -721,7 +736,7 @@ class GRiDCodeGenerator:
         # + the (max) inner forward scratch. n == get_num_pos() here. Additive.
         forward_dynamics_parameter_gradient_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() \
             + nv*nv + nv*10*self.robot.get_num_bodies() + nv + 18*n + nv \
-            + self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size() + XI_size
+            + self.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         self.forward_dynamics_parameter_gradient_t_count = forward_dynamics_parameter_gradient_t_count
         # FD-param-gradient g1-spill: 2-level surgical ladder. Level 0 keeps every
         # buffer in smem (current behavior on robots that fit). Level 1 spills the
@@ -745,7 +760,7 @@ class GRiDCodeGenerator:
         _feg_out = nv * 6 * _NB
         _feg_temp = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                 self.gen_minv_inner_temp_mem_size())
-        f_ext_gradient_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size
+        f_ext_gradient_t_count = _n_pos + 2*_feg_out + _feg_temp + XI_size + rt_xfixed_reserve
         # f_ext-gradient (first-order) g1-spill: 2-level surgical ladder. Level 0
         # keeps both outputs (s_dtau_dfext, s_dqdd_dfext) in smem. Level 1 spills
         # s_dqdd_dfext (the SECOND output, written write-once by the final
@@ -773,8 +788,8 @@ class GRiDCodeGenerator:
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_minv_inner_F_size()
         _minv_no_F_count = self.gen_minv_inner_no_F_size()
-        _minv_t_count_full     = n + n*n + _minv_F_count + _minv_no_F_count + XI_size
-        _minv_t_count_surgical = n + n*n                 + _minv_no_F_count + XI_size
+        _minv_t_count_full     = n + n*n + _minv_F_count + _minv_no_F_count + XI_size + rt_xfixed_reserve
+        _minv_t_count_surgical = n + n*n                 + _minv_no_F_count + XI_size + rt_xfixed_reserve
         self.minv_spill_tier_3way = select_shared_tier_3way(_minv_t_count_full, _minv_t_count_surgical)
         self.minv_use_workspace_F = self.minv_spill_tier_3way[0] == 1
         minv_t_count = _minv_t_count_full if not self.minv_use_workspace_F else _minv_t_count_surgical
@@ -791,7 +806,7 @@ class GRiDCodeGenerator:
         # nv. For a FIXED base n==nv so 3*n == old 3*nv+fb byte-identical; FLOATING
         # n>nv so the arena must reserve the wider 3*n slot the kernel slices (the
         # old 3*nv+fb under-reserved by 3*(n-nv)-fb floats -> smem overrun).
-        _fd_base = 3*n + nv + XI_size
+        _fd_base = 3*n + nv + XI_size + rt_xfixed_reserve
         _fd_t_count_full      = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
         _fd_t_count_surgical  = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
         self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
@@ -815,7 +830,7 @@ class GRiDCodeGenerator:
         _integrator_base = ((3*n) + nv
                             + (_max_stages - 1) * nv
                             + (_max_stages - 1) * (n + nv)
-                            + (n + nv) + XI_size)
+                            + (n + nv) + XI_size + rt_xfixed_reserve)
         integrator_t_count = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size()
         # Integrator VALUE surgical spill. The dominant inner buffer is the FD
         # inner's Minv F-region (6*NV*NV). Level 0 keeps it in smem; level 1
@@ -862,7 +877,7 @@ class GRiDCodeGenerator:
                                  + _vaf_count + nv*nv + nv
                                  + (n + nv) + _max_stages * nv + _max_stages * nv * 3*nv
                                  + 72
-                                 + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size)
+                                 + self.gen_forward_dynamics_gradient_inner_temp_mem_size() + XI_size + rt_xfixed_reserve)
         # The "with x_kp1" variant adds s_x_kp1 ([q (nq); qd (nv)] = n+nv) on top.
         integrator_gradient_with_x_kp1_t_count = integrator_gradient_t_count + (n + nv)
         # Integrator-gradient surgical spill ladder (4 rungs, least-spill first).
@@ -955,18 +970,18 @@ class GRiDCodeGenerator:
         # body-indexed f writes never overflow s_vaf into the XImats region.
         _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
         _vaf_cnt_id = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-        id_device_t_count = _vaf_cnt_id + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size
-        minv_device_t_count = self.gen_minv_inner_temp_mem_size() + XI_size
-        fd_device_t_count = self.gen_forward_dynamics_inner_temp_mem_size() + XI_size
-        inverse_dynamics_gradient_device_t_count = _vaf_cnt + inverse_dynamics_gradient_temp_count + XI_size
-        forward_dynamics_gradient_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size
-        inverse_dynamics_gradient_t_count_full = (nv + n) + (2*nv*nv) + (_vaf_cnt) + nv + inverse_dynamics_gradient_temp_count + XI_size
+        id_device_t_count = _vaf_cnt_id + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        minv_device_t_count = self.gen_minv_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        fd_device_t_count = self.gen_forward_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        inverse_dynamics_gradient_device_t_count = _vaf_cnt + inverse_dynamics_gradient_temp_count + XI_size + rt_xfixed_reserve
+        forward_dynamics_gradient_device_t_count = (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size + rt_xfixed_reserve
+        inverse_dynamics_gradient_t_count_full = (nv + n) + (2*nv*nv) + (_vaf_cnt) + nv + inverse_dynamics_gradient_temp_count + XI_size + rt_xfixed_reserve
         # Canonical input slot: q/qd/u each NUM_JOINTS(=nq=n here)-wide -> s_q_qd_u
         # is 3*n (matches _emit_forward_dynamics_gradient_kernel_body_for_flags'
         # ("s_q_qd_u", 3*nq)). For a FIXED base n==nv so 3*n == old 3*nv+fb
         # byte-identical; FLOATING n>nv reserves the wider input slot (old 3*nv+fb
         # under-reserved -> smem overrun on the s_q_qd_u load).
-        forward_dynamics_gradient_t_count_full = (3*n) + (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size
+        forward_dynamics_gradient_t_count_full = (3*n) + (2*nv*nv) + (_vaf_cnt) + nv + (nv*nv) + forward_dynamics_gradient_temp_count + XI_size + rt_xfixed_reserve
         inverse_dynamics_gradient_t_count_selective = inverse_dynamics_gradient_t_count_full - inverse_dynamics_gradient_temp_count + inverse_dynamics_gradient_selective_temp_count
         forward_dynamics_gradient_t_count_selective = forward_dynamics_gradient_t_count_full - forward_dynamics_gradient_temp_count + forward_dynamics_gradient_selective_temp_count
         inverse_dynamics_gradient_t_count_emergency = inverse_dynamics_gradient_t_count_full - inverse_dynamics_gradient_temp_count
@@ -1014,7 +1029,7 @@ class GRiDCodeGenerator:
         # above tempVec (the interior vcross slot still relocates to d_cold but
         # cannot be byte-identically compacted out of smem).
         _aba_surgical_inner_count = (_aba_inner_temp_count - 138) if self.robot.floating_base else (98 * NJ)
-        _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size
+        _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size + rt_xfixed_reserve
         _aba_t_count_full      = _aba_base_count + _aba_inner_temp_count
         _aba_t_count_surgical  = _aba_base_count + _aba_surgical_inner_count
         _aba_t_count_workspace = _aba_base_count
@@ -1033,7 +1048,7 @@ class GRiDCodeGenerator:
         # and the full arena (<=~19 KB) already fits smem at every default tier.
         # See _crba.py header (gen_crba_inner_temp_mem_size) for the full rationale.
         # Rungs stay at 2 (full | inner-band-to-workspace).
-        _crba_base_count = nv*nv + crba_input_t_count + XI_size
+        _crba_base_count = nv*nv + crba_input_t_count + XI_size + rt_xfixed_reserve
         _crba_t_count_full      = _crba_base_count + self.gen_crba_inner_temp_mem_size()
         _crba_t_count_workspace = _crba_base_count
         self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_workspace)
@@ -1096,7 +1111,7 @@ class GRiDCodeGenerator:
         # macro under-budgets and the high-body f-writes overflow shared mem (h1_2:fixed
         # NB=51>NV=39 crashed). Non-mimic (nb_vaf==n) is byte-identical to the old 18*n.
         nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
-        self.id_bias_t_count = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size
+        self.id_bias_t_count = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size + rt_xfixed_reserve
         # com/ccrba/energy share one arena sizing (use the largest input/output):
         #   s_in(<=2n) + s_out(<=6nv+6) + s_A(6nv) + s_com(3) + s_extra(4)
         #   + centroidal_inner_temp + XHom_size
@@ -1113,7 +1128,7 @@ class GRiDCodeGenerator:
         # iiwa14/go2 behavior.
         def _compute_idsva_body_t_count():
             inner = self.gen_idsva_so_body_frame_inner_temp_mem_size()
-            base = (3*n) + inner + XI_size
+            base = (3*n) + inner + XI_size + rt_xfixed_reserve
             full = base + 4*nv**3
             use_global_output = py_arena_bytes(full) > self.cuda_target_shared_mem_bytes
             return base if use_global_output else full, use_global_output
@@ -1148,8 +1163,8 @@ class GRiDCodeGenerator:
         _idsva_bf_jids_a = len(self.robot.get_jid_ancestor_ids(include_joint=True)[0])
         _idsva_bf_TP = 36 * _idsva_bf_jids_a
         _idsva_bf_base_smem = (3*n) + XI_size                                  # whole s_temp -> global
-        _idsva_bf_full     = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3
-        _idsva_bf_out      = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size
+        _idsva_bf_full     = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size + 4*nv**3 + rt_xfixed_reserve
+        _idsva_bf_out      = (3*n) + idsva_so_body_frame_inner_temp_count + XI_size + rt_xfixed_reserve
         _idsva_so_body_tiers = [
             ("full",          _idsva_bf_full,                False, False, False, False),
             ("global_output", _idsva_bf_out,                 True,  False, False, False),
@@ -1174,7 +1189,7 @@ class GRiDCodeGenerator:
         # world-frame path has its own (smaller) scratch — no gravity-shim shared, no
         # main-sweep extras. Sized via gen_idsva_so_world_frame_temp_mem_size.
         idsva_so_world_frame_inner_temp_count = self.gen_idsva_so_world_frame_temp_mem_size() if self.robot.floating_base else idsva_so_body_frame_inner_temp_count
-        idsva_so_world_frame_base_t_count = (3*n) + idsva_so_world_frame_inner_temp_count + XI_size
+        idsva_so_world_frame_base_t_count = (3*n) + idsva_so_world_frame_inner_temp_count + XI_size + rt_xfixed_reserve
         idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
         # ----- idsva_so WORLD-frame per-tier spill ladder -----
         # Flags = (use_global_output, s_temp_in_global, cold_in_global). The world inner
@@ -1205,7 +1220,9 @@ class GRiDCodeGenerator:
         # scratch), 2=output_bc (36*NB cold slab); 0/1 spill nothing into d_workspace.
         def _idsva_body_ws_floats(pick):
             if pick == 4:
-                return idsva_so_body_frame_inner_temp_count
+                # whole s_temp routed to workspace; the XImats helper still rebuilds
+                # Xfixed into it (offset 2*num_pos) so the workspace must reserve it.
+                return idsva_so_body_frame_inner_temp_count + rt_xfixed_reserve
             if pick == 3:
                 return _idsva_bf_TP
             if pick == 2:
@@ -1215,7 +1232,9 @@ class GRiDCodeGenerator:
             # pick 3 (output_temp) spills the whole inner arena; pick 2 (output_cold)
             # spills just the surgical cold trio (Xdown 36*NB + v_w/a_w 12*NB).
             if pick == 3:
-                return idsva_so_world_frame_inner_temp_count
+                # whole s_temp routed to workspace; XImats helper rebuilds Xfixed
+                # into it (offset 2*num_pos) so the workspace must reserve it.
+                return idsva_so_world_frame_inner_temp_count + rt_xfixed_reserve
             if pick == 2:
                 return 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
             return 0
@@ -1240,9 +1259,12 @@ class GRiDCodeGenerator:
             idsva_so_world_frame_inner_temp_count if self.robot.floating_base
             else idsva_so_body_frame_inner_temp_count
         )
-        _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count)
-        _temp_no_contract = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count)
-        _temp_spilled  = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count)
+        # runtime_transform: the composed XImats helper rebuilds Xfixed into this
+        # shared s_temp pool (offset 2*num_pos), so every pool variant must reserve
+        # the 36*NB Xfixed band on top of its inner peak (dead after the helper).
+        _temp_full     = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
+        _temp_no_contract = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
+        _temp_spilled  = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_fd_gradient_inline_spilled_count) + rt_xfixed_reserve
         # Phase 3e: extend to 6 levels. Each level pushes an additional buffer
         # to L2-pinned workspace. Tuple is
         # (name, shared_count, use_global_tensors, use_workspace_temp,
@@ -1304,7 +1326,7 @@ class GRiDCodeGenerator:
         # it unconditionally — the kernel/macros are only emitted on fixed-base anyway.
         _psh_d2ab = 2 * nv * (3 * nv) * (3 * nv)
         _psh_base = (nv + nv) + nv + nv*nv + 2*nv*nv + nv + XI_size  # s_x(nx==2nv fixed) + s_u + s_qdd + Minv + df_du
-        _psh_pool = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count)
+        _psh_pool = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
         _psh_t_full  = _psh_base + _psh_d2ab + 8*nv**3 + _psh_pool
         _psh_t_spill = _psh_base
         self.plant_step_hessian_spill_tier_3way = select_shared_tier_3way(_psh_t_full, _psh_t_spill)
@@ -1820,6 +1842,11 @@ class GRiDCodeGenerator:
             # floats, body-indexed, in the frozen regressor basis). Emitted ONLY
             # under runtime_inertia so the baked struct stays byte-identical.
             struct_lines.append("    T *d_inertia_params;")
+        if getattr(self, "runtime_transform", False):
+            # runtime_transform: flag-gated mutable joint-origin table (6*NB
+            # floats, joint-indexed, raw [x,y,z,r,p,y] basis). Emitted ONLY under
+            # runtime_transform so the baked struct stays byte-identical.
+            struct_lines.append("    T *d_transform_params;")
         struct_lines.append("};")
         self.gen_add_code_lines(struct_lines)
         self.gen_add_code_lines(["template <typename T, gridDataKind KIND = GRID_DATA_ALL>", \
@@ -2729,7 +2756,7 @@ class GRiDCodeGenerator:
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
-                     enable_idsva_so_world_frame = None, runtime_inertia = False):
+                     enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -2788,6 +2815,12 @@ class GRiDCodeGenerator:
         # Default False keeps the BAKED path byte-identical (the field + device
         # branch are entirely flag-gated).
         self.runtime_inertia = runtime_inertia
+        # runtime_transform: runtime-mutable joint-frame <origin> (xyz+rpy). When
+        # True, each joint's constant Xfixed is rebuilt on-device once per launch
+        # from a mutable d_transform_params table (set_transform_params) and the
+        # general-rpy DENSE X pattern is baked so rpy can move freely. Default
+        # False keeps the BAKED path byte-identical (field + branches flag-gated).
+        self.runtime_transform = runtime_transform
         self.generated_algorithms = algorithms
         # MIMIC GRADIENTS — fully supported, no refusal. All first/second-order mimic
         # gradients emit correctly for BOTH bases via the alpha-weighted reduced-v-slot
@@ -3033,6 +3066,12 @@ class GRiDCodeGenerator:
         if getattr(self, "runtime_inertia", False):
             self.gen_init_inertia_params()
             self.gen_set_inertia_params()
+        # runtime_transform: flag-gated mutable joint-origin table init + mutator.
+        # The device XImats helper rebuilds each joint's Xfixed scratch from this
+        # table once per launch and hoists it out of the hot sin/cos(q) loop.
+        if getattr(self, "runtime_transform", False):
+            self.gen_init_transform_params()
+            self.gen_set_transform_params()
         self.gen_init_robotModel()
         self.gen_init_gridData()
         self.gen_joint_limits_size()
