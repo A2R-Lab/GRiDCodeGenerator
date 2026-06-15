@@ -71,7 +71,8 @@ def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,
         s_temp_name = "s_temp", \
         d_workspace_name = "nullptr", \
         d_f_ext_name = "d_f_ext", \
-        gravity_name = "gravity"
+        gravity_name = "gravity", \
+        d_robotModel_name = "d_robotModel"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
@@ -80,9 +81,15 @@ def gen_forward_dynamics_inner_function_call(self, updated_var_names = None,
     # MINV_F_IN_SMEM and slices the internal Minv F-region from s_temp (smem) or
     # d_workspace (global) itself. The caller passes both arenas + the placement;
     # sizes come from FD_INNER_{SMEM,WORKSPACE}_BYTES<T, MINV_F_IN_SMEM>().
+    # runtime_joint_dynamics: forward d_robotModel (trailing defaulted = nullptr on
+    # the inner) so the reused ID inner's u-site bias can read the mutable
+    # damping/friction table. Every FD-inner caller (kernel / device / integrator
+    # inner / fdsva_so kernels) already has d_robotModel in scope. Off-build relies
+    # on the trailing default, keeping the emitted CUDA byte-identical.
+    _fd_rt_jd = (", " + var_names["d_robotModel_name"]) if getattr(self, "runtime_joint_dynamics", False) else ""
     fd_code_start = "forward_dynamics_inner<T, " + minv_f_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_q_name"] + ", " + \
                                                    var_names["s_qd_name"] + ", " + var_names["s_u_name"] + ", "
-    fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
+    fd_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + _fd_rt_jd + ");"
     fd_code_middle = self.gen_insert_helpers_function_call()
     fd_code = fd_code_start + fd_code_middle + fd_code_end
     self.gen_add_code_line(fd_code)
@@ -100,7 +107,15 @@ def gen_forward_dynamics_inner(self):
                    "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr", \
                    "gravity is the gravity constant"]
     func_def_start = "void forward_dynamics_inner(T *s_qdd, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
+    # runtime_joint_dynamics: the reused ID inner's u-site bias reads the mutable
+    # damping/friction table d_robotModel->d_joint_dynamics_params, so thread
+    # d_robotModel in as a trailing defaulted (= nullptr) param and forward it to
+    # the internal compute_c ID call. The default keeps the OFF build (and every
+    # caller relying on the positional-to-gravity call) byte-identical.
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values",
@@ -120,6 +135,10 @@ def gen_forward_dynamics_inner(self):
                              d_workspace_name = "d_workspace")
     self.gen_minv_inner_function_call(updated_var_names, f_in_smem_expr = "MINV_F_IN_SMEM")
     updated_var_names = dict(s_c_name = "&s_temp[" + str(n*n) + "]", s_vaf_name = "&s_temp[" + str(n*n + n) + "]", s_temp_name = "&s_temp[" + str(n*n + n + 18*NJ) + "]")
+    # runtime_joint_dynamics: the compute_c ID inner is the FD bias; opt it into the
+    # table-reading bias by forwarding d_robotModel (now a param of this inner).
+    if getattr(self, "runtime_joint_dynamics", False):
+        updated_var_names["d_robotModel_name"] = "d_robotModel"
     self.gen_inverse_dynamics_inner_function_call(compute_c = True, use_qdd_input = False, updated_var_names = updated_var_names)
     
     if self.DEBUG_MODE:

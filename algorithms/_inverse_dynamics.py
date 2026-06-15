@@ -40,7 +40,17 @@ def gen_inverse_dynamics_inner_function_call(self, compute_c = False, use_qdd_in
         for key,value in updated_var_names.items():
             var_names[key] = value
     id_code_start = "inverse_dynamics_inner<T>(" + var_names["s_vaf_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
-    id_code_end = var_names["s_temp_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
+    # runtime_joint_dynamics: pass d_robotModel as the trailing arg ONLY on the
+    # compute_c path (the only one that emits the table-reading bias) AND only when
+    # the caller's inner has d_robotModel in scope (it opts in via
+    # updated_var_names["d_robotModel_name"]; default "d_robotModel" for callers
+    # whose inner already binds that name). Every other call (and every non-runtime
+    # build) relies on the trailing `= nullptr` default, so no other call site needs
+    # editing and the byte-identity invariant holds.
+    _id_rt_jd = ""
+    if compute_c and getattr(self, "runtime_joint_dynamics", False):
+        _id_rt_jd = ", " + var_names.get("d_robotModel_name", "d_robotModel")
+    id_code_end = var_names["s_temp_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + _id_rt_jd + ");"
     if compute_c:
         id_code_start = id_code_start.replace("(", "(" + var_names["s_c_name"] + ", ")
     else:
@@ -71,38 +81,63 @@ def gen_inverse_dynamics_joint_dynamics_bias(self):
     HAS_FRIC = self.robot.robot_has_joint_friction()
     HAS_MIMIC = self.robot_has_mimic_joints()
     fb = self.robot.floating_base
+    RUNTIME = getattr(self, "runtime_joint_dynamics", False)
     self.gen_add_code_line("//")
     self.gen_add_code_line("// joint-local viscous damping + Coulomb friction: s_c += b*qd + f*sign(qd)")
     self.gen_add_code_line("//")
     self.gen_add_sync()
     self.gen_add_serial_ops()
-    for jid in range(self.robot.get_num_joints()):
-        b = float(self.robot.get_damping_by_id(jid)) if HAS_DAMP else 0.0
-        fr = float(self.robot.get_friction_by_id(jid)) if HAS_FRIC else 0.0
-        if b == 0.0 and fr == 0.0:
-            continue
-        # v-slot this joint folds into (mimic joints share their target's slot;
-        # for a floating base the root owns slots 0..5 so actuated joints start
-        # at v-slot 6). s_c and s_qd are both indexed by this v-slot, so the
-        # bias reads s_qd[vs] and accumulates into s_c[vs].
-        if fb and jid == 0:
-            continue  # floating root carries no damping/friction
-        if HAS_MIMIC:
-            vs = self._v_slot_cpp(jid)
-            alpha = float(self._alpha_for_jid(jid))
-        else:
-            vs = self.robot.get_joint_index_v(jid)
-            alpha = 1.0
-        qd = "s_qd[" + str(vs) + "]"
-        terms = []
-        if b != 0.0:
-            terms.append("static_cast<T>(" + repr(alpha * b) + ") * " + qd)
-        if fr != 0.0:
-            # exact sign matching np.sign (0 at qd==0): (qd>0) - (qd<0).
-            terms.append("static_cast<T>(" + repr(alpha * fr)
-                         + ") * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
-                         + qd + " < static_cast<T>(0)))")
-        self.gen_add_code_line("s_c[" + str(vs) + "] += " + " + ".join(terms) + ";")
+    if RUNTIME:
+        # runtime_joint_dynamics: read the alpha-FOLDED per-v-slot coefficients from
+        # the mutable device table (d_joint_dynamics_params[vs]=damping,
+        # [nv+vs]=friction) instead of the baked literal. The table ALREADY holds the
+        # folded value (init_joint_dynamics_params == _joint_dynamics_folded_by_vslot),
+        # so DO NOT re-apply alpha here — read the cell straight. URDF-initialized, so
+        # this is bit-identical to the literal path until set_joint_dynamics is called.
+        nv = self.robot.get_num_vel()
+        b_vslot, f_vslot = self._joint_dynamics_folded_by_vslot()
+        for vs in range(nv):
+            b = b_vslot[vs]; fr = f_vslot[vs]
+            if b == 0.0 and fr == 0.0:
+                continue
+            qd = "s_qd[" + str(vs) + "]"
+            terms = []
+            if b != 0.0:
+                terms.append("d_robotModel->d_joint_dynamics_params[" + str(vs) + "] * " + qd)
+            if fr != 0.0:
+                # exact sign matching np.sign (0 at qd==0): (qd>0) - (qd<0).
+                terms.append("d_robotModel->d_joint_dynamics_params[" + str(nv + vs)
+                             + "] * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
+                             + qd + " < static_cast<T>(0)))")
+            self.gen_add_code_line("s_c[" + str(vs) + "] += " + " + ".join(terms) + ";")
+    else:
+        for jid in range(self.robot.get_num_joints()):
+            b = float(self.robot.get_damping_by_id(jid)) if HAS_DAMP else 0.0
+            fr = float(self.robot.get_friction_by_id(jid)) if HAS_FRIC else 0.0
+            if b == 0.0 and fr == 0.0:
+                continue
+            # v-slot this joint folds into (mimic joints share their target's slot;
+            # for a floating base the root owns slots 0..5 so actuated joints start
+            # at v-slot 6). s_c and s_qd are both indexed by this v-slot, so the
+            # bias reads s_qd[vs] and accumulates into s_c[vs].
+            if fb and jid == 0:
+                continue  # floating root carries no damping/friction
+            if HAS_MIMIC:
+                vs = self._v_slot_cpp(jid)
+                alpha = float(self._alpha_for_jid(jid))
+            else:
+                vs = self.robot.get_joint_index_v(jid)
+                alpha = 1.0
+            qd = "s_qd[" + str(vs) + "]"
+            terms = []
+            if b != 0.0:
+                terms.append("static_cast<T>(" + repr(alpha * b) + ") * " + qd)
+            if fr != 0.0:
+                # exact sign matching np.sign (0 at qd==0): (qd>0) - (qd<0).
+                terms.append("static_cast<T>(" + repr(alpha * fr)
+                             + ") * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
+                             + qd + " < static_cast<T>(0)))")
+            self.gen_add_code_line("s_c[" + str(vs) + "] += " + " + ".join(terms) + ";")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
@@ -123,7 +158,17 @@ def gen_inverse_dynamics_inner(self, compute_c = False, use_qdd_input = False):
     # d_f_ext: optional GLOBAL per-body external forces (defaults nullptr); the
     # trailing pointer sits just before gravity so the no-fext call is a literal
     # nullptr (dead-code-eliminated) and shared-memory bytes are unchanged.
-    func_def_end = "T *s_temp, T *d_f_ext, const T gravity) {"
+    # runtime_joint_dynamics: the bias reads the mutable damping/friction table
+    # d_robotModel->d_joint_dynamics_params, so thread d_robotModel into the inner
+    # as a TRAILING DEFAULTED param (= nullptr) ONLY under that flag. A trailing
+    # default keeps every existing call site (id/fd/aba/gradient/so/regressor/...)
+    # source-compatible without edits; only the compute_c id-call passes a real
+    # pointer (below). The default keeps the signature byte-identical when off.
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, T *d_f_ext, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+        func_params.append("d_robotModel is the GPU model pointer (read for the mutable joint-dynamics table; nullptr when unused)")
+    else:
+        func_def_end = "T *s_temp, T *d_f_ext, const T gravity) {"
     func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     if compute_c:
         func_def_start += "T *s_c,  "

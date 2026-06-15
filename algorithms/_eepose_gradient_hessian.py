@@ -127,8 +127,22 @@ def gen_end_effector_pose_inner(self, fixed_target_name = ""):
                 self.gen_add_code_line("// Update with parent transform until you reach the base [level " + str(bfs_level) + "/" + str(n_bfs_levels-1) + "]")
                 # get the parents we need at this level working backwards from all_ees
                 curr_parents = all_ees
+                # A NAMED fixed target adds one extra BFS level (the +1 above), which can
+                # walk a branched column ONE PAST the root: on a floating base the root
+                # link's parent resolves to a link id with no link (get_link_by_id -> None),
+                # so a bare get_parent_id() dereferences None and crashes codegen. Clamp a
+                # column to the -1 sentinel once it reaches/passes the root (jid == -1 OR
+                # its link no longer resolves) — the runtime `if(parent_jid==-1){continue;}`
+                # guard below then skips the compose for already-rooted columns, exactly as
+                # the all-leaf path already does. Byte-identical for every non-crashing case
+                # (a valid jid still returns link.get_parent_id()).
+                def _parent_or_root(jid):
+                    if jid == -1:
+                        return -1
+                    link = self.robot.get_link_by_id(jid)
+                    return -1 if link is None else link.get_parent_id()
                 for i in range(bfs_level):
-                    curr_parents = [(-1 if jid == -1 else self.robot.get_parent_id(jid)) for jid in curr_parents]
+                    curr_parents = [_parent_or_root(jid) for jid in curr_parents]
                 # need to swap dst and start each time
                 even = bfs_level % 2
                 tempDstOffset = 16*num_ees*(even)

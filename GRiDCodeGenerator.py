@@ -79,11 +79,15 @@ def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU,
         return {}
     base = "floating" if floating_base else "fixed"
     host_block = (doc.get("bases") or {}).get(base) or {}
-    # FFI profile: overlay ffi_bases on top of the host bases (per-algo fallback).
-    if profile == "ffi":
-        ffi_block = (doc.get("ffi_bases") or {}).get(base) or {}
+    # Any non-host profile overlays its <profile>_bases on top of the host bases
+    # (per-algo fallback): "ffi" -> ffi_bases (jax), "torch" -> torch_bases,
+    # "pybind" -> pybind_bases. An unknown profile or a missing block leaves the
+    # host bases untouched -> byte-identical to an un-tuned robot. (ffi behavior is
+    # unchanged since "ffi" -> "ffi_bases".)
+    if profile != "host":
+        overlay = (doc.get(str(profile) + "_bases") or {}).get(base) or {}
         base_block = dict(host_block)
-        base_block.update(ffi_block)
+        base_block.update(overlay)
     else:
         base_block = host_block
     out = {}
@@ -110,6 +114,8 @@ class GRiDCodeGenerator:
                          gen_shared_arena_t_count, gen_device_wrapper, gen_tier_dispatch, gen_spatial_algebra_helpers, \
                          gen_get_XI_size, gen_init_XImats, gen_get_inertia_params_size, gen_init_inertia_params, gen_set_inertia_params, \
                          gen_get_transform_params_size, gen_init_transform_params, gen_set_transform_params, \
+                         _joint_dynamics_folded_by_vslot, gen_get_joint_dynamics_params_size, \
+                         gen_init_joint_dynamics_params, gen_set_joint_dynamics_params, \
                          gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
@@ -218,8 +224,19 @@ class GRiDCodeGenerator:
                       test_rnea_grad, test_fd_grad, mx0, mx1, mx2, mx3, mx4, mx5, mx, mxS, mxv, fx, fxS, fxv
 
     # initialize the object
-    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False, LAUNCH_CONFIG_ROBOT = None, LAUNCH_CONFIG_PROFILE = "host"):
+    def __init__(self, robotObj, DEBUG_MODE = False, NEED_PRINT_MAT = False, USE_DYNAMIC_SHARED_MEM = True, FILE_NAMESPACE = "grid", USE_JOINT_DYNAMICS = False, dtype = "float", MUJOCO_OUTPUT = False, LAUNCH_CONFIG_ROBOT = None, LAUNCH_CONFIG_PROFILE = "host", runtime_joint_dynamics = False):
         self.robot = robotObj
+        # runtime_joint_dynamics: when True, the id/fd/aba/*_gradient bias reads
+        # the per-DOF damping/friction coefficients from a mutable device table
+        # (set_joint_dynamics_params) instead of baking them as literals, so they
+        # can be poked at runtime (sysID / domain randomization) with no recompile.
+        # The table is initialized from the URDF (the alpha-FOLDED per-v-slot
+        # coefficient), so the runtime path is BIT-IDENTICAL to the baked path
+        # until poked. DEFAULT False keeps the baked path byte-identical (the
+        # struct field + the device reads are entirely flag-gated). Set here so the
+        # bias/gradient emitters (which read getattr(self,"runtime_joint_dynamics"))
+        # see it; gen_all_code can override it per call.
+        self.runtime_joint_dynamics = runtime_joint_dynamics
         # Which autotune profile to bake into launch_cfg<ALGO>::{TIER,THREADS}.
         # "host" = the C++/host throughput-optimal `bases` (default; used by the
         # C++ harness + numpy/pybind). "ffi" = the jax/torch FFI batch-to-land
@@ -301,6 +318,19 @@ class GRiDCodeGenerator:
         self.codegen_dtype = dtype
         _default_t_bytes = "8" if dtype == "double" else "4"
         self.cuda_shared_mem_type_size_bytes = int(os.environ.get("GRID_CUDA_SHARED_MEM_TYPE_SIZE_BYTES", _default_t_bytes))
+
+    def get_joint_dynamics_baked(self):
+        """Return the baked (alpha-FOLDED, per-v-slot) damping/friction the
+        runtime_joint_dynamics device table is initialized with.
+
+        Returns (damping, friction): two length-nv python float lists, v-slot
+        indexed, IDENTICAL to what init_joint_dynamics_params writes into
+        d_joint_dynamics_params (both call _joint_dynamics_folded_by_vslot). The
+        bindings (_compile.py) persist these as meta so handle.joint_damping /
+        .joint_friction echo EXACTLY the device init, and the codegen + meta agree
+        by construction.
+        """
+        return self._joint_dynamics_folded_by_vslot()
 
     def _normalize_codegen_algorithms(self, codegen_profile = "all", algorithm_list = None):
         all_algorithms = {
@@ -1847,6 +1877,12 @@ class GRiDCodeGenerator:
             # floats, joint-indexed, raw [x,y,z,r,p,y] basis). Emitted ONLY under
             # runtime_transform so the baked struct stays byte-identical.
             struct_lines.append("    T *d_transform_params;")
+        if getattr(self, "runtime_joint_dynamics", False):
+            # runtime_joint_dynamics: flag-gated mutable joint-dynamics table
+            # (2*nv floats, v-slot indexed, [damping||friction], alpha-folded).
+            # Emitted ONLY under runtime_joint_dynamics so the baked struct stays
+            # byte-identical.
+            struct_lines.append("    T *d_joint_dynamics_params;")
         struct_lines.append("};")
         self.gen_add_code_lines(struct_lines)
         self.gen_add_code_lines(["template <typename T, gridDataKind KIND = GRID_DATA_ALL>", \
@@ -2756,7 +2792,8 @@ class GRiDCodeGenerator:
     # finally generate all of the code
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
-                     enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False):
+                     enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False,
+                     runtime_joint_dynamics = None):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -2821,6 +2858,14 @@ class GRiDCodeGenerator:
         # general-rpy DENSE X pattern is baked so rpy can move freely. Default
         # False keeps the BAKED path byte-identical (field + branches flag-gated).
         self.runtime_transform = runtime_transform
+        # runtime_joint_dynamics: runtime-mutable per-DOF damping/friction. When
+        # True the id/fd/aba/*_gradient bias reads the coefficients from a mutable
+        # device table instead of baking them as literals; the table is URDF-
+        # initialized so the runtime path is BIT-IDENTICAL until set_joint_dynamics.
+        # gen_all_code default None means "keep the ctor value" (so the ctor arg and
+        # the gen_all_code arg compose); pass True/False to override per call.
+        if runtime_joint_dynamics is not None:
+            self.runtime_joint_dynamics = runtime_joint_dynamics
         self.generated_algorithms = algorithms
         # MIMIC GRADIENTS — fully supported, no refusal. All first/second-order mimic
         # gradients emit correctly for BOTH bases via the alpha-weighted reduced-v-slot
@@ -3072,6 +3117,12 @@ class GRiDCodeGenerator:
         if getattr(self, "runtime_transform", False):
             self.gen_init_transform_params()
             self.gen_set_transform_params()
+        # runtime_joint_dynamics: flag-gated mutable damping/friction table init +
+        # mutator. The id/fd/aba/*_gradient bias reads this table (URDF-initialized,
+        # alpha-folded per v-slot) instead of the baked literals when the flag is set.
+        if getattr(self, "runtime_joint_dynamics", False):
+            self.gen_init_joint_dynamics_params()
+            self.gen_set_joint_dynamics_params()
         self.gen_init_robotModel()
         self.gen_init_gridData()
         self.gen_joint_limits_size()

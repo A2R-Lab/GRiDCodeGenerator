@@ -289,6 +289,109 @@ def gen_set_transform_params(self):
     self.gen_add_code_line("gpuErrchk(cudaMemcpy(h_robotModel.d_transform_params,h_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
     self.gen_add_end_function()
 
+def _joint_dynamics_folded_by_vslot(self):
+    """runtime_joint_dynamics: the SINGLE source of truth for the alpha-FOLDED
+    per-v-slot damping/friction table (length nv each).
+
+    Reuses the EXACT jid->v-slot fold the baked bias emitters use
+    (gen_inverse_dynamics_joint_dynamics_bias / _idg_damping_diag_cpp): iterate
+    joints, skip the floating root, map jid->v-slot via _v_slot_cpp /
+    get_joint_index_v, and ACCUMULATE alpha*b / alpha*fr into the shared slot so
+    several mimic joints feeding one reduced coordinate fold to a single fused
+    coefficient. Returning the folded vectors here (rather than re-deriving the
+    fold in init_joint_dynamics_params, _compile meta, and the bias read) keeps
+    the device-table init, the persisted meta, and the bias reads agreeing BY
+    CONSTRUCTION — the bit-identity invariant in C5 plan §3.4.
+
+    Returns (damping_by_vslot, friction_by_vslot): two length-nv python float
+    lists, v-slot indexed (slot k == s_qd[k]/s_c[k]). Zero in every slot the
+    URDF leaves undamped (incl. the floating root's slots 0..5).
+    """
+    nv = self.robot.get_num_vel()
+    b_vslot  = [0.0] * nv
+    f_vslot  = [0.0] * nv
+    HAS_DAMP = self.robot.robot_has_joint_damping()
+    HAS_FRIC = self.robot.robot_has_joint_friction()
+    HAS_MIMIC = self.robot_has_mimic_joints()
+    fb = self.robot.floating_base
+    for jid in range(self.robot.get_num_joints()):
+        if fb and jid == 0:
+            continue  # floating root carries no damping/friction
+        b  = float(self.robot.get_damping_by_id(jid))  if HAS_DAMP else 0.0
+        fr = float(self.robot.get_friction_by_id(jid)) if HAS_FRIC else 0.0
+        if b == 0.0 and fr == 0.0:
+            continue
+        if HAS_MIMIC:
+            vs = self._v_slot_cpp(jid)
+            alpha = float(self._alpha_for_jid(jid))
+        else:
+            vs = self.robot.get_joint_index_v(jid)
+            alpha = 1.0
+        b_vslot[vs] += alpha * b
+        f_vslot[vs] += alpha * fr
+    return b_vslot, f_vslot
+
+def gen_get_joint_dynamics_params_size(self):
+    # runtime_joint_dynamics: nv damping + nv friction = 2*nv scalars, v-slot
+    # indexed (damping in [0,nv), friction in [nv,2nv)). Damping/friction are
+    # pure per-DOF scalars (NOT in any sparsity pattern), so this is the
+    # simplest of the three runtime tables.
+    return 2 * self.robot.get_num_vel()
+
+def gen_init_joint_dynamics_params(self):
+    # runtime_joint_dynamics (mirror of gen_init_inertia_params): host-side init
+    # of the flag-gated mutable [damping||friction] table. Fills
+    # d_joint_dynamics_params from the SAME URDF (the alpha-FOLDED per-v-slot
+    # coefficient, _joint_dynamics_folded_by_vslot) so init_robotModel reproduces
+    # the baked bias BIT-FOR-BIT until set_joint_dynamics_params is called. Unlike
+    # runtime_transform there is no on-device sin/cos rebuild and no sparsity
+    # change, so the runtime path is bit-identical (not merely float-identical).
+    self.gen_add_func_doc("Initializes the mutable joint-dynamics (damping/friction) table in GPU memory",
+            ["Memory order is jd[0..nv-1]=damping[v], jd[nv..2nv-1]=friction[v] (v-slot indexed, alpha-folded)"],
+            [], "A pointer to the joint-dynamics-params memory in the GPU")
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("T* init_joint_dynamics_params() {", True)
+    nv   = self.robot.get_num_vel()
+    size = self.gen_get_joint_dynamics_params_size()
+    self.gen_add_code_line("T *h_joint_dynamics_params = (T *)calloc(" + str(size) + ",sizeof(T));")
+    b_vslot, f_vslot = self._joint_dynamics_folded_by_vslot()
+    for vs in range(nv):
+        b = b_vslot[vs]; fr = f_vslot[vs]
+        if b == 0.0 and fr == 0.0:
+            continue  # leave calloc'd zero (incl. the floating root's slots 0..5)
+        self.gen_add_code_line("// v-slot " + str(vs))
+        if b != 0.0:
+            self.gen_add_code_line("h_joint_dynamics_params[" + str(vs) + "] = static_cast<T>(" + repr(float(b)) + ");")
+        if fr != 0.0:
+            self.gen_add_code_line("h_joint_dynamics_params[" + str(nv + vs) + "] = static_cast<T>(" + repr(float(fr)) + ");")
+    self.gen_add_code_line("T *d_joint_dynamics_params; gpuErrchk(cudaMalloc((void**)&d_joint_dynamics_params," + str(size) + "*sizeof(T)));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(d_joint_dynamics_params,h_joint_dynamics_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_code_line("free(h_joint_dynamics_params);")
+    self.gen_add_code_line("return d_joint_dynamics_params;")
+    self.gen_add_end_function()
+
+def gen_set_joint_dynamics_params(self):
+    # runtime_joint_dynamics (mirror of gen_set_inertia_params): public mutator.
+    # Thin cudaMemcpy of the 2*nv [damping||friction] table into
+    # d_joint_dynamics_params. The sysID / domain-randomization entry point for
+    # joint dynamics. h_params must be the alpha-FOLDED per-v-slot coefficients
+    # (same basis as init_joint_dynamics_params); passing the baked values back
+    # reproduces the baked result bit-for-bit.
+    size = self.gen_get_joint_dynamics_params_size()
+    self.gen_add_func_doc("Updates the mutable joint-dynamics table on the GPU at runtime (no recompile)",
+            ["h_params is the host array of " + str(size) + " floats: [damping(nv) || friction(nv)], v-slot indexed"],
+            [], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void set_joint_dynamics_params(robotModel<T> *d_robotModel, const T *h_params) {", True)
+    # d_joint_dynamics_params is an inner pointer inside the device-resident
+    # struct; read it back to host so we can memcpy into the buffer it points at.
+    self.gen_add_code_line("robotModel<T> h_robotModel;")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(&h_robotModel,d_robotModel,sizeof(robotModel<T>),cudaMemcpyDeviceToHost));")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(h_robotModel.d_joint_dynamics_params,h_params," + str(size) + "*sizeof(T),cudaMemcpyHostToDevice));")
+    self.gen_add_end_function()
+
 def _emit_runtime_transform_rebuild(self, n):
     """runtime_transform: rebuild each joint's constant 6x6 Xfixed scratch from
     d_transform_params, once per launch (mirror of _emit_runtime_inertia_rebuild).
@@ -1484,6 +1587,9 @@ def gen_init_robotModel(self):
     if getattr(self, "runtime_transform", False):
         # runtime_transform: flag-gated mutable joint-origin table init.
         init_lines.append("h_robotModel.d_transform_params = init_transform_params<T>();")
+    if getattr(self, "runtime_joint_dynamics", False):
+        # runtime_joint_dynamics: flag-gated mutable damping/friction table init.
+        init_lines.append("h_robotModel.d_joint_dynamics_params = init_joint_dynamics_params<T>();")
     self.gen_add_code_lines(init_lines)
     # then allocate memeory and copy to device
     self.gen_add_code_lines(["robotModel<T> *d_robotModel; gpuErrchk(cudaMalloc((void**)&d_robotModel,sizeof(robotModel<T>)));",

@@ -64,12 +64,22 @@ def _idg_damping_diag_cpp(self, n):
     self.gen_add_sync()
     # one thread per damped v-slot (parallel; each writes a distinct diagonal cell)
     slots = sorted(diag.keys())
+    RUNTIME = getattr(self, "runtime_joint_dynamics", False)
     self.gen_add_parallel_loop("ind", str(len(slots)))
     for k, vs in enumerate(slots):
         # diagonal cell of the dc_dqd half: base nv*nv, col vs, row vs
         cell = n * n + n * vs + vs
+        if RUNTIME:
+            # runtime_joint_dynamics: read the alpha-FOLDED per-v-slot damping from the
+            # mutable device table (damping at [vs]) instead of the baked literal. The
+            # table already holds the folded coefficient (same fold as `diag`), so the
+            # derivative diagonal is just that cell. Friction -> 0 (subgradient), so only
+            # the damping half [vs] is read (never [nv+vs]). Bit-identical until poked.
+            rhs = "d_robotModel->d_joint_dynamics_params[" + str(vs) + "]"
+        else:
+            rhs = "static_cast<T>(" + repr(diag[vs]) + ")"
         self.gen_add_code_line(("if (ind == " + str(k) + ") " if len(slots) > 1 else "")
-                               + "s_dc_du[" + str(cell) + "] += static_cast<T>(" + repr(diag[vs]) + ");")
+                               + "s_dc_du[" + str(cell) + "] += " + rhs + ";")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
 
@@ -221,14 +231,18 @@ def gen_inverse_dynamics_gradient_inner_function_call(self, updated_var_names = 
         s_temp_name = "s_temp", \
         d_temp_spill_name = "nullptr", \
         temp_spill_flag_name = "false", \
-        gravity_name = "gravity"
+        gravity_name = "gravity", \
+        d_robotModel_name = "d_robotModel"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     inverse_dynamics_gradient_code_start = "inverse_dynamics_gradient_inner<T, " + var_names["temp_spill_flag_name"] + ">(" + var_names["s_dc_du_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", "
     inverse_dynamics_gradient_code_middle = var_names["s_vaf_name"] + ", " + self.gen_insert_helpers_function_call()
-    inverse_dynamics_gradient_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + ");"
+    # runtime_joint_dynamics: forward d_robotModel into the inner (trailing defaulted
+    # param) so the damping-diag term can read the mutable table; omitted when off.
+    _idg_rt_jd = (", " + var_names["d_robotModel_name"]) if getattr(self, "runtime_joint_dynamics", False) else ""
+    inverse_dynamics_gradient_code_end = var_names["s_temp_name"] + ", " + var_names["d_temp_spill_name"] + ", " + var_names["gravity_name"] + _idg_rt_jd + ");"
     inverse_dynamics_gradient_code = inverse_dynamics_gradient_code_start + inverse_dynamics_gradient_code_middle + inverse_dynamics_gradient_code_end
     self.gen_add_code_line(inverse_dynamics_gradient_code)
 
@@ -248,7 +262,13 @@ def gen_inverse_dynamics_gradient_inner(self):
                             str(self.gen_inverse_dynamics_gradient_inner_temp_mem_size()), \
                    "gravity is the gravity constant"]
     func_def_start = "void inverse_dynamics_gradient_inner(T *s_dc_du, const T *s_q, const T *s_qd, const T *s_vaf, "
-    func_def_end = "T *s_temp, T *d_temp_spill, const T gravity) {"
+    # runtime_joint_dynamics: the damping-diag term reads
+    # d_robotModel->d_joint_dynamics_params, so thread d_robotModel in as a trailing
+    # defaulted param ONLY under that flag (byte-identical signature when off).
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, T *d_temp_spill, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, T *d_temp_spill, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "This is the inverse_dynamics_gradient band sub-inner (the stable surface composed by forward_dynamics_gradient / integrator_gradient). It does NOT own s_temp placement; the USE_DA_DF_SPILL band selectively spills its da_dq..fxvi band to d_temp_spill via grid_id_du_temp_ptr<T, USE_DA_DF_SPILL>. The whole-pool placement is owned by the wrapping inverse_dynamics_gradient_device."]

@@ -99,6 +99,20 @@ def _aba_jd_bias_term_cpp(self, jid):
         alpha = 1.0
     qd = "s_qd[" + str(vs) + "]"
     terms = []
+    if getattr(self, "runtime_joint_dynamics", False):
+        # runtime_joint_dynamics: read the alpha-FOLDED per-v-slot coefficient from
+        # the mutable device table (damping at [vs], friction at [nv+vs]) instead of
+        # the baked literal. DO NOT re-apply alpha — the table already holds the
+        # folded value. (For non-mimic robots the per-jid u-site and the v-slot are
+        # 1:1 so this is exact and bit-identical to the literal path until poked.)
+        nv = self.robot.get_num_vel()
+        if b != 0.0:
+            terms.append("d_robotModel->d_joint_dynamics_params[" + str(vs) + "] * " + qd)
+        if fr != 0.0:
+            terms.append("d_robotModel->d_joint_dynamics_params[" + str(nv + vs)
+                         + "] * static_cast<T>((" + qd + " > static_cast<T>(0)) - ("
+                         + qd + " < static_cast<T>(0)))")
+        return " + ".join(terms)
     if b != 0.0:
         terms.append("static_cast<T>(" + repr(alpha * b) + ") * " + qd)
     if fr != 0.0:
@@ -140,7 +154,13 @@ def gen_aba_inner_floating(self):
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
+    # runtime_joint_dynamics: the u-site bias reads d_robotModel->d_joint_dynamics_params,
+    # so thread d_robotModel in as a trailing defaulted param ONLY under that flag
+    # (byte-identical signature when off).
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
     func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
                   "Floating-base implementation keeps the scalar-joint ABA recursion and solves the 6x6 root block explicitly.",
@@ -489,7 +509,13 @@ def gen_aba_inner(self):
                 "gravity is the gravity constant"]
     func_def_start = "void aba_inner("
     func_def_middle = "T *s_qdd, T *s_va, const T *s_q, const T *s_qd, const T *s_tau, "
-    func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
+    # runtime_joint_dynamics: the u-site bias reads d_robotModel->d_joint_dynamics_params,
+    # so thread d_robotModel in as a trailing defaulted param ONLY under that flag
+    # (byte-identical signature when off).
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
     func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     func_notes = ["Assumes the XI matricies have already been updated for the given q",
                   "Inner-controlled placement, two orthogonal levers decided at the top:",
@@ -1251,13 +1277,17 @@ def gen_aba_inner_function_call(self, updated_var_names = None,
         s_temp_name = "s_temp", \
         d_workspace_name = "nullptr", \
         d_f_ext_name = "d_f_ext", \
-        gravity_name = "gravity"
+        gravity_name = "gravity", \
+        d_robotModel_name = "d_robotModel"
     )
     if updated_var_names is not None:
         for key,value in updated_var_names.items():
             var_names[key] = value
     aba_code_start = "aba_inner<T, " + temp_in_smem_expr + ", " + cold_in_smem_expr + ">(" + var_names["s_qdd_name"] + ", " + var_names["s_va_name"] + ", " + var_names["s_q_name"] + ", " + var_names["s_qd_name"] + ", " + var_names["s_tau_name"] + ", "
-    aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + ");"
+    # runtime_joint_dynamics: forward d_robotModel into aba_inner (trailing defaulted
+    # param) so the u-site bias can read the mutable table; omitted when off.
+    _aba_rt_jd = (", " + var_names["d_robotModel_name"]) if getattr(self, "runtime_joint_dynamics", False) else ""
+    aba_code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["d_f_ext_name"] + ", " + var_names["gravity_name"] + _aba_rt_jd + ");"
     aba_code_middle = self.gen_insert_helpers_function_call()
     aba_code = aba_code_start + aba_code_middle + aba_code_end
     self.gen_add_code_line(aba_code)

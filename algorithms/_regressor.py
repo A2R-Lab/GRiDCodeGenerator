@@ -533,6 +533,7 @@ def gen_forward_dynamics_parameter_gradient_inner_function_call(self, updated_va
         s_u_name="s_u",
         s_temp_name="s_temp",
         gravity_name="gravity",
+        d_robotModel_name="d_robotModel",
     )
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
@@ -543,7 +544,10 @@ def gen_forward_dynamics_parameter_gradient_inner_function_call(self, updated_va
         var_names["s_c_name"] + ", " + var_names["s_q_name"] + ", " + \
         var_names["s_qd_name"] + ", " + var_names["s_u_name"] + ", "
     code_middle = self.gen_insert_helpers_function_call()
-    code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    # runtime_joint_dynamics: forward d_robotModel into the inner (trailing defaulted
+    # param) so its reused ID bias can read the mutable table; omitted when off.
+    _rt_jd = (", " + var_names["d_robotModel_name"]) if getattr(self, "runtime_joint_dynamics", False) else ""
+    code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + _rt_jd + ");"
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 
@@ -570,7 +574,13 @@ def gen_forward_dynamics_parameter_gradient_inner(self):
         "dqdd/dpi = -Minv . Y(q,qd,qdd_actual) with qdd_actual = Minv.(u-c)",
     ]
     func_def_start = "void forward_dynamics_parameter_gradient_inner(T *s_dqdd_dpi, T *s_Minv, T *s_Y, T *s_qdd, T *s_vaf, T *s_c, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    # runtime_joint_dynamics: the reused inverse_dynamics_inner bias reads
+    # d_robotModel->d_joint_dynamics_params, so thread d_robotModel in as a trailing
+    # defaulted param ONLY under that flag (byte-identical signature when off).
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, const T gravity) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params("", func_params, -1)
     func_def = func_def_start + func_def_middle + func_def_end
 
@@ -587,9 +597,14 @@ def gen_forward_dynamics_parameter_gradient_inner(self):
 
     # 2) bias c = ID(q, qd, qdd=0) via inverse_dynamics inner (compute_c, no qdd).
     self.gen_add_code_line("// bias c = ID(q, qd, 0)")
+    # runtime_joint_dynamics: opt the reused ID inner into the table-reading bias by
+    # forwarding the d_robotModel threaded into this inner (default name d_robotModel).
+    _idcall_vn = dict(d_f_ext_name="nullptr")
+    if getattr(self, "runtime_joint_dynamics", False):
+        _idcall_vn["d_robotModel_name"] = "d_robotModel"
     self.gen_inverse_dynamics_inner_function_call(
         compute_c=True, use_qdd_input=False,
-        updated_var_names=dict(d_f_ext_name="nullptr"))
+        updated_var_names=_idcall_vn)
     self.gen_add_sync()
 
     # 3) qdd_actual = Minv . (u - c)  (symmetric-upper Minv, like forward_dynamics_finish).
@@ -876,6 +891,7 @@ def gen_kinetic_energy_regressor_inner_function_call(self, updated_var_names=Non
         s_qd_name="s_qd",
         s_temp_name="s_temp",
         gravity_name="gravity",
+        d_robotModel_name="d_robotModel",
     )
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
@@ -884,7 +900,10 @@ def gen_kinetic_energy_regressor_inner_function_call(self, updated_var_names=Non
         var_names["s_vaf_name"] + ", " + var_names["s_q_name"] + ", " + \
         var_names["s_qd_name"] + ", "
     code_middle = self.gen_insert_helpers_function_call()
-    code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + ");"
+    # runtime_joint_dynamics: forward d_robotModel into the inner (trailing defaulted
+    # param) so its reused ID bias can read the mutable table; omitted when off.
+    _rt_jd = (", " + var_names["d_robotModel_name"]) if getattr(self, "runtime_joint_dynamics", False) else ""
+    code_end = var_names["s_temp_name"] + ", " + var_names["gravity_name"] + _rt_jd + ");"
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 
@@ -905,7 +924,15 @@ def gen_kinetic_energy_regressor_inner(self):
         "KE = y_KE . pi ; y_KE[10*i+k] = 1/2 v_i^T (dI_k) v_i  (pi_i = [m, m*c(3), I_O(6)])",
     ]
     func_def_start = "void kinetic_energy_regressor_inner(T *s_y_ke, T *s_vaf, const T *s_q, const T *s_qd, "
-    func_def_end = "T *s_temp, const T gravity) {"
+    # runtime_joint_dynamics: the reused inverse_dynamics_inner bias reads
+    # d_robotModel->d_joint_dynamics_params, so thread d_robotModel in as a trailing
+    # defaulted param ONLY under that flag (byte-identical signature when off). The KE
+    # regressor consumes only s_vaf v|a, so the added bias on the scratch torque is
+    # discarded, but d_robotModel must be in scope for the read to compile.
+    if getattr(self, "runtime_joint_dynamics", False):
+        func_def_end = "T *s_temp, const T gravity, const robotModel<T> *d_robotModel = nullptr) {"
+    else:
+        func_def_end = "T *s_temp, const T gravity) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params("", func_params, -1)
     func_def = func_def_start + func_def_middle + func_def_end
 
@@ -919,9 +946,12 @@ def gen_kinetic_energy_regressor_inner(self):
     # 1) RNEA forward sweep -> s_vaf v|a (we only consume v). qdd is irrelevant to
     #    v, so reuse the bias variant (compute_c=True, use_qdd_input=False).
     self.gen_add_code_line("// forward RNEA sweep: populate s_vaf v (reuse RNEA vaf inner; qdd irrelevant to v)")
+    _ke_vn = dict(s_c_name="s_temp", d_f_ext_name="nullptr")
+    if getattr(self, "runtime_joint_dynamics", False):
+        _ke_vn["d_robotModel_name"] = "d_robotModel"
     self.gen_inverse_dynamics_inner_function_call(
         compute_c=True, use_qdd_input=False,
-        updated_var_names=dict(s_c_name="s_temp", d_f_ext_name="nullptr"))
+        updated_var_names=_ke_vn)
     self.gen_add_sync()
 
     # 2) P2-fan over the 10*NB columns. col -> (link i, param k); each thread writes
