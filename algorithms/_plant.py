@@ -253,7 +253,10 @@ def gen_plant_step(self):
                            "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt) {", True)
     self.gen_add_code_line("const T *s_q  = s_x;")
     self.gen_add_code_line("const T *s_qd = &s_x[" + str(nq) + "];")
-    self.gen_add_code_line("grid::integrator_device<T, IT>(s_x_kp1, s_q, s_qd, s_u, d_robotModel, gravity, dt);")
+    # d_f_ext = nullptr: plant_step is external-force-free for now (the integrator
+    # now accepts d_f_ext; threading it through plant_step is a follow-up tied to
+    # the grid_plant cost-surface work). nullptr -> byte-identical to before.
+    self.gen_add_code_line("grid::integrator_device<T, IT>(s_x_kp1, s_q, s_qd, s_u, d_robotModel, nullptr, gravity, dt);")
     if fb:
         # mjx output (RETRACT): the integrator integrated the base in the pin
         # convention (SE(3) V(phi) base-position coupling, O(dt^2) wrong for mjx).
@@ -363,7 +366,10 @@ def gen_plant_step_gradient(self, with_value=False):
                     "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
                     "s_dInt_q_6x6, s_dInt_v_6x6, ")
     inner_helpers = self.gen_insert_helpers_function_call()
-    inner_end = ("s_temp, d_workspace, d_temp_spill, d_robotModel, gravity, dt);")
+    # d_f_ext = nullptr: plant_step_gradient is external-force-free for now (see
+    # plant_step note). The integrator gradient now accepts d_f_ext; nullptr here
+    # keeps plant byte-identical until f_ext is threaded through the plant layer.
+    inner_end = ("s_temp, d_workspace, d_temp_spill, d_robotModel, nullptr, gravity, dt);")
     self.gen_add_code_line(inner + inner_middle + inner_helpers + inner_end)
     self.gen_add_end_function()
 
