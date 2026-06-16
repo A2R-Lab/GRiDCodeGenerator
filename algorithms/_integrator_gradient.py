@@ -220,8 +220,56 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT",
         self.gen_add_code_line("}")
     self.gen_add_code_line(s_dAB_name + "[ind] = val;")
     self.gen_add_end_control_flow()  # end if constexpr SI_EULER
+    # ----- TRAPEZOIDAL -----  (GATO integrator.cuh:143-184; fixed-base only)
+    # v_{k+1} = v + dt*qdd       -> bottom rows IDENTICAL to EULER (dt*dqdd, I+dt*dqdd, dt*Minv)
+    # q_{k+1} = q + dt*v + 0.5*dt^2*qdd -> top rows = SI-Euler top with dt2 -> 0.5*dt^2 (dt2h):
+    #   d(q_kp1)/dq  = I  + dt2h*dqdd/dq
+    #   d(q_kp1)/dqd = dt*I + dt2h*dqdd/dqd
+    #   d(q_kp1)/du  = dt2h*Minv
+    self.gen_add_code_line("else if constexpr (" + tok + " == IntegratorType::TRAPEZOIDAL) {", True)
+    if fb:
+        # Floating-base TRAPEZOIDAL deferred: refuse rather than emit a wrong tensor.
+        self.gen_add_code_line("static_assert(" + tok + " != IntegratorType::TRAPEZOIDAL,")
+        self.gen_add_code_line("              \"floating-base TRAPEZOIDAL gradient is a follow-up; fixed-base only.\");")
+    else:
+        self.gen_add_code_line("T val = static_cast<T>(0);")
+        self.gen_add_code_line("T dt2h = static_cast<T>(0.5) * dt * dt;")
+        self.gen_add_code_line("if (col < " + str(n) + ") {")
+        self.gen_add_code_line("    // d/dq column")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T diag = (row == col) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt2h * " + s_df_du_name + "[col * " + str(n) + " + row];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        val = dt * " + s_df_du_name + "[col * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else if (col < " + str(2 * n) + ") {")
+        self.gen_add_code_line("    // d/dqd column")
+        self.gen_add_code_line("    int j_local = col - " + str(n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T diag = (row == j_local) ? dt : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt2h * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + row];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        T diag = (i_local == j_local) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt * " + s_df_du_name + "[" + str(nn) + " + j_local * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else {")
+        self.gen_add_code_line("    // d/du column   (dqdd/du = Minv)")
+        self.gen_add_code_line("    int j_local = col - " + str(2 * n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        int midx = (row <= j_local) * (j_local * " + str(n) + " + row) + (row > j_local) * (row * " + str(n) + " + j_local);")
+        self.gen_add_code_line("        val = dt2h * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        int midx = (i_local <= j_local) * (j_local * " + str(n) + " + i_local) + (i_local > j_local) * (i_local * " + str(n) + " + j_local);")
+        self.gen_add_code_line("        val = dt * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("}")
+        self.gen_add_code_line(s_dAB_name + "[ind] = val;")
+    self.gen_add_end_control_flow()  # end if constexpr TRAPEZOIDAL
     self.gen_add_code_line("else {", True)
-    self.gen_add_code_line("static_assert(" + tok + " == IntegratorType::EULER || " + tok + " == IntegratorType::SEMI_IMPLICIT_EULER,")
+    self.gen_add_code_line("static_assert(" + tok + " == IntegratorType::EULER || " + tok + " == IntegratorType::SEMI_IMPLICIT_EULER || " + tok + " == IntegratorType::TRAPEZOIDAL,")
     self.gen_add_code_line("              \"dAB assembly handles single-stage IT only; Midpoint/RK3/RK4 are routed through gen_integrator_gradient_multistage.\");")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()  # end parallel loop
@@ -844,7 +892,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
     # literals through the stable FD-grad _inner_python composition surface.
     spill_flag = "USE_DA_DF_SPILL"
     self.gen_add_code_line(
-        "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True
+        "if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER || IT == IntegratorType::TRAPEZOIDAL) {", True
     )
     self.gen_integrator_gradient_inner_python(
         compute_x_kp1=compute_x_kp1,

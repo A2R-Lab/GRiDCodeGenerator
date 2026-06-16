@@ -14,17 +14,21 @@ later is purely additive (one extra `if constexpr (IT == ...)` branch).
 
 
 # integrator name <-> codegen-side string constant
-_INTEGRATOR_TYPES = ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
+_INTEGRATOR_TYPES = ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
 
 # Number of forward-dynamics evaluations each integrator type requires.
 # Used at codegen time to size shared-memory buffers (per-stage qdd) and to
 # guide which stage-computation branches are emitted.
+# TRAPEZOIDAL is single-stage (1 FD eval) like EULER, so _max_stages_in_use()
+# stays == 4 -> per-stage scratch sizing is byte-identical and EULER/SI/RK
+# kernels emit unchanged.
 _STAGE_COUNT = {
     "EULER": 1,
     "SEMI_IMPLICIT_EULER": 1,
     "MIDPOINT": 2,
     "RK3": 3,
     "RK4": 4,
+    "TRAPEZOIDAL": 1,
 }
 
 
@@ -537,18 +541,31 @@ def gen_integrator_finish(self):
     # ---- q_{k+1} part — Euler uses qd; SI Euler uses v_new ----
     # For SI-Euler, the v_new computed above is the integration source. Read
     # it back from s_x_kp1[nq:nq+nv] when IT == SEMI_IMPLICIT_EULER.
-    self.gen_add_code_line("// pick the source velocity for the q-update")
-    self.gen_add_code_line(f"const T *s_src_v = (IT == IntegratorType::EULER) ? s_qd : &s_x_kp1[{nq}];")
+    self.gen_add_code_line("// pick the source velocity for the q-update (SI reads v_new; EULER/TRAPEZOIDAL read old qd)")
+    self.gen_add_code_line(f"const T *s_src_v = (IT == IntegratorType::SEMI_IMPLICIT_EULER) ? &s_x_kp1[{nq}] : s_qd;")
     # q-update: fb -> SE(3) Lie retract; spherical -> SO(3) per-ball retract +
     # additive table for the rest; cardinal -> parallel Euler add. (size nq.)
     self._emit_q_update("dt", "s_x_kp1", src_q_name="s_q", src_v_name="s_src_v")
+    # TRAPEZOIDAL adds the +0.5*dt^2*qdd accel term onto q in place (GATO
+    # integrator.cuh:36 -> q_next = q + dt*qd + 0.5*dt^2*qdd; uses OLD qd). The
+    # if constexpr elides to nothing for EULER/SI/RK so their codegen stays
+    # byte-identical. Fixed-base, non-spherical only for the first delivery:
+    # floating would need a Lie retract with v_dt = dt*qd + 0.5*dt^2*qdd, and a
+    # spherical robot would (wrongly) add the accel term onto quaternion slots.
+    if not fb and not self.robot.robot_has_spherical():
+        self.gen_add_code_line("if constexpr (IT == IntegratorType::TRAPEZOIDAL) {", True)
+        self.gen_add_sync()
+        self.gen_add_parallel_loop("ind", str(nq))
+        self.gen_add_code_line("s_x_kp1[ind] += static_cast<T>(0.5) * dt * dt * s_qdd[ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
 
     # ---- Multi-stage IT values are not supposed to hit this function ----
     # Compile-time sentinel: emit a static_assert that fires if someone tries
     # to instantiate integrator_finish for MP/RK3/RK4 (they should drive the
     # finish inline from integrator_inner's multi-stage block).
     self.gen_add_code_line(
-        "static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER,")
+        "static_assert(IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER || IT == IntegratorType::TRAPEZOIDAL,")
     self.gen_add_code_line(
         "              \"integrator_finish only handles single-stage IT; multi-stage uses inner directly.\");")
     self.gen_add_end_function()
@@ -663,7 +680,7 @@ def gen_integrator_inner(self):
     self.gen_add_sync()
 
     # Single-stage branch — Euler / Semi-Implicit Euler.
-    self.gen_add_code_line("if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER) {", True)
+    self.gen_add_code_line("if constexpr (IT == IntegratorType::EULER || IT == IntegratorType::SEMI_IMPLICIT_EULER || IT == IntegratorType::TRAPEZOIDAL) {", True)
     self.gen_integrator_finish_function_call(integrator_type="IT")
     self.gen_add_end_control_flow()
 
