@@ -759,9 +759,9 @@ def gen_add_shared_memory_helpers(self):
         "enum gridDataKind { GRID_DATA_ALL = 0, GRID_DATA_DYNAMICS = 1, GRID_DATA_KINEMATICS = 2 };",
         "enum gridSharedTier { GRID_SHARED_FULL = 0, GRID_SPILL_DA_DF_OUTPUT = 1, GRID_SPILL_DV_DA_DF_OUTPUT = 2 };",
         "// Time integrator family selected by integrator kernels at compile time.",
-        "// EULER is the only variant currently emitted; semi-implicit Euler, midpoint,",
-        "// and RK3/RK4 are listed so future additions are purely additive in the codegen.",
-        "enum class IntegratorType { EULER = 0, SEMI_IMPLICIT_EULER = 1, MIDPOINT = 2, RK3 = 3, RK4 = 4 };",
+        "// EULER / SEMI_IMPLICIT_EULER / TRAPEZOIDAL are single-stage; MIDPOINT / RK3 / RK4",
+        "// are multi-stage (driven inline from integrator_inner). TRAPEZOIDAL = 5 (NOT MIDPOINT=2).",
+        "enum class IntegratorType { EULER = 0, SEMI_IMPLICIT_EULER = 1, MIDPOINT = 2, RK3 = 3, RK4 = 4, TRAPEZOIDAL = 5 };",
         "",
         "#ifndef GRID_CUDA_ENABLE_L2_PERSISTING",
         # Phase 3a/b/c spill design: workspace bytes are HOT (recursion-internal
