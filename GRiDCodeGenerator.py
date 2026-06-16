@@ -3148,6 +3148,26 @@ class GRiDCodeGenerator:
                                             include_pose = "end_effector_pose" in algorithms,
                                             include_gradient = "end_effector_pose_gradient" in algorithms,
                                             include_hessian = "end_effector_pose_hessian" in algorithms)
+            # C4: grid_rbd EE binding entry-point aliases. The C-ABI wrappers
+            # (grid_rbd_end_effector_pose[_gradient/_hessian]) and the A1 kernel-threads
+            # introspection call THROUGH these macros rather than the bare unsuffixed
+            # symbols. When a SINGLE named fixed target is baked (grid_rbd
+            # ee_joint_names=[name]), they route to the _<name> launchers anchored at
+            # that flange (matching pinocchio) and report a 1-EE output; "" / "all" keep
+            # the all-leaf default (the unsuffixed symbols, NUM_EES leaves). gen_all_code
+            # always emits exactly one of these blocks so the fixed wrapper compiles.
+            _ee_named = fixed_target_name not in ("", "all")
+            _ee_sfx = ("_" + fixed_target_name) if _ee_named else ""
+            self.gen_add_code_lines([
+                "// ---- grid_rbd EE binding entry-point aliases (single named target routes here) ----",
+                "#define GRID_RBD_NUM_EES " + ("1" if _ee_named else "grid::NUM_EES"),
+                "#define GRID_RBD_EE_POSE_FN end_effector_pose" + _ee_sfx,
+                "#define GRID_RBD_EE_POSE_GRADIENT_FN end_effector_pose_gradient" + _ee_sfx,
+                "#define GRID_RBD_EE_POSE_HESSIAN_FN end_effector_pose_hessian" + _ee_sfx,
+                "#define GRID_RBD_EE_POSE_KERNEL end_effector_pose_kernel" + _ee_sfx,
+                "#define GRID_RBD_EE_POSE_GRADIENT_KERNEL end_effector_pose_gradient_kernel" + _ee_sfx,
+                "#define GRID_RBD_EE_POSE_HESSIAN_KERNEL end_effector_pose_hessian_kernel" + _ee_sfx,
+                ""])
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms

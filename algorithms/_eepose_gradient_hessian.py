@@ -447,8 +447,14 @@ def _eepose_resolve_targets(self, fixed_target_name):
             "' is not a fixed joint of this robot.")
     anchor_jid = fj.get_id()
     parent_name = fj.get_parent()
-    parent_jid = (self.robot.get_joint_by_name(parent_name).get_id()
-                  if parent_name not in ("", "-1") else -1)
+    # The fixed joint's parent may be a non-movable link (e.g. the root trunk on a
+    # FIXED base, where the named target rigidly attaches to the world root). In
+    # that case get_joint_by_name returns None — treat it as "no movable parent"
+    # (parent_jid = -1) so the explicit root-attached case below fires cleanly,
+    # rather than crashing with AttributeError on None.get_id().
+    parent_joint = (self.robot.get_joint_by_name(parent_name)
+                    if parent_name not in ("", "-1") else None)
+    parent_jid = parent_joint.get_id() if parent_joint is not None else -1
     if parent_jid == -1:
         raise NotImplementedError(
             "gen_end_effector_pose_*: fixed target '" + fixed_target_name +
