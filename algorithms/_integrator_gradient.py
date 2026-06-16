@@ -511,7 +511,7 @@ def gen_integrator_gradient_multistage(self, compute_x_kp1=False,
             s_df_du_name="s_df_du",
             d_temp_spill_name=d_temp_spill_name,
             temp_spill_flag_name=temp_spill_flag_name,
-            d_f_ext_name="nullptr",  # integrator gradient does not thread external forces
+            d_f_ext_name="d_f_ext",  # threads external forces through the FD-grad inner
         )
         self.gen_add_sync()
 
@@ -715,7 +715,7 @@ def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
         s_df_du_name="s_df_du",
         d_temp_spill_name=d_temp_spill_name,
         temp_spill_flag_name=temp_spill_flag_name,
-        d_f_ext_name="nullptr",  # integrator gradient does not thread external forces
+        d_f_ext_name="d_f_ext",  # threads external forces through the FD-grad inner
     )
     self.gen_add_sync()
     if fb:
@@ -800,7 +800,7 @@ def gen_integrator_gradient_device_function_call(self, compute_x_kp1=False,
               "s_dInt_q_6x6, s_dInt_v_6x6, ")
     middle = self.gen_insert_helpers_function_call()
     end = ("s_temp, " + d_workspace_pool_name + ", " + d_temp_spill_name + ", "
-           + "d_robotModel, gravity, dt);")
+           + "d_robotModel, d_f_ext, gravity, dt);")
     self.gen_add_code_line(start + middle + end)
 
 
@@ -852,6 +852,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
         "d_workspace is the global scratch pool the FD-grad inner s_temp routes to (used when !SCRATCH_IN_SMEM)",
         "d_temp_spill is the inverse_dynamics_gradient da_df band spill region (used when USE_DA_DF_SPILL)",
         "d_robotModel holds XImats/topology; gravity is the gravity constant; dt is the timestep",
+        "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
     ]
     func_def_start = "void " + fname + "(T *s_dAB, "
     if compute_x_kp1:
@@ -860,7 +861,7 @@ def gen_integrator_gradient_device(self, compute_x_kp1=False):
                        "T *s_Minv, T *s_qdd, T *s_q_orig, T *s_qd_orig, T *s_stage_grad_qdd, "
                        "T *s_D_qdd_stage, T *s_dInt_q_6x6, T *s_dInt_v_6x6, ")
     func_def_end = ("T *s_temp, T *d_workspace, T *d_temp_spill, "
-                    "const robotModel<T> *d_robotModel, const T gravity, const T dt) {")
+                    "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, const T dt) {")
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(func_def_middle, func_params, -2)
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("integrator gradient orchestration as a single inner-owns-placement device function",
@@ -931,6 +932,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
         "d_q_qd_u is the packed joint positions, velocities, and input torques",
         "stride_q_qd_u is the stride between each (q, qd, u) tuple in d_q_qd_u",
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
+        "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
         "gravity is the gravity constant",
         "dt is the integration timestep",
         "num_timesteps is the length of the trajectory (or overloaded as test_iters for timing)",
@@ -940,7 +942,7 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
     # at LITE/MINIMAL (mirrors forward_dynamics_gradient_kernel's d_workspace).
     func_def_start = ("void " + ("integrator_with_gradient" if compute_x_kp1 else "integrator_gradient") + "_kernel(T *d_dAB, " + sig_x_kp1 +
                       "unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, ")
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
@@ -1187,7 +1189,7 @@ def gen_integrator_gradient_host(self, mode=0, compute_x_kp1=False):
     kernel_tmpl = ("<T, IT, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "<T, IT, RESOURCE_TIER>")
     func_call_start = (base_name + "_kernel" + kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(" +
                        "hd_data->d_dAB," + kernel_args_x_kp1 + "hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,")
-    func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
+    func_call_end = "d_robotModel,hd_data->d_f_ext,gravity,dt,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace(base_name + "_kernel" + kernel_tmpl,
                                                   base_name + "_kernel_single_timing" + kernel_tmpl)

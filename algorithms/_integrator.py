@@ -584,6 +584,7 @@ def gen_integrator_inner_function_call(self, integrator_type="IT", updated_var_n
         d_robotModel_name="d_robotModel",
         s_temp_name="s_temp",
         d_workspace_name="nullptr",
+        d_f_ext_name="nullptr",
         dt_name="dt",
         gravity_name="gravity",
     )
@@ -601,6 +602,7 @@ def gen_integrator_inner_function_call(self, integrator_type="IT", updated_var_n
     code_end = (var_names["d_robotModel_name"] + ", " +
                 var_names["s_temp_name"] + ", " +
                 var_names["d_workspace_name"] + ", " +
+                var_names["d_f_ext_name"] + ", " +
                 var_names["gravity_name"] + ", " +
                 var_names["dt_name"] + ");")
     code_middle = self.gen_insert_helpers_function_call()
@@ -660,9 +662,10 @@ def gen_integrator_inner(self):
     # at intermediate states. For single-stage (Euler / SI Euler) it's unused.
     # d_workspace holds the surgically-spilled Minv F-region (6*NV*NV) at the
     # LITE/MINIMAL tiers (MINV_F_IN_SMEM=false); nullptr / unused at PERF.
-    func_def_end = "const robotModel<T> *d_robotModel, T *s_temp, T *d_workspace, const T gravity, const T dt) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *s_temp, T *d_workspace, T *d_f_ext, const T gravity, const T dt) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -3)
     func_params.append("d_workspace is the L2-pinned global scratch for the spilled Minv F-region (LITE/MINIMAL); nullptr at PERF")
+    func_params.append("d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr")
     func_notes = ["Assumes s_XImats is updated already for the current s_q",
                   "MINV_F_IN_SMEM selects where the FD inner's Minv 6*NV*NV F-region lives (s_temp vs d_workspace)",
                   "For Midpoint/RK3/RK4, re-runs forward_dynamics at intermediate states and weights stage qdd outputs."]
@@ -676,7 +679,7 @@ def gen_integrator_inner(self):
     # placement + global scratch through every FD inner call (stages reuse the
     # same F bytes sequentially).
     self.gen_forward_dynamics_inner_function_call(
-        updated_var_names=dict(d_workspace_name="d_workspace", d_f_ext_name="nullptr"), minv_f_in_smem_expr="MINV_F_IN_SMEM")
+        updated_var_names=dict(d_workspace_name="d_workspace", d_f_ext_name="d_f_ext"), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync()
 
     # Single-stage branch — Euler / Semi-Implicit Euler.
@@ -720,7 +723,7 @@ def gen_integrator_inner(self):
     self.gen_add_sync()
     # FD at p1.
     self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
+        s_q_name="s_p1_q", s_qd_name="s_p1_qd", s_qdd_name="s_qdd_2", d_workspace_name="d_workspace", d_f_ext_name="d_f_ext",
     ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
     self.gen_add_sync()
 
@@ -743,7 +746,7 @@ def gen_integrator_inner(self):
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p2_q"))
         self.gen_add_sync()
         self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
+            s_q_name="s_p2_q", s_qd_name="s_p2_qd", s_qdd_name="s_qdd_3", d_workspace_name="d_workspace", d_f_ext_name="d_f_ext",
         ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync()
         self.gen_add_end_control_flow()
@@ -762,7 +765,7 @@ def gen_integrator_inner(self):
         self.gen_load_update_XImats_helpers_function_call(updated_var_names=dict(s_q_name="s_p3_q"))
         self.gen_add_sync()
         self.gen_forward_dynamics_inner_function_call(updated_var_names=dict(
-            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4", d_workspace_name="d_workspace", d_f_ext_name="nullptr",
+            s_q_name="s_p3_q", s_qd_name="s_p3_qd", s_qdd_name="s_qdd_4", d_workspace_name="d_workspace", d_f_ext_name="d_f_ext",
         ), minv_f_in_smem_expr="MINV_F_IN_SMEM")
         self.gen_add_sync()
         self.gen_add_end_control_flow()
@@ -807,10 +810,11 @@ def gen_integrator_device(self):
                    "s_qd is the vector of joint velocities",
                    "s_u is the vector of joint input torques",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
                    "gravity is the gravity constant",
                    "dt is the integration timestep"]
     func_def_start = "void integrator_device(T *s_x_kp1, const T *s_q, const T *s_qd, const T *s_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, const T dt) {"
     # Device wrapper keeps the FD Minv-F region in smem (the default PERF
     # placement); the spill ladder is exercised through the kernel path.
     shared_mem_size = self.gen_integrator_inner_temp_mem_size(minv_f_in_smem=True)
@@ -824,7 +828,8 @@ def gen_integrator_device(self):
     self.gen_device_wrapper(
         "Computes a single integrator step using the precomputed robotModel",
         func_def_start + func_def_end, shared_mem_size,
-        lambda: self.gen_integrator_inner_function_call(integrator_type="IT"),
+        lambda: self.gen_integrator_inner_function_call(integrator_type="IT",
+            updated_var_names=dict(d_f_ext_name="d_f_ext")),
         template_line = "template <typename T, IntegratorType IT = IntegratorType::EULER>",
         func_notes = [], func_params = func_params,
         extra_t_buffers = extra_t_buffers, include_linalg_scratch = True)
@@ -881,7 +886,7 @@ def _emit_integrator_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_ca
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_integrator_inner_function_call(integrator_type="IT",
-            updated_var_names=(dict(d_workspace_name="int_d_workspace") if spill_minv_F else None),
+            updated_var_names=(dict(d_workspace_name="int_d_workspace", d_f_ext_name="d_f_ext") if spill_minv_F else dict(d_f_ext_name="d_f_ext")),
             minv_f_in_smem_expr=minv_f_expr)
         self.gen_add_sync()
         # mjx output (RETRACT): the kernel integrated q in the PIN convention
@@ -920,7 +925,7 @@ def _emit_integrator_kernel_body_for_flags(self, nq, nv, spill_minv_F, single_ca
         self.gen_anti_licm_input_reload("q_qd_u", str(input_count), feedback_from="x_kp1")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_integrator_inner_function_call(integrator_type="IT",
-            updated_var_names=(dict(d_workspace_name="int_d_workspace") if spill_minv_F else None),
+            updated_var_names=(dict(d_workspace_name="int_d_workspace", d_f_ext_name="d_f_ext") if spill_minv_F else dict(d_f_ext_name="d_f_ext")),
             minv_f_in_smem_expr=minv_f_expr)
         self.gen_anti_licm_output_write("x_kp1")
         self.gen_add_end_control_flow()
@@ -935,11 +940,12 @@ def gen_integrator_kernel(self, single_call_timing=False):
                    "d_q_qd_u is the packed joint positions, velocities, and input torques",
                    "stride_q_qd_u is the stride between each (q, qd, u) tuple in d_q_qd_u",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
+                   "d_f_ext is the (optional) GLOBAL external forces, body-major 6*NUM_BODIES local-frame, or nullptr",
                    "gravity is the gravity constant",
                    "dt is the integration timestep",
                    "num_timesteps is the length of the trajectory (or overloaded as test_iters for timing)"]
     func_def_start = "void integrator_kernel(T *d_x_kp1, unsigned char *d_workspace, const T *d_q_qd_u, const int stride_q_qd_u, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_f_ext, const T gravity, const T dt, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
@@ -1001,7 +1007,7 @@ def gen_integrator_host(self, mode=0):
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"integrator requires all-data or dynamics gridData\");")
     integrator_kernel_tmpl = "integrator_kernel<T, IT, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "integrator_kernel<T, IT, RESOURCE_TIER>"
     func_call_start = integrator_kernel_tmpl + "<<<block_dimms,thread_dimms,INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_x_kp1,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_u,"
-    func_call_end = "d_robotModel,gravity,dt,num_timesteps);"
+    func_call_end = "d_robotModel,hd_data->d_f_ext,gravity,dt,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("integrator_kernel<", "integrator_kernel_single_timing<")
     self.gen_add_code_line("int stride_q_qd_u = 3*NUM_JOINTS;")
