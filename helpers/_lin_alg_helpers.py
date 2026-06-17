@@ -87,11 +87,16 @@ def gen_grid_linalg_backend_helpers(self):
     """
     glass_commit = _glass_commit()
     self.gen_add_func_doc("Vendored GLASS linear algebra helpers (SIMT only)")
-    self.gen_add_code_line("// Temporarily leave the generated namespace so GLASS keeps its public namespace.")
-    self.gen_add_end_control_flow()
+    # Vendor GLASS NESTED inside the generated namespace (e.g. `grid::glass`) rather
+    # than at global `glass::`. This keeps GRiD hermetic: a consumer can include its
+    # own (possibly newer) GLASS at the global `glass::` without an ODR clash against
+    # this pinned snapshot. Generated code refers to it as bare `glass::...`, which
+    # resolves to the nested namespace by ordinary lookup, so call sites need no
+    # qualification (and must NOT be globally qualified, which would escape to the
+    # consumer's global GLASS).
     self.gen_add_code_lines([
         "",
-        "// Vendored from GLASS at codegen time.",
+        "// Vendored from GLASS at codegen time (nested in this namespace).",
         "// Source repository: git@github.com:A2R-Lab/GLASS.git",
         "// Pinned commit: " + glass_commit,
         "namespace glass {",
@@ -102,7 +107,6 @@ def gen_grid_linalg_backend_helpers(self):
     self.gen_add_code_line("} // namespace glass")
     self.gen_add_code_line("")
 
-    self.gen_add_code_line("namespace " + self.file_namespace + " {", True)
     self.gen_add_func_doc("Linear algebra wrappers (SIMT GLASS)")
     self.gen_add_code_lines([
         "// SIMT-only linalg. cuBLASDx was removed in v2.0; the",
@@ -147,20 +151,20 @@ def gen_grid_linalg_backend_helpers(self):
         "template <typename T, int M, int N, int ROW_STRIDE>",
         "__device__ void grid_linalg_row_strided_gemv(const T *A, const T *x, T *y, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
         "    (void)glass_nvidia_smem;",
-        "    ::glass::row_strided_gemv<T, M, N, ROW_STRIDE>(A, x, y, alpha, beta);",
+        "    glass::row_strided_gemv<T, M, N, ROW_STRIDE>(A, x, y, alpha, beta);",
         "    __syncthreads();",
         "}",
         "",
         "template <typename T, int M, int N, int K, int A_RS, int B_RS>",
         "__device__ void grid_linalg_row_strided_gemm(const T *A, const T *B, T *C, T alpha, T beta, unsigned char *glass_nvidia_smem = nullptr) {",
         "    (void)glass_nvidia_smem;",
-        "    ::glass::row_strided_gemm<T, M, N, K, A_RS, B_RS>(A, B, C, alpha, beta);",
+        "    glass::row_strided_gemm<T, M, N, K, A_RS, B_RS>(A, B, C, alpha, beta);",
         "    __syncthreads();",
         "}",
         "",
         "template <typename T, int N, int S1, int S2>",
         "__device__ T grid_linalg_dot_strided(const T *vec1, const T *vec2) {",
-        "    return ::glass::dot_strided<T, N, S1, S2>(vec1, vec2);",
+        "    return glass::dot_strided<T, N, S1, S2>(vec1, vec2);",
         "}",
         "",
         "// Segmented (batched) row-strided GEMV: `segments` independent M x N GEMVs in one",
@@ -169,7 +173,7 @@ def gen_grid_linalg_backend_helpers(self):
         "template <typename T, int M, int N, int ROW_STRIDE = M, bool FUSE_SCALED_ADD = false>",
         "__device__ void grid_linalg_segmented_row_strided_gemv(unsigned int segments, const int *seg_a_off, const int *seg_x_off, const int *seg_y_off, const T *A, const T *x, T *y, T alpha, T beta, const int *seg_s_off = nullptr, const T *S = nullptr, const T *scalar = nullptr, unsigned char *glass_nvidia_smem = nullptr) {",
         "    (void)glass_nvidia_smem;",
-        "    ::glass::segmented_row_strided_gemv<T, M, N, ROW_STRIDE, FUSE_SCALED_ADD>(segments, seg_a_off, seg_x_off, seg_y_off, A, x, y, alpha, beta, seg_s_off, S, scalar);",
+        "    glass::segmented_row_strided_gemv<T, M, N, ROW_STRIDE, FUSE_SCALED_ADD>(segments, seg_a_off, seg_x_off, seg_y_off, A, x, y, alpha, beta, seg_s_off, S, scalar);",
         "    __syncthreads();",
         "}",
         "",
@@ -178,7 +182,7 @@ def gen_grid_linalg_backend_helpers(self):
         "template <typename T, int DIM = 4>",
         "__device__ void grid_linalg_indexed_batched_gemm(unsigned int pairs, const int *a_idx, const int *b_idx, const int *c_idx, const T *A_base, const T *B_base, T *C_base, unsigned char *glass_nvidia_smem = nullptr) {",
         "    (void)glass_nvidia_smem;",
-        "    ::glass::indexed_batched_gemm<T, DIM>(pairs, a_idx, b_idx, c_idx, A_base, B_base, C_base);",
+        "    glass::indexed_batched_gemm<T, DIM>(pairs, a_idx, b_idx, c_idx, A_base, B_base, C_base);",
         "    __syncthreads();",
         "}",
         "",
@@ -189,7 +193,7 @@ def gen_grid_linalg_backend_helpers(self):
         "// T of s_scratch. NOT a drop-in for grid_linalg_dot_strided (that one is per-thread).",
         "template <typename T, int N, int SX = 1, int SY = 1>",
         "__device__ void grid_linalg_dot_strided_coalesced(const T *x, const T *y, T *out, T *s_scratch) {",
-        "    ::glass::dot_strided_coalesced<T, N, SX, SY>(x, y, out, s_scratch);",
+        "    glass::dot_strided_coalesced<T, N, SX, SY>(x, y, out, s_scratch);",
         "    __syncthreads();",
         "}",
         ""
