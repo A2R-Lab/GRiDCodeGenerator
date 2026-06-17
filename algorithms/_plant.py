@@ -609,21 +609,34 @@ def gen_ee_pos_cost(self):
     # ---- value ----
     self.gen_add_func_doc(
         "ee_pos_cost: value = 1/2 * sum_r W[r] * (p_r(q) - p_des_r)^2 over the 3 position axes",
-        ["Calls grid::end_effector_pose_device for p(q) (auto-allocating; owns its scratch).",
+        ["Caller-scratch INNER: lays out the EE-pose scratch from s_scratch and calls "
+         "grid::end_effector_pose_inner directly (NOT the auto-allocating _device), so it is "
+         "callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
          "EE selects which end-effector (0.." + str(num_ees - 1) + ").",
-         "s_end_effector_pose must hold 6*NUM_EE; s_scratch unused here but kept for signature uniformity."],
+         "s_end_effector_pose must hold 6*NUM_EE; s_scratch must hold >= "
+         "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT elements of T."],
         ["s_out is the scalar cost output (s_out[0])",
          "s_q is the joint position vector (size NUM_POS)",
          "s_p_des is the desired EE position (3-vector)",
          "s_W is the per-axis position weight (3-vector)",
          "s_end_effector_pose is scratch for the 6*NUM_EE pose (the position is rows 0..2 of EE block)",
+         "s_scratch is caller shared scratch for the EE-pose helper (>= END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)",
          "d_robotModel is the GPU model helpers"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_end_effector_pose, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # EE pose via the caller-scratch inner path (NOT the auto-allocating _device, whose
+    # extern __shared__ would alias an outer kernel's arena). using namespace grid lets the
+    # shared XmatsHom/load/inner emit helpers resolve unqualified (same pattern as plant_step_gradient_kernel).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = self.gen_end_effector_pose_inner_temp_mem_size()
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_inner_function_call()
     self.gen_add_sync()
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")

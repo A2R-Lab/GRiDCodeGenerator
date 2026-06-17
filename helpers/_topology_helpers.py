@@ -1060,7 +1060,8 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                                  include_dxhom_shared = True,
                                                  include_d2xhom_shared = True,
                                                  include_linalg_scratch = False,
-                                                 linalg_scratch_bytes = "GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()"):
+                                                 linalg_scratch_bytes = "GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()",
+                                                 arena_base_expr = None):
     n = self.robot.get_num_pos()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
     if extra_t_buffers is None:
@@ -1076,7 +1077,8 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                   ximat_size = 0,
                                   temp_name = "s_temp",
                                   topology_name = "s_topology_helpers",
-                                  extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None)
+                                  extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
+                                  arena_base_expr = arena_base_expr)
 
 def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
