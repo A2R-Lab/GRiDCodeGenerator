@@ -649,20 +649,39 @@ def gen_ee_pos_cost(self):
     # ---- gradient wrt x = [q; qd] (qd block is zero) ----
     self.gen_add_func_doc(
         "ee_pos_cost_gradient: grad_x = [J_p^T W (p - p_des) ; 0], over x = [q; qd]",
-        ["Calls grid::end_effector_pose_device (for p) and grid::end_effector_pose_gradient_device (for J_p).",
+        ["Caller-scratch INNER: ONE XmatsHom load feeds BOTH end_effector_pose_inner (for p) and "
+         "end_effector_pose_gradient_inner (for J_p) -- s_Xhom is const in both inners, so the local "
+         "homogeneous transforms are loaded once and shared (vs the old double-load through two "
+         "auto-allocating _device calls). The geometric-Jacobian inner uses only s_Xhom (s_dXhom = "
+         "nullptr), so no per-joint d-transform load is needed. Callable from another kernel's block "
+         "without aliasing that kernel's dynamic-smem arena.",
          "J_p = rows 0..2 of s_end_effector_pose_gradient, layout s_end_effector_pose_gradient[6*NUM_VEL*ee + 6*vi + row].",
          "The qd-block of the gradient (entries NUM_VEL.." + str(nx - 1) + ") is set to exactly zero.",
          "ACCUMULATE=false overwrites s_grad; true adds (for fusing with a state-cost gradient)."],
         ["s_grad is the gradient over x (size NUM_POS + NUM_VEL = " + str(nx) + ")",
          "s_q / s_p_des / s_W / d_robotModel as above",
-         "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch",
+         "s_scratch is caller shared scratch for the EE-pose+gradient helper "
+         "(>= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_end_effector_pose, T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER path: lay out the (shared) XmatsHom + temp + linalg arena from s_scratch,
+    # load the local homogeneous transforms ONCE, then call end_effector_pose_inner (p) and
+    # end_effector_pose_gradient_inner (J_p) -- both read the same const s_Xhom. using namespace grid
+    # lets the unqualified XmatsHom/load/inner emit helpers resolve (same pattern as the value fn).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = max(self.gen_end_effector_pose_inner_temp_mem_size(),
+                      self.gen_end_effector_pose_gradient_inner_temp_mem_size())
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_inner_function_call()
+    self.gen_add_sync()
+    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     # grad_q[i] = sum_r J_p[r,i] * W[r] * (p_r - p_des_r)
     self.gen_add_parallel_loop("i", str(nv))
@@ -695,16 +714,29 @@ def gen_ee_pos_cost(self):
     self.gen_add_func_doc(
         "ee_pos_cost_hessian: Gauss-Newton hessian = J_p^T W J_p in the q-block of the x-hessian",
         ["RATIFIED GN choice: H = J_p^T diag(W) J_p (the W*r weighted EE-Hessian term is dropped).",
+         "Caller-scratch INNER (GN hessian needs only J_p): lays out the EE-pose-gradient arena from "
+         "s_scratch and calls end_effector_pose_gradient_inner directly (s_dXhom = nullptr), so it is "
+         "callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
          "Dense column-major NX x NX (NX = NUM_POS + NUM_VEL = " + str(nx) + "); only the top-left NUM_VEL x NUM_VEL q-block is non-zero.",
          "ACCUMULATE=false overwrites the whole NX x NX block; true adds the q-block into an existing hessian."],
         ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
-         "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch",
+         "s_scratch is caller shared scratch for the EE-pose-gradient helper "
+         "(>= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
-                           "T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
+                           "T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER path: lay out the EE-pose-gradient arena from s_scratch, load XmatsHom,
+    # then call the geometric-Jacobian inner directly (s_dXhom = nullptr; uses only local s_Xhom).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     # H[i,j] = sum_r J_p[r,i] * W[r] * J_p[r,j], column-major over the full NX x NX
     # block (zero outside the NUM_VEL x NUM_VEL q-block).
@@ -1653,9 +1685,13 @@ def gen_quadratic_cost_kernel(self, which):
 def gen_ee_pos_cost_kernel(self):
     """`ee_pos_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::ee_pos_cost[_gradient/_hessian], which call the
-    auto-allocating grid::end_effector_pose[_gradient]_device. Global in/out;
-    reuses grid::END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES for the launch smem.
+    Calls grid_plant::ee_pos_cost[_gradient/_hessian], which are caller-scratch
+    INNERS (they bottom out at grid::end_effector_pose_inner /
+    end_effector_pose_gradient_inner). The kernel grabs the dynamic
+    `extern __shared__` arena and threads it as s_scratch into all three (reused
+    serially with a __syncthreads between). Global in/out; the launch reserves
+    grid::END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES (the gradient arena
+    dominates the value arena).
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -1676,6 +1712,10 @@ def gen_ee_pos_cost_kernel(self):
     self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_p_des, const T *d_W, T *d_end_effector_pose, T *d_end_effector_pose_gradient, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena threaded as s_scratch into the caller-scratch cost inners (reused
+    # serially across the value/gradient/hessian calls; the launch reserves the
+    # gradient arena, which dominates). 16B aligned for the homogeneous-transform loads.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_ee_arena[];")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
     self.gen_add_code_line("T *s_end_effector_pose = &d_end_effector_pose[k*" + str(6*num_ees) + "]; T *s_end_effector_pose_gradient = &d_end_effector_pose_gradient[k*" + str(6*nv*num_ees) + "];")
@@ -1693,11 +1733,11 @@ def gen_ee_pos_cost_kernel(self):
     else:
         qname = "s_q"
         gh_tmpl = ", EE"
-    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], " + qname + ", s_p_des, s_W, s_end_effector_pose, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_end_effector_pose_gradient, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
