@@ -800,14 +800,16 @@ def gen_com_cost(self):
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    com_out = 3 + 3 * nv  # com (3) + Jcom (3 x nv) layout from grid::com_device
     # ---- value ----
     self.gen_add_func_doc(
         "com_cost: value = 1/2 sum_r W[r] (p_com_r(q) - p_des_r)^2 over the 3 CoM axes",
-        ["Calls grid::com_device for [p_com; J_com] (auto-allocating; owns its scratch).",
-         "s_com scratch must hold 3 + 3*NUM_VEL (the com device output)."],
+        ["Caller-scratch INNER: lays out the centroidal arena from s_scratch and runs centroidal_inner "
+         "(fills s_com = CoM pos, s_A = CMM, s_extra = mass), NOT the auto-allocating grid::com_device, "
+         "so it is callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
+         "s_scratch must hold >= COM_DYNAMIC_SHARED_MEM_COUNT elements of T (16B aligned)."],
         ["s_out scalar cost", "s_q joint positions", "s_p_des desired CoM (3)",
-         "s_W per-axis weight (3)", "s_com scratch (3 + 3*NUM_VEL)", "d_robotModel GPU model helpers"],
+         "s_W per-axis weight (3)", "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)",
+         "d_robotModel GPU model helpers"],
         None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
@@ -827,9 +829,10 @@ def gen_com_cost(self):
     # ---- gradient wrt x = [q; qd] (qd block zero) ----
     self.gen_add_func_doc(
         "com_cost_gradient: grad_x = [J_com^T W (p_com - p_des) ; 0]",
-        ["J_com = rows of s_com starting at offset 3, layout s_com[3 + 3*vi + r] (3 x NUM_VEL column-major)."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): J_com[r,vi] = s_A[r + 6*vi] / mass "
+         "(top-3 rows of the CMM s_A / mass)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_p_des / s_W / d_robotModel as above",
-         "s_com scratch (3 + 3*NUM_VEL)"], None)
+         "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
@@ -866,9 +869,10 @@ def gen_com_cost(self):
     # ---- GN hessian J_com^T W J_com over the q-block of x ----
     self.gen_add_func_doc(
         "com_cost_hessian: Gauss-Newton hessian = J_com^T diag(W) J_com in the q-block of the x-hessian",
-        ["Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch); J_com[r,vi] = s_A[r + 6*vi] / mass.",
+         "Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_W / d_robotModel as above",
-         "s_com scratch (3 + 3*NUM_VEL)"], None)
+         "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
@@ -910,10 +914,13 @@ def gen_momentum_cost(self):
     nx = nq + nv
     self.gen_add_func_doc(
         "momentum_cost: value = 1/2 sum_r W[r] (h_r(q,qd) - h_des_r)^2 over the 6 centroidal components",
-        ["Calls grid::ccrba_device for [A; h] (auto-allocating; owns its scratch).",
-         "s_ccrba scratch must hold 6*NUM_VEL + 6 (the ccrba device output)."],
+        ["Caller-scratch INNER: lays out the centroidal arena from s_scratch and runs centroidal_inner "
+         "(fills s_A = CMM 6 x NUM_VEL col-major), NOT the auto-allocating grid::ccrba_device. "
+         "The momentum h = A*qd is computed here from s_A (ccrba's separate h-output is not in the arena).",
+         "s_scratch must hold >= CCRBA_DYNAMIC_SHARED_MEM_COUNT elements of T (16B aligned)."],
         ["s_out scalar cost", "s_q / s_qd joint position/velocity", "s_h_des desired momentum (6)",
-         "s_W per-component weight (6)", "s_ccrba scratch (6*NUM_VEL + 6)", "d_robotModel GPU model helpers"],
+         "s_W per-component weight (6)", "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)",
+         "d_robotModel GPU model helpers"],
         None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
@@ -933,9 +940,10 @@ def gen_momentum_cost(self):
     # gradient wrt x = [q; qd]; the q-block is dropped (GN on A), qd-block = A^T W r
     self.gen_add_func_doc(
         "momentum_cost_gradient: grad_x = [0 ; A^T W (h - h_des)] (q-block dropped, GN on A)",
-        ["A = s_ccrba[r + 6*vi] (6 x NUM_VEL column-major); h = s_ccrba[6*NUM_VEL + r]."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): A = s_A[r + 6*vi] (6 x NUM_VEL "
+         "column-major, the CMM); h = A*qd; J_h = A (GN drops dA/dq)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_qd / s_h_des / s_W / d_robotModel as above",
-         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+         "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
@@ -966,9 +974,10 @@ def gen_momentum_cost(self):
     # GN hessian A^T W A in the qd-block of the NX x NX hessian
     self.gen_add_func_doc(
         "momentum_cost_hessian: Gauss-Newton hessian = A^T diag(W) A in the qd-block of the x-hessian",
-        ["Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): A = s_A[r + 6*vi] (the CMM).",
+         "Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_qd / s_W / d_robotModel as above",
-         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+         "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
@@ -1717,14 +1726,13 @@ def gen_plant_step_hessian_kernel(self):
 def gen_com_cost_kernel(self):
     """`com_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::com_cost[_gradient/_hessian], which call the
-    auto-allocating grid::com_device. Global in/out; reuses
-    grid::COM_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Mirrors
-    gen_ee_pos_cost_kernel (CoM position/Jacobian in place of EE)."""
+    Calls grid_plant::com_cost[_gradient/_hessian] (caller-scratch inners over
+    centroidal_inner). The kernel reserves grid::COM_DYNAMIC_SHARED_MEM_BYTES as a
+    dynamic-smem arena and passes it as the cost fns' s_scratch. Global in/out.
+    Mirrors gen_ee_pos_cost_kernel (CoM position/Jacobian in place of EE)."""
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    com_out = 3 + 3 * nv  # grid::com_device output: [p_com(3); J_com(3 x NV)]
     self.gen_add_func_doc("com_cost_kernel: value + grad_x + GN hess_x per timestep",
                           [], ["d_out scalar cost (1 per timestep)",
                                "d_grad grad over x (" + str(nx) + " per timestep)",
@@ -1772,14 +1780,13 @@ def gen_com_cost_kernel(self):
 def gen_momentum_cost_kernel(self):
     """`momentum_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::momentum_cost[_gradient/_hessian], which call the
-    auto-allocating grid::ccrba_device. Global in/out; reuses
-    grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Reads q + qd (the
-    momentum h = A qd depends on qd)."""
+    Calls grid_plant::momentum_cost[_gradient/_hessian] (caller-scratch inners over
+    centroidal_inner). The kernel reserves grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES as a
+    dynamic-smem arena and passes it as the cost fns' s_scratch. Global in/out.
+    Reads q + qd (the momentum h = A qd depends on qd)."""
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    ccrba_out = 6 * nv + 6  # grid::ccrba_device output: [A(6 x NV); h(6)]
     self.gen_add_func_doc("momentum_cost_kernel: value + grad_x + GN hess_x per timestep",
                           [], ["d_out scalar cost (1 per timestep)",
                                "d_grad grad over x (" + str(nx) + " per timestep)",
