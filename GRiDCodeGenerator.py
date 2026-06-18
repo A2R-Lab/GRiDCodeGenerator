@@ -2300,19 +2300,19 @@ class GRiDCodeGenerator:
             (f"integrator_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
-            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
         ]),
         ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_gradient_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
-            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
         ]),
         ("integrator_with_gradient", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_with_gradient_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
-            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
+            for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
         ]),
         # ee_pose_hessian is special: only emitted when its shared-mem fits the
         # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime

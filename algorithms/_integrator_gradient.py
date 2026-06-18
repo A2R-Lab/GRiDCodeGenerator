@@ -220,17 +220,70 @@ def gen_integrator_gradient_dAB_assembly(self, integrator_type="IT",
         self.gen_add_code_line("}")
     self.gen_add_code_line(s_dAB_name + "[ind] = val;")
     self.gen_add_end_control_flow()  # end if constexpr SI_EULER
-    # ----- TRAPEZOIDAL -----  (GATO integrator.cuh:143-184; fixed-base only)
+    # ----- TRAPEZOIDAL -----  (GATO integrator.cuh:143-184)
     # v_{k+1} = v + dt*qdd       -> bottom rows IDENTICAL to EULER (dt*dqdd, I+dt*dqdd, dt*Minv)
     # q_{k+1} = q + dt*v + 0.5*dt^2*qdd -> top rows = SI-Euler top with dt2 -> 0.5*dt^2 (dt2h):
+    # (fixed-base below; the floating-base arm with SE(3) dIntegrate wiring is above)
     #   d(q_kp1)/dq  = I  + dt2h*dqdd/dq
     #   d(q_kp1)/dqd = dt*I + dt2h*dqdd/dqd
     #   d(q_kp1)/du  = dt2h*Minv
     self.gen_add_code_line("else if constexpr (" + tok + " == IntegratorType::TRAPEZOIDAL) {", True)
     if fb:
-        # Floating-base TRAPEZOIDAL deferred: refuse rather than emit a wrong tensor.
-        self.gen_add_code_line("static_assert(" + tok + " != IntegratorType::TRAPEZOIDAL,")
-        self.gen_add_code_line("              \"floating-base TRAPEZOIDAL gradient is a follow-up; fixed-base only.\");")
+        # Floating-base TRAPEZOIDAL: v_new = qd + dt*qdd (bottom rows IDENTICAL to
+        # the Euler/SI velocity update); q_new = integrate(q, w), w = dt*qd + dt2h*qdd,
+        # dt2h = 0.5*dt^2. The position (top) rows have the SAME structure as the
+        # floating SI-Euler top rows — dInt_q + dInt_v @ dw/dX — but the inner tangent
+        # derivative is dw/dX (dt2h-scaled accel term) instead of dt*dv_new/dX, and
+        # dInt_q/dInt_v are precomputed at w (see gen_integrator_gradient_inner_python).
+        #   dw/dq = dt2h*J_qq,  dw/dqd = dt*I + dt2h*J_qv,  dw/du = dt2h*Minv
+        # dInt is block-diagonal (6x6 free-flyer block + identity joints), so the
+        # dInt_v @ dw/dX matmul only mixes rows < 6; joint position rows (6<=row<n)
+        # collapse to the fixed-base trapezoidal formula. Mirrors the Python reference
+        # RBDReference.integrator_gradient trapezoidal branch exactly.
+        self.gen_add_code_line("T val = static_cast<T>(0);")
+        self.gen_add_code_line("T dt2h = static_cast<T>(0.5) * dt * dt;")
+        self.gen_add_code_line("if (col < " + str(n) + ") {")
+        self.gen_add_code_line("    // d/dq column. dw/dq[k] = dt2h*J_qq[c*n+k].")
+        self.gen_add_code_line("    int c = col;")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T dInt_q_term = (row < 6 && c < 6) ? s_dInt_q_6x6[row * 6 + c]")
+        self.gen_add_code_line("                       : ((row >= 6 && c >= 6) ? ((row == c) ? static_cast<T>(1) : static_cast<T>(0)) : static_cast<T>(0));")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) mm += s_dInt_v_6x6[row * 6 + k] * (dt2h * " + s_df_du_name + "[c * " + str(n) + " + k]); }")
+        self.gen_add_code_line("        else { mm = dt2h * " + s_df_du_name + "[c * " + str(n) + " + row]; }")
+        self.gen_add_code_line("        val = dInt_q_term + mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        val = dt * " + s_df_du_name + "[c * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else if (col < " + str(2 * n) + ") {")
+        self.gen_add_code_line("    // d/dqd column. dw/dqd[k] = (k==c?dt:0) + dt2h*J_qv[k].")
+        self.gen_add_code_line("    int c = col - " + str(n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) { T dw_k = ((k == c) ? dt : static_cast<T>(0)) + dt2h * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + k]; mm += s_dInt_v_6x6[row * 6 + k] * dw_k; } }")
+        self.gen_add_code_line("        else { mm = ((row == c) ? dt : static_cast<T>(0)) + dt2h * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + row]; }")
+        self.gen_add_code_line("        val = mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        T diag = (i_local == c) ? static_cast<T>(1) : static_cast<T>(0);")
+        self.gen_add_code_line("        val = diag + dt * " + s_df_du_name + "[" + str(nn) + " + c * " + str(n) + " + i_local];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("} else {")
+        self.gen_add_code_line("    // d/du column. dw/du[k] = dt2h*Minv[k,c] (SYMMETRIC_UPPER).")
+        self.gen_add_code_line("    int c = col - " + str(2 * n) + ";")
+        self.gen_add_code_line("    if (row < " + str(n) + ") {")
+        self.gen_add_code_line("        T mm;")
+        self.gen_add_code_line("        if (row < 6) { mm = static_cast<T>(0); for (int k = 0; k < 6; ++k) { int midx = (k <= c) * (c * " + str(n) + " + k) + (k > c) * (k * " + str(n) + " + c); mm += s_dInt_v_6x6[row * 6 + k] * (dt2h * " + s_Minv_name + "[midx]); } }")
+        self.gen_add_code_line("        else { int midx = (row <= c) * (c * " + str(n) + " + row) + (row > c) * (row * " + str(n) + " + c); mm = dt2h * " + s_Minv_name + "[midx]; }")
+        self.gen_add_code_line("        val = mm;")
+        self.gen_add_code_line("    } else {")
+        self.gen_add_code_line("        int i_local = row - " + str(n) + ";")
+        self.gen_add_code_line("        int midx = (i_local <= c) * (c * " + str(n) + " + i_local) + (i_local > c) * (i_local * " + str(n) + " + c);")
+        self.gen_add_code_line("        val = dt * " + s_Minv_name + "[midx];")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("}")
+        self.gen_add_code_line(s_dAB_name + "[ind] = val;")
     else:
         self.gen_add_code_line("T val = static_cast<T>(0);")
         self.gen_add_code_line("T dt2h = static_cast<T>(0.5) * dt * dt;")
@@ -720,13 +773,18 @@ def gen_integrator_gradient_inner_python(self, compute_x_kp1=False,
     self.gen_add_sync()
     if fb:
         # Precompute the SE(3) dIntegrate blocks at the q-update increment v_dt.
-        # Euler:    q_new = integrate(q, dt*qd)            -> v_dt = dt*qd
-        # SI-Euler: q_new = integrate(q, dt*v_new), where  -> v_dt = dt*(qd + dt*qdd)
-        #           v_new = qd + dt*qdd  (s_qdd holds qdd after the FD gradient).
+        # Euler:       q_new = integrate(q, dt*qd)               -> v_dt = dt*qd
+        # SI-Euler:    q_new = integrate(q, dt*v_new), where     -> v_dt = dt*(qd + dt*qdd)
+        #              v_new = qd + dt*qdd  (s_qdd holds qdd after the FD gradient).
+        # TRAPEZOIDAL: q_new = integrate(q, dt*qd + 0.5*dt^2*qdd) -> v_dt = dt*qd + dt2h*qdd
+        #              (the combined position tangent w; dt2h = 0.5*dt*dt).
+        tok = _integrator_type_token(integrator_type)
         self.gen_add_serial_ops()
         self.gen_add_code_line(f"T v_dt_for_dInt[{n}];")
-        self.gen_add_code_line("if constexpr (" + _integrator_type_token(integrator_type) + " == IntegratorType::SEMI_IMPLICIT_EULER) {")
+        self.gen_add_code_line("if constexpr (" + tok + " == IntegratorType::SEMI_IMPLICIT_EULER) {")
         self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * (s_qd[i] + dt * s_qdd[i]);")
+        self.gen_add_code_line("} else if constexpr (" + tok + " == IntegratorType::TRAPEZOIDAL) {")
+        self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * s_qd[i] + static_cast<T>(0.5) * dt * dt * s_qdd[i];")
         self.gen_add_code_line("} else {")
         self.gen_add_code_line(f"    for (int i = 0; i < {n}; ++i) v_dt_for_dInt[i] = dt * s_qd[i];")
         self.gen_add_code_line("}")
