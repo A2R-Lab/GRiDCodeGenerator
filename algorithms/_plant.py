@@ -56,6 +56,24 @@ def _emit_centroidal_caller_scratch(self):
     self.gen_add_sync()
 
 
+def _emit_momentum_residual_precompute(self, nv):
+    """Compute the centroidal-momentum residual e[6] = A*qd - h_des ONCE into a
+    block-shared s_e[6] (parallel over the 6 components), so the value reduction and
+    the per-DOF gradient both READ it instead of each recomputing h = A*qd. The old
+    gradient recomputed the full h (6*NUM_VEL work) inside every per-DOF thread -> an
+    O(NUM_VEL^2) redundancy; this makes it O(NUM_VEL). Numerically identical (the h
+    sum runs over vi = 0..NUM_VEL in the same order). Requires s_A (the CMM) already
+    filled by centroidal_inner; ends with a sync so all threads see s_e."""
+    self.gen_add_code_line("__shared__ T s_e[6];")
+    self.gen_add_parallel_loop("r", "6")
+    self.gen_add_code_line("T h = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int vi = 0; vi < " + str(nv) + "; ++vi) h += s_A[r + 6*vi] * s_qd[vi];")
+    self.gen_add_code_line("s_e[r] = h - s_h_des[r];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+
 # ---------------------------------------------------------------------------
 # mjx (MuJoCo output-convention) helper for the tracking-cost epilogues.
 #
@@ -926,13 +944,15 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost(T *s_out, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
                            "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
-    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major). h = A*qd (computed here;
-    # ccrba_device's separate h-output is not in the centroidal arena).
+    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major). The residual
+    # e = A*qd - h_des is precomputed once into s_e[6] (ccrba_device's separate
+    # h-output is not in the centroidal arena), then reduced into the value.
     _emit_centroidal_caller_scratch(self)
+    _emit_momentum_residual_precompute(self, nv)
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T h = static_cast<T>(0); for (int vi = 0; vi < " + str(nv) + "; ++vi) h += s_A[r + 6*vi] * s_qd[vi]; T e = h - s_h_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T e = s_e[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -948,8 +968,11 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
                            "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
-    # Caller-scratch INNER: s_A = CMM. J_h = A (the qd-Jacobian of h = A*qd, GN drops dA/dq).
+    # Caller-scratch INNER: s_A = CMM. J_h = A (the qd-Jacobian of h = A*qd, GN drops
+    # dA/dq). The residual e = A*qd - h_des is precomputed once into s_e[6], so each
+    # per-DOF thread reads s_e[r] instead of recomputing the full h (O(NV) not O(NV^2)).
     _emit_centroidal_caller_scratch(self)
+    _emit_momentum_residual_precompute(self, nv)
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
     self.gen_add_parallel_loop("i", str(nq))
     self.gen_add_code_line("s_grad[i] = static_cast<T>(0);")
@@ -958,7 +981,7 @@ def gen_momentum_cost(self):
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T h = static_cast<T>(0); for (int vj = 0; vj < " + str(nv) + "; ++vj) h += s_A[r + 6*vj] * s_qd[vj]; T Ari = s_A[r + 6*i]; T e = h - s_h_des[r]; g += Ari * s_W[r] * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { g += s_A[r + 6*i] * s_W[r] * s_e[r]; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[" + str(nq) + " + i] += g; } else { s_grad[" + str(nq) + " + i] = g; }")
     self.gen_add_end_control_flow()
     if self.robot.floating_base:
@@ -1740,18 +1763,16 @@ def gen_com_cost_kernel(self):
                                "d_q joint positions (NUM_POS per timestep)",
                                "d_p_des desired CoM position (3 per timestep)",
                                "d_W per-axis weight (3 per timestep)",
-                               "d_com global scratch (3 + 3*NUM_VEL per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
-                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_com, "
+                           "const T *d_q, const T *d_p_des, const T *d_W, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
     # Dynamic arena for the caller-scratch centroidal cost inners (the launch reserves
-    # COM_DYNAMIC_SHARED_MEM_BYTES). d_com is kept for ABI compat but no longer used.
+    # COM_DYNAMIC_SHARED_MEM_BYTES); the cost fns lay their scratch out from it.
     self.gen_add_code_line("extern __shared__ __align__(16) T s_com_arena[];")
-    self.gen_add_code_line("(void)d_com;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
     if self.robot.floating_base:
@@ -1794,18 +1815,16 @@ def gen_momentum_cost_kernel(self):
                                "d_q / d_qd joint positions/velocities (NUM_POS / NUM_VEL per timestep)",
                                "d_h_des desired centroidal momentum (6 per timestep)",
                                "d_W per-component weight (6 per timestep)",
-                               "d_ccrba global scratch (6*NUM_VEL + 6 per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
-                           "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, T *d_ccrba, "
+                           "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
     # Dynamic arena for the caller-scratch centroidal cost inners (launch reserves
-    # CCRBA_DYNAMIC_SHARED_MEM_BYTES). d_ccrba kept for ABI compat but no longer used.
+    # CCRBA_DYNAMIC_SHARED_MEM_BYTES); the cost fns lay their scratch out from it.
     self.gen_add_code_line("extern __shared__ __align__(16) T s_ccrba_arena[];")
-    self.gen_add_code_line("(void)d_ccrba;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_qd = &d_qd[k*" + str(nv) + "];")
     self.gen_add_code_line("const T *s_h_des = &d_h_des[k*6]; const T *s_W = &d_W[k*6];")
