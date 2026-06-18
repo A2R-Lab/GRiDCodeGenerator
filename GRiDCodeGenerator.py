@@ -497,6 +497,17 @@ class GRiDCodeGenerator:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics"})
         if "integrator_gradient" in algorithms or "integrator_with_gradient" in algorithms:
             algorithms.update({"inverse_dynamics", "minv", "forward_dynamics", "inverse_dynamics_gradient", "forward_dynamics_gradient"})
+        # FLOATING forward_dynamics_gradient rebuilds the mass matrix M via crba_inner
+        # (the floating FD-gradient path composes M explicitly, unlike the fixed-base
+        # per-body ABA-recursion which never calls crba_inner). A NON-mimic/non-spherical
+        # floating robot is NOT caught by the mimic/spherical minv->crba guards above, so
+        # it would emit the crba_inner CALL (in the floating FD-gradient) without the
+        # DEFINITION -> nvlink: unresolved extern crba_inner (breaks every floating
+        # integrator gradient: euler/si/rk + trapezoidal). Declare the crba dependency
+        # whenever a floating robot emits forward_dynamics_gradient. Fixed-base FD-gradient
+        # does not call crba_inner, so this is gated on floating (cardinal byte-identical).
+        if "forward_dynamics_gradient" in algorithms and self.robot.floating_base:
+            algorithms.add("crba")
         # The minv->crba spherical/mimic expansion above runs BEFORE integrator
         # pulls in `minv` (line ordering), so a spherical robot requesting ONLY
         # `integrator` would add minv here WITHOUT crba_inner being emitted ->
@@ -2287,19 +2298,19 @@ class GRiDCodeGenerator:
         # (the only one historically registered) succeeds.
         ("integrator", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_gradient_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
         ("integrator_with_gradient", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             (f"integrator_with_gradient_kernel{suffix}<T, IntegratorType::{it}>",
-             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")
         ]),
@@ -2501,12 +2512,12 @@ class GRiDCodeGenerator:
                    "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
                 ("integrator(mjx)", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"integrator_kernel<T, IntegratorType::{it}, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
                   for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")]),
                 # integrator_gradient mjx is single-stage (EULER / SI-Euler) only.
                 ("integrator_gradient(mjx)", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"integrator_gradient_kernel<T, IntegratorType::{it}, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const T, const int)")
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
                   for it in ("EULER", "SEMI_IMPLICIT_EULER")]),
             ]
         for entry in self.KERNEL_ATTR_MANIFEST + mujoco_manifest:
