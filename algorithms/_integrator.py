@@ -413,7 +413,7 @@ def _spherical_retract_index_tables(self):
 
 
 def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_src_v",
-                   cardinal_line=None):
+                   cardinal_line=None, accel_name=None, accel_scale_expr=None):
     """Emit the q-side update q_new = q (+) scale*src_v for one stage, branching
     on base type:
       - fb            : SE(3) Lie retract (grid_integrate_floating_q), verbatim.
@@ -426,14 +426,28 @@ def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_s
     emit; supplied by callers that need to preserve the historical column
     alignment so cardinal-robot codegen stays byte-identical. Defaults to the
     canonical single-space form when not given.
+
+    `accel_name` / `accel_scale_expr` (optional, TRAPEZOIDAL): fold an extra
+    `accel_scale_expr * accel_name[v]` term into the retracted tangent at every
+    v-index, so the effective tangent is `scale*src_v + accel_scale*accel`. This
+    lets TRAPEZOIDAL retract `dt*qd + 0.5*dt^2*qdd` in ONE step — correct for
+    fixed-base (collapses to the in-place add), floating-base (single SE(3) Lie
+    retract of the combined tangent) AND spherical (the SO(3) half-angle uses the
+    combined angular velocity). When `accel_name is None` the emitted code is
+    byte-identical to the historical single-term form (EULER/SI/RK unaffected).
     """
     nv = self.robot.get_num_vel()
     nq = self.robot.get_num_pos()
     fb = self.robot.floating_base
+    # Per-v-index accel suffix folded into the tangent (empty when no accel term).
+    def _acc(vidx):
+        if accel_name is None:
+            return ""
+        return f" + {accel_scale_expr} * {accel_name}[{vidx}]"
     if fb:
         self.gen_add_serial_ops()
         self.gen_add_code_line(f"T v_scaled[{nv}];")
-        self.gen_add_code_line(f"for (int i = 0; i < {nv}; ++i) v_scaled[i] = {scale_expr} * {src_v_name}[i];")
+        self.gen_add_code_line(f"for (int i = 0; i < {nv}; ++i) v_scaled[i] = {scale_expr} * {src_v_name}[i]{_acc('i')};")
         self.gen_add_code_line(f"grid_integrate_floating_q<T, {nq}>({src_q_name}, v_scaled, {dst_name});")
         self.gen_add_end_control_flow()
     elif self.robot.robot_has_spherical():
@@ -452,7 +466,7 @@ def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_s
                 "const int add_v[" + str(n_add) + "] = {" + ", ".join(str(i) for i in add_v) + "};")
             self.gen_add_parallel_loop("ind", str(n_add))
             self.gen_add_code_line(
-                f"{dst_name}[add_q[ind]] = {src_q_name}[add_q[ind]] + {scale_expr} * {src_v_name}[add_v[ind]];")
+                f"{dst_name}[add_q[ind]] = {src_q_name}[add_q[ind]] + {scale_expr} * {src_v_name}[add_v[ind]]{_acc('add_v[ind]')};")
             self.gen_add_end_control_flow()
             self.gen_add_end_control_flow()
         # Spherical joints: serial SO(3) quaternion retract (one thread).
@@ -465,11 +479,16 @@ def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_s
             self.gen_add_code_line(f"T sph_qblk_{blk_i}[4] = {{"
                                    f"{src_q_name}[sph_q_{blk_i}[0]], {src_q_name}[sph_q_{blk_i}[1]], "
                                    f"{src_q_name}[sph_q_{blk_i}[2]], {src_q_name}[sph_q_{blk_i}[3]]}};")
-            # half = 0.5 * scale * omega
+            # half = 0.5 * (scale * omega [+ accel_scale * alpha])  (combined angular tangent)
+            def _sph_half(k):
+                if accel_name is None:
+                    return f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[{k}]]"
+                return (f"static_cast<T>(0.5)*({scale_expr}*{src_v_name}[sph_v_{blk_i}[{k}]]"
+                        f" + {accel_scale_expr}*{accel_name}[sph_v_{blk_i}[{k}]])")
             self.gen_add_code_line(f"T sph_half_{blk_i}[3] = {{"
-                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[0]], "
-                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[1]], "
-                                   f"static_cast<T>(0.5)*{scale_expr}*{src_v_name}[sph_v_{blk_i}[2]]}};")
+                                   f"{_sph_half(0)}, "
+                                   f"{_sph_half(1)}, "
+                                   f"{_sph_half(2)}}};")
             self.gen_add_code_line(f"T sph_qnew_{blk_i}[4];")
             self.gen_add_code_line(
                 f"grid_integrate_spherical_q<T>(sph_qblk_{blk_i}, sph_half_{blk_i}, sph_qnew_{blk_i});")
@@ -480,7 +499,7 @@ def _emit_q_update(self, scale_expr, dst_name, src_q_name="s_q", src_v_name="s_s
     else:
         self.gen_add_parallel_loop("ind", str(nq))
         if cardinal_line is None:
-            cardinal_line = f"{dst_name}[ind] = {src_q_name}[ind] + {scale_expr} * {src_v_name}[ind];"
+            cardinal_line = f"{dst_name}[ind] = {src_q_name}[ind] + {scale_expr} * {src_v_name}[ind]{_acc('ind')};"
         self.gen_add_code_line(cardinal_line)
         self.gen_add_end_control_flow()
 
@@ -541,24 +560,24 @@ def gen_integrator_finish(self):
     # ---- q_{k+1} part — Euler uses qd; SI Euler uses v_new ----
     # For SI-Euler, the v_new computed above is the integration source. Read
     # it back from s_x_kp1[nq:nq+nv] when IT == SEMI_IMPLICIT_EULER.
-    self.gen_add_code_line("// pick the source velocity for the q-update (SI reads v_new; EULER/TRAPEZOIDAL read old qd)")
+    # q-update by integrator type. EULER retracts dt*qd; SI-EULER retracts dt*v_new;
+    # TRAPEZOIDAL retracts the COMBINED tangent dt*qd + 0.5*dt^2*qdd in ONE step
+    # (GATO integrator.cuh:36 -> q_next = q + dt*qd + 0.5*dt^2*qdd, reading OLD qd).
+    # Folding the accel into the single retract (via _emit_q_update's accel term) is
+    # correct for fixed-base (collapses to the in-place add), floating-base (SE(3)
+    # Lie retract of the combined tangent) AND spherical (SO(3) half uses the
+    # combined angular velocity) — no in-place add onto manifold/quaternion slots.
+    # if constexpr discards the untaken branch, so EULER/SI/RK codegen is byte-identical.
+    self.gen_add_code_line("if constexpr (IT == IntegratorType::TRAPEZOIDAL) {", True)
+    self._emit_q_update("dt", "s_x_kp1", src_q_name="s_q", src_v_name="s_qd",
+                        accel_name="s_qdd", accel_scale_expr="static_cast<T>(0.5) * dt * dt")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("else {", True)
     self.gen_add_code_line(f"const T *s_src_v = (IT == IntegratorType::SEMI_IMPLICIT_EULER) ? &s_x_kp1[{nq}] : s_qd;")
     # q-update: fb -> SE(3) Lie retract; spherical -> SO(3) per-ball retract +
     # additive table for the rest; cardinal -> parallel Euler add. (size nq.)
     self._emit_q_update("dt", "s_x_kp1", src_q_name="s_q", src_v_name="s_src_v")
-    # TRAPEZOIDAL adds the +0.5*dt^2*qdd accel term onto q in place (GATO
-    # integrator.cuh:36 -> q_next = q + dt*qd + 0.5*dt^2*qdd; uses OLD qd). The
-    # if constexpr elides to nothing for EULER/SI/RK so their codegen stays
-    # byte-identical. Fixed-base, non-spherical only for the first delivery:
-    # floating would need a Lie retract with v_dt = dt*qd + 0.5*dt^2*qdd, and a
-    # spherical robot would (wrongly) add the accel term onto quaternion slots.
-    if not fb and not self.robot.robot_has_spherical():
-        self.gen_add_code_line("if constexpr (IT == IntegratorType::TRAPEZOIDAL) {", True)
-        self.gen_add_sync()
-        self.gen_add_parallel_loop("ind", str(nq))
-        self.gen_add_code_line("s_x_kp1[ind] += static_cast<T>(0.5) * dt * dt * s_qdd[ind];")
-        self.gen_add_end_control_flow()
-        self.gen_add_end_control_flow()
+    self.gen_add_end_control_flow()
 
     # ---- Multi-stage IT values are not supposed to hit this function ----
     # Compile-time sentinel: emit a static_assert that fires if someone tries
