@@ -120,7 +120,7 @@ class GRiDCodeGenerator:
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
                          gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
-                         gen_topology_S_sign_for_cpp, gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
+                         gen_topology_S_sign_for_cpp, gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_free_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
                          gen_grid_linalg_backend_helpers, gen_linalg_smem_setup, gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_mxS_general, gen_outer_product, custom_is_constant, \
                          gen_mjx_input_convert, gen_mjx_quat_reorder, gen_mjx_base_rotate, gen_mjx_base_rotate_rows, gen_mjx_symmetrize_full, gen_mjx_accel_out, gen_mjx_congruence, gen_mjx_column_reframe, gen_mjx_retract, \
                          robot_has_mimic_joints, _v_slot_cpp, _alpha_for_jid, _alpha_prefix_cpp, _id_S_desc
@@ -2574,7 +2574,7 @@ class GRiDCodeGenerator:
         self.gen_add_code_line("template <typename T, gridDataKind KIND = GRID_DATA_ALL>")
         self.gen_add_code_line("__host__")
         self.gen_add_code_line("void close_grid(cudaStream_t *streams, robotModel<T> *d_robotModel, gridData<T, KIND> *hd_data){", True)
-        self.gen_add_code_lines(["gpuErrchk(cudaFree(d_robotModel));", \
+        self.gen_add_code_lines(["free_robotModel(d_robotModel); // frees nested d_XImats/d_topology_helpers(+runtime tables)+struct (bare cudaFree would leak the nested arrays)", \
                                  "gpuErrchk(cudaFree(hd_data->d_q_qd_u)); gpuErrchk(cudaFree(hd_data->d_q_qd)); gpuErrchk(cudaFree(hd_data->d_q));", \
                                  "gpuErrchk(cudaFree(hd_data->d_f_ext)); free(hd_data->h_f_ext);", \
                                  "gpuErrchk(cudaFree(hd_data->d_c)); gpuErrchk(cudaFree(hd_data->d_Minv)); gpuErrchk(cudaFree(hd_data->d_qdd)); gpuErrchk(cudaFree(hd_data->d_M));", \
@@ -3135,6 +3135,7 @@ class GRiDCodeGenerator:
             self.gen_init_joint_dynamics_params()
             self.gen_set_joint_dynamics_params()
         self.gen_init_robotModel()
+        self.gen_free_robotModel()
         self.gen_init_gridData()
         self.gen_joint_limits_size()
         self.gen_init_joint_limits()

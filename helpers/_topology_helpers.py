@@ -1599,6 +1599,31 @@ def gen_init_robotModel(self):
     self.gen_add_code_line("return d_robotModel;")
     self.gen_add_end_function()
 
+def gen_free_robotModel(self):
+    self.gen_add_func_doc(
+        "Frees a robotModel allocated by init_robotModel: the NESTED device arrays "
+        "(d_XImats / d_topology_helpers [+ any flag-gated runtime parameter tables]) AND the "
+        "struct itself. A bare cudaFree(d_robotModel) frees ONLY the struct and leaks the nested "
+        "arrays; this recovers them by copying the struct back to host first.",
+        [], ["d_robotModel is a pointer returned by init_robotModel"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void free_robotModel(robotModel<T> *d_robotModel) {", True)
+    # Copy the struct back to host to recover the nested device pointers, then free each.
+    self.gen_add_code_line("robotModel<T> h_robotModel;")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(&h_robotModel, d_robotModel, sizeof(robotModel<T>), cudaMemcpyDeviceToHost));")
+    free_lines = ["gpuErrchk(cudaFree(h_robotModel.d_XImats));",
+                  "gpuErrchk(cudaFree(h_robotModel.d_topology_helpers));"]
+    if getattr(self, "runtime_inertia", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_inertia_params));")
+    if getattr(self, "runtime_transform", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_transform_params));")
+    if getattr(self, "runtime_joint_dynamics", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_joint_dynamics_params));")
+    self.gen_add_code_lines(free_lines)
+    self.gen_add_code_line("gpuErrchk(cudaFree(d_robotModel));")
+    self.gen_add_end_function()
+
 def gen_joint_limits_size(self):
     n = self.robot.get_num_pos()
     return 2 * n
