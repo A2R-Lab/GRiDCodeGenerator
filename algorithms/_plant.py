@@ -475,6 +475,7 @@ def _gen_quadratic_cost_family(self, which):
     self.gen_add_func_doc(
         base + ": value = 1/2 * sum_i " + w + "[i] * (" + var + "[i] - " + des + "[i])^2",
         ["Block-cooperative: each thread accumulates its strided terms into s_scratch, then a serial reduction writes s_out[0].",
+         "ACCUMULATE=false overwrites s_out[0]; ACCUMULATE=true ADDS into it (for summing cost terms into one scalar).",
          "s_scratch must hold at least " + N + " elements."],
         ["s_out is the scalar cost output (s_out[0])",
          var + " is the current value (size " + size_doc + ")",
@@ -482,7 +483,7 @@ def _gen_quadratic_cost_family(self, which):
          w + " is the diagonal weight vector (size " + size_doc + ")",
          "s_scratch is shared scratch of size >= " + N],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void " + base + "(T *s_out, const T *" + var + ", const T *" + des +
                            ", const T *" + w + ", T *s_scratch) {", True)
@@ -494,7 +495,7 @@ def _gen_quadratic_cost_family(self, which):
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("for (int i = 0; i < " + N + "; ++i) acc += s_scratch[i];")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -623,7 +624,7 @@ def gen_ee_pos_cost(self):
          "s_scratch is caller shared scratch for the EE-pose helper (>= END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)",
          "d_robotModel is the GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0>")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_end_effector_pose, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
@@ -642,7 +643,7 @@ def gen_ee_pos_cost(self):
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
     self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_end_effector_pose[6*EE + r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
