@@ -851,7 +851,8 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
                              ximat_name = "s_XImats", ximat_size = 0,
                              temp_name = "s_temp", topology_name = "s_topology_helpers",
                              extra_byte_regions = None,
-                             tier_workspace_expr = None):
+                             tier_workspace_expr = None,
+                             arena_base_expr = None):
     """Emit the shared-memory arena layout.
 
     When ``tier_workspace_expr`` is non-None, the ``s_temp`` slot becomes
@@ -864,6 +865,16 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
 
     The caller must declare ``RESOURCE_TIER`` as a template parameter and
     expose ``tier_workspace_expr`` as a function argument.
+
+    When ``arena_base_expr`` is non-None the arena is sourced from a CALLER
+    pointer (e.g. ``"s_scratch"``) instead of the kernel's ``extern __shared__``
+    dynamic-smem block. This lets an `_inner` lay out the same sub-buffers from
+    memory the caller already owns -- so it can be invoked from another kernel
+    (e.g. GATO's BSQP) without the ``extern __shared__`` aliasing the caller's
+    live arena. The base must be at least 16-byte aligned (it is reinterpreted
+    to ``unsigned char *`` and the per-slot grid_align_up handles the rest).
+    Default None preserves the ``extern __shared__`` declaration verbatim, so
+    every existing caller is byte-identical.
     """
     if extra_byte_regions is None:
         extra_byte_regions = []
@@ -904,7 +915,10 @@ def gen_declare_shared_arena(self, t_buffers, temp_mem_size, include_topology_he
         self.gen_add_code_line("//   int " + topology_name + "[" + str(topology_count) + "]")
     for name, count in extra_byte_regions:
         self.gen_add_code_line("//   bytes " + name + "[" + str(count) + "]")
-    self.gen_add_code_line("extern __shared__ __align__(16) unsigned char s_arena[];")
+    if arena_base_expr is None:
+        self.gen_add_code_line("extern __shared__ __align__(16) unsigned char s_arena[];")
+    else:
+        self.gen_add_code_line("unsigned char *s_arena = reinterpret_cast<unsigned char *>(" + arena_base_expr + ");")
     self.gen_add_code_line("size_t s_arena_offset = 0;")
     for name, count in t_buffers:
         self.gen_add_code_line("s_arena_offset = grid_align_up(s_arena_offset, alignof(T));")

@@ -35,6 +35,43 @@ unbounded joint contributes EXACTLY zero to value/gradient/hessian.
 """
 
 from GRiDCodeGenerator.helpers._code_generation_helpers import _gen_mjx_build_R_lines
+from GRiDCodeGenerator.algorithms._centroidal import (
+    _gen_centroidal_call, _centroidal_inner_temp_mem_size, _centroidal_device_extra,
+)
+
+
+def _emit_centroidal_caller_scratch(self):
+    """Lay out the centroidal arena from a caller-provided s_scratch + load XmatsHom +
+    run centroidal_inner -> fills s_A (CMM 6 x NUM_VEL, col-major), s_com (CoM pos 3),
+    s_extra (mass at [0]). Mirrors com_device/ccrba_device but caller-scratch (arena
+    sourced from s_scratch, NOT extern __shared__), so the cost fns are true inners
+    callable from another kernel's block without aliasing its dynamic-smem arena."""
+    self.gen_add_code_line("using namespace grid;")
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _centroidal_inner_temp_mem_size(self), extra_t_buffers=_centroidal_device_extra(self),
+        include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
+        arena_base_expr="s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    _gen_centroidal_call(self)
+    self.gen_add_sync()
+
+
+def _emit_momentum_residual_precompute(self, nv):
+    """Compute the centroidal-momentum residual e[6] = A*qd - h_des ONCE into a
+    block-shared s_e[6] (parallel over the 6 components), so the value reduction and
+    the per-DOF gradient both READ it instead of each recomputing h = A*qd. The old
+    gradient recomputed the full h (6*NUM_VEL work) inside every per-DOF thread -> an
+    O(NUM_VEL^2) redundancy; this makes it O(NUM_VEL). Numerically identical (the h
+    sum runs over vi = 0..NUM_VEL in the same order). Requires s_A (the CMM) already
+    filled by centroidal_inner; ends with a sync so all threads see s_e."""
+    self.gen_add_code_line("__shared__ T s_e[6];")
+    self.gen_add_parallel_loop("r", "6")
+    self.gen_add_code_line("T h = static_cast<T>(0);")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int vi = 0; vi < " + str(nv) + "; ++vi) h += s_A[r + 6*vi] * s_qd[vi];")
+    self.gen_add_code_line("s_e[r] = h - s_h_des[r];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +512,7 @@ def _gen_quadratic_cost_family(self, which):
     self.gen_add_func_doc(
         base + ": value = 1/2 * sum_i " + w + "[i] * (" + var + "[i] - " + des + "[i])^2",
         ["Block-cooperative: each thread accumulates its strided terms into s_scratch, then a serial reduction writes s_out[0].",
+         "ACCUMULATE=false overwrites s_out[0]; ACCUMULATE=true ADDS into it (for summing cost terms into one scalar).",
          "s_scratch must hold at least " + N + " elements."],
         ["s_out is the scalar cost output (s_out[0])",
          var + " is the current value (size " + size_doc + ")",
@@ -482,7 +520,7 @@ def _gen_quadratic_cost_family(self, which):
          w + " is the diagonal weight vector (size " + size_doc + ")",
          "s_scratch is shared scratch of size >= " + N],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void " + base + "(T *s_out, const T *" + var + ", const T *" + des +
                            ", const T *" + w + ", T *s_scratch) {", True)
@@ -494,7 +532,7 @@ def _gen_quadratic_cost_family(self, which):
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("for (int i = 0; i < " + N + "; ++i) acc += s_scratch[i];")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -609,47 +647,79 @@ def gen_ee_pos_cost(self):
     # ---- value ----
     self.gen_add_func_doc(
         "ee_pos_cost: value = 1/2 * sum_r W[r] * (p_r(q) - p_des_r)^2 over the 3 position axes",
-        ["Calls grid::end_effector_pose_device for p(q) (auto-allocating; owns its scratch).",
+        ["Caller-scratch INNER: lays out the EE-pose scratch from s_scratch and calls "
+         "grid::end_effector_pose_inner directly (NOT the auto-allocating _device), so it is "
+         "callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
          "EE selects which end-effector (0.." + str(num_ees - 1) + ").",
-         "s_end_effector_pose must hold 6*NUM_EE; s_scratch unused here but kept for signature uniformity."],
+         "s_end_effector_pose must hold 6*NUM_EE; s_scratch must hold >= "
+         "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT elements of T."],
         ["s_out is the scalar cost output (s_out[0])",
          "s_q is the joint position vector (size NUM_POS)",
          "s_p_des is the desired EE position (3-vector)",
          "s_W is the per-axis position weight (3-vector)",
          "s_end_effector_pose is scratch for the 6*NUM_EE pose (the position is rows 0..2 of EE block)",
+         "s_scratch is caller shared scratch for the EE-pose helper (>= END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)",
          "d_robotModel is the GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0>")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_end_effector_pose, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # EE pose via the caller-scratch inner path (NOT the auto-allocating _device, whose
+    # extern __shared__ would alias an outer kernel's arena). using namespace grid lets the
+    # shared XmatsHom/load/inner emit helpers resolve unqualified (same pattern as plant_step_gradient_kernel).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = self.gen_end_effector_pose_inner_temp_mem_size()
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_inner_function_call()
     self.gen_add_sync()
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
     self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_end_effector_pose[6*EE + r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # ---- gradient wrt x = [q; qd] (qd block is zero) ----
     self.gen_add_func_doc(
         "ee_pos_cost_gradient: grad_x = [J_p^T W (p - p_des) ; 0], over x = [q; qd]",
-        ["Calls grid::end_effector_pose_device (for p) and grid::end_effector_pose_gradient_device (for J_p).",
+        ["Caller-scratch INNER: ONE XmatsHom load feeds BOTH end_effector_pose_inner (for p) and "
+         "end_effector_pose_gradient_inner (for J_p) -- s_Xhom is const in both inners, so the local "
+         "homogeneous transforms are loaded once and shared (vs the old double-load through two "
+         "auto-allocating _device calls). The geometric-Jacobian inner uses only s_Xhom (s_dXhom = "
+         "nullptr), so no per-joint d-transform load is needed. Callable from another kernel's block "
+         "without aliasing that kernel's dynamic-smem arena.",
          "J_p = rows 0..2 of s_end_effector_pose_gradient, layout s_end_effector_pose_gradient[6*NUM_VEL*ee + 6*vi + row].",
          "The qd-block of the gradient (entries NUM_VEL.." + str(nx - 1) + ") is set to exactly zero.",
          "ACCUMULATE=false overwrites s_grad; true adds (for fusing with a state-cost gradient)."],
         ["s_grad is the gradient over x (size NUM_POS + NUM_VEL = " + str(nx) + ")",
          "s_q / s_p_des / s_W / d_robotModel as above",
-         "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch",
+         "s_scratch is caller shared scratch for the EE-pose+gradient helper "
+         "(>= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_end_effector_pose, T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_device<T>(s_end_effector_pose, s_q, d_robotModel);")
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
+                           "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER path: lay out the (shared) XmatsHom + temp + linalg arena from s_scratch,
+    # load the local homogeneous transforms ONCE, then call end_effector_pose_inner (p) and
+    # end_effector_pose_gradient_inner (J_p) -- both read the same const s_Xhom. using namespace grid
+    # lets the unqualified XmatsHom/load/inner emit helpers resolve (same pattern as the value fn).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = max(self.gen_end_effector_pose_inner_temp_mem_size(),
+                      self.gen_end_effector_pose_gradient_inner_temp_mem_size())
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_inner_function_call()
+    self.gen_add_sync()
+    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     # grad_q[i] = sum_r J_p[r,i] * W[r] * (p_r - p_des_r)
     self.gen_add_parallel_loop("i", str(nv))
@@ -685,16 +755,29 @@ def gen_ee_pos_cost(self):
     self.gen_add_func_doc(
         "ee_pos_cost_hessian: Gauss-Newton hessian = J_p^T W J_p in the q-block of the x-hessian",
         ["RATIFIED GN choice: H = J_p^T diag(W) J_p (the W*r weighted EE-Hessian term is dropped).",
+         "Caller-scratch INNER (GN hessian needs only J_p): lays out the EE-pose-gradient arena from "
+         "s_scratch and calls end_effector_pose_gradient_inner directly (s_dXhom = nullptr), so it is "
+         "callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
          "Dense column-major NX x NX (NX = NUM_POS + NUM_VEL = " + str(nx) + "); only the top-left NUM_VEL x NUM_VEL q-block is non-zero.",
          "ACCUMULATE=false overwrites the whole NX x NX block; true adds the q-block into an existing hessian."],
         ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
-         "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch"],
+         "s_q / s_W / d_robotModel as above; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE Jacobian scratch",
+         "s_scratch is caller shared scratch for the EE-pose-gradient helper "
+         "(>= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT, 16B aligned)"],
         None)
     self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
-                           "T *s_end_effector_pose_gradient, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::end_effector_pose_gradient_device<T>(s_end_effector_pose_gradient, s_q, d_robotModel);")
+                           "T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER path: lay out the EE-pose-gradient arena from s_scratch, load XmatsHom,
+    # then call the geometric-Jacobian inner directly (s_dXhom = nullptr; uses only local s_Xhom).
+    self.gen_add_code_line("using namespace grid;")
+    _ee_scratch = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                      linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      arena_base_expr = "s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     # H[i,j] = sum_r J_p[r,i] * W[r] * J_p[r,j], column-major over the full NX x NX
     # block (zero outside the NUM_VEL x NUM_VEL q-block).
@@ -738,45 +821,51 @@ def gen_com_cost(self):
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    com_out = 3 + 3 * nv  # com (3) + Jcom (3 x nv) layout from grid::com_device
     # ---- value ----
     self.gen_add_func_doc(
         "com_cost: value = 1/2 sum_r W[r] (p_com_r(q) - p_des_r)^2 over the 3 CoM axes",
-        ["Calls grid::com_device for [p_com; J_com] (auto-allocating; owns its scratch).",
-         "s_com scratch must hold 3 + 3*NUM_VEL (the com device output)."],
+        ["Caller-scratch INNER: lays out the centroidal arena from s_scratch and runs centroidal_inner "
+         "(fills s_com = CoM pos, s_A = CMM, s_extra = mass), NOT the auto-allocating grid::com_device, "
+         "so it is callable from another kernel's block without aliasing that kernel's dynamic-smem arena.",
+         "s_scratch must hold >= COM_DYNAMIC_SHARED_MEM_COUNT elements of T (16B aligned)."],
         ["s_out scalar cost", "s_q joint positions", "s_p_des desired CoM (3)",
-         "s_W per-axis weight (3)", "s_com scratch (3 + 3*NUM_VEL)", "d_robotModel GPU model helpers"],
+         "s_W per-axis weight (3)", "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)",
+         "d_robotModel GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: lay out the centroidal arena from s_scratch + run centroidal_inner
+    # (fills s_com = CoM pos, s_A = CMM, s_extra = mass) instead of the auto-allocating com_device.
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
     self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_com[r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # ---- gradient wrt x = [q; qd] (qd block zero) ----
     self.gen_add_func_doc(
         "com_cost_gradient: grad_x = [J_com^T W (p_com - p_des) ; 0]",
-        ["J_com = rows of s_com starting at offset 3, layout s_com[3 + 3*vi + r] (3 x NUM_VEL column-major)."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): J_com[r,vi] = s_A[r + 6*vi] / mass "
+         "(top-3 rows of the CMM s_A / mass)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_p_des / s_W / d_robotModel as above",
-         "s_com scratch (3 + 3*NUM_VEL)"], None)
+         "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major), s_com = CoM pos, s_extra[0] = mass.
+    # J_com[r, vi] = s_A[r + 6*vi] / mass (the CoM Jacobian = top-3 rows of the CMM / mass).
+    _emit_centroidal_caller_scratch(self)
+    self.gen_add_code_line("T inv_m = static_cast<T>(1) / s_extra[0];")
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*i + r]; T e = s_com[r] - s_p_des[r]; g += Jri * s_W[r] * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T Jri = s_A[r + 6*i] * inv_m; T e = s_com[r] - s_p_des[r]; g += Jri * s_W[r] * e; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
@@ -801,21 +890,23 @@ def gen_com_cost(self):
     # ---- GN hessian J_com^T W J_com over the q-block of x ----
     self.gen_add_func_doc(
         "com_cost_hessian: Gauss-Newton hessian = J_com^T diag(W) J_com in the q-block of the x-hessian",
-        ["Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch); J_com[r,vi] = s_A[r + 6*vi] / mass.",
+         "Dense column-major NX x NX; only the top-left NUM_VEL x NUM_VEL q-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_W / d_robotModel as above",
-         "s_com scratch (3 + 3*NUM_VEL)"], None)
+         "s_scratch caller centroidal-arena scratch (>= COM_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: J_com[r, vi] = s_A[r + 6*vi] / mass (top-3 CMM rows / mass).
+    _emit_centroidal_caller_scratch(self)
+    self.gen_add_code_line("T inv_m = static_cast<T>(1) / s_extra[0];")
     self.gen_add_parallel_loop("ind", str(nx * nx))
     self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
     self.gen_add_code_line("T h = static_cast<T>(0);")
     self.gen_add_code_line("if (row < " + str(nv) + " && col < " + str(nv) + ") {")
     self.gen_add_code_line("    #pragma unroll")
-    self.gen_add_code_line("    for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*row + r]; T Jrj = s_com[3 + 3*col + r]; h += Jri * s_W[r] * Jrj; }")
+    self.gen_add_code_line("    for (int r = 0; r < 3; ++r) { T Jri = s_A[r + 6*row] * inv_m; T Jrj = s_A[r + 6*col] * inv_m; h += Jri * s_W[r] * Jrj; }")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
@@ -844,37 +935,47 @@ def gen_momentum_cost(self):
     nx = nq + nv
     self.gen_add_func_doc(
         "momentum_cost: value = 1/2 sum_r W[r] (h_r(q,qd) - h_des_r)^2 over the 6 centroidal components",
-        ["Calls grid::ccrba_device for [A; h] (auto-allocating; owns its scratch).",
-         "s_ccrba scratch must hold 6*NUM_VEL + 6 (the ccrba device output)."],
+        ["Caller-scratch INNER: lays out the centroidal arena from s_scratch and runs centroidal_inner "
+         "(fills s_A = CMM 6 x NUM_VEL col-major), NOT the auto-allocating grid::ccrba_device. "
+         "The momentum h = A*qd is computed here from s_A (ccrba's separate h-output is not in the arena).",
+         "s_scratch must hold >= CCRBA_DYNAMIC_SHARED_MEM_COUNT elements of T (16B aligned)."],
         ["s_out scalar cost", "s_q / s_qd joint position/velocity", "s_h_des desired momentum (6)",
-         "s_W per-component weight (6)", "s_ccrba scratch (6*NUM_VEL + 6)", "d_robotModel GPU model helpers"],
+         "s_W per-component weight (6)", "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)",
+         "d_robotModel GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost(T *s_out, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major). The residual
+    # e = A*qd - h_des is precomputed once into s_e[6] (ccrba_device's separate
+    # h-output is not in the centroidal arena), then reduced into the value.
+    _emit_centroidal_caller_scratch(self)
+    _emit_momentum_residual_precompute(self, nv)
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T e = s_e[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
     # gradient wrt x = [q; qd]; the q-block is dropped (GN on A), qd-block = A^T W r
     self.gen_add_func_doc(
         "momentum_cost_gradient: grad_x = [0 ; A^T W (h - h_des)] (q-block dropped, GN on A)",
-        ["A = s_ccrba[r + 6*vi] (6 x NUM_VEL column-major); h = s_ccrba[6*NUM_VEL + r]."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): A = s_A[r + 6*vi] (6 x NUM_VEL "
+         "column-major, the CMM); h = A*qd; J_h = A (GN drops dA/dq)."],
         ["s_grad gradient over x (" + str(nx) + ")", "s_q / s_qd / s_h_des / s_W / d_robotModel as above",
-         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+         "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM. J_h = A (the qd-Jacobian of h = A*qd, GN drops
+    # dA/dq). The residual e = A*qd - h_des is precomputed once into s_e[6], so each
+    # per-DOF thread reads s_e[r] instead of recomputing the full h (O(NV) not O(NV^2)).
+    _emit_centroidal_caller_scratch(self)
+    _emit_momentum_residual_precompute(self, nv)
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
     self.gen_add_parallel_loop("i", str(nq))
     self.gen_add_code_line("s_grad[i] = static_cast<T>(0);")
@@ -883,7 +984,7 @@ def gen_momentum_cost(self):
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*i]; T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; g += Ari * s_W[r] * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { g += s_A[r + 6*i] * s_W[r] * s_e[r]; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[" + str(nq) + " + i] += g; } else { s_grad[" + str(nq) + " + i] = g; }")
     self.gen_add_end_control_flow()
     if self.robot.floating_base:
@@ -899,22 +1000,23 @@ def gen_momentum_cost(self):
     # GN hessian A^T W A in the qd-block of the NX x NX hessian
     self.gen_add_func_doc(
         "momentum_cost_hessian: Gauss-Newton hessian = A^T diag(W) A in the qd-block of the x-hessian",
-        ["Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
+        ["Caller-scratch INNER (centroidal_inner from s_scratch): A = s_A[r + 6*vi] (the CMM).",
+         "Dense column-major NX x NX; only the bottom-right NUM_VEL x NUM_VEL qd-block is non-zero."],
         ["s_hess dense x-hessian (" + str(nx*nx) + ")", "s_q / s_qd / s_W / d_robotModel as above",
-         "s_ccrba scratch (6*NUM_VEL + 6)"], None)
+         "s_scratch caller centroidal-arena scratch (>= CCRBA_DYNAMIC_SHARED_MEM_COUNT)"], None)
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: GN hessian A^T diag(W) A in the qd-block (A = s_A = CMM).
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_parallel_loop("ind", str(nx * nx))
     self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
     self.gen_add_code_line("T h = static_cast<T>(0);")
     self.gen_add_code_line("if (row >= " + str(nq) + " && col >= " + str(nq) + ") {")
     self.gen_add_code_line("    int vi = row - " + str(nq) + "; int vj = col - " + str(nq) + ";")
     self.gen_add_code_line("    #pragma unroll")
-    self.gen_add_code_line("    for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*vi]; T Arj = s_ccrba[r + 6*vj]; h += Ari * s_W[r] * Arj; }")
+    self.gen_add_code_line("    for (int r = 0; r < 6; ++r) { T Ari = s_A[r + 6*vi]; T Arj = s_A[r + 6*vj]; h += Ari * s_W[r] * Arj; }")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
@@ -927,6 +1029,172 @@ def gen_momentum_cost(self):
         self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
         _gen_cost_congruence_at_offset(self, "s_hess", nx, nq, q_name="s_q")
         self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+
+# ---------------------------------------------------------------------------
+# tracking_cost PRESET: one composition of the per-term cost inners above into
+# GATO's batched-SQP recipe (EE-pose tracking + qd quadratic + u quadratic +
+# joint-position/velocity/torque log-barriers), emitting the SEPARATE state /
+# input blocks BSQP wants (value scalar; gradient s_qk(NX)+s_rk(NU); hessian
+# s_Qk(NX*NX)+s_Rk(NU*NU)).
+#
+# This is SUGAR, not a ceiling: the per-term inners (ee_pos_cost,
+# quadratic_state/input_cost, joint_*_barrier) are the public API — a user
+# composes any mix (joint-space vs EE vs CoM tracking, +/- barriers, different
+# regularization) by calling them directly with the uniform ACCUMULATE contract.
+# The preset just wires up the common case. Running-vs-terminal is the caller's:
+# write terminal weights into the weight buffers at the terminal knot (contract,
+# NOT a baked KNOT_POINTS-1 branch). A zero weight / +/-inf bound disables a term
+# cleanly (barrier mu=0 => 0 value/grad/hess; EE/quadratic zero weight => 0), so
+# the single preset covers the whole family by weight selection.
+#
+# FIXED-BASE ONLY (NUM_POS == NUM_VEL): the mjx-output reframe must be applied
+# ONCE to the composed blocks (per-term reframing would double-rotate), so the
+# floating-base preset is a follow-up. gen_grid_plant gates the emit on the
+# fixed-base profile; the per-term inners still carry their own MUJOCO_OUTPUT
+# path for users who compose floating costs manually with a single final reframe.
+# ---------------------------------------------------------------------------
+
+def gen_tracking_cost_preset(self):
+    """Emit `tracking_cost` / `tracking_cost_gradient` / `tracking_cost_hessian`
+    (fixed-base): the GATO BSQP tracking recipe composed from the per-term cost
+    inners via the uniform ACCUMULATE contract. Caller-scratch throughout."""
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nu = nv
+    nx = nq + nv
+    NQ, NV, NU, NX = str(nq), str(nv), str(nu), str(nx)
+
+    # Shared param-doc fragments (the weight/bound/target buffers are the
+    # composition contract; the caller packs running OR terminal weights).
+    weight_doc = [
+        "s_x / s_u are the current state [q; qd] and control (sizes " + NX + " / " + NU + ")",
+        "s_x_des / s_u_des / s_ee_des are the targets (state " + NX + ", input " + NU + ", EE position 3)",
+        "s_Q / s_R are the quadratic state/input diagonal weights (sizes " + NX + " / " + NU + "); "
+        "s_W is the per-axis EE position weight (3). Zero a weight to disable that term.",
+        "s_q_lower/upper + mu_q, s_qd_lower/upper + mu_qd, s_u_lower/upper + mu_u are the "
+        "position / velocity / torque log-barrier bounds + weights (mu=0 or +/-inf bound disables).",
+        "EE selects the end-effector; running-vs-terminal weighting is caller-supplied (write terminal "
+        "weights at the terminal knot — contract, not a baked branch).",
+    ]
+
+    # ---- value: total scalar cost (EE + qd-quad + u-quad + 3 barriers) ----
+    self.gen_add_func_doc(
+        "tracking_cost: total scalar cost = ee_pos_cost + quadratic_state_cost + quadratic_input_cost "
+        "+ joint_{position,velocity,torque}_barrier (GATO BSQP recipe, composed from the per-term inners)",
+        ["PRESET (sugar): one composition of the public per-term cost inners; users compose other mixes directly.",
+         "ACCUMULATE=false overwrites s_out[0]; true adds (the first term carries ACCUMULATE, the rest add).",
+         "s_end_effector_pose holds 6*NUM_EE; s_scratch must hold >= END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT (and >= NX).",
+         "Fixed-base only (NUM_POS == NUM_VEL); floating-base composition is a follow-up."],
+        ["s_out is the scalar total-cost output (s_out[0])"] + weight_doc +
+        ["s_end_effector_pose / s_scratch are caller EE-pose scratch; d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost(T *s_out, const T *s_x, const T *s_u, "
+        "const T *s_x_des, const T *s_u_des, const T *s_ee_des, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Each term reuses s_scratch (EE arena, then tiny reduction buffers) and the
+    # s_out[0] accumulator, so sync between every term. The first (EE) carries the
+    # preset ACCUMULATE; the rest always add.
+    self.gen_add_code_line("ee_pos_cost<T, EE, ACCUMULATE>(s_out, s_x, s_ee_des, s_W, s_end_effector_pose, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost<T, true>(s_out, s_x, s_x_des, s_Q, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_input_cost<T, true>(s_out, s_u, s_u_des, s_R, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier<T>(s_out, s_x, s_q_lower, s_q_upper, mu_q, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier<T>(s_out, s_x, s_qd_lower, s_qd_upper, mu_qd, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier<T>(s_out, s_u, s_u_lower, s_u_upper, mu_u, s_scratch);")
+    self.gen_add_end_function()
+
+    # ---- gradient: s_qk (NX, state block) + s_rk (NU, input block) ----
+    self.gen_add_func_doc(
+        "tracking_cost_gradient: s_qk (state gradient, NX) + s_rk (input gradient, NU), composed from the per-term gradient inners",
+        ["State block s_qk = ee_pos_cost_gradient (J^T W r in q-block, 0 in qd) + quadratic_state_cost_gradient "
+         "+ joint_position_barrier_gradient (q-block) + joint_velocity_barrier_gradient (qd-block).",
+         "Input block s_rk = quadratic_input_cost_gradient + joint_torque_barrier_gradient.",
+         "ACCUMULATE=false overwrites the blocks; true adds into them (the EE / input-quadratic terms carry ACCUMULATE, the rest add).",
+         "Sync between every accumulating term (different inners own different threads per index).",
+         "s_scratch must hold >= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT. Fixed-base only."],
+        ["s_qk is the state-block gradient output (size NX = " + NX + ")",
+         "s_rk is the input-block gradient output (size NU = " + NU + ")"] + weight_doc +
+        ["s_end_effector_pose (6*NUM_EE) / s_end_effector_pose_gradient (6*NUM_VEL*NUM_EE) / s_scratch are caller EE scratch",
+         "d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost_gradient(T *s_qk, T *s_rk, const T *s_x, const T *s_u, "
+        "const T *s_x_des, const T *s_u_des, const T *s_ee_des, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_scratch, "
+        "const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("// ---- state-block gradient s_qk (NX) ----")
+    self.gen_add_code_line("ee_pos_cost_gradient<T, EE, ACCUMULATE>(s_qk, s_x, s_ee_des, s_W, "
+                           "s_end_effector_pose, s_end_effector_pose_gradient, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost_gradient<T, true>(s_qk, s_x, s_x_des, s_Q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier_gradient<T, 0, 0>(s_qk, s_x, s_q_lower, s_q_upper, mu_q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier_gradient<T, " + NQ + ", " + NQ + ">(s_qk, s_x, s_qd_lower, s_qd_upper, mu_qd);")
+    self.gen_add_sync()
+    self.gen_add_code_line("// ---- input-block gradient s_rk (NU) ----")
+    self.gen_add_code_line("quadratic_input_cost_gradient<T, ACCUMULATE>(s_rk, s_u, s_u_des, s_R);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier_gradient<T, 0, 0>(s_rk, s_u, s_u_lower, s_u_upper, mu_u);")
+    self.gen_add_end_function()
+
+    # ---- hessian: s_Qk (NX*NX, GN state block) + s_Rk (NU*NU, input block) ----
+    self.gen_add_func_doc(
+        "tracking_cost_hessian: s_Qk (state GN hessian, NX*NX col-major) + s_Rk (input hessian, NU*NU), composed from the per-term hessian inners",
+        ["State block s_Qk = ee_pos_cost_hessian (J^T W J in q-block) + quadratic_state_cost_hessian (diag) "
+         "+ joint_position_barrier_hessian (q diagonal) + joint_velocity_barrier_hessian (qd diagonal).",
+         "Input block s_Rk = quadratic_input_cost_hessian (diag) + joint_torque_barrier_hessian (diagonal).",
+         "Gauss-Newton: the EE value-curvature is dropped (matches the per-term GN choice).",
+         "ACCUMULATE=false overwrites; true adds (the EE / input-quadratic terms carry ACCUMULATE, the rest add).",
+         "s_scratch must hold >= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT. Fixed-base only."],
+        ["s_Qk is the state GN hessian output (size NX*NX = " + str(nx * nx) + ", column-major)",
+         "s_Rk is the input hessian output (size NU*NU = " + str(nu * nu) + ", column-major)",
+         "s_x / s_u are the current state and control",
+         "s_Q / s_R / s_W are the quadratic state/input + EE weights",
+         "s_q_lower/upper + mu_q, s_qd_lower/upper + mu_qd, s_u_lower/upper + mu_u are the barrier bounds + weights",
+         "s_end_effector_pose_gradient (6*NUM_VEL*NUM_EE) / s_scratch are caller EE scratch; d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost_hessian(T *s_Qk, T *s_Rk, const T *s_x, const T *s_u, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("// ---- state-block GN hessian s_Qk (NX*NX) ----")
+    self.gen_add_code_line("ee_pos_cost_hessian<T, EE, ACCUMULATE>(s_Qk, s_x, s_W, s_end_effector_pose_gradient, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost_hessian<T, true>(s_Qk, s_Q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier_hessian<T, " + NX + ", 0, 0>(s_Qk, s_x, s_q_lower, s_q_upper, mu_q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier_hessian<T, " + NX + ", " + NQ + ", " + NQ + ">(s_Qk, s_x, s_qd_lower, s_qd_upper, mu_qd);")
+    self.gen_add_sync()
+    self.gen_add_code_line("// ---- input-block hessian s_Rk (NU*NU) ----")
+    self.gen_add_code_line("quadratic_input_cost_hessian<T, ACCUMULATE>(s_Rk, s_R);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier_hessian<T, " + NU + ", 0, 0>(s_Rk, s_u, s_u_lower, s_u_upper, mu_u);")
     self.gen_add_end_function()
 
 
@@ -1484,14 +1752,13 @@ def gen_plant_step_hessian_kernel(self):
 def gen_com_cost_kernel(self):
     """`com_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::com_cost[_gradient/_hessian], which call the
-    auto-allocating grid::com_device. Global in/out; reuses
-    grid::COM_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Mirrors
-    gen_ee_pos_cost_kernel (CoM position/Jacobian in place of EE)."""
+    Calls grid_plant::com_cost[_gradient/_hessian] (caller-scratch inners over
+    centroidal_inner). The kernel reserves grid::COM_DYNAMIC_SHARED_MEM_BYTES as a
+    dynamic-smem arena and passes it as the cost fns' s_scratch. Global in/out.
+    Mirrors gen_ee_pos_cost_kernel (CoM position/Jacobian in place of EE)."""
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    com_out = 3 + 3 * nv  # grid::com_device output: [p_com(3); J_com(3 x NV)]
     self.gen_add_func_doc("com_cost_kernel: value + grad_x + GN hess_x per timestep",
                           [], ["d_out scalar cost (1 per timestep)",
                                "d_grad grad over x (" + str(nx) + " per timestep)",
@@ -1499,17 +1766,18 @@ def gen_com_cost_kernel(self):
                                "d_q joint positions (NUM_POS per timestep)",
                                "d_p_des desired CoM position (3 per timestep)",
                                "d_W per-axis weight (3 per timestep)",
-                               "d_com global scratch (3 + 3*NUM_VEL per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
-                           "const T *d_q, const T *d_p_des, const T *d_W, T *d_com, "
+                           "const T *d_q, const T *d_p_des, const T *d_W, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena for the caller-scratch centroidal cost inners (the launch reserves
+    # COM_DYNAMIC_SHARED_MEM_BYTES); the cost fns lay their scratch out from it.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_com_arena[];")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
-    self.gen_add_code_line("T *s_com = &d_com[k*" + str(com_out) + "];")
     if self.robot.floating_base:
         # mjx INPUT convert (q wxyz->xyzw) so the world-frame CoM/J_com are computed
         # from the correct PIN base orientation; grad/hess epilogues reframe the output.
@@ -1523,11 +1791,11 @@ def gen_com_cost_kernel(self):
     else:
         qname = "s_q"
         gh_tmpl = ""
-    self.gen_add_code_line("com_cost<T>(&d_out[k], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost<T>(&d_out[k], " + qname + ", s_p_des, s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1536,14 +1804,13 @@ def gen_com_cost_kernel(self):
 def gen_momentum_cost_kernel(self):
     """`momentum_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::momentum_cost[_gradient/_hessian], which call the
-    auto-allocating grid::ccrba_device. Global in/out; reuses
-    grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES for the launch smem. Reads q + qd (the
-    momentum h = A qd depends on qd)."""
+    Calls grid_plant::momentum_cost[_gradient/_hessian] (caller-scratch inners over
+    centroidal_inner). The kernel reserves grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES as a
+    dynamic-smem arena and passes it as the cost fns' s_scratch. Global in/out.
+    Reads q + qd (the momentum h = A qd depends on qd)."""
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     nx = nq + nv
-    ccrba_out = 6 * nv + 6  # grid::ccrba_device output: [A(6 x NV); h(6)]
     self.gen_add_func_doc("momentum_cost_kernel: value + grad_x + GN hess_x per timestep",
                           [], ["d_out scalar cost (1 per timestep)",
                                "d_grad grad over x (" + str(nx) + " per timestep)",
@@ -1551,18 +1818,19 @@ def gen_momentum_cost_kernel(self):
                                "d_q / d_qd joint positions/velocities (NUM_POS / NUM_VEL per timestep)",
                                "d_h_des desired centroidal momentum (6 per timestep)",
                                "d_W per-component weight (6 per timestep)",
-                               "d_ccrba global scratch (6*NUM_VEL + 6 per timestep)",
                                "NUM_TIMESTEPS is the batch size"], None)
     mjx_tmpl = ", bool MUJOCO_OUTPUT = false"
     self.gen_add_code_line("template <typename T" + mjx_tmpl + ">")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
-                           "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, T *d_ccrba, "
+                           "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena for the caller-scratch centroidal cost inners (launch reserves
+    # CCRBA_DYNAMIC_SHARED_MEM_BYTES); the cost fns lay their scratch out from it.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_ccrba_arena[];")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_qd = &d_qd[k*" + str(nv) + "];")
     self.gen_add_code_line("const T *s_h_des = &d_h_des[k*6]; const T *s_W = &d_W[k*6];")
-    self.gen_add_code_line("T *s_ccrba = &d_ccrba[k*" + str(ccrba_out) + "];")
     if self.robot.floating_base:
         # mjx INPUT convert: q wxyz->xyzw AND qd[0:3]=R^T qd[0:3] (mjx GLOBAL base
         # velocity -> pin LOCAL), so the centroidal momentum h = A qd is computed in
@@ -1578,11 +1846,11 @@ def gen_momentum_cost_kernel(self):
     else:
         qn, qdn = "s_q", "s_qd"
         gh_tmpl = ""
-    self.gen_add_code_line("momentum_cost<T>(&d_out[k], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost<T>(&d_out[k], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qn + ", " + qdn + ", s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qn + ", " + qdn + ", s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1643,9 +1911,13 @@ def gen_quadratic_cost_kernel(self, which):
 def gen_ee_pos_cost_kernel(self):
     """`ee_pos_cost_kernel` — one block/timestep value+grad_x+GN-hess_x.
 
-    Calls grid_plant::ee_pos_cost[_gradient/_hessian], which call the
-    auto-allocating grid::end_effector_pose[_gradient]_device. Global in/out;
-    reuses grid::END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES for the launch smem.
+    Calls grid_plant::ee_pos_cost[_gradient/_hessian], which are caller-scratch
+    INNERS (they bottom out at grid::end_effector_pose_inner /
+    end_effector_pose_gradient_inner). The kernel grabs the dynamic
+    `extern __shared__` arena and threads it as s_scratch into all three (reused
+    serially with a __syncthreads between). Global in/out; the launch reserves
+    grid::END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES (the gradient arena
+    dominates the value arena).
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -1666,6 +1938,10 @@ def gen_ee_pos_cost_kernel(self):
     self.gen_add_code_line("void ee_pos_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_p_des, const T *d_W, T *d_end_effector_pose, T *d_end_effector_pose_gradient, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena threaded as s_scratch into the caller-scratch cost inners (reused
+    # serially across the value/gradient/hessian calls; the launch reserves the
+    # gradient arena, which dominates). 16B aligned for the homogeneous-transform loads.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_ee_arena[];")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
     self.gen_add_code_line("T *s_end_effector_pose = &d_end_effector_pose[k*" + str(6*num_ees) + "]; T *s_end_effector_pose_gradient = &d_end_effector_pose_gradient[k*" + str(6*nv*num_ees) + "];")
@@ -1683,11 +1959,11 @@ def gen_ee_pos_cost_kernel(self):
     else:
         qname = "s_q"
         gh_tmpl = ", EE"
-    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], " + qname + ", s_p_des, s_W, s_end_effector_pose, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost<T, EE>(&d_out[k], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_end_effector_pose, s_end_effector_pose_gradient, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("ee_pos_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_end_effector_pose_gradient, d_robotModel);")
+    self.gen_add_code_line("ee_pos_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_end_effector_pose_gradient, s_ee_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1761,6 +2037,11 @@ def gen_plant_kernels(self, algorithms):
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         gen_ee_pos_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
+        # tracking_cost preset (fixed-base only) is emitted alongside the EE cost in
+        # gen_grid_plant; flag it so the smoke runner can guard its preset==composition
+        # check (the preset references grid_plant::tracking_cost, absent on floating).
+        if not self.robot.floating_base:
+            self.gen_add_code_line("#define GRID_PLANT_HAS_TRACKING_COST 1")
     # CoM / centroidal-momentum cost kernels emit whenever their device fns do
     # (gated identically to gen_com_cost/gen_momentum_cost in gen_grid_plant:
     # require grid::com_device + grid::ccrba_device). MIMIC-OK (de-gate #3): the
@@ -1819,10 +2100,22 @@ def gen_grid_plant(self, algorithms):
         self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device) — not generated.")
 
     # EE position cost needs both ee_pose and ee_pose_gradient.
-    if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
+    ee_cost_ok = ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms)
+    if ee_cost_ok:
         self.gen_ee_pos_cost()
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'end_effector_pose' and 'end_effector_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
+
+    # tracking_cost PRESET (GATO BSQP recipe): composes the EE-pose cost + the
+    # always-present quadratic state/input costs + the three barriers. Needs the EE
+    # cost (=> the ee_pose deps) and is FIXED-BASE only (the mjx single-reframe
+    # composition is a follow-up); floating profiles emit a skip note.
+    if ee_cost_ok and not self.robot.floating_base:
+        gen_tracking_cost_preset(self)
+    elif ee_cost_ok:
+        self.gen_add_code_line("// [grid_plant] tracking_cost preset skipped: fixed-base only (NUM_POS == NUM_VEL); floating-base composition is a follow-up.")
+    else:
+        self.gen_add_code_line("// [grid_plant] tracking_cost preset skipped: requires ee_pos_cost (both 'end_effector_pose' and 'end_effector_pose_gradient').")
 
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
     # kinematics-domain device fns (grid::com_device / grid::ccrba_device), which

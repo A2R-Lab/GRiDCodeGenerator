@@ -1060,7 +1060,8 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                                  include_dxhom_shared = True,
                                                  include_d2xhom_shared = True,
                                                  include_linalg_scratch = False,
-                                                 linalg_scratch_bytes = "GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()"):
+                                                 linalg_scratch_bytes = "GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()",
+                                                 arena_base_expr = None):
     n = self.robot.get_num_pos()
     Xhom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
     if extra_t_buffers is None:
@@ -1076,7 +1077,8 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                   ximat_size = 0,
                                   temp_name = "s_temp",
                                   topology_name = "s_topology_helpers",
-                                  extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None)
+                                  extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
+                                  arena_base_expr = arena_base_expr)
 
 def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
@@ -1595,6 +1597,31 @@ def gen_init_robotModel(self):
     self.gen_add_code_lines(["robotModel<T> *d_robotModel; gpuErrchk(cudaMalloc((void**)&d_robotModel,sizeof(robotModel<T>)));",
                              "gpuErrchk(cudaMemcpy(d_robotModel,&h_robotModel,sizeof(robotModel<T>),cudaMemcpyHostToDevice));"])
     self.gen_add_code_line("return d_robotModel;")
+    self.gen_add_end_function()
+
+def gen_free_robotModel(self):
+    self.gen_add_func_doc(
+        "Frees a robotModel allocated by init_robotModel: the NESTED device arrays "
+        "(d_XImats / d_topology_helpers [+ any flag-gated runtime parameter tables]) AND the "
+        "struct itself. A bare cudaFree(d_robotModel) frees ONLY the struct and leaks the nested "
+        "arrays; this recovers them by copying the struct back to host first.",
+        [], ["d_robotModel is a pointer returned by init_robotModel"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line("void free_robotModel(robotModel<T> *d_robotModel) {", True)
+    # Copy the struct back to host to recover the nested device pointers, then free each.
+    self.gen_add_code_line("robotModel<T> h_robotModel;")
+    self.gen_add_code_line("gpuErrchk(cudaMemcpy(&h_robotModel, d_robotModel, sizeof(robotModel<T>), cudaMemcpyDeviceToHost));")
+    free_lines = ["gpuErrchk(cudaFree(h_robotModel.d_XImats));",
+                  "gpuErrchk(cudaFree(h_robotModel.d_topology_helpers));"]
+    if getattr(self, "runtime_inertia", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_inertia_params));")
+    if getattr(self, "runtime_transform", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_transform_params));")
+    if getattr(self, "runtime_joint_dynamics", False):
+        free_lines.append("gpuErrchk(cudaFree(h_robotModel.d_joint_dynamics_params));")
+    self.gen_add_code_lines(free_lines)
+    self.gen_add_code_line("gpuErrchk(cudaFree(d_robotModel));")
     self.gen_add_end_function()
 
 def gen_joint_limits_size(self):
