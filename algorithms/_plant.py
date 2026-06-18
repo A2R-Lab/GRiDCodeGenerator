@@ -35,6 +35,25 @@ unbounded joint contributes EXACTLY zero to value/gradient/hessian.
 """
 
 from GRiDCodeGenerator.helpers._code_generation_helpers import _gen_mjx_build_R_lines
+from GRiDCodeGenerator.algorithms._centroidal import (
+    _gen_centroidal_call, _centroidal_inner_temp_mem_size, _centroidal_device_extra,
+)
+
+
+def _emit_centroidal_caller_scratch(self):
+    """Lay out the centroidal arena from a caller-provided s_scratch + load XmatsHom +
+    run centroidal_inner -> fills s_A (CMM 6 x NUM_VEL, col-major), s_com (CoM pos 3),
+    s_extra (mass at [0]). Mirrors com_device/ccrba_device but caller-scratch (arena
+    sourced from s_scratch, NOT extern __shared__), so the cost fns are true inners
+    callable from another kernel's block without aliasing its dynamic-smem arena."""
+    self.gen_add_code_line("using namespace grid;")
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _centroidal_inner_temp_mem_size(self), extra_t_buffers=_centroidal_device_extra(self),
+        include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
+        arena_base_expr="s_scratch")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    _gen_centroidal_call(self)
+    self.gen_add_sync()
 
 
 # ---------------------------------------------------------------------------
@@ -790,17 +809,18 @@ def gen_com_cost(self):
         ["s_out scalar cost", "s_q joint positions", "s_p_des desired CoM (3)",
          "s_W per-axis weight (3)", "s_com scratch (3 + 3*NUM_VEL)", "d_robotModel GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost(T *s_out, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: lay out the centroidal arena from s_scratch + run centroidal_inner
+    # (fills s_com = CoM pos, s_A = CMM, s_extra = mass) instead of the auto-allocating com_device.
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
     self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T e = s_com[r] - s_p_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -813,13 +833,15 @@ def gen_com_cost(self):
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_gradient(T *s_grad, const T *s_q, const T *s_p_des, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major), s_com = CoM pos, s_extra[0] = mass.
+    # J_com[r, vi] = s_A[r + 6*vi] / mass (the CoM Jacobian = top-3 rows of the CMM / mass).
+    _emit_centroidal_caller_scratch(self)
+    self.gen_add_code_line("T inv_m = static_cast<T>(1) / s_extra[0];")
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*i + r]; T e = s_com[r] - s_p_des[r]; g += Jri * s_W[r] * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 3; ++r) { T Jri = s_A[r + 6*i] * inv_m; T e = s_com[r] - s_p_des[r]; g += Jri * s_W[r] * e; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
@@ -850,15 +872,16 @@ def gen_com_cost(self):
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void com_cost_hessian(T *s_hess, const T *s_q, const T *s_W, "
-                           "T *s_com, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::com_device<T>(s_com, s_q, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: J_com[r, vi] = s_A[r + 6*vi] / mass (top-3 CMM rows / mass).
+    _emit_centroidal_caller_scratch(self)
+    self.gen_add_code_line("T inv_m = static_cast<T>(1) / s_extra[0];")
     self.gen_add_parallel_loop("ind", str(nx * nx))
     self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
     self.gen_add_code_line("T h = static_cast<T>(0);")
     self.gen_add_code_line("if (row < " + str(nv) + " && col < " + str(nv) + ") {")
     self.gen_add_code_line("    #pragma unroll")
-    self.gen_add_code_line("    for (int r = 0; r < 3; ++r) { T Jri = s_com[3 + 3*row + r]; T Jrj = s_com[3 + 3*col + r]; h += Jri * s_W[r] * Jrj; }")
+    self.gen_add_code_line("    for (int r = 0; r < 3; ++r) { T Jri = s_A[r + 6*row] * inv_m; T Jrj = s_A[r + 6*col] * inv_m; h += Jri * s_W[r] * Jrj; }")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
@@ -892,17 +915,18 @@ def gen_momentum_cost(self):
         ["s_out scalar cost", "s_q / s_qd joint position/velocity", "s_h_des desired momentum (6)",
          "s_W per-component weight (6)", "s_ccrba scratch (6*NUM_VEL + 6)", "d_robotModel GPU model helpers"],
         None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool ACCUMULATE = false>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost(T *s_out, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM (6 x NUM_VEL col-major). h = A*qd (computed here;
+    # ccrba_device's separate h-output is not in the centroidal arena).
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
-    self.gen_add_code_line("s_out[0] = acc;")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T h = static_cast<T>(0); for (int vi = 0; vi < " + str(nv) + "; ++vi) h += s_A[r + 6*vi] * s_qd[vi]; T e = h - s_h_des[r]; acc += static_cast<T>(0.5) * s_W[r] * e * e; }")
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
@@ -915,9 +939,9 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_gradient(T *s_grad, const T *s_q, const T *s_qd, const T *s_h_des, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: s_A = CMM. J_h = A (the qd-Jacobian of h = A*qd, GN drops dA/dq).
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
     self.gen_add_parallel_loop("i", str(nq))
     self.gen_add_code_line("s_grad[i] = static_cast<T>(0);")
@@ -926,7 +950,7 @@ def gen_momentum_cost(self):
     self.gen_add_parallel_loop("i", str(nv))
     self.gen_add_code_line("T g = static_cast<T>(0);")
     self.gen_add_code_line("#pragma unroll")
-    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*i]; T e = s_ccrba[" + str(6*nv) + " + r] - s_h_des[r]; g += Ari * s_W[r] * e; }")
+    self.gen_add_code_line("for (int r = 0; r < 6; ++r) { T h = static_cast<T>(0); for (int vj = 0; vj < " + str(nv) + "; ++vj) h += s_A[r + 6*vj] * s_qd[vj]; T Ari = s_A[r + 6*i]; T e = h - s_h_des[r]; g += Ari * s_W[r] * e; }")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[" + str(nq) + " + i] += g; } else { s_grad[" + str(nq) + " + i] = g; }")
     self.gen_add_end_control_flow()
     if self.robot.floating_base:
@@ -948,16 +972,16 @@ def gen_momentum_cost(self):
     self.gen_add_code_line("template <typename T, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void momentum_cost_hessian(T *s_hess, const T *s_q, const T *s_qd, const T *s_W, "
-                           "T *s_ccrba, const grid::robotModel<T> *d_robotModel) {", True)
-    self.gen_add_code_line("grid::ccrba_device<T>(s_ccrba, s_q, s_qd, d_robotModel);")
-    self.gen_add_sync()
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Caller-scratch INNER: GN hessian A^T diag(W) A in the qd-block (A = s_A = CMM).
+    _emit_centroidal_caller_scratch(self)
     self.gen_add_parallel_loop("ind", str(nx * nx))
     self.gen_add_code_line("int row = ind % " + str(nx) + "; int col = ind / " + str(nx) + ";")
     self.gen_add_code_line("T h = static_cast<T>(0);")
     self.gen_add_code_line("if (row >= " + str(nq) + " && col >= " + str(nq) + ") {")
     self.gen_add_code_line("    int vi = row - " + str(nq) + "; int vj = col - " + str(nq) + ";")
     self.gen_add_code_line("    #pragma unroll")
-    self.gen_add_code_line("    for (int r = 0; r < 6; ++r) { T Ari = s_ccrba[r + 6*vi]; T Arj = s_ccrba[r + 6*vj]; h += Ari * s_W[r] * Arj; }")
+    self.gen_add_code_line("    for (int r = 0; r < 6; ++r) { T Ari = s_A[r + 6*vi]; T Arj = s_A[r + 6*vj]; h += Ari * s_W[r] * Arj; }")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
     self.gen_add_end_control_flow()
@@ -1550,9 +1574,12 @@ def gen_com_cost_kernel(self):
     self.gen_add_code_line("void com_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_p_des, const T *d_W, T *d_com, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena for the caller-scratch centroidal cost inners (the launch reserves
+    # COM_DYNAMIC_SHARED_MEM_BYTES). d_com is kept for ABI compat but no longer used.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_com_arena[];")
+    self.gen_add_code_line("(void)d_com;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_p_des = &d_p_des[k*3]; const T *s_W = &d_W[k*3];")
-    self.gen_add_code_line("T *s_com = &d_com[k*" + str(com_out) + "];")
     if self.robot.floating_base:
         # mjx INPUT convert (q wxyz->xyzw) so the world-frame CoM/J_com are computed
         # from the correct PIN base orientation; grad/hess epilogues reframe the output.
@@ -1566,11 +1593,11 @@ def gen_com_cost_kernel(self):
     else:
         qname = "s_q"
         gh_tmpl = ""
-    self.gen_add_code_line("com_cost<T>(&d_out[k], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost<T>(&d_out[k], " + qname + ", s_p_des, s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qname + ", s_p_des, s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("com_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_com, d_robotModel);")
+    self.gen_add_code_line("com_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qname + ", s_W, s_com_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
@@ -1602,10 +1629,13 @@ def gen_momentum_cost_kernel(self):
     self.gen_add_code_line("void momentum_cost_kernel(T *d_out, T *d_grad, T *d_hess, "
                            "const T *d_q, const T *d_qd, const T *d_h_des, const T *d_W, T *d_ccrba, "
                            "const grid::robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {", True)
+    # Dynamic arena for the caller-scratch centroidal cost inners (launch reserves
+    # CCRBA_DYNAMIC_SHARED_MEM_BYTES). d_ccrba kept for ABI compat but no longer used.
+    self.gen_add_code_line("extern __shared__ __align__(16) T s_ccrba_arena[];")
+    self.gen_add_code_line("(void)d_ccrba;")
     self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
     self.gen_add_code_line("const T *s_q = &d_q[k*" + str(nq) + "]; const T *s_qd = &d_qd[k*" + str(nv) + "];")
     self.gen_add_code_line("const T *s_h_des = &d_h_des[k*6]; const T *s_W = &d_W[k*6];")
-    self.gen_add_code_line("T *s_ccrba = &d_ccrba[k*" + str(ccrba_out) + "];")
     if self.robot.floating_base:
         # mjx INPUT convert: q wxyz->xyzw AND qd[0:3]=R^T qd[0:3] (mjx GLOBAL base
         # velocity -> pin LOCAL), so the centroidal momentum h = A qd is computed in
@@ -1621,11 +1651,11 @@ def gen_momentum_cost_kernel(self):
     else:
         qn, qdn = "s_q", "s_qd"
         gh_tmpl = ""
-    self.gen_add_code_line("momentum_cost<T>(&d_out[k], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost<T>(&d_out[k], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_gradient<T" + gh_tmpl + ">(&d_grad[k*" + str(nx) + "], " + qn + ", " + qdn + ", s_h_des, s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
-    self.gen_add_code_line("momentum_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qn + ", " + qdn + ", s_W, s_ccrba, d_robotModel);")
+    self.gen_add_code_line("momentum_cost_hessian<T" + gh_tmpl + ">(&d_hess[k*" + str(nx*nx) + "], " + qn + ", " + qdn + ", s_W, s_ccrba_arena, d_robotModel);")
     self.gen_add_sync()
     self.gen_add_end_control_flow()
     self.gen_add_end_function()
