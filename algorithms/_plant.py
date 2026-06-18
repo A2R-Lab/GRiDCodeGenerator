@@ -998,6 +998,172 @@ def gen_momentum_cost(self):
 
 
 # ---------------------------------------------------------------------------
+# tracking_cost PRESET: one composition of the per-term cost inners above into
+# GATO's batched-SQP recipe (EE-pose tracking + qd quadratic + u quadratic +
+# joint-position/velocity/torque log-barriers), emitting the SEPARATE state /
+# input blocks BSQP wants (value scalar; gradient s_qk(NX)+s_rk(NU); hessian
+# s_Qk(NX*NX)+s_Rk(NU*NU)).
+#
+# This is SUGAR, not a ceiling: the per-term inners (ee_pos_cost,
+# quadratic_state/input_cost, joint_*_barrier) are the public API — a user
+# composes any mix (joint-space vs EE vs CoM tracking, +/- barriers, different
+# regularization) by calling them directly with the uniform ACCUMULATE contract.
+# The preset just wires up the common case. Running-vs-terminal is the caller's:
+# write terminal weights into the weight buffers at the terminal knot (contract,
+# NOT a baked KNOT_POINTS-1 branch). A zero weight / +/-inf bound disables a term
+# cleanly (barrier mu=0 => 0 value/grad/hess; EE/quadratic zero weight => 0), so
+# the single preset covers the whole family by weight selection.
+#
+# FIXED-BASE ONLY (NUM_POS == NUM_VEL): the mjx-output reframe must be applied
+# ONCE to the composed blocks (per-term reframing would double-rotate), so the
+# floating-base preset is a follow-up. gen_grid_plant gates the emit on the
+# fixed-base profile; the per-term inners still carry their own MUJOCO_OUTPUT
+# path for users who compose floating costs manually with a single final reframe.
+# ---------------------------------------------------------------------------
+
+def gen_tracking_cost_preset(self):
+    """Emit `tracking_cost` / `tracking_cost_gradient` / `tracking_cost_hessian`
+    (fixed-base): the GATO BSQP tracking recipe composed from the per-term cost
+    inners via the uniform ACCUMULATE contract. Caller-scratch throughout."""
+    nq = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    nu = nv
+    nx = nq + nv
+    NQ, NV, NU, NX = str(nq), str(nv), str(nu), str(nx)
+
+    # Shared param-doc fragments (the weight/bound/target buffers are the
+    # composition contract; the caller packs running OR terminal weights).
+    weight_doc = [
+        "s_x / s_u are the current state [q; qd] and control (sizes " + NX + " / " + NU + ")",
+        "s_x_des / s_u_des / s_ee_des are the targets (state " + NX + ", input " + NU + ", EE position 3)",
+        "s_Q / s_R are the quadratic state/input diagonal weights (sizes " + NX + " / " + NU + "); "
+        "s_W is the per-axis EE position weight (3). Zero a weight to disable that term.",
+        "s_q_lower/upper + mu_q, s_qd_lower/upper + mu_qd, s_u_lower/upper + mu_u are the "
+        "position / velocity / torque log-barrier bounds + weights (mu=0 or +/-inf bound disables).",
+        "EE selects the end-effector; running-vs-terminal weighting is caller-supplied (write terminal "
+        "weights at the terminal knot — contract, not a baked branch).",
+    ]
+
+    # ---- value: total scalar cost (EE + qd-quad + u-quad + 3 barriers) ----
+    self.gen_add_func_doc(
+        "tracking_cost: total scalar cost = ee_pos_cost + quadratic_state_cost + quadratic_input_cost "
+        "+ joint_{position,velocity,torque}_barrier (GATO BSQP recipe, composed from the per-term inners)",
+        ["PRESET (sugar): one composition of the public per-term cost inners; users compose other mixes directly.",
+         "ACCUMULATE=false overwrites s_out[0]; true adds (the first term carries ACCUMULATE, the rest add).",
+         "s_end_effector_pose holds 6*NUM_EE; s_scratch must hold >= END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_COUNT (and >= NX).",
+         "Fixed-base only (NUM_POS == NUM_VEL); floating-base composition is a follow-up."],
+        ["s_out is the scalar total-cost output (s_out[0])"] + weight_doc +
+        ["s_end_effector_pose / s_scratch are caller EE-pose scratch; d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost(T *s_out, const T *s_x, const T *s_u, "
+        "const T *s_x_des, const T *s_u_des, const T *s_ee_des, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    # Each term reuses s_scratch (EE arena, then tiny reduction buffers) and the
+    # s_out[0] accumulator, so sync between every term. The first (EE) carries the
+    # preset ACCUMULATE; the rest always add.
+    self.gen_add_code_line("ee_pos_cost<T, EE, ACCUMULATE>(s_out, s_x, s_ee_des, s_W, s_end_effector_pose, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost<T, true>(s_out, s_x, s_x_des, s_Q, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_input_cost<T, true>(s_out, s_u, s_u_des, s_R, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier<T>(s_out, s_x, s_q_lower, s_q_upper, mu_q, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier<T>(s_out, s_x, s_qd_lower, s_qd_upper, mu_qd, s_scratch);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier<T>(s_out, s_u, s_u_lower, s_u_upper, mu_u, s_scratch);")
+    self.gen_add_end_function()
+
+    # ---- gradient: s_qk (NX, state block) + s_rk (NU, input block) ----
+    self.gen_add_func_doc(
+        "tracking_cost_gradient: s_qk (state gradient, NX) + s_rk (input gradient, NU), composed from the per-term gradient inners",
+        ["State block s_qk = ee_pos_cost_gradient (J^T W r in q-block, 0 in qd) + quadratic_state_cost_gradient "
+         "+ joint_position_barrier_gradient (q-block) + joint_velocity_barrier_gradient (qd-block).",
+         "Input block s_rk = quadratic_input_cost_gradient + joint_torque_barrier_gradient.",
+         "ACCUMULATE=false overwrites the blocks; true adds into them (the EE / input-quadratic terms carry ACCUMULATE, the rest add).",
+         "Sync between every accumulating term (different inners own different threads per index).",
+         "s_scratch must hold >= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT. Fixed-base only."],
+        ["s_qk is the state-block gradient output (size NX = " + NX + ")",
+         "s_rk is the input-block gradient output (size NU = " + NU + ")"] + weight_doc +
+        ["s_end_effector_pose (6*NUM_EE) / s_end_effector_pose_gradient (6*NUM_VEL*NUM_EE) / s_scratch are caller EE scratch",
+         "d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost_gradient(T *s_qk, T *s_rk, const T *s_x, const T *s_u, "
+        "const T *s_x_des, const T *s_u_des, const T *s_ee_des, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_scratch, "
+        "const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("// ---- state-block gradient s_qk (NX) ----")
+    self.gen_add_code_line("ee_pos_cost_gradient<T, EE, ACCUMULATE>(s_qk, s_x, s_ee_des, s_W, "
+                           "s_end_effector_pose, s_end_effector_pose_gradient, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost_gradient<T, true>(s_qk, s_x, s_x_des, s_Q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier_gradient<T, 0, 0>(s_qk, s_x, s_q_lower, s_q_upper, mu_q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier_gradient<T, " + NQ + ", " + NQ + ">(s_qk, s_x, s_qd_lower, s_qd_upper, mu_qd);")
+    self.gen_add_sync()
+    self.gen_add_code_line("// ---- input-block gradient s_rk (NU) ----")
+    self.gen_add_code_line("quadratic_input_cost_gradient<T, ACCUMULATE>(s_rk, s_u, s_u_des, s_R);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier_gradient<T, 0, 0>(s_rk, s_u, s_u_lower, s_u_upper, mu_u);")
+    self.gen_add_end_function()
+
+    # ---- hessian: s_Qk (NX*NX, GN state block) + s_Rk (NU*NU, input block) ----
+    self.gen_add_func_doc(
+        "tracking_cost_hessian: s_Qk (state GN hessian, NX*NX col-major) + s_Rk (input hessian, NU*NU), composed from the per-term hessian inners",
+        ["State block s_Qk = ee_pos_cost_hessian (J^T W J in q-block) + quadratic_state_cost_hessian (diag) "
+         "+ joint_position_barrier_hessian (q diagonal) + joint_velocity_barrier_hessian (qd diagonal).",
+         "Input block s_Rk = quadratic_input_cost_hessian (diag) + joint_torque_barrier_hessian (diagonal).",
+         "Gauss-Newton: the EE value-curvature is dropped (matches the per-term GN choice).",
+         "ACCUMULATE=false overwrites; true adds (the EE / input-quadratic terms carry ACCUMULATE, the rest add).",
+         "s_scratch must hold >= END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_COUNT. Fixed-base only."],
+        ["s_Qk is the state GN hessian output (size NX*NX = " + str(nx * nx) + ", column-major)",
+         "s_Rk is the input hessian output (size NU*NU = " + str(nu * nu) + ", column-major)",
+         "s_x / s_u are the current state and control",
+         "s_Q / s_R / s_W are the quadratic state/input + EE weights",
+         "s_q_lower/upper + mu_q, s_qd_lower/upper + mu_qd, s_u_lower/upper + mu_u are the barrier bounds + weights",
+         "s_end_effector_pose_gradient (6*NUM_VEL*NUM_EE) / s_scratch are caller EE scratch; d_robotModel is the GPU model"],
+        None)
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(
+        "void tracking_cost_hessian(T *s_Qk, T *s_Rk, const T *s_x, const T *s_u, "
+        "const T *s_Q, const T *s_R, const T *s_W, "
+        "const T *s_q_lower, const T *s_q_upper, const T mu_q, "
+        "const T *s_qd_lower, const T *s_qd_upper, const T mu_qd, "
+        "const T *s_u_lower, const T *s_u_upper, const T mu_u, "
+        "T *s_end_effector_pose_gradient, T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+    self.gen_add_code_line("// ---- state-block GN hessian s_Qk (NX*NX) ----")
+    self.gen_add_code_line("ee_pos_cost_hessian<T, EE, ACCUMULATE>(s_Qk, s_x, s_W, s_end_effector_pose_gradient, s_scratch, d_robotModel);")
+    self.gen_add_sync()
+    self.gen_add_code_line("quadratic_state_cost_hessian<T, true>(s_Qk, s_Q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_position_barrier_hessian<T, " + NX + ", 0, 0>(s_Qk, s_x, s_q_lower, s_q_upper, mu_q);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_velocity_barrier_hessian<T, " + NX + ", " + NQ + ", " + NQ + ">(s_Qk, s_x, s_qd_lower, s_qd_upper, mu_qd);")
+    self.gen_add_sync()
+    self.gen_add_code_line("// ---- input-block hessian s_Rk (NU*NU) ----")
+    self.gen_add_code_line("quadratic_input_cost_hessian<T, ACCUMULATE>(s_Rk, s_R);")
+    self.gen_add_sync()
+    self.gen_add_code_line("joint_torque_barrier_hessian<T, " + NU + ", 0, 0>(s_Rk, s_u, s_u_lower, s_u_upper, mu_u);")
+    self.gen_add_end_function()
+
+
+# ---------------------------------------------------------------------------
 # Log-barriers (joint position / velocity / torque). Explicit bound pointers.
 # ---------------------------------------------------------------------------
 
@@ -1842,6 +2008,11 @@ def gen_plant_kernels(self, algorithms):
     if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
         gen_ee_pos_cost_kernel(self)
         self.gen_add_code_line("#define GRID_PLANT_HAS_EE_COST 1")
+        # tracking_cost preset (fixed-base only) is emitted alongside the EE cost in
+        # gen_grid_plant; flag it so the smoke runner can guard its preset==composition
+        # check (the preset references grid_plant::tracking_cost, absent on floating).
+        if not self.robot.floating_base:
+            self.gen_add_code_line("#define GRID_PLANT_HAS_TRACKING_COST 1")
     # CoM / centroidal-momentum cost kernels emit whenever their device fns do
     # (gated identically to gen_com_cost/gen_momentum_cost in gen_grid_plant:
     # require grid::com_device + grid::ccrba_device). MIMIC-OK (de-gate #3): the
@@ -1900,10 +2071,22 @@ def gen_grid_plant(self, algorithms):
         self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device) — not generated.")
 
     # EE position cost needs both ee_pose and ee_pose_gradient.
-    if ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms):
+    ee_cost_ok = ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms)
+    if ee_cost_ok:
         self.gen_ee_pos_cost()
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'end_effector_pose' and 'end_effector_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
+
+    # tracking_cost PRESET (GATO BSQP recipe): composes the EE-pose cost + the
+    # always-present quadratic state/input costs + the three barriers. Needs the EE
+    # cost (=> the ee_pose deps) and is FIXED-BASE only (the mjx single-reframe
+    # composition is a follow-up); floating profiles emit a skip note.
+    if ee_cost_ok and not self.robot.floating_base:
+        gen_tracking_cost_preset(self)
+    elif ee_cost_ok:
+        self.gen_add_code_line("// [grid_plant] tracking_cost preset skipped: fixed-base only (NUM_POS == NUM_VEL); floating-base composition is a follow-up.")
+    else:
+        self.gen_add_code_line("// [grid_plant] tracking_cost preset skipped: requires ee_pos_cost (both 'end_effector_pose' and 'end_effector_pose_gradient').")
 
     # CoM-tracking / centroidal-momentum-tracking costs need the centroidal
     # kinematics-domain device fns (grid::com_device / grid::ccrba_device), which
