@@ -662,10 +662,13 @@ def gen_ee_pos_cost(self):
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_grad[i] += g; } else { s_grad[i] = g; }")
     self.gen_add_end_control_flow()
-    # qd-block is exactly zero (only meaningful for the non-accumulate path).
+    # Zero the entire non-q-gradient tail [nv, nx): the meaningful gradient occupies
+    # [0, nv); everything after must be zero. Zeroing [nq, nq+nv) left [nv, nq)
+    # UNINITIALIZED for floating-base robots (nq>nv) -> stale shared mem (go2 nq=19,
+    # nv=18 left s_grad[18] stale). Mirrors com_cost_gradient. Byte-identical fixed-base (nq==nv).
     self.gen_add_code_line("if (!ACCUMULATE) {", True)
-    self.gen_add_parallel_loop("i", str(nv))
-    self.gen_add_code_line("s_grad[" + str(nq) + " + i] = static_cast<T>(0);")
+    self.gen_add_parallel_loop("i", str(nq))
+    self.gen_add_code_line("s_grad[" + str(nv) + " + i] = static_cast<T>(0);")
     self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
     if self.robot.floating_base:
