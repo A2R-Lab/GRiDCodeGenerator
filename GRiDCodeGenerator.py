@@ -2489,6 +2489,12 @@ class GRiDCodeGenerator:
                 ("end_effector_pose(mjx)", "end_effector_pose", None, "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"end_effector_pose_kernel<T, {_GT}, true>",
                    "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")]),
+                # osc_inertia(mjx): the mjx kernel (Lambda is frame-invariant; quat reorder
+                # on input) was missing its >48KB dynamic-smem opt-in (passes on go2 where
+                # the arena < 48KB, would fail cudaErrorInvalidValue on a big floating robot).
+                ("osc_inertia(mjx)", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()",
+                 [(f"osc_inertia_kernel<T, {_GT}, true>",
+                   "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")]),
                 ("end_effector_pose_gradient(mjx)", "end_effector_pose_gradient", None, "END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"end_effector_pose_gradient_kernel<T, {_GT}, true>",
                    "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
