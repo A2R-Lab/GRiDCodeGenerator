@@ -352,6 +352,11 @@ def _emit_integrator_gradient_mjx_output(self, integrator_type, s_mjx_scratch="s
     twoN = 2 * n
     si = "(" + _integrator_type_token(integrator_type) + " == IntegratorType::SEMI_IMPLICIT_EULER)"
     self.gen_add_code_line("// === mjx output convention (floating-base integrator gradient) ===")
+    # The dAB assembly writes s_dAB in a parallel loop with NO trailing sync; this
+    # epilogue's Phase 1 reads s_dAB across all threads, so without a barrier the
+    # high-column (du-block) entries — written by high-index threads — are read
+    # before they land (race -> zeros in the bottom-half base rows). Sync first.
+    self.gen_add_sync()
     self.gen_add_code_line("T *s_mjx = " + s_mjx_scratch + ";   // 2n*3n mjx output band (dead FD-grad pool)")
     self.gen_add_code_line("const bool si_mjx = " + si + ";")
     # ---- PARALLELIZED assembly (was single-thread; ~50% runtime at large batch). ----
