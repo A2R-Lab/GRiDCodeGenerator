@@ -2945,6 +2945,63 @@ def gen_ee_pose_inner_thread(self, fixed_target_name = ""):
 
     self.gen_add_end_function()
 
+def gen_update_XmatHom_joint(self):
+    # Single-joint local-transform builder at an EXPLICIT angle. Lets a caller
+    # re-evaluate ONE perturbed joint (coordinate-descent candidate / suffix FK)
+    # without recomputing the whole chain. Mirrors the per-joint q-cell pattern of
+    # gen_ee_pose_inner_thread, but indexed by a runtime `j` (switch) and driven by
+    # a `theta` argument instead of s_q. Robot-general (parser's per-joint Xmats).
+    import sympy as sp
+    NJ = self.robot.get_num_joints()
+    Xmats_hom, joint_has_q = self.gen_ee_pose_inner_xform_from_q_lines()
+
+    self.gen_add_func_doc(
+        "Single-joint homogeneous-transform builder: writes joint j's 4x4 local "
+        "transform (16 cells) into s_Xj at an EXPLICIT angle theta, sourcing the "
+        "constant cells from the pre-loaded s_XmatsHom and overriding only the "
+        "q-dependent cells. Robot-general (switch over the parser's per-joint Xmats). "
+        "Lets a caller re-evaluate one perturbed joint without recomputing the whole "
+        "chain (coordinate-descent candidate FK / suffix recompute).",
+        ["Assumes the constant (q-independent) cells of s_XmatsHom are pre-loaded."],
+        [
+            "s_Xj is the 16-element destination for joint j's local transform",
+            "s_XmatsHom is the pointer to the per-joint homogeneous transforms (16 per joint)",
+            "j is the joint id to (re)build",
+            "theta is the joint angle to evaluate at",
+        ],
+        None
+    )
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line("void update_XmatHom_joint(T *s_Xj, const T *s_XmatsHom, int j, T theta) {", True)
+    self.gen_add_code_line("const T s = static_cast<T>(sin(theta));")
+    self.gen_add_code_line("const T c = static_cast<T>(cos(theta));")
+    self.gen_add_code_line("(void)s; (void)c;")
+    self.gen_add_code_line("#pragma unroll")
+    self.gen_add_code_line("for (int m = 0; m < 16; ++m) { s_Xj[m] = s_XmatsHom[16*j + m]; }")
+    self.gen_add_code_line("switch (j) {", True)
+    for jid in range(NJ):
+        if not joint_has_q[jid]:
+            continue
+        self.gen_add_code_line("case " + str(jid) + ": {", True)
+        M = Xmats_hom[jid]
+        for col in range(4):
+            for row in range(4):
+                val = M[row, col]
+                if self.custom_is_constant(val):
+                    continue
+                # sin/cos(theta) -> precomputed s/c; a PRISMATIC joint also leaves a
+                # BARE theta (e.g. an axial offset emits `theta + 0.1`) -> the param.
+                str_val = sp.ccode(val).replace("sin(theta)", "s").replace("cos(theta)", "c")
+                cell = self.gen_static_array_ind_3d(jid, col, row, ind_stride=16, col_stride=4)
+                self.gen_add_code_line("s_Xj[" + str(cell - 16*jid) +
+                                       "] = static_cast<T>(" + str_val + ");")
+        self.indent_level -= 1
+        self.gen_add_code_line("} break;")
+    self.gen_add_code_line("default: break;")
+    self.gen_add_end_control_flow()   # close switch
+    self.gen_add_end_function()       # close function
+
 def gen_ee_pose_inner_parent_lookup(self, parents):
     # Emit a constant lookup expression mapping the loop index j -> parent id.
     # For a serial chain this is just (j-1); otherwise emit a small static table.
@@ -3244,6 +3301,7 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
         if (not self.robot.floating_base and not self.robot_has_mimic_joints()
                 and not self.robot.robot_has_spherical()):
             self.gen_ee_pose_inner_thread(fixed_target_name = fixed_target_name)
+            self.gen_update_XmatHom_joint()
             self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_fk_batched_kernel()
             self.gen_ee_pose_fk_batched_host()
