@@ -2,6 +2,12 @@ import os
 import json
 import numpy as np
 
+# Codegen-time frame-selection predicate shared with the idsva_so dispatcher /
+# device wrapper. The emission gate (enable_idsva_so_world_frame) MUST agree with
+# it so the world-frame inner is emitted exactly when a wrapper forwards there
+# (else high-DOF fixed-base robots route to an undefined idsva_so_world_frame_inner).
+from .algorithms._idsva_so import _idsva_so_use_world_frame
+
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
 # launch_configs/<robot>/<DEFAULT_GPU>.json. At codegen time we read the
@@ -2828,7 +2834,12 @@ class GRiDCodeGenerator:
         # override with enable_idsva_so_world_frame=True/False to force a
         # specific variant (the bench harness exercises both for comparison).
         if enable_idsva_so_world_frame is None:
-            enable_idsva_so_world_frame = self.robot.floating_base
+            # Match the dispatcher/device frame predicate EXACTLY: world-frame for
+            # floating-base, spherical, OR high-DOF fixed-base (NV >= threshold).
+            # If this drifts from _idsva_so_use_world_frame, a fixed-base robot the
+            # dispatcher routes to world (g1/h1_2/h2_plus) gets no world_frame inner
+            # emitted -> undefined idsva_so_world_frame_inner at compile time.
+            enable_idsva_so_world_frame = _idsva_so_use_world_frame(self)
         # idsva_so_world_frame is also a first-class algorithm_list key: an
         # explicit request enables the world-frame emit even on fixed-base
         # (where the kwarg default is False). Resolve the algorithm set up front
@@ -3233,9 +3244,11 @@ class GRiDCodeGenerator:
                 # the new entry point is `idsva_so_world_frame_kernel`/`idsva_so_world_frame` (host).
                 if enable_idsva_so_world_frame:
                     self.gen_idsva_so_world_frame()
-                # Emit the dispatching `idsva_so` host wrapper. For floating-base
-                # robots, requires world_frame to be enabled (it forwards there).
-                # For fixed-base, forwards to body_frame.
+                # Emit the dispatching `idsva_so` host wrapper. It forwards to
+                # world_frame for floating-base / spherical / high-DOF fixed-base
+                # (NV >= threshold) and to body_frame otherwise; the world-frame
+                # cases require world_frame to have been enabled above (now kept in
+                # lockstep via _idsva_so_use_world_frame).
                 if (not self.robot.floating_base) or enable_idsva_so_world_frame:
                     self.gen_idsva_so_dispatcher()
             if "fdsva_so" in algorithms:
