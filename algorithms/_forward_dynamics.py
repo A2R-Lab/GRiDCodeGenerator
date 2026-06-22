@@ -117,7 +117,8 @@ def gen_forward_dynamics_inner(self):
     else:
         func_def_end = "T *s_temp, T *d_workspace, T *d_f_ext, const T gravity) {"
     func_def_start, func_params = self.gen_insert_helpers_func_def_params(func_def_start, func_params, -2)
-    func_notes = ["Assumes s_XImats is updated already for the current s_q",
+    func_notes = ["CALLER CONTRACT (direct *_inner callers): s_XImats must ALREADY be populated for the current s_q -- the inner READS but never writes it. Call load_update_XImats_helpers(s_XImats, s_q, s_topology_helpers, d_robotModel, s_temp) then __syncthreads() first, or just call forward_dynamics_device (which does this for you). Skipping it reads uninitialized shared -> NaN (race-clean, initcheck-fixable).",
+                  "CALLER CONTRACT (sizing): s_temp MUST be FD_INNER_SMEM_BYTES<T, MINV_F_IN_SMEM>() bytes. At MINV_F_IN_SMEM=true the 6*NV*NV Minv-F band lives in the TAIL of s_temp (the macro includes it); d_workspace is 0/nullptr but that does NOT mean the band is free -- it just moved into s_temp. Under-sizing s_temp (e.g. reusing a fewer-DoF constant) makes the inner read its own never-written band -> NaN, and the failure is DoF-specific because the band scales as 6*NV*NV.",
                   "Does not internally sync the thread group, so it should be called after all threads have finished computing their values",
                   "Inner-controlled placement: MINV_F_IN_SMEM selects where the internal Minv 6*NV*NV F-region lives (s_temp tail vs d_workspace). Decided here; caller sizes both arenas from FD_INNER_*_BYTES and hands both pointers in."]
     func_def = func_def_start + func_def_end

@@ -111,7 +111,7 @@ def gen_minv_inner(self):
                    "s_q is the vector of joint positions", \
                    "s_temp is the (shared) scratch; size MINV_INNER_SMEM_BYTES<T, F_IN_SMEM>() (= " + str(no_F_size) + " always, plus the " + str(F_size) + "-float F-region when F_IN_SMEM)", \
                    "d_workspace is the global scratch; size MINV_INNER_WORKSPACE_BYTES<T, F_IN_SMEM>() (= " + str(F_size) + " when !F_IN_SMEM, else 0). Pass nullptr when F_IN_SMEM"]
-    func_notes = ["Assumes the XI matricies have already been updated for the given q", \
+    func_notes = ["CALLER CONTRACT (direct *_inner callers): s_XImats must ALREADY be populated for the current s_q (READ-only here) via load_update_XImats_helpers(...) + __syncthreads(), and s_temp MUST be MINV_INNER_SMEM_BYTES<T, F_IN_SMEM>() bytes -- at F_IN_SMEM=true the 6*NV*NV F-band lives in the TAIL of s_temp (d_workspace=0/nullptr does NOT mean the band is free). Under-populating XImats or under-sizing s_temp reads never-written shared -> NaN (race-clean, DoF-specific since the band scales as 6*NV*NV). Prefer minv_device, which handles both.", \
                   "Outputs a SYMMETRIC_UPPER triangular matrix for Minv", \
                   "Inner-controlled placement: F_IN_SMEM selects where the 6*NV*NV F-region lives.", \
                   "  true  -> tail of s_temp (shared; fastest, default).  false -> d_workspace (global).", \
