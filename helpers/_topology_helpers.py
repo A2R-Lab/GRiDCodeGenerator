@@ -1084,6 +1084,33 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
                                   extra_byte_regions = [("s_linalg_smem", linalg_scratch_bytes)] if include_linalg_scratch else None,
                                   arena_base_expr = arena_base_expr)
 
+def gen_load_topology_helpers(self):
+    """Emit a standalone ``load_topology_helpers(s_topology_helpers, d_robotModel)``
+    device helper that cooperatively fills a caller-provided shared topology buffer
+    from the model (then syncs). For external / inline-CUDA callers that drive the
+    generated ``*_inner`` functions directly (e.g. a generic multi-robot solver):
+    those inners TAKE a pre-filled ``s_topology_helpers``, so the caller needs to
+    surface it from ``d_robotModel->d_topology_helpers`` first. Serial chains with
+    identical Ss (TOPOLOGY_HELPERS_COUNT == 0) make this a no-op (the loop is empty),
+    so it is safe to call unconditionally with a nullptr buffer. Emitted for EVERY
+    robot for a uniform interface."""
+    count = self.gen_topology_helpers_size()
+    self.gen_add_func_doc(
+        "Cooperatively fill s_topology_helpers from the model (no-op when "
+        "TOPOLOGY_HELPERS_COUNT == 0); for external callers of the *_inner functions",
+        [],
+        ["s_topology_helpers is the (shared) int buffer to fill (size TOPOLOGY_HELPERS_COUNT; nullptr/unused when 0)",
+         "d_robotModel holds d_topology_helpers"],
+        None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line("void load_topology_helpers(int *s_topology_helpers, const robotModel<T> *d_robotModel) {", True)
+    self.gen_add_parallel_loop("ind", str(count))
+    self.gen_add_code_line("s_topology_helpers[ind] = d_robotModel->d_topology_helpers[ind];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
 def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include_gradients = False, include_hessians = False):
     n = self.robot.get_num_pos()
     NJ = self.robot.get_num_joints()

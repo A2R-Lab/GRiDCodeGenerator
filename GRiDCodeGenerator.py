@@ -124,7 +124,7 @@ class GRiDCodeGenerator:
                          gen_init_joint_dynamics_params, gen_set_joint_dynamics_params, \
                          gen_load_update_XImats_helpers_temp_mem_size, gen_load_update_XImats_helpers_function_call, \
                          gen_XImats_helpers_temp_shared_memory_code, gen_load_update_XImats_helpers, gen_topology_helpers_size, \
-                         gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, \
+                         gen_get_Xhom_size, gen_load_update_XmatsHom_helpers, gen_load_update_XmatsHom_helpers_function_call, gen_XmatsHom_helpers_temp_shared_memory_code, gen_load_topology_helpers, \
                          gen_topology_sparsity_helpers_python, gen_init_topology_helpers, gen_topology_helpers_pointers_for_cpp, \
                          gen_topology_S_sign_for_cpp, gen_insert_helpers_function_call, gen_insert_helpers_func_def_params, gen_init_robotModel, gen_free_robotModel, gen_joint_limits_size, gen_init_joint_limits, \
                          gen_grid_linalg_backend_helpers, gen_linalg_smem_setup, gen_invert_matrix, gen_matmul, gen_matmul_trans, gen_crm_mul, gen_crm, gen_mxS_general, gen_outer_product, custom_is_constant, \
@@ -3157,6 +3157,9 @@ class GRiDCodeGenerator:
         self.gen_joint_limits_size()
         self.gen_init_joint_limits()
         self.gen_load_update_XImats_helpers()
+        # Standalone topology-helper filler for external/inline-CUDA callers of the
+        # *_inner functions (uniform interface; no-op for serial chains).
+        self.gen_load_topology_helpers()
         if include_homogenous_transforms and include_any_kinematics:
             self.gen_load_update_XmatsHom_helpers(include_base_inertia)
             if "end_effector_pose_gradient" in algorithms or "end_effector_pose_hessian" in algorithms:
