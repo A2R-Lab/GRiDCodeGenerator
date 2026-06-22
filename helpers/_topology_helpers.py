@@ -1051,8 +1051,9 @@ def gen_load_update_XmatsHom_helpers_function_call(self, updated_var_names = Non
         code_start += var_names["s_dXmatsHom_name"] + ", "
     if include_hessians:
         code_start += var_names["s_d2XmatsHom_name"] + ", "
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        code_start += var_names["s_topology_helpers_name"] + ", "
+    # Always pass s_topology_helpers (uniform signature; nullptr for serial chains
+    # with identical Ss — see load_update_XImats_helpers / gen_declare_shared_arena).
+    code_start += var_names["s_topology_helpers_name"] + ", "
     self.gen_add_code_line(code_start + code_end)
 
 def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, include_gradients = False,
@@ -1072,7 +1073,10 @@ def gen_XmatsHom_helpers_temp_shared_memory_code(self, temp_mem_size = 0, includ
     if include_hessians and include_d2xhom_shared:
         hom_buffers.append(("s_d2XmatsHom", d2Xhom_size))
     self.gen_declare_shared_arena(extra_t_buffers + hom_buffers, temp_mem_size,
-                                  include_topology_helpers = (not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n)))),
+                                  # Always declare s_topology_helpers (nullptr for serial chains with
+                                  # identical Ss) so the uniform load_update_XmatsHom_helpers signature
+                                  # always has the arg in scope. Mirrors load_update_XImats_helpers.
+                                  include_topology_helpers = True,
                                   ximat_name = "",
                                   ximat_size = 0,
                                   temp_name = "s_temp",
@@ -1101,9 +1105,13 @@ def gen_load_update_XmatsHom_helpers(self, include_base_inertia = False, include
     if include_hessians:
         func_params.insert(1,"s_d2XmatsHom is the (shared) memory destination location for the d2XmatsHom")
         func_def_middle += "T *s_d2XmatsHom, "
-    if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
-        func_def_middle += "int *s_topology_helpers, "
-        func_params.insert(-2,"s_topology_helpers is the (shared) memory destination location for the topology_helpers")
+    # Always emit s_topology_helpers for a uniform signature across ALL robots
+    # (mirrors load_update_XImats_helpers). Serial chains with identical Ss pass
+    # nullptr and skip the topology-copy body below; a generic caller (e.g. a
+    # Parallel-DDP-style solver driving many robots through one entry) no longer
+    # hits per-robot overload drift. -Wunused-parameter is off in our builds.
+    func_def_middle += "int *s_topology_helpers, "
+    func_params.insert(-2,"s_topology_helpers is the (shared) memory location for the topology_helpers (nullptr/unused for serial chains with identical Ss)")
     func_def = func_def_start + func_def_middle + func_def_middle2 + func_def_end
     # then genearte the code
     self.gen_add_func_doc("Updates the (d)XmatsHom in (shared) GPU memory acording to the configuration",[],func_params,None)

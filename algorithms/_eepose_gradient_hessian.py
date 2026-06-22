@@ -3155,8 +3155,15 @@ def gen_ee_pose_fk_batched_kernel(self):
     self.gen_add_code_line("__shared__ T s_XmatsHom[" + str(Xhom_size) + "];")
     self.gen_add_code_line("__shared__ T s_jointXforms[" + str(16*NJ) + "];")
     self.gen_add_code_line("__shared__ T s_temp[" + str(max(temp_size,1)) + "];")
+    # s_topology_helpers must always be in scope now that load_update_XmatsHom_helpers
+    # takes it unconditionally (uniform signature). COUNT>0 robots get a real shared
+    # buffer; serial chains with identical Ss pass nullptr (the loader skips the
+    # topology copy). This kernel hand-declares its shared arena, so the nullptr case
+    # is explicit here (callers using gen_declare_shared_arena get it automatically).
     if not self.robot.is_serial_chain() or not self.robot.are_Ss_identical(list(range(n))):
         self.gen_add_code_line("__shared__ int s_topology_helpers[" + str(self.gen_topology_helpers_size()) + "];")
+    else:
+        self.gen_add_code_line("int *s_topology_helpers = nullptr;")
     self.gen_add_code_line("for (int b = blockIdx.x; b < B; b += gridDim.x) {", True)
     # cooperative load of this sample's q
     self.gen_add_code_line("for (int j = threadIdx.x; j < " + str(n) + "; j += blockDim.x) { s_q[j] = d_q[b*stride_q + j]; }")
