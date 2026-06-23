@@ -124,6 +124,136 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-algo DESCRIPTOR table (item M, Step 0). One row per algorithm capturing the
+# launch-config + kernel-attribute METADATA that is otherwise scattered across
+# GRiDCodeGenerator.py. This step generates NOTHING — it is the parity safety net
+# (test/test_algo_descriptor_parity.py asserts the table reproduces the live
+# LAUNCH_CONFIG_ALGO_TO_SYMBOL dict and the KERNEL_ATTR_MANIFEST metadata exactly).
+# Later steps (per docs/open-tasks/design_descriptor_table_spec.md) extend the
+# schema with the arena/spill closures and DRIVE those sites from these rows.
+#
+# Only the IRREGULAR fields are stored per row; everything regular is derived:
+#   - bytes_macro defaults to "<KEY.upper()>_DYNAMIC_SHARED_MEM_BYTES" — overridden
+#     for the 4 algos that share a sibling's macro (integrator_gradient /
+#     integrator_with_gradient -> INTEGRATOR_DU; generalized_gravity /
+#     nonlinear_effects -> INVERSE_DYNAMICS_BIAS).
+#   - gate_attr defaults to None (registration falls back to membership in
+#     generated_algorithms) — overridden for the 7 opt-in / conditionally-emitted
+#     kernels that carry an explicit `generate_*` / `_*_emitted` flag.
+#   - has_kernel_attr defaults True — False for the 3 registry keys with no own
+#     cudaFuncSetAttribute entry: `idsva_so` (a dispatch alias for the body/world
+#     kernels), `integrator_hessian` (no standalone benchmarked kernel yet), and
+#     `plant` (cost/constraint primitives, no __global__).
+#   - autotune_keys defaults to () — set for the 17 algos that carry a baked
+#     launch_cfg<> (the bench-abbreviated JSON key(s) that map to this grid symbol).
+
+
+@dataclass(frozen=True)
+class AlgoDescriptor:
+    key: str                              # == AlgoEntry.key (the join)
+    autotune_keys: tuple[str, ...] = ()   # bench JSON keys -> LAUNCH_CONFIG_ALGO_TO_SYMBOL
+    has_kernel_attr: bool = True          # has its own KERNEL_ATTR_MANIFEST entry
+    gate_attr: str | None = None          # explicit generate_*/_*_emitted gate, else None
+    bytes_macro_stem: str | None = None   # override the default *_DYNAMIC_SHARED_MEM_BYTES stem
+
+    @property
+    def carries_launch_cfg(self) -> bool:
+        return bool(self.autotune_keys)
+
+    @property
+    def enum_name(self) -> str:
+        return "GRID_ALGO_" + self.key.upper()
+
+    @property
+    def bytes_macro(self) -> str:
+        """Full `NAME<T>()` string as it appears in KERNEL_ATTR_MANIFEST."""
+        stem = self.bytes_macro_stem or (self.key.upper() + "_DYNAMIC_SHARED_MEM_BYTES")
+        return stem + "<T>()"
+
+
+ALGO_DESCRIPTORS: tuple[AlgoDescriptor, ...] = (
+    # Core Dynamics
+    AlgoDescriptor("inverse_dynamics", autotune_keys=("id",)),
+    AlgoDescriptor("minv", autotune_keys=("minv",)),
+    AlgoDescriptor("forward_dynamics", autotune_keys=("fd",)),
+    AlgoDescriptor("aba", autotune_keys=("aba",)),
+    AlgoDescriptor("crba", autotune_keys=("crba",)),
+
+    # Gradients
+    AlgoDescriptor("inverse_dynamics_gradient", autotune_keys=("id_du",),
+                   gate_attr="generate_inverse_dynamics_gradient"),
+    AlgoDescriptor("forward_dynamics_gradient", autotune_keys=("fd_du",),
+                   gate_attr="generate_forward_dynamics_gradient"),
+    AlgoDescriptor("f_ext_gradient"),
+    AlgoDescriptor("f_ext_gradient_dq", gate_attr="_f_ext_gradient_dq_emitted"),
+    AlgoDescriptor("inverse_dynamics_regressor"),
+    AlgoDescriptor("forward_dynamics_parameter_gradient"),
+    AlgoDescriptor("kinetic_energy_regressor"),
+    AlgoDescriptor("potential_energy_regressor"),
+
+    # Integrators
+    AlgoDescriptor("integrator", autotune_keys=("integrator",)),
+    AlgoDescriptor("integrator_gradient", autotune_keys=("integrator_gradient",),
+                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("integrator_with_gradient", autotune_keys=("integrator_with_gradient",),
+                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("integrator_hessian", has_kernel_attr=False),
+
+    # Kinematics
+    AlgoDescriptor("end_effector_pose", autotune_keys=("ee_pose",)),
+    AlgoDescriptor("end_effector_pose_gradient", autotune_keys=("ee_pose_gradient",)),
+    AlgoDescriptor("end_effector_pose_hessian", autotune_keys=("ee_pose_hessian",),
+                   gate_attr="generate_end_effector_pose_hessian"),
+    AlgoDescriptor("frame_jacobian"),
+    AlgoDescriptor("frame_jacobian_dot"),
+    AlgoDescriptor("osc_inertia"),
+    AlgoDescriptor("end_effector_pose_runtime"),
+    AlgoDescriptor("end_effector_pose_gradient_runtime"),
+
+    # Second-Order
+    AlgoDescriptor("idsva_so", autotune_keys=("idsva_so",), has_kernel_attr=False),
+    AlgoDescriptor("idsva_so_body_frame", autotune_keys=("idsva_so_body_frame",),
+                   gate_attr="generate_idsva_so_body_frame"),
+    AlgoDescriptor("idsva_so_world_frame", autotune_keys=("idsva_so_world_frame",),
+                   gate_attr="generate_idsva_so_world_frame"),
+    AlgoDescriptor("fdsva_so", autotune_keys=("fdsva_so",), gate_attr="generate_fdsva_so"),
+
+    # Centroidal / Energy / CoM
+    AlgoDescriptor("generalized_gravity",
+                   bytes_macro_stem="INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("nonlinear_effects",
+                   bytes_macro_stem="INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("energy"),
+    AlgoDescriptor("com"),
+    AlgoDescriptor("ccrba"),
+    AlgoDescriptor("coriolis_matrix"),
+    AlgoDescriptor("dccrba"),
+    AlgoDescriptor("cmm_time_variation"),
+
+    # Plant (no standalone kernel)
+    AlgoDescriptor("plant", has_kernel_attr=False),
+)
+
+
+_BY_KEY_DESCRIPTOR = {d.key: d for d in ALGO_DESCRIPTORS}
+
+
+def descriptor_for(key: str) -> AlgoDescriptor:
+    try:
+        return _BY_KEY_DESCRIPTOR[key]
+    except KeyError:
+        raise KeyError(f"{key!r} not in ALGO_DESCRIPTORS — add it to algo_registry.py") from None
+
+
+def build_launch_config_algo_to_symbol() -> dict[str, str]:
+    """Reconstruct LAUNCH_CONFIG_ALGO_TO_SYMBOL (bench JSON key -> grid symbol)
+    from the descriptor rows. Parity-checked against the live dict in
+    test/test_algo_descriptor_parity.py; the eventual Step-1 generation will
+    consume this directly."""
+    return {k: d.key for d in ALGO_DESCRIPTORS for k in d.autotune_keys}
+
+
 def build_single_label_map() -> dict[str, str]:
     """e.g. {'single call inverse_dynamics': 'inverse_dynamics', 'single call idsva_so_body_frame': 'idsva_so_body_frame', ...}."""
     return {f"single call {e.printf_label.lower()}": e.key for e in ALGO_REGISTRY}
