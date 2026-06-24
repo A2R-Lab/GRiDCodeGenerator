@@ -1,12 +1,14 @@
 import numpy as np
 import copy
 
-# CRBA keeps only 2 tier rungs (full | inner-band-to-workspace), no surgical
-# intermediate rung: the post-I-crba inner band is entirely HOT (no cold sub-band
-# to relocate), and the whole arena already fits smem at PERF/LITE for every
-# production robot, so only MINIMAL ever spills. Re-open only if a future rewrite
-# introduces a genuinely cold sub-band (e.g. a materialized composite-inertia
-# output kept for a downstream consumer).
+# CRBA has a 3-rung ladder: full | s_M->d_workspace (surgical OUTPUT_SPILL of the
+# nv*nv mass matrix, the dominant write-once buffer, read only by the optional mjx
+# congruence; keeps the HOT inner band + XI in smem) | whole-band-to-workspace
+# (MINIMAL fallback). s_M routes to the L2-pinned SO band exactly like dccrba's
+# output. The inner band itself is entirely HOT (no cold sub-band), so it only
+# spills at the deepest rung; the surgical rung's win is raising LITE occupancy on
+# big floating robots by keeping the hot band resident instead of the blunt whole-
+# band dump (h2_plus crba LITE ~47.6KB -> ~34KB).
 
 def gen_crba_inner_temp_mem_size(self):
     if self.robot.floating_base:
@@ -819,13 +821,23 @@ def gen_crba_device(self):
         func_notes = func_notes, func_params = func_params,
         include_linalg_scratch = True, skip_floating_base_X = True)
 
-def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, single_call_timing):
-    """Emit crba_kernel body for one tier's spill flag.
-    use_workspace_temp=False: s_temp in smem (full arena); Level 0 / current.
-    use_workspace_temp=True:  s_temp redirected to L2-pinned workspace; smem arena holds only extra_t_buffers."""
+def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace_temp, m_in_smem, single_call_timing):
+    """Emit crba_kernel body for one tier's spill flags.
+    use_workspace_temp=False: inner band in smem; True: inner band -> L2-pinned workspace.
+    m_in_smem=True: s_M output in smem; False: s_M -> the L2-pinned SO band (dccrba-style)."""
     shared_mem_size = 0 if use_workspace_temp else self.gen_crba_inner_temp_mem_size()
-    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)], include_linalg_scratch=True)
+    # s_M (nv*nv mass matrix) is the dominant write-once output (read only by the optional
+    # mjx congruence). At rung0 (m_in_smem) it lives in smem -> byte-identical to the
+    # pre-spill emission. At the spill rungs it is dropped from the smem arena and repointed
+    # to the L2-pinned SO band (dccrba-style), shrinking the arena by nv*nv.
+    if m_in_smem:
+        extra_t_buffers = [("s_M", nv*nv), ("s_q_qd", input_count)]
+    else:
+        extra_t_buffers = [("s_q_qd", input_count)]
+    self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(nq) + "];")
+    if not m_in_smem:
+        self.gen_add_code_line("T *s_M;  // repointed to the L2-pinned SO band (output spill) per timing branch")
     if not single_call_timing:
         # load to shared mem and loop over blocks to compute all requested comps
         self.gen_add_parallel_loop("k","NUM_TIMESTEPS",block_level = True)
@@ -836,8 +848,13 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
             # null. Repoint s_temp at the workspace BEFORE the XImats helper call
             # so its sincos scratch (and the inner) have a valid backing store.
             self.gen_add_code_line("s_temp = crba_d_workspace;")
-        else:
+        elif m_in_smem:
             self.gen_add_code_line("(void)d_workspace;")
+        if not m_in_smem:
+            # s_M output spill: route the mass matrix to the L2-pinned SO band (offset
+            # GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES, the SO section). At rung2 this is disjoint
+            # from crba_d_workspace (GRAD section, offset 0) where the inner band lives.
+            self.gen_add_code_line("s_M = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         # mjx input convert (quaternion only -> the congruence epilogue's R; M(q)
         # is base-orientation-independent so no qd/accel convert is needed).
         if self.robot.floating_base:
@@ -870,8 +887,11 @@ def _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, use_workspace
             # See note above: repoint the null smem s_temp at the spilled workspace
             # before the XImats helper call so its scratch is valid (global) memory.
             self.gen_add_code_line("s_temp = crba_d_workspace;")
-        else:
+        elif m_in_smem:
             self.gen_add_code_line("(void)d_workspace;")
+        if not m_in_smem:
+            # s_M output spill -> L2-pinned SO band (single-timing: no per-k stride).
+            self.gen_add_code_line("s_M = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         # then compute in loop for timing
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
@@ -918,12 +938,14 @@ def gen_crba_kernel(self, single_call_timing = False):
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
 
-    # Whole-arena spill lever: the CRBA inner scratch band is spilled as one
-    # band to L2-pinned workspace at LITE/MINIMAL. Level 0 = arena in smem
-    # (current); Level 1 = redirected to workspace.
+    # 3-rung surgical ladder: rung0 full (s_M + inner band in smem); rung1 output-spill
+    # (s_M -> L2-pinned SO band, hot inner band stays in smem); rung2 whole-band (both
+    # s_M and inner band spilled). gen_tier_dispatch de-dups tiers that share a pick, so
+    # rung0-only robots emit one byte-identical body (Gate A).
     picks = getattr(self, "crba_spill_tier_3way", (0, 0, 0))
     self.gen_tier_dispatch(picks, lambda pick:
-        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count, bool(pick), single_call_timing))
+        _emit_crba_kernel_body_for_flags(self, nq, nv, n, input_count,
+            use_workspace_temp=(pick == 2), m_in_smem=(pick == 0), single_call_timing=single_call_timing))
     self.gen_add_end_function()
 
 def gen_crba_host(self, mode = 0):

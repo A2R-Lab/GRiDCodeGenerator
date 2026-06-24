@@ -1094,16 +1094,24 @@ class GRiDCodeGenerator:
         # the whole inner band (42*NJ / 36*NJ+slab) is hot with no cold sub-band,
         # and the full arena (<=~19 KB) already fits smem at every default tier.
         # See _crba.py header (gen_crba_inner_temp_mem_size) for the full rationale.
-        # Rungs stay at 2 (full | inner-band-to-workspace).
-        _crba_base_count = nv*nv + crba_input_t_count + XI_size + rt_xfixed_reserve
-        _crba_t_count_full      = _crba_base_count + self.gen_crba_inner_temp_mem_size()
-        _crba_t_count_workspace = _crba_base_count
-        self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_workspace)
-        self.crba_use_workspace_temp = self.crba_spill_tier_3way[0] == 1
-        crba_t_count = _crba_t_count_full if not self.crba_use_workspace_temp else _crba_t_count_workspace
+        # 3-rung ladder: full | s_M->d_workspace (surgical OUTPUT_SPILL of the nv*nv mass
+        # matrix, the dominant write-once buffer, read only by the optional mjx congruence;
+        # the HOT inner band + XI stay in smem) | whole-band-to-workspace (MINIMAL fallback).
+        # s_M routes to the L2-pinned SO band exactly like dccrba's output. The surgical
+        # rung keeps the hot band resident at LITE (vs the blunt whole-band spill it replaces),
+        # raising occupancy on big floating robots (h2_plus crba LITE ~47.6KB -> ~34KB).
+        _crba_inner   = self.gen_crba_inner_temp_mem_size()
+        _crba_no_M    = crba_input_t_count + XI_size + rt_xfixed_reserve   # input + XI, no s_M
+        _crba_t_count_full         = nv*nv + _crba_no_M + _crba_inner      # s_M + inner band + input/XI
+        _crba_t_count_output_spill = _crba_no_M + _crba_inner              # s_M -> d_workspace; hot band stays smem
+        _crba_t_count_workspace    = _crba_no_M                            # both s_M and inner band spilled
+        self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)
+        # whole-band spill (inner band -> d_workspace) fires only at the deepest rung (index 2).
+        self.crba_use_workspace_temp = self.crba_spill_tier_3way[0] == 2
         self.crba_t_count_per_tier = tuple(
-            (_crba_t_count_full, _crba_t_count_workspace)[i] for i in self.crba_spill_tier_3way
+            (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)[i] for i in self.crba_spill_tier_3way
         )
+        crba_t_count = self.crba_t_count_per_tier[0]
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         # Phase 3d (EE_POSE_GRAD): two-tier spill, mirrors D2EE's (full, spill, spill).
         # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient). Level 1 =
@@ -1770,7 +1778,10 @@ class GRiDCodeGenerator:
                                  "// --- crba_inner (scratch band) ---",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t CRBA_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_crba_inner_temp_mem_size()) + "); }",
-                                 "template <int TIER> __host__ __device__ constexpr bool CRBA_TEMP_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.crba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.crba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.crba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 # Inner band stays in smem at rung0 AND rung1 (surgical output-spill); spills only at rung2 (whole-band). Mirror DCCRBA_J_IN_SMEM's <=1.
+                                 "template <int TIER> __host__ __device__ constexpr bool CRBA_TEMP_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.crba_spill_tier_3way[0] <= 1 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.crba_spill_tier_3way[1] <= 1 else "false") + " : " + ("true" if self.crba_spill_tier_3way[2] <= 1 else "false") + "; }",
+                                 # s_M output in smem ONLY at rung0; spilled to the SO band at rung1/rung2. Mirror DCCRBA_OUTPUT_IN_SMEM's ==0.
+                                 "template <int TIER> __host__ __device__ constexpr bool CRBA_M_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.crba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.crba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.crba_spill_tier_3way[2] == 0 else "false") + "; }",
                                  "// --- end_effector_pose_gradient_inner (chain workspace) ---",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_SMEM_BYTES() { return TEMP_IN_SMEM ? sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + ") : static_cast<size_t>(0); }",
                                  "template <typename T, bool TEMP_IN_SMEM = true> __host__ __device__ constexpr size_t EE_GRAD_INNER_WORKSPACE_BYTES() { return TEMP_IN_SMEM ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(self.gen_end_effector_pose_gradient_inner_temp_mem_size()) + "); }",
