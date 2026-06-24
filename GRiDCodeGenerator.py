@@ -1105,21 +1105,24 @@ class GRiDCodeGenerator:
             (_crba_t_count_full, _crba_t_count_workspace)[i] for i in self.crba_spill_tier_3way
         )
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
-        # Phase 3d (EE_POSE_GRAD): three-tier spill, mirrors D2EE.
-        # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient + dXmatsHom). Level 1 =
-        # inner_temp + s_end_effector_pose_gradient -> workspace/global. Level 2 = also
-        # dXmatsHom -> workspace. inner_temp is recursion-hot but L2-pinned at
-        # the host wrapper for spill tiers; s_end_effector_pose_gradient is write-once output.
+        # Phase 3d (EE_POSE_GRAD): two-tier spill, mirrors D2EE's (full, spill, spill).
+        # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient). Level 1 =
+        # inner_temp + s_end_effector_pose_gradient -> workspace/global. The old dXmatsHom
+        # spill rung is RETIRED: the geometric-Jacobian gradient inner reads only s_Xhom
+        # and (void)s_dXhom, so dXmatsHom was never allocated in smem -> dropping the dead
+        # + dXhom_size reservation shrinks the PERF/LITE arenas fleet-wide and pushes the
+        # spill threshold outward. inner_temp is recursion-hot but L2-pinned at the host
+        # wrapper for spill tiers; s_end_effector_pose_gradient is write-once output.
         _end_effector_pose_gradient_num_ees = self.robot.get_total_leaf_nodes()
         _end_effector_pose_gradient_inner_temp_count = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
-        _end_effector_pose_gradient_full_t_count        = n + 6*n*_end_effector_pose_gradient_num_ees + _end_effector_pose_gradient_inner_temp_count + XHom_size + dXhom_size
-        _end_effector_pose_gradient_spill_temp_t_count  = n                                                    + XHom_size + dXhom_size
-        _end_effector_pose_gradient_spill_dxhom_t_count = n                                                    + XHom_size
-        _end_effector_pose_gradient_arenas = (_end_effector_pose_gradient_full_t_count, _end_effector_pose_gradient_spill_temp_t_count, _end_effector_pose_gradient_spill_dxhom_t_count)
+        _end_effector_pose_gradient_full_t_count        = n + 6*n*_end_effector_pose_gradient_num_ees + _end_effector_pose_gradient_inner_temp_count + XHom_size
+        _end_effector_pose_gradient_spill_temp_t_count  = n                                                    + XHom_size
+        # Degenerate 3rd arena == 2nd (MINIMAL = last index always; collapses to spill).
+        _end_effector_pose_gradient_arenas = (_end_effector_pose_gradient_full_t_count, _end_effector_pose_gradient_spill_temp_t_count, _end_effector_pose_gradient_spill_temp_t_count)
         self.end_effector_pose_gradient_spill_tier_3way = select_shared_tier_3way(*_end_effector_pose_gradient_arenas)
         self.end_effector_pose_gradient_spill_tier = self.end_effector_pose_gradient_spill_tier_3way[0]
         self.end_effector_pose_gradient_use_workspace_temp = self.end_effector_pose_gradient_spill_tier >= 1
-        self.end_effector_pose_gradient_use_workspace_dxhom = self.end_effector_pose_gradient_spill_tier >= 2
+        self.end_effector_pose_gradient_use_workspace_dxhom = False  # dXhom never in smem; mirror d2ee_use_workspace_d2xhom=False
         dee_t_count = _end_effector_pose_gradient_arenas[self.end_effector_pose_gradient_spill_tier]
         self.end_effector_pose_gradient_t_count_per_tier = tuple(_end_effector_pose_gradient_arenas[i] for i in self.end_effector_pose_gradient_spill_tier_3way)
         # D2EE (FD-on-d/dv-Jacobian): two spill levels (the nv^2 output is the only
@@ -1407,8 +1410,8 @@ class GRiDCodeGenerator:
         end_effector_pose_gradient_workspace_t_count = 0
         if any(p >= 1 for p in self.end_effector_pose_gradient_spill_tier_3way):
             end_effector_pose_gradient_workspace_t_count += _end_effector_pose_gradient_inner_temp_count
-        if any(p >= 2 for p in self.end_effector_pose_gradient_spill_tier_3way):
-            end_effector_pose_gradient_workspace_t_count += dXhom_size
+        # dXhom workspace clause RETIRED: the dxhom-spill rung is gone (pick 2 == pick 1),
+        # so no tier materializes s_dXmatsHom -> the phantom dXhom reservation is dropped.
         # Include the floating-base gravity-shim spill (Phase D): the d2X/d2a/d2f
         # tensors live in d_workspace instead of shared memory for larger robots.
         idsva_so_body_frame_grav_spill_t_count = self.gen_floating_gravity_d2tau_dq_spill_count() if self.robot.floating_base else 0

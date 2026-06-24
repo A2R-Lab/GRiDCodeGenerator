@@ -865,10 +865,14 @@ def gen_end_effector_pose_gradient_device(self, fixed_target_name = ""):
     self.gen_add_end_function()
 
 _EE_GRAD_PICK_FLAGS = [
-    # (use_workspace_temp, use_workspace_dxhom)
+    # (use_workspace_temp, use_workspace_dxhom). The geometric-Jacobian gradient inner
+    # reads only s_Xhom and (void)s_dXhom -> the dXmatsHom region was never allocated,
+    # so the old dxhom-spill rung is RETIRED: pick 2 == pick 1 (whole inner arena +
+    # output -> workspace). The degenerate 3rd entry keeps MINIMAL (=last index) in range
+    # and de-dups to pick 1 via gen_tier_dispatch. Matches the hessian's single-lever ladder.
     (False, False),   # pick 0: full smem (PERF)
     (True,  False),   # pick 1: inner_temp + s_end_effector_pose_gradient -> workspace/global (LITE)
-    (True,  True),    # pick 2: also dXmatsHom -> workspace (MINIMAL)
+    (True,  False),   # pick 2 == pick 1 (dxhom rung retired; MINIMAL collapses to whole-arena spill)
 ]
 
 def _emit_eepose_grad_mjx_reframe(self, buf, nv, num_ees):
