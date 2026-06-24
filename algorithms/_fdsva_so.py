@@ -638,10 +638,11 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         self.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled() if fd_grad_use_spill
         else self.gen_fdsva_so_fd_gradient_inline_temp_mem_size()
     )
-    # A4: cold-trio span (Xdown 36*NB + v_w/a_w 12*NB = 48*NB floats). Subtracted
-    # from the world-inner footprint when idsva_cold_in_global routes it to global.
-    # Mirrors the standalone idsva_so world cold rung (_idsva_wf_cold in GRiDCodeGenerator.py).
-    cold_floats = 48 * self.robot.get_num_bodies()
+    # A4: cold-quad span (Xup 36*NB + Xdown 36*NB + v_w/a_w 12*NB = 84*NB floats).
+    # Subtracted from the world-inner footprint when idsva_cold_in_global routes it to
+    # global. Single source of truth = gen_idsva_so_world_cold_floats (mirrors the
+    # standalone idsva_so world cold rung _idsva_wf_cold in GRiDCodeGenerator.py).
+    cold_floats = self.gen_idsva_so_world_cold_floats()
     if use_workspace_idsva_temp:
         # Pool -> global: fdsva_so_device runs with SCRATCH_IN_SMEM=false, so the
         # WHOLE shared s_temp pool (helper sincos + minv + fd + fd_grad + idsva) lives
@@ -651,8 +652,8 @@ def _emit_fdsva_so_kernel_body_for_flags(self, n, NUM_POS, use_global_tensors, u
         idsva_temp_size = inner_idsva_so_temp_size
         if idsva_cold_in_global:
             # Surgical: the world inner keeps its hot band in smem but repoints the
-            # cold trio to d_workspace (COLD_IN_SMEM=false), so its smem footprint
-            # shrinks by exactly the cold-trio span. (No-op for the body inner — but
+            # cold quad to d_workspace (COLD_IN_SMEM=false), so its smem footprint
+            # shrinks by exactly the cold-quad span. (No-op for the body inner — but
             # this rung is only ever PICKED when the world inner is composed, see the
             # GRiDCodeGenerator.py tier table which gates the rung's arena on world.)
             idsva_temp_size = inner_idsva_so_temp_size - cold_floats

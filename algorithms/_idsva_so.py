@@ -3199,8 +3199,10 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
     ] if is_mimic else []) + [
         "T *Ipool   = s_XImats + XIMAT_SIZE*NUM_BODIES;",
         "// --- HOT region (always smem when SCRATCH_IN_SMEM) ---",
-        "T *Xup     = s_temp;",
-        "T *IC      = Xup     + 36*NUM_BODIES;",
+        "// Xup is RELOCATED to the tail cold band (built Step 1, dead after the Step-4 IC",
+        "// build; never read by the Step-5 hot triple-walk). The hot chain now starts at IC",
+        "// so the recursion-hot arena stays in smem at the surgical (output_cold) rung.",
+        "T *IC      = s_temp;",
         "T *BC      = IC      + 36*NUM_BODIES;",
         "T *f_w     = BC      + 36*NUM_BODIES;",
         "T *S_vel   = f_w     +  6*NUM_BODIES;",
@@ -3248,19 +3250,21 @@ def gen_idsva_so_world_frame_inner(self, use_qdd_input = False):
         # coords into this slab, then alpha-folds to the reduced 4*NV^3 public caller output.
         "T *wf_so_internal = S_A7_vec + 6;  // 4*SO_N_INT^3 internal slab (always-hot region)",
     ] if is_mimic else []) + [
-        "// --- COLD region (end of arena): Xdown (dead after Step 3) + v_w/a_w (dead",
-        "// after Step 4's f_w build). Placed last so a surgical sub-region (d_cold) can",
-        "// route JUST these to d_workspace at a spill rung while the hot buffers stay smem.",
-        ("T *Xdown   = wf_so_internal + 4*SO_N_INT*SO_N_INT*SO_N_INT;" if is_mimic
-         else "T *Xdown   = S_A7_vec  +  6;"),
+        "// --- COLD region (end of arena), cold-QUAD: Xup (dead after the Step-4 IC build)",
+        "// + Xdown (dead after Step 3) + v_w/a_w (dead after Step 4's f_w build). Placed",
+        "// last (contiguous tail) so a surgical sub-region (d_cold) can route JUST these",
+        "// 84*NB floats to d_workspace at the output_cold rung while the hot arena stays smem.",
+        ("T *Xup     = wf_so_internal + 4*SO_N_INT*SO_N_INT*SO_N_INT;" if is_mimic
+         else "T *Xup     = S_A7_vec  +  6;"),
+        "T *Xdown   = Xup       + 36*NUM_BODIES;",
         "T *v_w     = Xdown     + 36*NUM_BODIES;",
         "T *a_w     = v_w       +  6*NUM_BODIES;",
-        "// COLD_IN_SMEM=false repoints the cold trio to a d_workspace sub-region (d_cold).",
+        "// COLD_IN_SMEM=false repoints the cold quad to a d_workspace sub-region (d_cold).",
         "// Contract: COLD_IN_SMEM=false is only used with SCRATCH_IN_SMEM=true (hot stays",
         "// in smem), so d_cold = &d_workspace[0] is exclusive — the deep rung instead uses",
         "// SCRATCH_IN_SMEM=false (whole arena, incl. these three, to d_workspace) with",
         "// COLD_IN_SMEM=true. The two spill levers are mutually exclusive by construction.",
-        "if constexpr (!COLD_IN_SMEM) { Xdown = d_workspace; v_w = Xdown + 36*NUM_BODIES; a_w = v_w + 6*NUM_BODIES; }",] + ([
+        "if constexpr (!COLD_IN_SMEM) { Xup = d_workspace; Xdown = Xup + 36*NUM_BODIES; v_w = Xdown + 36*NUM_BODIES; a_w = v_w + 6*NUM_BODIES; }",] + ([
         # Mimic: assemble into the internal slab; the public caller dest is saved + folded last.
         "T *s_idsva_so_public = s_idsva_so;  // reduced 4*NV^3 caller dest (saved before repoint)",
         "T *s_idsva_so_internal = wf_so_internal;",
@@ -4584,14 +4588,26 @@ def gen_idsva_so_world_frame_inner_function_call(self, scratch_in_smem_expr = "t
     self.gen_add_code_line(id_so_code_start + id_so_code_middle + id_so_code_end)
 
 
+def gen_idsva_so_world_cold_floats(self):
+    """Float count of the world-frame idsva_so surgical (output_cold) cold band.
+
+    The cold QUAD {Xup, Xdown, v_w, a_w} = (36+36+6+6)*NB = 84*NB, all provably dead
+    before the Step-5 hot triple-walk (Xup's last read is the Step-4 IC build; Xdown
+    dead after Step 3; v_w/a_w dead after Step 4's f_w build). SINGLE SOURCE OF TRUTH
+    for: the inner cold-band layout, the kernel surgical-rung smem arena sizing
+    (cold_floats below), the world ws-floats reservation, and fdsva_so's composed
+    idsva_cold rung (all in GRiDCodeGenerator.py)."""
+    return 84 * self.robot.get_num_bodies()
+
+
 def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_call_timing,
                                                      use_global_output, s_temp_in_global, cold_in_global = False):
     """Emit the idsva_so world-frame kernel body for one tier's spill flags.
 
     Flags:
       - use_global_output: 4*NV^3 output -> d_idsva_so global.
-      - cold_in_global:    surgical — only the cold trio (Xdown 36*NB + v_w/a_w 6*NB each)
-                           routes to d_workspace (inner COLD_IN_SMEM=false); hot stays smem.
+      - cold_in_global:    surgical — only the cold quad (Xup 36*NB + Xdown 36*NB + v_w/a_w
+                           6*NB each = 84*NB) routes to d_workspace (inner COLD_IN_SMEM=false); hot stays smem.
       - s_temp_in_global:  whole world inner s_temp arena -> d_workspace (inner
                            SCRATCH_IN_SMEM=false; guaranteed-fit fallback).
     The inner now OWNS its scratch placement AND the XImats load (inner-owns-placement,
@@ -4608,8 +4624,10 @@ def _emit_idsva_so_world_frame_kernel_body_for_flags(self, n, NUM_POS, single_ca
     if not use_global_output:
         extra_t_buffers.append(("s_idsva_so", 4*n**3))
     inner_temp = gen_idsva_so_world_frame_temp_mem_size(self) if self.robot.floating_base else self.gen_idsva_so_body_frame_inner_temp_mem_size()
-    # Surgical rung: hot arena = inner_temp minus the cold trio (36*NB + 12*NB).
-    cold_floats = 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
+    # Surgical rung: hot arena = inner_temp minus the cold QUAD (Xup 36*NB + Xdown 36*NB +
+    # v_w/a_w 12*NB = 84*NB). Single source of truth (must stay in lockstep with the inner
+    # cold-band layout ~3251-3263 and the shared-file _idsva_wf_cold).
+    cold_floats = self.gen_idsva_so_world_cold_floats()
     if s_temp_in_global:
         smem_temp = 0
     elif cold_in_global:

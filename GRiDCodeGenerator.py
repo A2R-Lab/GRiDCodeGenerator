@@ -185,7 +185,7 @@ class GRiDCodeGenerator:
                             gen_idsva_so_body_frame_inner_temp_mem_size, gen_idsva_so_body_frame_inner_function_call, idsva_so_needs_reference_order_output_repair, \
                             gen_idsva_so_body_frame_reference_order_output_repair, gen_idsva_so_body_frame_floating_reference_inner, gen_idsva_so_body_frame_public_dvdq_layout_repair, gen_idsva_so_body_frame_inner, \
                             gen_idsva_so_body_frame_kernel, gen_idsva_so_body_frame_host, gen_idsva_so_body_frame, \
-                            gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, \
+                            gen_idsva_so_world_frame_temp_mem_size, gen_idsva_so_world_frame_inner, gen_idsva_so_world_cold_floats, \
                             gen_idsva_so_world_frame_inner_function_call, gen_idsva_so_world_frame_kernel, \
                             gen_idsva_so_world_frame_host, gen_idsva_so_world_frame, \
                             gen_idsva_so_device, gen_idsva_so_dispatcher_host, gen_idsva_so_dispatcher, \
@@ -1240,15 +1240,16 @@ class GRiDCodeGenerator:
         idsva_so_world_frame_full_t_count = idsva_so_world_frame_base_t_count + 4*nv**3
         # ----- idsva_so WORLD-frame per-tier spill ladder -----
         # Flags = (use_global_output, s_temp_in_global, cold_in_global). The world inner
-        # is UN-aliased, so a surgical rung is now landed: the cold trio Xdown (36*NB,
-        # dead after Step 3) + v_w/a_w (6*NB each, dead after Step 4's f_w build) can move
-        # to d_workspace while the hot arena stays in smem (inner COLD_IN_SMEM=false).
+        # is UN-aliased, so a surgical rung is landed: the cold QUAD Xup (36*NB, dead after
+        # the Step-4 IC build) + Xdown (36*NB, dead after Step 3) + v_w/a_w (6*NB each, dead
+        # after Step 4's f_w build) = 84*NB can move to d_workspace while the hot arena stays
+        # in smem (inner COLD_IN_SMEM=false).
         # Rungs least->most spill:
         #   full:               output + whole s_temp arena in smem
         #   global_output:      4*NV^3 output tensor -> d_idsva_so global (coalesced one-shot)
-        #   output_cold:        + surgical cold trio (36*NB + 12*NB) -> d_workspace
+        #   output_cold:        + surgical cold quad (Xup 36*NB + Xdown 36*NB + v_w/a_w 12*NB = 84*NB) -> d_workspace
         #   output_temp:        + whole s_temp inner arena -> d_workspace (guaranteed-fit fallback)
-        _idsva_wf_cold = 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
+        _idsva_wf_cold = self.gen_idsva_so_world_cold_floats()
         _idsva_wf_base_smem = (3*n) + XI_size
         _idsva_so_world_tiers = [
             ("full",          idsva_so_world_frame_full_t_count,                  False, False, False),
@@ -1277,13 +1278,13 @@ class GRiDCodeGenerator:
             return 0
         def _idsva_world_ws_floats(pick):
             # pick 3 (output_temp) spills the whole inner arena; pick 2 (output_cold)
-            # spills just the surgical cold trio (Xdown 36*NB + v_w/a_w 12*NB).
+            # spills just the surgical cold quad (Xup 36*NB + Xdown 36*NB + v_w/a_w 12*NB).
             if pick == 3:
                 # whole s_temp routed to workspace; XImats helper rebuilds Xfixed
                 # into it (offset 2*num_pos) so the workspace must reserve it.
                 return idsva_so_world_frame_inner_temp_count + rt_xfixed_reserve
             if pick == 2:
-                return 36 * self.robot.get_num_bodies() + 12 * self.robot.get_num_bodies()
+                return self.gen_idsva_so_world_cold_floats()
             return 0
         idsva_so_spill_ws_t_count = max(
             [_idsva_body_ws_floats(p) for p in self.idsva_so_body_frame_spill_tier_3way] +
@@ -1330,17 +1331,17 @@ class GRiDCodeGenerator:
         # world) — the sub-inner just uses the pointer it is given (inner-owns-placement).
         # A4: idsva_cold rung (between global_tensors and workspace_temp). Keeps outputs
         # in global (like global_tensors) but additionally spills the embedded WORLD
-        # idsva_so inner's cold trio (Xdown 36*NB + v_w/a_w 12*NB = 48*NB floats, dead
-        # before the hot triple-walk) to the SO-temp d_workspace region via the inner's
+        # idsva_so inner's cold quad (Xup 36*NB + Xdown 36*NB + v_w/a_w 12*NB = 84*NB floats,
+        # dead before the hot triple-walk) to the SO-temp d_workspace region via the inner's
         # COLD_IN_SMEM=false, while the hot pool stays in smem. Its smem arena = the
-        # global_tensors arena minus the cold-trio span. Only EFFECTIVE when the composed
+        # global_tensors arena minus the cold-quad span. Only EFFECTIVE when the composed
         # idsva inner is the WORLD frame (floating OR spherical) — the body-frame inner
-        # has no exposed cold trio, so for body-frame robots this rung's arena is set
+        # has no exposed cold quad, so for body-frame robots this rung's arena is set
         # EQUAL to global_tensors (no fit advantage -> the picker never distinguishes it,
         # and the kernel's COLD flag is inert there). The reduction matches the standalone
         # idsva_so world cold rung (_idsva_wf_cold).
         _fdsva_so_uses_world_idsva = self.robot.floating_base or self.robot.robot_has_spherical()
-        _fdsva_so_cold_floats = (48 * self.robot.get_num_bodies()) if _fdsva_so_uses_world_idsva else 0
+        _fdsva_so_cold_floats = self.gen_idsva_so_world_cold_floats() if _fdsva_so_uses_world_idsva else 0
         # 9-tuple: (..., use_workspace_idsva_temp == pool->global, idsva_cold_in_global). Levels keep pool in smem except pool_global.
         _fdsva_so_tiers = [
             ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False, False),
