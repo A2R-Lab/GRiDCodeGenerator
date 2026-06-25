@@ -358,7 +358,12 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
         "gravity is the gravity constant",
         "num_timesteps is the length of the trajectory points",
     ]
-    func_def_start = "void inverse_dynamics_regressor_kernel(T *d_Y, const T *d_q_qd_qdd, const int stride_q_qd_qdd, "
+    # g1-spill: the kernel takes d_workspace as its 2nd arg. At a spilled tier
+    # (INVERSE_DYNAMICS_REGRESSOR_Y_IN_SMEM<TIER>()==false) the s_Y output (nv*10*NB,
+    # ~277KB on h2_plus -> unlaunchable) lives in the L2-pinned d_workspace SO section
+    # instead of smem, making the kernel launchable; at TIER_SHARED it stays in smem and
+    # d_workspace is unused. Verbatim clone of the in-file fdpg s_Y spill.
+    func_def_start = "void inverse_dynamics_regressor_kernel(T *d_Y, unsigned char *d_workspace, const T *d_q_qd_qdd, const int stride_q_qd_qdd, "
     func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -375,12 +380,28 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    extra_t_buffers = [("s_q_qd_qdd", in_size), ("s_Y", out_size), ("s_vaf", 18 * NUM_POS)]
+    # g1-spill: s_Y is the LAST t_buffer (tail-carve); its arena slot is sized out_size
+    # at an in-smem tier and 0 when spilled (the real s_Y is then routed to d_workspace),
+    # shrinking the smem footprint exactly to match the tiered DYNAMIC_SHARED_MEM_BYTES.
+    self.gen_add_code_line("constexpr bool REGRESSOR_Y_IN_SMEM = INVERSE_DYNAMICS_REGRESSOR_Y_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int REGRESSOR_Y_SLOT = REGRESSOR_Y_IN_SMEM ? " + str(out_size) + " : 0;")
+    extra_t_buffers = [("s_q_qd_qdd", in_size), ("s_vaf", 18 * NUM_POS), ("s_Y", "REGRESSOR_Y_SLOT")]
     shared_mem_size = self.gen_inverse_dynamics_regressor_inner_temp_mem_size()
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
+    self.gen_add_code_line("if constexpr (REGRESSOR_Y_IN_SMEM) { (void)d_workspace; }")
     self.gen_add_code_line("T *s_q = s_q_qd_qdd; T *s_qd = &s_q_qd_qdd[" + str(NUM_POS) +
                            "]; T *s_qdd = &s_q_qd_qdd[" + str(2 * NUM_POS) + "];")
+    def _repoint_spilled_Y(in_timestep_loop):
+        # When spilled, repoint s_Y at the L2-pinned d_workspace SO section (per-timestep
+        # slot; the regressor never runs concurrently with the SO kernels). Emitted where
+        # `k` is in scope for the batched path. Verbatim clone of fdpg's _repoint_spilled_Y.
+        self.gen_add_code_line("if constexpr (!REGRESSOR_Y_IN_SMEM) {", True)
+        if in_timestep_loop:
+            self.gen_add_code_line("s_Y = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("s_Y = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
+        self.gen_add_end_control_flow()
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd_qdd", str(in_size), stride="stride_q_qd_qdd")
@@ -389,6 +410,7 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
             self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
             self.gen_mjx_input_convert(qdd_name="s_qdd")
             self.gen_add_end_control_flow()
+        _repoint_spilled_Y(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_inverse_dynamics_regressor_inner_function_call()
@@ -402,6 +424,7 @@ def gen_inverse_dynamics_regressor_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q_qd_qdd", str(in_size))
+        _repoint_spilled_Y(in_timestep_loop=False)
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call()
@@ -448,7 +471,7 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"inverse_dynamics_regressor requires all-data or dynamics gridData\");")
     kernel_tmpl = "inverse_dynamics_regressor_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "inverse_dynamics_regressor_kernel<T, RESOURCE_TIER>"
-    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_Y,hd_data->d_q_qd_u,stride_q_qd_qdd,"
+    func_call_start = kernel_tmpl + "<<<block_dimms,thread_dimms,INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_Y,hd_data->d_workspace,hd_data->d_q_qd_u,stride_q_qd_qdd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("inverse_dynamics_regressor_kernel<", "inverse_dynamics_regressor_kernel_single_timing<")
@@ -468,7 +491,11 @@ def gen_inverse_dynamics_regressor_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics_regressor\", INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    # g1-spill: L2-pin d_workspace when the tier spills s_Y into it.
+    ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!INVERSE_DYNAMICS_REGRESSOR_Y_IN_SMEM<RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"inverse_dynamics_regressor\", INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([

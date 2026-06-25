@@ -728,6 +728,17 @@ class GRiDCodeGenerator:
         regressor_t_count = (n + 2*nv) + nv*10*self.robot.get_num_bodies() + 18*n \
             + self.gen_inverse_dynamics_regressor_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         self.regressor_t_count = regressor_t_count
+        # g1-spill: 2-rung s_Y output-spill ladder (mirror fdpg :795-802). The s_Y output
+        # (nv*10*NB, ~277KB on h2_plus -> unlaunchable) routes to the L2-pinned d_workspace
+        # SO section at any tier whose full arena overflows the target, keeping s_vaf +
+        # inputs + XImats + RNEA scratch in smem. Small robots stay rung 0 (s_Y in smem).
+        _idr_Y_count          = nv*10*self.robot.get_num_bodies()
+        _idr_t_count_full     = regressor_t_count
+        _idr_t_count_surgical = regressor_t_count - _idr_Y_count
+        self.inverse_dynamics_regressor_spill_tier_3way = select_shared_tier_3way(_idr_t_count_full, _idr_t_count_surgical)
+        self.inverse_dynamics_regressor_t_count_per_tier = tuple(
+            (_idr_t_count_full, _idr_t_count_surgical)[i] for i in self.inverse_dynamics_regressor_spill_tier_3way)
+        self.inverse_dynamics_regressor_spill_Y_ws_count = _idr_Y_count
         # PS5 energy regressors. Both outputs are 10*NUM_BODIES (no DoF sweep).
         # KE (spatial / XImats domain): s_q_qd(n+nv) + s_y_ke(10NB) + s_vaf(18n)
         #   + RNEA forward scratch + XI_size.
@@ -1429,6 +1440,7 @@ class GRiDCodeGenerator:
         # so reuse is safe and costs no new allocation. Fold their spill counts into
         # the max so the per-timestep workspace always covers them.
         _fpg_spill_ws = self.forward_dynamics_parameter_gradient_spill_Y_ws_count if any(p >= 1 for p in self.forward_dynamics_parameter_gradient_spill_tier_3way) else 0
+        _idr_spill_ws = self.inverse_dynamics_regressor_spill_Y_ws_count if any(p >= 1 for p in self.inverse_dynamics_regressor_spill_tier_3way) else 0
         _feg_spill_ws = self.f_ext_gradient_spill_out_ws_count if any(p >= 1 for p in self.f_ext_gradient_spill_tier_3way) else 0
         # PS5 dccrba: its 6*nv*nv output (L1+) and the Jw sweep band (L2, DE-GATE #2)
         # surgically spill into this same SO band at DISTINCT sub-offsets, so at L2 the
@@ -1445,7 +1457,7 @@ class GRiDCodeGenerator:
         # that offset region (6*nv*nv) plus the Jw band itself, even though cmm never
         # writes the output region.
         _cmm_spill_ws = (6 * nv * nv + self.cmm_time_variation_spill_J_ws_count) if any(p >= 1 for p in self.cmm_time_variation_spill_tier_3way) else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _feg_spill_ws, _dccrba_spill_ws, _cmm_spill_ws)
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _idr_spill_ws, _feg_spill_ws, _dccrba_spill_ws, _cmm_spill_ws)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -1572,7 +1584,13 @@ class GRiDCodeGenerator:
                                  ""])
         self.gen_add_code_lines([
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(id_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.inverse_dynamics_regressor_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.inverse_dynamics_regressor_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.inverse_dynamics_regressor_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
+                                 # g1-spill: per-tier placement of s_Y -- true => smem, false => d_workspace.
+                                 "template <int TIER> __host__ __device__ constexpr bool INVERSE_DYNAMICS_REGRESSOR_Y_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.inverse_dynamics_regressor_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.inverse_dynamics_regressor_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.inverse_dynamics_regressor_spill_tier_3way[2] == 0 else "false") + "; }",
                                  # PS5 energy regressors (each output 10*NUM_BODIES, fits every tier -> no spill).
                                  "template <typename T> __host__ __device__ inline size_t KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.kinetic_energy_regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  # PS5 Coriolis matrix C(q,qd) (nv x nv; fits smem at FULL -> no spill).
@@ -2261,9 +2279,9 @@ class GRiDCodeGenerator:
         # default dynamic-smem cap on big robots (g1: ~55 KB), so it MUST opt in.
         ("inverse_dynamics_regressor", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("inverse_dynamics_regressor_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_regressor_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
         # PS5 energy regressors (each output 10*NUM_BODIES; opt-in like the joint-torque
         # regressor so big-robot launches set the dynamic-smem attr).
@@ -2530,7 +2548,7 @@ class GRiDCodeGenerator:
                    "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
                 ("inverse_dynamics_regressor(mjx)", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"inverse_dynamics_regressor_kernel<T, {_GT}, true>",
-                   "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)")]),
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
                 ("idsva_so_world_frame(mjx)", "idsva_so_world_frame", "generate_idsva_so_world_frame", "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"idsva_so_world_frame_kernel<T, {_GT}, true>",
                    "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
