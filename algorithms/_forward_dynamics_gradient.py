@@ -413,14 +413,15 @@ def gen_forward_dynamics_gradient_kernel_max_temp_mem_size(self):
     return base_size + temp_mem_size
 
 _FD_DU_PICK_FLAGS = [
-    # (use_selective_spill, use_global_temp)
-    (False, False),   # pick 0: full smem
-    (True,  False),   # pick 1: selective spill
-    (False, True),    # pick 2: global temp
+    # (use_selective_spill, use_global_temp, use_output_spill)
+    (False, False, False),   # pick 0: full smem
+    (True,  False, False),   # pick 1: selective spill (id_du da_df band -> d_temp_spill)
+    (False, True,  False),   # pick 2: global temp (whole inner pool -> d_workspace GRAD section)
+    (False, True,  True),    # pick 3: output-spill (global temp + s_dc_du/s_Minv -> L2-pinned SO band)
 ]
 
 def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_selective_spill, use_global_temp,
-                                      use_qdd_Minv_input, single_call_timing, mjx_kernel = False):
+                                      use_output_spill, use_qdd_Minv_input, single_call_timing, mjx_kernel = False):
     """Emit forward_dynamics_gradient kernel body for one tier's spill flags.
     `mjx_kernel` (floating + non-mimic/skew, u-input variant): emit the
     MUJOCO_OUTPUT input-convert (before the device fn builds XImats) and forward
@@ -441,6 +442,13 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_sele
     # NB > nv, so size 18*NB to keep the ID inner's writes from overflowing into
     # s_qdd/s_Minv. Non-mimic keeps 18*nv (byte-identical; floating nv > NB).
     _vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else nv)
+    # OUTPUT-spill rung (use_output_spill): the s_dc_du (2*nv*nv id-gradient band) and
+    # s_Minv (nv*nv mass matrix) write-once OUTPUT buffers are dropped from the smem
+    # arena and repointed to the L2-pinned SO band (crba/fdsva_so style), shrinking the
+    # arena by 3*nv*nv. The hot inner pool already lives in d_workspace's GRAD section
+    # (use_output_spill implies use_global_temp); the outputs sit in the disjoint SO
+    # section. fd_du never runs concurrently with the SO/regressor kernels that also
+    # reuse the SO band, so the placement is safe and costs no new allocation.
     extra_t_buffers = [("s_q_qd", 2*nq),
                        ("s_dc_du", nv*2*nv),
                        ("s_vaf", _vaf_cnt),
@@ -448,11 +456,15 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_sele
                        ("s_Minv", nv*nv)]
     if not use_qdd_Minv_input:
         extra_t_buffers[0] = ("s_q_qd_u", 3*nq)
+    if use_output_spill:
+        extra_t_buffers = [b for b in extra_t_buffers if b[0] not in ("s_dc_du", "s_Minv")]
     shared_mem_size = 0 if use_global_temp else (
         max(self.gen_minv_inner_temp_mem_size(), self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"])
         if use_selective_spill else self.gen_forward_dynamics_gradient_inner_temp_mem_size()
     )
     self.gen_XImats_helpers_temp_shared_memory_code(shared_mem_size, extra_t_buffers = extra_t_buffers, include_linalg_scratch=True)
+    if use_output_spill:
+        self.gen_add_code_line("T *s_dc_du; T *s_Minv;  // repointed to the L2-pinned SO band (output spill) per timing branch")
     self.gen_add_code_line("T *d_temp_spill = nullptr; (void)d_temp_spill;")
     if use_qdd_Minv_input:
         self.gen_add_code_line(f"T *s_q = s_q_qd; T *s_qd = &s_q_qd[{nq}];")
@@ -479,6 +491,10 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_sele
             self.gen_add_code_line("T *d_df_du_k = &d_df_du[k*" + str(nv*2*nv) + "];")
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+        if use_output_spill:
+            # s_dc_du (2*nv*nv) + s_Minv (nv*nv) -> L2-pinned SO band, disjoint from the
+            # inner pool which lives in the GRAD section (offset 0) under use_global_temp.
+            self.gen_add_code_line("s_dc_du = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]); s_Minv = &s_dc_du[" + str(2*nv*nv) + "];")
         self.gen_add_code_line("// compute — the orchestration inner owns its s_temp pool placement")
         self.gen_forward_dynamics_gradient_device_function_call(
             use_qdd_Minv_input,
@@ -500,6 +516,9 @@ def _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, use_sele
             self.gen_add_code_line("T *d_df_du_k = d_df_du;")
         if use_selective_spill:
             self.gen_add_code_line("d_temp_spill = reinterpret_cast<T *>(d_workspace);")
+        if use_output_spill:
+            # s_dc_du/s_Minv -> L2-pinned SO band (single-timing: no per-k stride).
+            self.gen_add_code_line("s_dc_du = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]); s_Minv = &s_dc_du[" + str(2*nv*nv) + "];")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         if use_qdd_Minv_input:
@@ -569,8 +588,8 @@ def gen_forward_dynamics_gradient_kernel(self, use_qdd_Minv_input = False, singl
     self.gen_add_code_line(func_def, True)
     picks = getattr(self, "forward_dynamics_gradient_spill_tier_3way", (0, 0, 0))
     def _emit_forward_dynamics_gradient_body(pick):
-        uss, ugt = _FD_DU_PICK_FLAGS[pick]
-        _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, uss, ugt, use_qdd_Minv_input, single_call_timing, mjx_kernel)
+        uss, ugt, uos = _FD_DU_PICK_FLAGS[pick]
+        _emit_forward_dynamics_gradient_kernel_body_for_flags(self, nq, nv, uss, ugt, uos, use_qdd_Minv_input, single_call_timing, mjx_kernel)
     self.gen_tier_dispatch(picks, _emit_forward_dynamics_gradient_body)
     self.gen_add_end_function()
 

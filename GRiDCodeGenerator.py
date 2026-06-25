@@ -1044,12 +1044,21 @@ class GRiDCodeGenerator:
         forward_dynamics_gradient_t_count_selective = forward_dynamics_gradient_t_count_full - forward_dynamics_gradient_temp_count + forward_dynamics_gradient_selective_temp_count
         inverse_dynamics_gradient_t_count_emergency = inverse_dynamics_gradient_t_count_full - inverse_dynamics_gradient_temp_count
         forward_dynamics_gradient_t_count_emergency = forward_dynamics_gradient_t_count_full - forward_dynamics_gradient_temp_count
+        # fd_du OUTPUT-spill rung (h2_plus de-gate): the emergency rung routes the
+        # whole inner s_temp pool to d_workspace but keeps the OUTPUT bands s_dc_du
+        # (2*nv*nv id-gradient band) + s_Minv (nv*nv mass matrix) in smem -> on a big
+        # floating robot (h2_plus) those 3*nv*nv floats leave the arena at ~105KB,
+        # still over sm_120's ~99KB. This rung additionally repoints s_dc_du/s_Minv
+        # to the L2-pinned SO band (crba/fdsva_so output-spill style), shrinking the
+        # arena by 3*nv*nv (~77KB) so h2_plus launches (~28KB). Inner pool stays in
+        # the GRAD section (offset 0); the outputs sit in the disjoint SO section.
+        forward_dynamics_gradient_t_count_output_spill = forward_dynamics_gradient_t_count_emergency - (2*nv*nv + nv*nv)
         # Per-tier picks (perf, lite, minimal). The existing single-pick flags
         # (inverse_dynamics_gradient_spill_tier etc.) are kept = perf pick so today's emit paths
         # are byte-for-byte unchanged; the lite/minimal indices are exposed
         # only as metadata until the per-tier emit work lands.
         _inverse_dynamics_gradient_arenas = (inverse_dynamics_gradient_t_count_full, inverse_dynamics_gradient_t_count_selective, inverse_dynamics_gradient_t_count_emergency)
-        _forward_dynamics_gradient_arenas = (forward_dynamics_gradient_t_count_full, forward_dynamics_gradient_t_count_selective, forward_dynamics_gradient_t_count_emergency)
+        _forward_dynamics_gradient_arenas = (forward_dynamics_gradient_t_count_full, forward_dynamics_gradient_t_count_selective, forward_dynamics_gradient_t_count_emergency, forward_dynamics_gradient_t_count_output_spill)
         self.inverse_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_inverse_dynamics_gradient_arenas)
         self.forward_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_forward_dynamics_gradient_arenas)
         self.inverse_dynamics_gradient_spill_tier = self.inverse_dynamics_gradient_spill_tier_3way[0]
@@ -1057,7 +1066,10 @@ class GRiDCodeGenerator:
         self.inverse_dynamics_gradient_use_selective_spill = self.inverse_dynamics_gradient_spill_tier == 1
         self.forward_dynamics_gradient_use_selective_spill = self.forward_dynamics_gradient_spill_tier == 1
         self.inverse_dynamics_gradient_use_global_temp = self.inverse_dynamics_gradient_spill_tier == 2
-        self.forward_dynamics_gradient_use_global_temp = self.forward_dynamics_gradient_spill_tier == 2
+        # global-temp (whole inner pool -> d_workspace) is used at BOTH the emergency
+        # rung (2) and the output-spill rung (3, which also spills s_dc_du/s_Minv).
+        self.forward_dynamics_gradient_use_global_temp = self.forward_dynamics_gradient_spill_tier >= 2
+        self.forward_dynamics_gradient_use_output_spill = self.forward_dynamics_gradient_spill_tier == 3
         inverse_dynamics_gradient_t_count = _inverse_dynamics_gradient_arenas[self.inverse_dynamics_gradient_spill_tier]
         forward_dynamics_gradient_t_count = _forward_dynamics_gradient_arenas[self.forward_dynamics_gradient_spill_tier]
         # Per-tier t_counts exposed for tier-aware constexpr metadata.
