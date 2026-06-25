@@ -705,28 +705,37 @@ def gen_osc_inertia_device(self):
 
     func_def = ("void osc_inertia_device(T *s_Lambda, const int target_jid, "
                 "const int reference_frame, const T *s_q, "
-                "const robotModel<T> *d_robotModel) {")
+                "const robotModel<T> *d_robotModel, unsigned char *d_workspace = nullptr) {")
     func_params = ["s_Lambda holds the 6 x 6 operational-space inertia (column-major)",
                    "target_jid is the joint id of the frame",
                    "reference_frame is 0=LOCAL, 1=WORLD, 2=LOCAL_WORLD_ALIGNED",
                    "s_q is the joint position vector",
-                   "d_robotModel is the GPU model helpers"]
+                   "d_robotModel is the GPU model helpers",
+                   "d_workspace is the L2-pinned spill workspace (used when OSC_INERTIA_F_IN_SMEM<TIER>() is false; pass nullptr at the full tier)"]
     func_notes = ["Lambda = (J Minv J^T)^{-1}; self-contained — Minv is composed on device via minv_inner (no caller Minv)."]
     self.gen_add_func_doc("Compute the operational-space (task) inertia",
                           func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
 
-    # Arena: BOTH transform families + Minv + the minv F-region (passed
-    # as d_workspace) + the Jacobian J + the J*Minv*J^T compose scratch.
-    # s_Lambda is a param. s_XImats / s_temp / topology / linalg are emitted by
-    # gen_XImats_helpers_temp_shared_memory_code; the rest are extra_t_buffers.
-    extra = [("s_XmatsHom", Xhom_size), ("s_Minv", nv * nv), ("s_F", F_size),
+    # Arena: BOTH transform families + Minv + the minv F-region (passed as
+    # minv's d_workspace) + the Jacobian J + the J*Minv*J^T compose scratch.
+    # 2-rung spill: at the spill-F tier OSC_INERTIA_F_IN_SMEM<TIER>() is false, so
+    # s_F drops from the smem arena (slot 0) and routes to the L2-pinned minv-F
+    # workspace offset, shrinking the arena by 6*nv*nv (the dominant band). The macro
+    # OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T,TIER> sizes the launch from the same predicate.
+    self.gen_add_code_line("constexpr bool OSC_F_SMEM = OSC_INERTIA_F_IN_SMEM<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int OSC_F_SLOT = OSC_F_SMEM ? " + str(F_size) + " : 0;")
+    extra = [("s_XmatsHom", Xhom_size), ("s_Minv", nv * nv), ("s_F", "OSC_F_SLOT"),
              ("s_Jfj", 6 * nv), ("s_MJt", nv * 6), ("s_task", 36), ("s_taskinv", 36)]
     self.gen_XImats_helpers_temp_shared_memory_code(
         temp_size, extra_t_buffers=extra,
         include_linalg_scratch=True, linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    # spill-F: route s_F to the L2-pinned minv-F workspace offset (d_workspace is the
+    # per-timestep base, sliced by the kernel). Disjoint from any concurrent kernel —
+    # osc_inertia is a standalone kinematics launch.
+    self.gen_add_code_line("if constexpr (!OSC_F_SMEM) { s_F = reinterpret_cast<T *>(&d_workspace[GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()]); } else { (void)d_workspace; }")
 
     # ---- Step 1: spatial transforms -> minv_inner -> SYMMETRIC_UPPER Minv ----
     self.gen_load_update_XImats_helpers_function_call()
@@ -799,7 +808,7 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
                    "stride_q is the stride between each q",
                    "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
                    "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
-    func_def_start = "void osc_inertia_kernel(T *d_osc_inertia, const T *d_q, const int stride_q, "
+    func_def_start = "void osc_inertia_kernel(T *d_osc_inertia, unsigned char *d_workspace, const T *d_q, const int stride_q, "
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
     if single_call_timing:
@@ -828,8 +837,8 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
             self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
             self.gen_mjx_quat_reorder("s_q")
             self.gen_add_end_control_flow()
-        self.gen_add_code_line("// compute")
-        self.gen_add_code_line("osc_inertia_device<T>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel);")
+        self.gen_add_code_line("// compute (slice the per-timestep workspace base for the spill-F tier)")
+        self.gen_add_code_line("osc_inertia_device<T, RESOURCE_TIER>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel, &d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
         self.gen_add_sync()
         self.gen_kernel_save_result("osc_inertia", "36", stride="36")
         self.gen_add_end_control_flow()
@@ -838,7 +847,7 @@ def gen_osc_inertia_kernel(self, single_call_timing=False):
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q", str(n), feedback_from="osc_inertia")
-        self.gen_add_code_line("osc_inertia_device<T>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel);")
+        self.gen_add_code_line("osc_inertia_device<T, RESOURCE_TIER>(s_osc_inertia, target_jid, reference_frame, s_q, d_robotModel, d_workspace);")
         self.gen_anti_licm_output_write("osc_inertia")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("osc_inertia", "36")
@@ -878,8 +887,8 @@ def gen_osc_inertia_host(self, mode=0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"osc_inertia requires all-data or kinematics gridData\");")
     osc_kernel_tmpl = "osc_inertia_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "osc_inertia_kernel<T, RESOURCE_TIER>"
-    func_call_start = (osc_kernel_tmpl + "<<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
-                       "(hd_data->d_osc_inertia,hd_data->d_q,stride_q,")
+    func_call_start = (osc_kernel_tmpl + "<<<block_dimms,thread_dimms,OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>"
+                       "(hd_data->d_osc_inertia,hd_data->d_workspace,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("osc_inertia_kernel<", "osc_inertia_kernel_single_timing<")
@@ -903,7 +912,7 @@ def gen_osc_inertia_host(self, mode=0):
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"osc_inertia\", OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"osc_inertia\", OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines(["// finally transfer the result back",

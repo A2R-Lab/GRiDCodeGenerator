@@ -1148,6 +1148,21 @@ class GRiDCodeGenerator:
             (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)[i] for i in self.crba_spill_tier_3way
         )
         crba_t_count = self.crba_t_count_per_tier[0]
+        # osc_inertia (Lambda = (J Minv J^T)^-1): SELF-CONTAINED, composes Minv on
+        # device via minv_inner with the heavy F-region kept in a dedicated SHARED
+        # s_F buffer (6*nv*nv). On h2_plus that F-region is ~153KB and the full arena
+        # ~228KB (UNLAUNCHABLE). 2-rung ladder: full (s_F in smem) | spill-F (s_F ->
+        # the L2-pinned minv-F workspace offset, keeping s_Minv + everything else in
+        # smem). h2_plus picks spill-F (~74KB) -> LAUNCHES; all other robots fit full.
+        _osc_XI = self.gen_get_XI_size(False, False)
+        _osc_Xhom, _, _ = self.gen_get_Xhom_size()
+        _osc_F = self.gen_minv_inner_F_size()                          # 6*nv*nv minv F-region
+        _osc_temp = max(self.gen_minv_inner_no_F_size(), 16 * self.robot.get_num_joints())
+        _osc_t_full     = _osc_XI + _osc_Xhom + nv*nv + _osc_F + 6*nv + nv*6 + 72 + _osc_temp
+        _osc_t_spill_F  = _osc_t_full - _osc_F                         # s_F -> d_workspace
+        self.osc_inertia_spill_tier_3way = select_shared_tier_3way(_osc_t_full, _osc_t_spill_F)
+        self.osc_inertia_t_count_per_tier = tuple(
+            (_osc_t_full, _osc_t_spill_F)[i] for i in self.osc_inertia_spill_tier_3way)
         ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         # Phase 3d (EE_POSE_GRAD): two-tier spill, mirrors D2EE's (full, spill, spill).
         # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient). Level 1 =
@@ -1441,6 +1456,9 @@ class GRiDCodeGenerator:
         # because Minv runs before inverse_dynamics_gradient / forward_dynamics_gradient in any kernel that
         # composes both — they sequentially reuse the same workspace bytes).
         _minv_F_workspace_count = self.gen_minv_inner_F_size() if any(p == 1 for p in self.minv_spill_tier_3way) else 0
+        # osc_inertia spill-F rung routes its 6*nv*nv minv F-region (s_F) to the same
+        # minv-F workspace offset (offset 0 of the GRAD section); cover it in the max.
+        _osc_F_workspace_count = self.gen_minv_inner_F_size() if any(p >= 1 for p in self.osc_inertia_spill_tier_3way) else 0
         # CRBA whole-arena spill: when crba_inner's scratch band is redirected to
         # d_workspace (LITE/MINIMAL, or a forced deep-spill tier), the per-timestep
         # workspace must be able to back the full 140*NJ-class band. Include it in
@@ -1457,6 +1475,7 @@ class GRiDCodeGenerator:
                                            _crba_inner_temp_count,
                                            _coriolis_inner_temp_count,
                                            _minv_F_workspace_count,
+                                           _osc_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_gradient_workspace_count)
         # D2EE needs no d_workspace: under the FD-on-Jacobian inner the only large
@@ -1565,6 +1584,9 @@ class GRiDCodeGenerator:
                                  # DE-GATE #2: 1 if the DEFAULT tier spills the dccrba output or Jw band / cmm Jw band
                                  # into d_workspace (so init_gridData must allocate d_workspace in the kinematics path).
                                  "const int GRID_DCCRBA_USES_WORKSPACE_TEMP = " + str(1 if (self.dccrba_spill_tier_3way[0] >= 1 or self.cmm_time_variation_spill_tier_3way[0] >= 1 or self.com_spill_tier_3way[0] >= 1 or self.ccrba_spill_tier_3way[0] >= 1 or self.energy_spill_tier_3way[0] >= 1) else 0) + ";", \
+                                 # osc_inertia (kinematics-path) spill-F rung needs d_workspace; the dynamics
+                                 # block does not allocate it for a kinematics-only codegen -> signal the lazy-alloc.
+                                 "const int GRID_OSC_INERTIA_USES_WORKSPACE = " + str(1 if self.osc_inertia_spill_tier_3way[0] >= 1 else 0) + ";", \
                                  "const int GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.inverse_dynamics_gradient_spill_tier) + ";", \
                                  "const int GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.forward_dynamics_gradient_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(inverse_dynamics_gradient_temp_layout["spill_start"]) + ";", \
@@ -2172,7 +2194,7 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose, 6*NUM_EES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_gradient, 6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_end_effector_pose_hessian, 6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP || GRID_DCCRBA_USES_WORKSPACE_TEMP) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
+                      "    if ((GRID_END_EFFECTOR_POSE_HESSIAN_USES_WORKSPACE_TEMP || GRID_END_EFFECTOR_POSE_GRADIENT_USES_WORKSPACE_TEMP || GRID_DCCRBA_USES_WORKSPACE_TEMP || GRID_OSC_INERTIA_USES_WORKSPACE) && hd_data->d_workspace == nullptr) {gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));}", \
                       "    hd_data->h_end_effector_pose = (T *)malloc(6*NUM_EES*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_end_effector_pose_gradient = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_end_effector_pose_hessian = (T *)malloc(6*NUM_EES*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
@@ -2483,9 +2505,9 @@ class GRiDCodeGenerator:
         ]),
         ("osc_inertia", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("osc_inertia_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("osc_inertia_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         # Runtime-target pose / pose-gradient (opt-in). Kernels take target_jid +
         # the runtime offset pointer: (T *out, const T *q, const int stride_q,
@@ -2596,7 +2618,7 @@ class GRiDCodeGenerator:
                 # the arena < 48KB, would fail cudaErrorInvalidValue on a big floating robot).
                 ("osc_inertia(mjx)", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"osc_inertia_kernel<T, {_GT}, true>",
-                   "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")]),
+                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
                 ("end_effector_pose_gradient(mjx)", "end_effector_pose_gradient", None, "END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
                  [(f"end_effector_pose_gradient_kernel<T, {_GT}, true>",
                    "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
@@ -3434,16 +3456,22 @@ class GRiDCodeGenerator:
                 # d_workspace) and the J*Minv*J^T compose scratch.
                 # arena = s_XImats(XI) + extras + s_temp(max(no_F, 16*NJ)) where
                 # extras = s_XmatsHom + s_Minv + s_F + s_Jfj + s_MJt + s_task + s_taskinv.
-                osc_XI_size = self.gen_get_XI_size(False, False)
-                osc_noF = self.gen_minv_inner_no_F_size()
-                osc_F = self.gen_minv_inner_F_size()
-                osc_temp = max(osc_noF, 16 * NJ_fj)
-                osc_t_count = (osc_XI_size + Xhom_size_fj + (nv_fj * nv_fj) + osc_F
-                               + (6 * nv_fj) + (nv_fj * 6) + 36 + 36 + osc_temp)
+                # 2-rung spill ladder (full | spill-F): the per-tier t-counts +
+                # spill_tier picks were computed in initialize_constants_helpers. The
+                # OSC_INERTIA_F_IN_SMEM<TIER> predicate (true at the rungs whose pick
+                # keeps s_F in smem) is the single source of truth the device reads.
+                _osc_per = self.osc_inertia_t_count_per_tier
+                _osc_F_in_smem = tuple(p == 0 for p in self.osc_inertia_spill_tier_3way)
                 self.gen_add_code_line(
-                    "template <typename T> __host__ __device__ inline size_t OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES() "
-                    "{ return grid_shared_arena_bytes<T>(" + str(osc_t_count) +
-                    ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                    "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES() { "
+                    "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(_osc_per[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                    "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(_osc_per[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                    "else                                 return grid_shared_arena_bytes<T>(" + str(_osc_per[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }")
+                self.gen_add_code_line(
+                    "template <int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr bool OSC_INERTIA_F_IN_SMEM() { return (TIER == TIER_SHARED) ? "
+                    + ("true" if _osc_F_in_smem[0] else "false") + " : (TIER == TIER_LITE) ? "
+                    + ("true" if _osc_F_in_smem[1] else "false") + " : "
+                    + ("true" if _osc_F_in_smem[2] else "false") + "; }")
                 self.gen_add_code_line("#define GRID_HAS_OSC_INERTIA 1")
                 self.gen_osc_inertia()
         # Mimic-only marker: signal to consumers (e.g. the frame_jacobian smoke
