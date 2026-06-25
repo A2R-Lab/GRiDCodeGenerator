@@ -612,9 +612,16 @@ def _centroidal_device_extra(self):
     return [("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
 
 
-def _gen_centroidal_call(self):
-    # com/ccrba/energy keep s_J in smem (J_IN_SMEM=true) -> s_J_ext is nullptr.
-    self.gen_add_code_line("centroidal_inner<T, true>(s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, nullptr, s_linalg_smem);")
+def _gen_centroidal_call(self, spill=False):
+    if spill:
+        # kernel path (DE-GATE #2): s_J is carved as a SEPARATE tier-routed buffer
+        # (in-smem tail at the J-in-smem tiers, d_workspace at the J-spilled tier), so
+        # the inner is ALWAYS called with J external (J_IN_SMEM=false) and s_temp is the
+        # SHRUNK no-J pool. s_J already points at the right place (smem tail or repointed).
+        self.gen_add_code_line("centroidal_inner<T, false>(s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, s_J, s_linalg_smem);")
+    else:
+        # device-wrapper path: keep s_J inside s_temp (J_IN_SMEM=true) -> s_J_ext nullptr.
+        self.gen_add_code_line("centroidal_inner<T, true>(s_A, s_com, s_extra, s_q, s_XmatsHom, d_robotModel, s_temp, nullptr, s_linalg_smem);")
 
 
 # ----- com (p_com + J_com) device/kernel/host -----
@@ -724,7 +731,12 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
     input_count = (2 * n) if has_qd else n
     in_name = "q_qd" if has_qd else "q"
     grav = ", const T gravity" if has_gravity else ""
-    func_def = ("void " + name + "_kernel(T *d_out, const T *d_" + in_name + ", const int stride_" + in_name + ", "
+    NB = self.robot.get_num_bodies()
+    sJ = 6 * nv * NB
+    PRED = name.upper() + "_J_IN_SMEM"
+    SMEM = name.upper() + "_J_SMEM"
+    SLOT = name.upper() + "_J_SLOT"
+    func_def = ("void " + name + "_kernel(T *d_out, unsigned char *d_workspace, const T *d_" + in_name + ", const int stride_" + in_name + ", "
                 "const robotModel<T> *d_robotModel" + grav + ", const int NUM_TIMESTEPS) {")
     if single_call_timing:
         func_def = func_def.replace("kernel(", "kernel_single_timing(")
@@ -736,12 +748,28 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    extra = [("s_" + in_name, input_count), ("s_out", out_size)] + _centroidal_device_extra(self)
+    # DE-GATE #2: the Jw band (6*nv*NB) is the LAST t_buffer; sized sJ at the J-in-smem
+    # tiers (<ALGO>_J_IN_SMEM<TIER>()==true) and 0 at the J-spilled tier (then repointed
+    # to the L2-pinned d_workspace SO band below). s_temp is the SHRUNK no-J pool.
+    self.gen_add_code_line("constexpr bool " + SMEM + " = " + PRED + "<RESOURCE_TIER>();")
+    self.gen_add_code_line("constexpr int " + SLOT + " = " + SMEM + " ? " + str(sJ) + " : 0;")
+    extra = [("s_" + in_name, input_count), ("s_out", out_size)] + _centroidal_device_extra(self) + [("s_J", SLOT)]
     self.gen_XmatsHom_helpers_temp_shared_memory_code(
-        _centroidal_inner_temp_mem_size(self), extra_t_buffers=extra, include_linalg_scratch=True,
+        _centroidal_inner_temp_mem_size(self, j_in_smem=False), extra_t_buffers=extra, include_linalg_scratch=True,
         linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
     if has_qd:
         self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(n) + "];")
+    self.gen_add_code_line("if constexpr (" + SMEM + ") { (void)d_workspace; }")
+
+    def _repoint(in_loop):
+        # J-spilled tier: point s_J at the L2-pinned d_workspace SO band (shared
+        # GRID_DCCRBA_J_OFFSET_BYTES sub-offset with dccrba/cmm; same 6*nv*NB band).
+        self.gen_add_code_line("if constexpr (!" + SMEM + ") {", True)
+        if in_loop:
+            self.gen_add_code_line("s_J = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_DCCRBA_J_OFFSET_BYTES<T>()]);")
+        else:
+            self.gen_add_code_line("s_J = reinterpret_cast<T *>(&d_workspace[GRID_DCCRBA_J_OFFSET_BYTES<T>()]);")
+        self.gen_add_end_control_flow()
 
     def _compute():
         # mjx INPUT convert (floating only): reorder the base quaternion wxyz->xyzw
@@ -757,7 +785,7 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
                 self.gen_mjx_quat_reorder("s_q")
             self.gen_add_end_control_flow()
         self.gen_load_update_XmatsHom_helpers_function_call()
-        _gen_centroidal_call(self)
+        _gen_centroidal_call(self, spill=True)
         self.gen_add_sync()
         # finalize per-family from the inner outputs (s_A, s_com, s_extra, s_temp)
         if name == "com":
@@ -791,11 +819,12 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
                 self.gen_mjx_column_reframe("s_out", 6, nv)
                 self.gen_add_end_control_flow()
         elif name == "energy":
-            NB = self.robot.get_num_bodies()
-            off_J = 16 * self.robot.get_num_joints()
-            off_Iw = off_J + 6 * nv * NB
+            # KE reach-back. With J carved out of s_temp, the inner used the no-J pool:
+            # s_J lives in the external s_J buffer (smem tail or d_workspace) and s_Iw
+            # sits right after s_Xworld at 16*NJ (no 6*nv*NB hole). cJ = s_J; cIw @ 16*NJ.
+            off_Iw = 16 * self.robot.get_num_joints()
             self.gen_add_serial_ops()
-            self.gen_add_code_line("T *cJ  = &s_temp[" + str(off_J) + "]; T *cIw = &s_temp[" + str(off_Iw) + "];")
+            self.gen_add_code_line("const T *cJ = s_J; const T *cIw = &s_temp[" + str(off_Iw) + "];")
             self.gen_add_code_line("T ke = static_cast<T>(0);")
             self.gen_add_code_line("for (int jid = 0; jid < " + str(NB) + "; ++jid) {", True)
             self.gen_add_code_line("const T *Jb = &cJ[" + str(6 * nv) + "*jid]; const T *Iw = &cIw[36*jid];")
@@ -810,12 +839,14 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs(in_name, str(input_count), stride="stride_" + in_name)
+        _repoint(in_loop=True)
         self.gen_add_code_line("// compute")
         _compute()
         self.gen_kernel_save_result("out", str(out_size), stride=str(out_size))
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs(in_name, str(input_count))
+        _repoint(in_loop=False)
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload(in_name, str(input_count), feedback_from="out")
         _compute()
@@ -827,7 +858,7 @@ def _gen_kin_centroidal_kernel(self, name, out_size, has_qd, has_gravity, single
 
 def _gen_kin_centroidal_host(self, name, out_buf, out_size, has_qd, has_gravity, mode=0):
     n = self.robot.get_num_pos()
-    macro = name.upper() + "_DYNAMIC_SHARED_MEM_BYTES<T>()"
+    macro = name.upper() + "_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()"
     single_call_timing = (mode == 1)
     compute_only = (mode == 2)
     in_name = "q_qd" if has_qd else "q"
@@ -860,7 +891,7 @@ def _gen_kin_centroidal_host(self, name, out_buf, out_size, has_qd, has_gravity,
         kname = name + ("_kernel_single_timing" if single_call_timing else "_kernel") + ktmpl
     else:
         kname = name + ("_kernel_single_timing<T, RESOURCE_TIER>" if single_call_timing else "_kernel<T, RESOURCE_TIER>")
-    func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->" + out_buf + ",hd_data->d_" + in_name +
+    func_call = (kname + "<<<block_dimms,thread_dimms," + macro + ">>>(hd_data->" + out_buf + ",hd_data->d_workspace,hd_data->d_" + in_name +
                  ",stride_" + in_name + ",d_robotModel," + grav_arg + "num_timesteps);")
     if not compute_only:
         if has_qd:
@@ -890,6 +921,10 @@ def _gen_kin_centroidal_host(self, name, out_buf, out_size, has_qd, has_gravity,
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    # DE-GATE #2: L2-pin d_workspace when the chosen tier spills the Jw band into it.
+    ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!" + name.upper() + "_J_IN_SMEM<RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + ws_bytes + "));}")
     self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"" + name + "\", " + macro + "));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:

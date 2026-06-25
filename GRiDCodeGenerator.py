@@ -1181,14 +1181,25 @@ class GRiDCodeGenerator:
         # NB=51>NV=39 crashed). Non-mimic (nb_vaf==n) is byte-identical to the old 18*n.
         nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
         self.id_bias_t_count = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size + rt_xfixed_reserve
-        # com/ccrba/energy share one arena sizing (use the largest input/output):
-        #   s_in(<=2n) + s_out(<=6nv+6) + s_A(6nv) + s_com(3) + s_extra(4)
-        #   + centroidal_inner_temp + XHom_size
-        _centroidal_inner_temp = 16*self.robot.get_num_joints() + 6*nv*NB + 36*NB + 6*nv + 36
-        _centroidal_base = 6*nv + 3 + 4 + _centroidal_inner_temp + XHom_size
-        self.com_t_count    = n + (3 + 3*nv) + _centroidal_base
-        self.ccrba_t_count  = 2*n + (6*nv + 6) + _centroidal_base
-        self.energy_t_count = 2*n + 3 + _centroidal_base
+        # com/ccrba/energy (DE-GATE #2): the Jw band (6*nv*NB) is carved as a SEPARATE
+        # tier-routed buffer s_J (in-smem tail at the J-in-smem tier, d_workspace at the
+        # J-spilled tier), mirroring cmm/dccrba. Each family gets a 2-rung ladder:
+        #   L0 keeps s_J in smem (arena byte-equivalent to the old single rung),
+        #   L1 spills it -> d_workspace at the shared GRID_DCCRBA_J_OFFSET_BYTES.
+        # base = s_in(<=2n) + s_out(<=6nv+6) + s_A(6nv) + s_com(3) + s_extra(4)
+        #        + centroidal_inner(no-J) + XHom_size  (the Jw band is added per-tier).
+        _centroidal_inner_noJ = 16*self.robot.get_num_joints() + 36*NB + 6*nv + 36
+        _centroidal_sJ = 6*nv*NB
+        _com_base    = n     + (3 + 3*nv) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
+        _ccrba_base  = 2*n   + (6*nv + 6) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
+        _energy_base = 2*n   + 3          + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
+        self.com_spill_tier_3way    = select_shared_tier_3way(_com_base + _centroidal_sJ, _com_base)
+        self.ccrba_spill_tier_3way  = select_shared_tier_3way(_ccrba_base + _centroidal_sJ, _ccrba_base)
+        self.energy_spill_tier_3way = select_shared_tier_3way(_energy_base + _centroidal_sJ, _energy_base)
+        self.com_t_count_per_tier    = tuple((_com_base + _centroidal_sJ, _com_base)[i] for i in self.com_spill_tier_3way)
+        self.ccrba_t_count_per_tier  = tuple((_ccrba_base + _centroidal_sJ, _ccrba_base)[i] for i in self.ccrba_spill_tier_3way)
+        self.energy_t_count_per_tier = tuple((_energy_base + _centroidal_sJ, _energy_base)[i] for i in self.energy_spill_tier_3way)
+        self.centroidal_spill_J_ws_count = _centroidal_sJ
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
         # would exceed the target, set self.idsva_so_body_frame_grav_full_spill and
         # let gen_idsva_so_body_frame_inner_temp_mem_size() return the smaller value
@@ -1457,7 +1468,12 @@ class GRiDCodeGenerator:
         # that offset region (6*nv*nv) plus the Jw band itself, even though cmm never
         # writes the output region.
         _cmm_spill_ws = (6 * nv * nv + self.cmm_time_variation_spill_J_ws_count) if any(p >= 1 for p in self.cmm_time_variation_spill_tier_3way) else 0
-        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _idr_spill_ws, _feg_spill_ws, _dccrba_spill_ws, _cmm_spill_ws)
+        # com/ccrba/energy place their Jw band at the SAME GRID_DCCRBA_J_OFFSET_BYTES
+        # sub-offset (SO_TEMP_OFFSET + 6*nv*nv), so the band must span that offset region
+        # plus the Jw band itself when any of them spills (same robots cmm spills).
+        _centroidal_spill_ws = (6 * nv * nv + self.centroidal_spill_J_ws_count) if any(
+            p >= 1 for p in (self.com_spill_tier_3way + self.ccrba_spill_tier_3way + self.energy_spill_tier_3way)) else 0
+        so_workspace_t_count = max(8*max(nv**3, 1), d2ee_workspace_t_count, end_effector_pose_gradient_workspace_t_count, idsva_so_body_frame_grav_spill_t_count, idsva_so_spill_ws_t_count, _fpg_spill_ws, _idr_spill_ws, _feg_spill_ws, _dccrba_spill_ws, _cmm_spill_ws, _centroidal_spill_ws)
         # Deprecated launch-count constants remain for external callers that still
         # pass COUNT*sizeof(T).  Make them conservative aliases for the byte arena
         # layouts so those callers do not under-allocate int topology helpers or
@@ -1519,7 +1535,7 @@ class GRiDCodeGenerator:
                                  "const int GRID_END_EFFECTOR_POSE_GRADIENT_SHARED_TIER_VALUE = " + str(self.end_effector_pose_gradient_spill_tier) + ";", \
                                  # DE-GATE #2: 1 if the DEFAULT tier spills the dccrba output or Jw band / cmm Jw band
                                  # into d_workspace (so init_gridData must allocate d_workspace in the kinematics path).
-                                 "const int GRID_DCCRBA_USES_WORKSPACE_TEMP = " + str(1 if (self.dccrba_spill_tier_3way[0] >= 1 or self.cmm_time_variation_spill_tier_3way[0] >= 1) else 0) + ";", \
+                                 "const int GRID_DCCRBA_USES_WORKSPACE_TEMP = " + str(1 if (self.dccrba_spill_tier_3way[0] >= 1 or self.cmm_time_variation_spill_tier_3way[0] >= 1 or self.com_spill_tier_3way[0] >= 1 or self.ccrba_spill_tier_3way[0] >= 1 or self.energy_spill_tier_3way[0] >= 1) else 0) + ";", \
                                  "const int GRID_INVERSE_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.inverse_dynamics_gradient_spill_tier) + ";", \
                                  "const int GRID_FORWARD_DYNAMICS_GRADIENT_SHARED_TIER_VALUE = " + str(self.forward_dynamics_gradient_spill_tier) + ";", \
                                  "const int ID_DU_TEMP_SPILL_START = " + str(inverse_dynamics_gradient_temp_layout["spill_start"]) + ";", \
@@ -1713,9 +1729,23 @@ class GRiDCodeGenerator:
                                  "}",
                                  # G2 centroidal quick-wins shared-mem macros (no tier spill).
                                  "template <typename T> __host__ __device__ inline size_t INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.id_bias_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t COM_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.com_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t CCRBA_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-                                 "template <typename T> __host__ __device__ inline size_t ENERGY_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.energy_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 # com/ccrba/energy: 2-rung J-spill ladder (DE-GATE #2). L0 keeps the Jw
+                                 # band in smem (== old single rung), L1 spills it -> d_workspace.
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t COM_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.com_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.com_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.com_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t CCRBA_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.ccrba_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t ENERGY_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.energy_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.energy_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.energy_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+                                 "template <int TIER> __host__ __device__ constexpr bool COM_J_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.com_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.com_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.com_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "template <int TIER> __host__ __device__ constexpr bool CCRBA_J_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.ccrba_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.ccrba_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.ccrba_spill_tier_3way[2] == 0 else "false") + "; }",
+                                 "template <int TIER> __host__ __device__ constexpr bool ENERGY_J_IN_SMEM() { return (TIER == TIER_SHARED) ? " + ("true" if self.energy_spill_tier_3way[0] == 0 else "false") + " : (TIER == TIER_LITE) ? " + ("true" if self.energy_spill_tier_3way[1] == 0 else "false") + " : " + ("true" if self.energy_spill_tier_3way[2] == 0 else "false") + "; }",
                                  # PS5 dCCRBA (kinematics domain, uses the EE linalg scratch like ccrba):
                                  # cmm_time_variation (Adot, 6*nv; no spill) + dccrba (6*nv*nv; per-tier
                                  # surgical spill of the output to the d_workspace SO band).
@@ -2443,21 +2473,21 @@ class GRiDCodeGenerator:
         ]),
         ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("com_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("com_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("ccrba", "ccrba", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("ccrba_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("ccrba_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
         ]),
         ("energy", "energy", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
             ("energy_kernel<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("energy_kernel_single_timing<T>",
-             "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
         ]),
     ]
 
