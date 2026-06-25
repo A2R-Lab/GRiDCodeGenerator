@@ -750,9 +750,22 @@ class GRiDCodeGenerator:
             + 16*self.robot.get_num_joints() + XHom_size
         # PS5 Coriolis matrix C(q,qd): kernel smem = XI + s_q_qd(NUM_POS+nv) + s_coriolis(nv*nv)
         #   + the inner spatial-recursion scratch (per-body NB bands + per-column n_int bands).
-        # The nv*nv output fits smem at FULL for every shipped robot -> no tier spill.
-        self.coriolis_matrix_t_count = (n + nv) + nv*nv \
-            + self.gen_coriolis_matrix_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        # 3-rung surgical ladder (mirror crba): full | s_coriolis(nv*nv output) -> L2-pinned SO
+        # band, hot inner band stays smem | whole-band (inner scratch -> d_workspace GRAD section,
+        # output -> SO band). On h2_plus the inner band (18330 t ~73KB) dominates and the full
+        # arena is ~121KB (UNLAUNCHABLE); the output-spill rung is ~95KB (PERF-launchable) and the
+        # whole-band rung ~22KB (LITE/MINIMAL).
+        _coriolis_inner   = self.gen_coriolis_matrix_inner_temp_mem_size()
+        _coriolis_no_out  = (n + nv) + XI_size + rt_xfixed_reserve            # input + XI, no s_coriolis
+        _coriolis_t_full          = nv*nv + _coriolis_no_out + _coriolis_inner   # output + inner band + input/XI
+        _coriolis_t_output_spill  = _coriolis_no_out + _coriolis_inner          # s_coriolis -> SO band; inner stays smem
+        _coriolis_t_workspace     = _coriolis_no_out                            # both output and inner band spilled
+        self.coriolis_matrix_spill_tier_3way = select_shared_tier_3way(_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)
+        # whole-band spill (inner scratch -> d_workspace) fires only at the deepest rung (index 2).
+        self.coriolis_matrix_use_workspace_temp = self.coriolis_matrix_spill_tier_3way[0] == 2
+        self.coriolis_matrix_t_count_per_tier = tuple(
+            (_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)[i] for i in self.coriolis_matrix_spill_tier_3way)
+        self.coriolis_matrix_t_count = self.coriolis_matrix_t_count_per_tier[0]
         # PS5 dCCRBA (kinematics / XmatsHom domain). The shared inner pool is the
         # SHRUNK (no-J) centroidal_inner pool + 6*n_int per-unit phi band
         # (== _dccrba_inner_temp_mem_size). The Jw sweep band (6*nv*NB) is carved as a
@@ -1434,11 +1447,15 @@ class GRiDCodeGenerator:
         # the grad-section max so the allocation always covers it regardless of the
         # tier the kernel template is instantiated with.
         _crba_inner_temp_count = self.gen_crba_inner_temp_mem_size()
+        # coriolis whole-band spill: at the deepest rung the inner spatial-recursion
+        # scratch redirects to the GRAD section, so it must back the full inner band.
+        _coriolis_inner_temp_count = self.gen_coriolis_matrix_inner_temp_mem_size() if any(p >= 2 for p in self.coriolis_matrix_spill_tier_3way) else 0
         grad_spill_workspace_t_count = max(inverse_dynamics_gradient_temp_layout["spill_count"],
                                            inverse_dynamics_gradient_temp_count,
                                            forward_dynamics_gradient_temp_count,
                                            2*nv*nv,
                                            _crba_inner_temp_count,
+                                           _coriolis_inner_temp_count,
                                            _minv_F_workspace_count,
                                            self.integrator_minv_F_workspace_count,
                                            self.integrator_gradient_workspace_count)
@@ -1622,7 +1639,11 @@ class GRiDCodeGenerator:
                                  # PS5 energy regressors (each output 10*NUM_BODIES, fits every tier -> no spill).
                                  "template <typename T> __host__ __device__ inline size_t KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.kinetic_energy_regressor_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
                                  # PS5 Coriolis matrix C(q,qd) (nv x nv; fits smem at FULL -> no spill).
-                                 "template <typename T> __host__ __device__ inline size_t CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES() { return grid_shared_arena_bytes<T>(" + str(self.coriolis_matrix_t_count) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); }",
+                                 "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES() { "
+                                 "if constexpr (TIER == TIER_SHARED)    return grid_shared_arena_bytes<T>(" + str(self.coriolis_matrix_t_count_per_tier[0]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else if constexpr (TIER == TIER_LITE) return grid_shared_arena_bytes<T>(" + str(self.coriolis_matrix_t_count_per_tier[1]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "else                                 return grid_shared_arena_bytes<T>(" + str(self.coriolis_matrix_t_count_per_tier[2]) + ", TOPOLOGY_HELPERS_COUNT, GRID_LINALG_NVIDIA_MAX_HELPER_BYTES<T>()); "
+                                 "}",
                                  # g1-spill: tier-aware. At a spilled tier the s_Y regressor
                                  # scratch moves to d_workspace, shrinking the smem arena. Default
                                  # TIER = TIER_SHARED keeps every existing single-arg call site working.

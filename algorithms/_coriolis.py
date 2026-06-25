@@ -544,42 +544,37 @@ def gen_coriolis_matrix_device(self):
         extra_t_buffers=None, include_linalg_scratch=True)
 
 
-def gen_coriolis_matrix_kernel(self, single_call_timing=False):
-    NUM_POS = self.robot.get_num_pos()
-    nv = self.robot.get_num_vel()
-    out_size = nv * nv
-    in_size = NUM_POS + nv
-    func_params = [
-        "d_coriolis is the output Coriolis matrix, row-major nv x nv = " + str(out_size),
-        "d_workspace is the L2-pinned spill workspace (reserved; unused at the default tier)",
-        "d_q_qd is the vector of joint positions, velocities (q|qd)",
-        "stride_q_qd is the stride between each (q, qd) pair",
-        "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
-        "gravity is the gravity constant (unused)",
-        "num_timesteps is the length of the trajectory points",
-    ]
-    func_def_start = "void coriolis_matrix_kernel(T *d_coriolis, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
-    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("kernel(", "kernel_single_timing(")
-    self.gen_add_func_doc("Compute the Coriolis matrix C(q, qd)", [], func_params, None)
-    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
-    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
-    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
-    self.gen_add_code_line("(void)d_workspace;")
-    extra_t_buffers = [("s_q_qd", in_size), ("s_coriolis", out_size)]
-    shared_mem_size = gen_coriolis_matrix_inner_temp_mem_size(self)
+def _emit_coriolis_matrix_kernel_body_for_flags(self, NUM_POS, nv, in_size, out_size,
+                                                use_workspace_temp, coriolis_in_smem, single_call_timing):
+    """Emit coriolis_matrix_kernel body for one tier's spill flags (mirror crba).
+    coriolis_in_smem=True: s_coriolis output in smem; False: s_coriolis -> L2-pinned SO band.
+    use_workspace_temp=False: inner spatial-recursion scratch in smem; True: -> L2-pinned GRAD section."""
+    shared_mem_size = 0 if use_workspace_temp else gen_coriolis_matrix_inner_temp_mem_size(self)
+    # s_coriolis (nv*nv) is the write-once output. At rung0 (coriolis_in_smem) it lives in
+    # smem -> byte-identical to the pre-spill emission. At the spill rungs it drops from the
+    # smem arena and repoints to the L2-pinned SO band (crba/dccrba-style), shrinking by nv*nv.
+    if coriolis_in_smem:
+        extra_t_buffers = [("s_q_qd", in_size), ("s_coriolis", out_size)]
+    else:
+        extra_t_buffers = [("s_q_qd", in_size)]
     self.gen_XImats_helpers_temp_shared_memory_code(
         shared_mem_size, extra_t_buffers=extra_t_buffers, include_linalg_scratch=True)
     self.gen_add_code_line("T *s_q = s_q_qd; T *s_qd = &s_q_qd[" + str(NUM_POS) + "];")
+    if not coriolis_in_smem:
+        self.gen_add_code_line("T *s_coriolis;  // repointed to the L2-pinned SO band (output spill) per timing branch")
     if not single_call_timing:
         self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
         self.gen_kernel_load_inputs("q_qd", str(in_size), stride="stride_q_qd")
+        if use_workspace_temp:
+            # whole inner band spilled: the smem s_temp slot is null. Repoint s_temp at the
+            # GRAD section BEFORE the XImats helper so its sincos scratch + the inner have a
+            # valid backing store. Disjoint from the SO band where s_coriolis lives.
+            self.gen_add_code_line("T *coriolis_d_workspace = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()]);")
+            self.gen_add_code_line("s_temp = coriolis_d_workspace;")
+        elif coriolis_in_smem:
+            self.gen_add_code_line("(void)d_workspace;")
+        if not coriolis_in_smem:
+            self.gen_add_code_line("s_coriolis = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         # mjx input convert: quaternion wxyz->xyzw AND qd[0:3] = R^T qd[0:3] (the
         # Coriolis matrix reads qd, so the base-linear velocity must be in pin frame)
         # before the XImats build (so X[0] is built from the reordered quaternion).
@@ -603,6 +598,13 @@ def gen_coriolis_matrix_kernel(self, single_call_timing=False):
         self.gen_add_end_control_flow()
     else:
         self.gen_kernel_load_inputs("q_qd", str(in_size))
+        if use_workspace_temp:
+            self.gen_add_code_line("T *coriolis_d_workspace = reinterpret_cast<T *>(d_workspace);")
+            self.gen_add_code_line("s_temp = coriolis_d_workspace;")
+        elif coriolis_in_smem:
+            self.gen_add_code_line("(void)d_workspace;")
+        if not coriolis_in_smem:
+            self.gen_add_code_line("s_coriolis = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_load_update_XImats_helpers_function_call()
@@ -610,6 +612,43 @@ def gen_coriolis_matrix_kernel(self, single_call_timing=False):
         self.gen_add_sync()
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("coriolis", str(out_size))
+
+
+def gen_coriolis_matrix_kernel(self, single_call_timing=False):
+    NUM_POS = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = nv * nv
+    in_size = NUM_POS + nv
+    func_params = [
+        "d_coriolis is the output Coriolis matrix, row-major nv x nv = " + str(out_size),
+        "d_workspace is the L2-pinned spill workspace (used at the output-spill / whole-band tiers)",
+        "d_q_qd is the vector of joint positions, velocities (q|qd)",
+        "stride_q_qd is the stride between each (q, qd) pair",
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU",
+        "gravity is the gravity constant (unused)",
+        "num_timesteps is the length of the trajectory points",
+    ]
+    func_def_start = "void coriolis_matrix_kernel(T *d_coriolis, unsigned char *d_workspace, const T *d_q_qd, const int stride_q_qd, "
+    func_def_end = "const robotModel<T> *d_robotModel, const T gravity, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("kernel(", "kernel_single_timing(")
+    self.gen_add_func_doc("Compute the Coriolis matrix C(q, qd)", [], func_params, None)
+    # MUJOCO_OUTPUT (floating only): compile-time mjx output-convention flag, LAST
+    # after RESOURCE_TIER so existing positional <T,TIER> call sites are unaffected;
+    # default false if-constexpr-elides the epilogue -> byte-identical PTX.
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    # 3-rung surgical ladder: rung0 full (s_coriolis + inner band in smem); rung1 output-spill
+    # (s_coriolis -> L2-pinned SO band, hot inner band stays smem); rung2 whole-band (both
+    # output and inner band spilled). gen_tier_dispatch de-dups tiers that share a pick, so
+    # rung0-only robots emit one byte-identical body (Gate A).
+    picks = getattr(self, "coriolis_matrix_spill_tier_3way", (0, 0, 0))
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_coriolis_matrix_kernel_body_for_flags(self, NUM_POS, nv, in_size, out_size,
+            use_workspace_temp=(pick == 2), coriolis_in_smem=(pick == 0), single_call_timing=single_call_timing))
     self.gen_add_end_function()
 
 
@@ -647,7 +686,7 @@ def gen_coriolis_matrix_host(self, mode=0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"coriolis_matrix requires all-data or dynamics gridData\");")
     coriolis_kernel_tmpl = "coriolis_matrix_kernel<T, RESOURCE_TIER, MUJOCO_OUTPUT>" if mjx_host else "coriolis_matrix_kernel<T, RESOURCE_TIER>"
-    func_call_start = coriolis_kernel_tmpl + "<<<block_dimms,thread_dimms,CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(hd_data->d_coriolis,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
+    func_call_start = coriolis_kernel_tmpl + "<<<block_dimms,thread_dimms,CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>(hd_data->d_coriolis,hd_data->d_workspace,hd_data->d_q_qd,stride_q_qd,"
     func_call_end = "d_robotModel,gravity,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("coriolis_matrix_kernel<", "coriolis_matrix_kernel_single_timing<")
@@ -668,7 +707,7 @@ def gen_coriolis_matrix_host(self, mode=0):
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("gpuErrchkKernel();")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"coriolis_matrix\", CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"coriolis_matrix\", CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([
