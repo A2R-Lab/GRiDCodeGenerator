@@ -97,12 +97,16 @@ def _f_ext_gradient_chain_jobs(self):
 
 
 def gen_f_ext_gradient_inner_temp_mem_size(self):
-    # scratch: per work-item 6x6 product buffer is built serially via two 36-slot
-    # double buffers shared across the block. We allocate 2 * 36 * NB so each body
-    # i has its own running product (parallel across bodies). Plus a 6-vec staging
-    # per job is folded into the output directly.
+    # The inner stages ONE 6-vector contribution per (body, chain-joint, S-col) job in
+    # s_temp (s_feg_slab, size njobs*6), then lane-0 reduces it into the output. On deep
+    # serial chains njobs*6 exceeds the legacy 2*36*NB double-buffer reserve (h2_plus:
+    # 7026 > 5472), so take the max -- small robots (njobs*6 <= 2*36*NB) keep the legacy
+    # size byte-identical, while big robots get the real slab. At the f_ext full/out-spill
+    # rungs the minv scratch dominates this anyway; it only sets the floor at the deep
+    # rung (minv-F spilled) and for the dq kernel's in-smem s_jt_temp.
     NB = self.robot.get_num_bodies()
-    return 2 * 36 * NB
+    _, _, jobs = _f_ext_gradient_chain_jobs(self)
+    return max(2 * 36 * NB, 6 * len(jobs))
 
 
 def gen_f_ext_gradient_inner_function_call(self, updated_var_names=None):
@@ -343,14 +347,19 @@ def _emit_f_ext_gradient_dq_perturb(self, sign):
     self.gen_add_sync()
 
 
-def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
+def _emit_f_ext_gradient_dq_body(self, out_ptr_expr, in_timestep_loop, jt_smem):
     """Emit the per-timestep -dJ^T/dq FD body. Assumes s_q (smem), s_XImats, and
     s_temp arena are already declared/loaded. Writes into `out_ptr_expr` (a global
     or shared pointer to the nv*6NB*nv output for this timestep).
 
     The per-coordinate perturbation is a scalar retract on a fixed base and an
     SE(3) Lie-group retract on a floating base (see
-    _emit_f_ext_gradient_dq_perturb); both feed the same central FD of -J^T."""
+    _emit_f_ext_gradient_dq_perturb); both feed the same central FD of -J^T.
+
+    h2_plus-spill: the two nv x (6*NB) -J^T FD buffers (s_JTp, s_JTm) are the dominant
+    band (~288 KB on h2_plus). When jt_smem is False (rung 1) they live in the L2-pinned
+    d_workspace SO section (s_JTp at SO base, s_JTm at SO base + nv*6NB) and the smem layout
+    drops them; s_qpert/s_dv/s_jt_temp/s_xi_scratch stay hot in smem."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
@@ -365,10 +374,19 @@ def _emit_f_ext_gradient_dq_body(self, out_ptr_expr):
         # s_dv velocity-perturbation buffer (nv) lives at the head, after s_qpert.
         self.gen_add_code_line("T *s_dv = &s_temp[" + str(n_pos) + "];")
     base = n_pos + dv_extra
-    self.gen_add_code_line("T *s_JTp = &s_temp[" + str(base) + "];")
-    self.gen_add_code_line("T *s_JTm = &s_temp[" + str(base + nv * out6) + "];")
-    self.gen_add_code_line("T *s_jt_temp = &s_temp[" + str(base + 2 * nv * out6) + "];")
-    self.gen_add_code_line("T *s_xi_scratch = &s_temp[" + str(base + 2 * nv * out6 + jt_temp) + "];")
+    # The s_JTp/s_JTm pair occupies 2*nv*out6 smem slots only when jt_smem; when spilled,
+    # the smem layout closes that gap and the pair points at the d_workspace SO section.
+    jt_slot = 2 * nv * out6 if jt_smem else 0
+    self.gen_add_code_line("T *s_jt_temp = &s_temp[" + str(base + jt_slot) + "];")
+    self.gen_add_code_line("T *s_xi_scratch = &s_temp[" + str(base + jt_slot + jt_temp) + "];")
+    if jt_smem:
+        self.gen_add_code_line("T *s_JTp = &s_temp[" + str(base) + "];")
+        self.gen_add_code_line("T *s_JTm = &s_temp[" + str(base + nv * out6) + "];")
+        self.gen_add_code_line("(void)d_workspace;")
+    else:
+        _ws_base = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " if in_timestep_loop else "") + "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
+        self.gen_add_code_line("T *s_JTp = reinterpret_cast<T *>(&d_workspace[" + _ws_base + "]);")
+        self.gen_add_code_line("T *s_JTm = reinterpret_cast<T *>(&d_workspace[" + _ws_base + " + " + str(nv * out6) + "*sizeof(T)]);")
     # loop over each q coordinate qi in [0, nv)
     self.gen_add_code_line("for (int qi = 0; qi < " + str(nv) + "; ++qi) {", True)
     # +h perturbation -> s_qpert
@@ -423,7 +441,8 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
         "d_robotModel is the initialized model helpers on the GPU",
         "NUM_TIMESTEPS is the trajectory length (or timing reps)",
     ]
-    func_def_start = ("void f_ext_gradient_dq_kernel(T *d_f_ext_gradient_dq, "
+    # h2_plus-spill: d_workspace 2nd arg backs the spilled s_JTp/s_JTm pair at rung 1.
+    func_def_start = ("void f_ext_gradient_dq_kernel(T *d_f_ext_gradient_dq, unsigned char *d_workspace, "
                       "const T *d_q, const int stride_q, ")
     func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
     func_def = func_def_start + func_def_end
@@ -435,22 +454,32 @@ def gen_f_ext_gradient_dq_kernel(self, single_call_timing=False):
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
     self.gen_add_code_line(func_def, True)
-    shared_extra = _f_ext_gradient_dq_smem_count(self)
-    self.gen_XImats_helpers_temp_shared_memory_code(
-        shared_extra, extra_t_buffers=[("s_q", n_pos)], include_linalg_scratch=True)
-    if not single_call_timing:
-        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-        self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
-        self.gen_add_code_line("// compute")
-        _emit_f_ext_gradient_dq_body(self, "&d_f_ext_gradient_dq[k*" + str(out_each) + "]")
-        self.gen_add_end_control_flow()
-    else:
-        self.gen_kernel_load_inputs("q", str(n_pos))
-        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
-        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
-        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="f_ext_gradient_dq")
-        _emit_f_ext_gradient_dq_body(self, "d_f_ext_gradient_dq")
-        self.gen_add_end_control_flow()
+    _dq_full = _f_ext_gradient_dq_smem_count(self)
+
+    def _emit_body(pick):
+        # pick 0: JT pair in smem (full arena). pick 1: spill the pair to d_workspace.
+        jt_smem = (pick == 0)
+        scratch = _dq_full if jt_smem else _dq_full - 2 * nv * out6
+        self.gen_XImats_helpers_temp_shared_memory_code(
+            scratch, extra_t_buffers=[("s_q", n_pos)], include_linalg_scratch=True)
+        if jt_smem:
+            self.gen_add_code_line("(void)d_workspace;")
+        if not single_call_timing:
+            self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+            self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
+            self.gen_add_code_line("// compute")
+            _emit_f_ext_gradient_dq_body(self, "&d_f_ext_gradient_dq[k*" + str(out_each) + "]", in_timestep_loop=True, jt_smem=jt_smem)
+            self.gen_add_end_control_flow()
+        else:
+            self.gen_kernel_load_inputs("q", str(n_pos))
+            self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+            self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+            self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="f_ext_gradient_dq")
+            _emit_f_ext_gradient_dq_body(self, "d_f_ext_gradient_dq", in_timestep_loop=False, jt_smem=jt_smem)
+            self.gen_add_end_control_flow()
+
+    picks = getattr(self, "f_ext_gradient_dq_spill_tier_3way", (0, 0, 0))
+    self.gen_tier_dispatch(picks, _emit_body)
     self.gen_add_end_function()
 
 
@@ -480,8 +509,8 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
     self.gen_add_code_line(func_def_end, True)
     self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_DYNAMICS, \"f_ext_gradient_dq requires all-data or dynamics gridData\");")
     out_each = "NUM_VEL*6*NUM_BODIES*NUM_VEL"
-    func_call_start = ("f_ext_gradient_dq_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()>>>("
-                       "hd_data->d_f_ext_gradient_dq,hd_data->d_q,stride_q,")
+    func_call_start = ("f_ext_gradient_dq_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()>>>("
+                       "hd_data->d_f_ext_gradient_dq,hd_data->d_workspace,hd_data->d_q,stride_q,")
     func_call_end = "d_robotModel,num_timesteps);"
     if single_call_timing:
         func_call_start = func_call_start.replace("kernel<T, RESOURCE_TIER>", "kernel_single_timing<T, RESOURCE_TIER>")
@@ -502,7 +531,11 @@ def gen_f_ext_gradient_dq_host(self, mode=0):
     if single_call_timing:
         func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
         func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
-    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient_dq\", F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"f_ext_gradient_dq\", F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>()));")
+    # h2_plus-spill: L2-pin d_workspace when the tier spills the s_JTp/s_JTm pair into it.
+    _feg_dq_ws_bytes = ("GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()" if single_call_timing
+                        else "GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*static_cast<size_t>(num_timesteps)")
+    self.gen_add_code_line("if (!F_EXT_GRADIENT_DQ_JT_IN_SMEM<RESOURCE_TIER>() && hd_data->d_workspace != nullptr) {gpuErrchk(grid_begin_l2_persisting(0, hd_data->d_workspace, " + _feg_dq_ws_bytes + "));}")
     self.gen_add_code_lines(func_call_code)
     if not compute_only:
         self.gen_add_code_lines([
@@ -587,77 +620,71 @@ def gen_f_ext_gradient_device(self):
     self.gen_add_end_function()
 
 
-def gen_f_ext_gradient_kernel(self, single_call_timing=False):
+def _emit_f_ext_gradient_kernel_body_for_flags(self, pick, single_call_timing):
+    """Emit the f_ext_gradient kernel body for one tier's spill pick.
+
+    pick 0 (full):      both outputs (s_dtau, s_dqdd) + minv-F in smem.
+    pick 1 (out-spill): s_dqdd -> d_workspace SO section; s_dtau + minv-F in smem.
+    pick 2 (deep):      s_dqdd + s_dtau -> d_workspace SO section; minv's 6*nv*nv
+                        F-region -> GRAD-section minv-F offset (F_IN_SMEM=false).
+    The pick is static here, so sizes are literal ints (no constexpr SLOTs) and the
+    s_temp scratch shrinks to the minv no-F band at the deep rung. select_shared_tier
+    picks the least-spill rung that fits, so non-spilling robots collapse to pick 0."""
     NB = self.robot.get_num_bodies()
     nv = self.robot.get_num_vel()
     n_pos = self.robot.get_num_pos()
     out_each = nv * 6 * NB
-
-    func_params = [
-        "d_dtau_dfext / d_dqdd_dfext are the two outputs (each NV*6*NB per timestep)",
-        "d_q is the joint positions, stride_q the per-timestep stride",
-        "d_robotModel is the initialized model helpers on the GPU",
-        "NUM_TIMESTEPS is the trajectory length (or timing reps)",
-    ]
-    # g1-spill: the kernel takes d_workspace as its 2nd arg. At a spilled tier
-    # (F_EXT_GRADIENT_DQDD_IN_SMEM<TIER>()==false) the s_dqdd_dfext output (written
-    # write-once by the final -Minv@s_dtau GEMM) lives in the L2-pinned
-    # d_workspace SO section instead of smem; s_dtau_dfext (read by that GEMM) +
-    # s_Minv + the inner stay in smem. Default TIER keeps the arena byte-identical.
-    func_def_start = ("void f_ext_gradient_kernel(T *d_dtau_dfext, T *d_dqdd_dfext, unsigned char *d_workspace, "
-                      "const T *d_q, const int stride_q, ")
-    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
-    func_def = func_def_start + func_def_end
-    if single_call_timing:
-        func_def = func_def.replace("(", "_single_timing(")
-    self.gen_add_func_doc("Compute the f_ext gradient (batched kernel)",
-                          [], func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
-    self.gen_add_code_line("__global__")
-    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
-    self.gen_add_code_line(func_def, True)
     jt_temp = self.gen_f_ext_gradient_inner_temp_mem_size()
-    minv_temp = self.gen_minv_inner_temp_mem_size()
-    shared_extra = nv * nv + max(jt_temp, minv_temp)
-    # g1-spill: s_dqdd_dfext is the LAST t_buffer; sized out_each at TIER_SHARED, 0
-    # at spilled tiers (then routed to d_workspace below). Single arena declaration
-    # keeps every pointer in this scope; the smem footprint shrinks to match
-    # F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES.
-    self.gen_add_code_line("constexpr bool DQDD_DFEXT_OUTPUT_IN_SMEM = F_EXT_GRADIENT_DQDD_IN_SMEM<RESOURCE_TIER>();")
-    self.gen_add_code_line("constexpr int DQDD_DFEXT_OUTPUT_SLOT = DQDD_DFEXT_OUTPUT_IN_SMEM ? " + str(out_each) + " : 0;")
+    minv_temp = self.gen_minv_inner_temp_mem_size()       # minv scratch incl. F-region
+    minv_no_F = self.gen_minv_inner_no_F_size()            # minv scratch WITHOUT F-region
+    dqdd_smem = (pick == 0)
+    dtau_smem = (pick <= 1)                                # minv-F placement == DTAU placement
+    scratch = nv * nv + max(jt_temp, (minv_temp if dtau_smem else minv_no_F))
     self.gen_XImats_helpers_temp_shared_memory_code(
-        shared_extra, extra_t_buffers=[("s_q", n_pos), ("s_dtau_dfext", out_each),
-                                       ("s_dqdd_dfext", "DQDD_DFEXT_OUTPUT_SLOT")],
+        scratch, extra_t_buffers=[("s_q", n_pos),
+                                  ("s_dtau_dfext", out_each if dtau_smem else 0),
+                                  ("s_dqdd_dfext", out_each if dqdd_smem else 0)],
         include_linalg_scratch=True)
-    self.gen_add_code_line("if constexpr (DQDD_DFEXT_OUTPUT_IN_SMEM) { (void)d_workspace; }")
+    if dqdd_smem and dtau_smem:
+        self.gen_add_code_line("(void)d_workspace;")
 
     def _repoint_spilled_output(in_timestep_loop):
-        # When spilled, repoint s_dqdd_dfext at the L2-pinned d_workspace SO section
-        # (per-timestep slot; reused safely -- f_ext_gradient never runs concurrently
-        # with the SO kernels). Emitted inside the per-timestep loop so `k` is in scope.
-        self.gen_add_code_line("if constexpr (!DQDD_DFEXT_OUTPUT_IN_SMEM) {", True)
-        if in_timestep_loop:
-            self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
-        else:
-            self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()]);")
-        self.gen_add_end_control_flow()
+        # repoint spilled output(s) at the L2-pinned d_workspace SO section (per-timestep
+        # slot; reused safely -- f_ext_gradient never co-runs with the SO kernels). s_dqdd
+        # at the SO base, s_dtau at SO base + out_each (deep rung only).
+        base = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " if in_timestep_loop else "") + "GRID_SO_WORKSPACE_TEMP_OFFSET_BYTES<T>()"
+        if not dqdd_smem:
+            self.gen_add_code_line("s_dqdd_dfext = reinterpret_cast<T *>(&d_workspace[" + base + "]);")
+        if not dtau_smem:
+            self.gen_add_code_line("s_dtau_dfext = reinterpret_cast<T *>(&d_workspace[" + base + " + " + str(out_each) + "*sizeof(T)]);")
 
-    def _body():
+    def _body(in_timestep_loop):
         self.gen_add_code_line("T *s_Minv = s_temp;")
         self.gen_add_code_line("T *s_fext_temp = &s_temp[" + str(nv * nv) + "];")
         self.gen_load_update_XImats_helpers_function_call()
         self.gen_f_ext_gradient_inner_function_call(
             updated_var_names={"s_temp_name": "s_fext_temp"})
         self.gen_add_sync()
-        self.gen_minv_inner_function_call(
-            updated_var_names={"s_Minv_name": "s_Minv", "s_temp_name": "s_fext_temp"},
-            f_in_smem_expr="true")
+        if dtau_smem:
+            # minv keeps F in the tail of s_fext_temp (smem).
+            self.gen_minv_inner_function_call(
+                updated_var_names={"s_Minv_name": "s_Minv", "s_temp_name": "s_fext_temp"},
+                f_in_smem_expr="true")
+        else:
+            # deep rung: route minv's 6*nv*nv F-region to the GRAD-section minv-F offset.
+            _minv_ws = ("k*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>() + " if in_timestep_loop else "") + "GRID_MINV_F_WORKSPACE_OFFSET_BYTES<T>()"
+            self.gen_add_code_line("T *minv_d_workspace = reinterpret_cast<T *>(&d_workspace[" + _minv_ws + "]);")
+            self.gen_minv_inner_function_call(
+                updated_var_names={"s_Minv_name": "s_Minv", "s_temp_name": "s_fext_temp", "d_workspace_name": "minv_d_workspace"},
+                f_in_smem_expr="false")
         self.gen_add_sync()
+        self.gen_add_code_line("// densify Minv (minv emits symmetric-upper)")
         self.gen_add_parallel_loop("ind", str(nv * nv))
         self.gen_add_code_line("int r = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
         self.gen_add_code_line("if (c < r) { s_Minv[r + " + str(nv) + "*c] = s_Minv[c + " + str(nv) + "*r]; }")
         self.gen_add_end_control_flow()
         self.gen_add_sync()
+        self.gen_add_code_line("// dqdd/dfext = M^{-1} J^T = -Minv @ (dtau/dfext)")
         self.gen_add_parallel_loop("ind", str(out_each))
         self.gen_add_code_line("int row = ind % " + str(nv) + "; int col = ind / " + str(nv) + ";")
         self.gen_add_code_line("T acc = static_cast<T>(0);")
@@ -671,7 +698,7 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
         self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
         _repoint_spilled_output(in_timestep_loop=True)
         self.gen_add_code_line("// compute")
-        _body()
+        _body(in_timestep_loop=True)
         self.gen_kernel_save_result("dtau_dfext", str(out_each), stride=str(out_each))
         self.gen_kernel_save_result("dqdd_dfext", str(out_each), stride=str(out_each))
         self.gen_add_end_control_flow()
@@ -681,11 +708,42 @@ def gen_f_ext_gradient_kernel(self, single_call_timing=False):
         self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
         self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
         self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="dtau_dfext")
-        _body()
+        _body(in_timestep_loop=False)
         self.gen_anti_licm_output_write("dtau_dfext")
         self.gen_add_end_control_flow()
         self.gen_kernel_save_result("dtau_dfext", str(out_each))
         self.gen_kernel_save_result("dqdd_dfext", str(out_each))
+
+
+def gen_f_ext_gradient_kernel(self, single_call_timing=False):
+    NB = self.robot.get_num_bodies()
+    nv = self.robot.get_num_vel()
+
+    func_params = [
+        "d_dtau_dfext / d_dqdd_dfext are the two outputs (each NV*6*NB per timestep)",
+        "d_workspace is the L2-pinned global spill buffer (outputs / minv-F at spilled tiers)",
+        "d_q is the joint positions, stride_q the per-timestep stride",
+        "d_robotModel is the initialized model helpers on the GPU",
+        "NUM_TIMESTEPS is the trajectory length (or timing reps)",
+    ]
+    # g1/h2_plus-spill: the kernel takes d_workspace as its 3rd arg. A 3-rung surgical
+    # ladder (full / s_dqdd-spill / +s_dtau+minv-F-spill) backs the L2-pinned spill;
+    # non-spilling robots collapse to the full body (smem-arena-bytes unchanged).
+    func_def_start = ("void f_ext_gradient_kernel(T *d_dtau_dfext, T *d_dqdd_dfext, unsigned char *d_workspace, "
+                      "const T *d_q, const int stride_q, ")
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute the f_ext gradient (batched kernel)",
+                          [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool MUJOCO_OUTPUT = false>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    picks = getattr(self, "f_ext_gradient_spill_tier_3way", (0, 0, 0))
+    self.gen_tier_dispatch(picks, lambda pick:
+        _emit_f_ext_gradient_kernel_body_for_flags(self, pick, single_call_timing))
     self.gen_add_end_function()
 
 
