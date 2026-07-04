@@ -622,7 +622,7 @@ def gen_quadratic_input_cost(self):
 # End-effector position cost (value, gradient wrt x=[q;qd], GN hessian J_p^T W J_p).
 # ---------------------------------------------------------------------------
 
-def gen_ee_pos_cost(self):
+def gen_ee_pos_cost(self, with_newton = False):
     """ee_pos_cost family. p(q) = grid::end_effector_pose (rows 0..2 of the 6-pose);
     J_p = rows 0..2 of grid::end_effector_pose_gradient (layout
     s_end_effector_pose_gradient[6*NV*ee + 6*vi + row]). Templated on `int EE = 0`.
@@ -633,11 +633,12 @@ def gen_ee_pos_cost(self):
         grad_x  = [grad_q ; 0]     (the qd-block is exactly zero)
         GN hess = J_p^T W J_p      (NV x NV block; the qd rows/cols are zero)
 
-    W is a 3-vector of per-axis position weights. The true second-order term
-    (sum_r W[r] r[r] * d^2 p_r/dq^2, i.e. folding the EE Hessian) is dropped per
-    the ratified Gauss-Newton decision.
-    // TODO(ee-2nd-order): add the W*r weighted EE-Hessian term for a true Newton
-    // hessian once/if an analytic d2ee path is wired in here.
+    W is a 3-vector of per-axis position weights. ee_pos_cost_hessian keeps the
+    ratified Gauss-Newton choice (the sum_r W[r] r[r] * d^2 p_r/dq^2 curvature
+    term is dropped). When with_newton is True (requires the analytic d2ee,
+    i.e. 'end_effector_pose_hessian' in the algorithm set), an additional
+    ee_pos_cost_hessian_newton is emitted that folds that curvature term back
+    in via grid::end_effector_pose_hessian_inner for a true Newton hessian.
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
@@ -805,6 +806,79 @@ def gen_ee_pos_cost(self):
         self.gen_mjx_congruence("s_hess", str(nx), q_name="s_q")
         self.gen_add_end_control_flow()
     self.gen_add_end_function()
+
+    # ---- full-Newton hessian: GN + sum_r W[r] r[r] d2p_r/dv2 (analytic d2ee) ----
+    # Emitted only when the analytic d2ee path exists ('end_effector_pose_hessian'
+    # in the algorithm set); the closed-form EE Hessian makes the curvature term
+    # the GN function drops exact and cheap (one hessian_inner call, no FD).
+    if with_newton:
+        self.gen_add_func_doc(
+            "ee_pos_cost_hessian_newton: full Newton hessian = J_p^T W J_p + sum_r W[r] (p_r - p_des_r) d2p_r/dv2 in the q-block of the x-hessian",
+            ["Folds the exact residual-weighted EE-curvature term the ratified-GN ee_pos_cost_hessian "
+             "drops, via the analytic d2ee (grid::end_effector_pose_hessian_inner). Not necessarily PSD "
+             "away from the solution -- callers must regularize (e.g. the solver's rho schedule).",
+             "Caller-scratch INNER: ONE XmatsHom load feeds end_effector_pose_inner (residual p) and "
+             "end_effector_pose_hessian_inner (J_p + d2p; the hessian inner also fills "
+             "s_end_effector_pose_gradient), so it is callable from another kernel's block without "
+             "aliasing that kernel's dynamic-smem arena.",
+             "d2p layout: s_end_effector_pose_hessian[6*NV*NV*ee + r*NV*NV + vi*NV + vj] (pose row r, "
+             "joint pair (vi, vj); tangent d/dv convention, position rows 0..2 symmetric in (vi, vj)).",
+             "Dense column-major NX x NX (NX = " + str(nx) + "); only the top-left NUM_VEL x NUM_VEL q-block is non-zero.",
+             "ACCUMULATE=false overwrites the whole NX x NX block; true adds the q-block into an existing hessian."],
+            ["s_hess is the dense x-hessian output (size " + str(nx) + "*" + str(nx) + ", column-major)",
+             "s_q / s_p_des / s_W / d_robotModel as above",
+             "s_end_effector_pose is 6*NUM_EE pose scratch; s_end_effector_pose_gradient is 6*NUM_VEL*NUM_EE "
+             "Jacobian scratch; s_end_effector_pose_hessian is 6*NUM_VEL*NUM_VEL*NUM_EE d2ee scratch",
+             "s_scratch is caller shared scratch for the EE-pose+hessian helpers "
+             "(>= END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_COUNT covers it, 16B aligned)"],
+            None)
+        self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false" + ", bool MUJOCO_OUTPUT = false" + ">")
+        self.gen_add_code_line("__device__")
+        self.gen_add_code_line("void ee_pos_cost_hessian_newton(T *s_hess, const T *s_q, const T *s_p_des, const T *s_W, "
+                               "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_end_effector_pose_hessian, "
+                               "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+        # Caller-scratch INNER path: lay out the XmatsHom + temp + linalg arena from s_scratch (temp
+        # sized for the larger of the pose / d2ee inners; they run sequentially and share it), load
+        # the local homogeneous transforms ONCE, then pose_inner (p for the residual) followed by
+        # hessian_inner (J_p + d2p; out-in-smem to the caller-provided buffer).
+        self.gen_add_code_line("using namespace grid;")
+        _ee_scratch = max(self.gen_end_effector_pose_inner_temp_mem_size(),
+                          self.gen_end_effector_pose_hessian_inner_temp_mem_size())
+        self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
+                                                          linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                          arena_base_expr = "s_scratch")
+        self.gen_load_update_XmatsHom_helpers_function_call()
+        self.gen_end_effector_pose_inner_function_call()
+        self.gen_add_sync()
+        self.gen_end_effector_pose_hessian_inner_function_call(out_in_smem_expr = "true")
+        self.gen_add_sync()
+        # H[i,j] = sum_r J_p[r,i] W[r] J_p[r,j] + W[r] (p_r - p_des_r) d2p[r,i,j], column-major over
+        # the full NX x NX block (zero outside the NUM_VEL x NUM_VEL q-block).
+        self.gen_add_parallel_loop("ind", str(nx * nx))
+        self.gen_add_code_line("int row = ind % " + str(nx) + ";")
+        self.gen_add_code_line("int col = ind / " + str(nx) + ";")
+        self.gen_add_code_line("T h = static_cast<T>(0);")
+        self.gen_add_code_line("if (row < " + str(nv) + " && col < " + str(nv) + ") {")
+        self.gen_add_code_line("    #pragma unroll")
+        self.gen_add_code_line("    for (int r = 0; r < 3; ++r) {")
+        self.gen_add_code_line("        T Jri = s_end_effector_pose_gradient[6*" + str(nv) + "*EE + 6*row + r];")
+        self.gen_add_code_line("        T Jrj = s_end_effector_pose_gradient[6*" + str(nv) + "*EE + 6*col + r];")
+        self.gen_add_code_line("        T e   = s_end_effector_pose[6*EE + r] - s_p_des[r];")
+        self.gen_add_code_line("        T Hij = s_end_effector_pose_hessian[6*" + str(nv * nv) + "*EE + r*" + str(nv * nv) + " + row*" + str(nv) + " + col];")
+        self.gen_add_code_line("        h += Jri * s_W[r] * Jrj + s_W[r] * e * Hij;")
+        self.gen_add_code_line("    }")
+        self.gen_add_code_line("}")
+        self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
+        self.gen_add_end_control_flow()
+        if self.robot.floating_base:
+            # mjx output: same congruence reframe as the GN hessian. Like GN, NO
+            # frame-correction term -- exact in the pin convention; the mjx-frame
+            # Newton curvature correction is a follow-up. s_q is already xyzw.
+            self.gen_add_sync()
+            self.gen_add_code_line("if constexpr (MUJOCO_OUTPUT) {", True)
+            self.gen_mjx_congruence("s_hess", str(nx), q_name="s_q")
+            self.gen_add_end_control_flow()
+        self.gen_add_end_function()
 
 
 # ---------------------------------------------------------------------------
@@ -2099,10 +2173,11 @@ def gen_grid_plant(self, algorithms):
     else:
         self.gen_add_code_line("// [grid_plant] plant_step_hessian skipped: requires 'fdsva_so' (grid::integrator_hessian_device) — not generated.")
 
-    # EE position cost needs both ee_pose and ee_pose_gradient.
+    # EE position cost needs both ee_pose and ee_pose_gradient. The Newton hessian
+    # variant additionally needs the analytic d2ee ('end_effector_pose_hessian').
     ee_cost_ok = ("end_effector_pose" in algorithms) and ("end_effector_pose_gradient" in algorithms)
     if ee_cost_ok:
-        self.gen_ee_pos_cost()
+        self.gen_ee_pos_cost(with_newton = ("end_effector_pose_hessian" in algorithms))
     else:
         self.gen_add_code_line("// [grid_plant] ee_pos_cost skipped: requires both 'end_effector_pose' and 'end_effector_pose_gradient' (grid::end_effector_pose[_gradient]_device) — not generated.")
 
