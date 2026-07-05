@@ -200,7 +200,7 @@ def gen_grid_linalg_backend_helpers(self):
 
 
 def gen_invert_matrix(self):
-    """Emits a thin wrapper around `glass::invertMatrix_dense` (block-
+    """Emits a thin wrapper around `glass::inv_dense` (block-
     cooperative Gauss-Jordan; `GLASS/src/base/L3/inv.cuh`).
 
     Why a wrapper rather than re-implementing here: GLASS is the first-party
@@ -210,11 +210,12 @@ def gen_invert_matrix(self):
     pivot loop) auto-propagate on the next vendor without re-touching the
     emitter.
 
-    The base `glass::invertMatrix` (also embedded) takes the classic
-    augmented `[A | I]` n×(2n) layout; that doesn't fit the GRiD callers
-    which pre-allocate separate A and Ainv buffers, so we use the dense
-    in-place variant `glass::invertMatrix_dense(dimA, A, Ainv, s_temp)`
-    added in GLASS 2026-05-29 (3*dimA scratch, A → A^-1 AND Ainv → A^-1).
+    The base `glass::inv` (also embedded) takes the classic augmented
+    `[A | I]` n×(2n) layout; that doesn't fit the GRiD callers which
+    pre-allocate separate A and Ainv buffers, so we use the dense
+    in-place variant `glass::inv_dense(dimA, A, Ainv, s_temp)`
+    (3*dimA scratch, A → A^-1 AND Ainv → A^-1; named
+    invertMatrix_dense before the GLASS r2 rename).
 
     Signature preserved for caller compatibility:
         invert_matrix(dimA, A, Ainv, s_temp)
@@ -226,7 +227,7 @@ def gen_invert_matrix(self):
     4*dimA so there is headroom.
     """
     self.gen_add_func_doc(
-        "Compute the inverse of a matrix (wraps glass::invertMatrix_dense)",
+        "Compute the inverse of a matrix (wraps glass::inv_dense)",
         ["Block-cooperative Gauss-Jordan via GLASS.",
          "Both A and Ainv hold A^-1 on return (dual-output for caller compat).",
          "s_temp must hold at least 3*dimA elements."],
@@ -237,7 +238,7 @@ def gen_invert_matrix(self):
     self.gen_add_code_line("template <typename T>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void invert_matrix(uint32_t dimA, T *A, T *Ainv, T *s_temp) {", True)
-    self.gen_add_code_line("glass::invertMatrix_dense<T>(dimA, A, Ainv, s_temp);")
+    self.gen_add_code_line("glass::inv_dense<T>(dimA, A, Ainv, s_temp);")
     self.gen_add_end_function()
     return
 

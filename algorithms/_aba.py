@@ -326,7 +326,7 @@ def gen_aba_inner_floating(self):
             self.gen_add_code_line("int S_row = row < 3 ? row + 3 : row - 3;")
             self.gen_add_code_line("s_fb_cold[" + str(fbUOffset) + " + ind] = s_temp[" + str(IAOffset) + " + row + 6*S_col];")
             self.gen_add_code_line("s_fb_cold[" + str(fbDOffset) + " + ind] = s_temp[" + str(IAOffset) + " + S_row + 6*S_col];")
-            # No Ainv=I pre-init: glass::invertMatrix_dense seeds Ainv internally.
+            # No Ainv=I pre-init: glass::inv_dense seeds Ainv internally.
             self.gen_add_end_control_flow()
             self.gen_add_sync()
             self.gen_add_code_line("invert_matrix(6, &s_fb_cold[" + str(fbDOffset) + "], &s_fb_cold[" + str(fbDinvOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
@@ -398,7 +398,7 @@ def gen_aba_inner_floating(self):
             self.gen_add_code_line("// root acceleration from gravity, then solve root qdd")
             self.gen_add_parallel_loop("ind", "36")
             self.gen_add_code_line("s_temp[" + str(tempMatOffset) + " + ind] = s_XImats[ind];")
-            # No Ainv=I pre-init (or row/col): glass::invertMatrix_dense seeds Ainv internally.
+            # No Ainv=I pre-init (or row/col): glass::inv_dense seeds Ainv internally.
             self.gen_add_end_control_flow()
             self.gen_add_sync()
             self.gen_add_code_line("invert_matrix(6, &s_temp[" + str(tempMatOffset) + "], &s_temp[" + str(tempVecOffset) + "], &s_fb_cold[" + str(fbInvTempOffset) + "]);")
