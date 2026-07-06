@@ -23,6 +23,7 @@ _GLASS_BASE_FILES = [
     "src/base/L3/gemm_strided.cuh",
     "src/base/L3/gemm_batched_indexed.cuh",
     "src/base/L3/inv.cuh",            # used by invert_matrix (floating-base 6x6 root invert)
+    "src/base/L3/syev.cuh",           # symmetric eigensolve + eig_clamp (PSD projection of the Newton ee cost hessian)
 ]
 
 

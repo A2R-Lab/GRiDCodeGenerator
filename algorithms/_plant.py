@@ -771,6 +771,10 @@ def gen_ee_pos_cost(self, with_d2ee = False):
          "solution -- callers must regularize (e.g. the solver's rho schedule).",
          "GAUSS_NEWTON=true keeps the ratified PSD choice H = J_p^T diag(W) J_p (curvature dropped); "
          "s_p_des, s_end_effector_pose and s_end_effector_pose_hessian may be nullptr in that case.",
+         "PSD_CLAMP=true (opt-in, default false) eigen-clamps the NV x NV q-block to >= psd_reg_eps "
+         "(glass::eig_clamp) so the returned hessian is SPD and directly factorable even when the Newton "
+         "curvature is indefinite -- a guaranteed-PSD alternative to a caller-side rho schedule. Costs one "
+         "block-cooperative Jacobi eigensolve; s_scratch must hold NV*NV + eig_clamp_scratch when set.",
          "Caller-scratch INNER: ONE XmatsHom load feeds the needed inners (GN: gradient_inner only, "
          "s_dXhom = nullptr; Newton: pose_inner for the residual + hessian_inner, which also fills "
          "the gradient buffer), so it is callable from another kernel's block without aliasing that "
@@ -788,11 +792,11 @@ def gen_ee_pos_cost(self, with_d2ee = False):
          "DYNAMIC_SHARED_MEM_COUNT; Newton: >= END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_COUNT "
          "covers it; 16B aligned)"],
         None)
-    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false, bool GAUSS_NEWTON = false" + ", bool MUJOCO_OUTPUT = false" + ">")
+    self.gen_add_code_line("template <typename T, int EE = 0, bool ACCUMULATE = false, bool GAUSS_NEWTON = false" + ", bool MUJOCO_OUTPUT = false" + ", bool PSD_CLAMP = false" + ">")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line("void ee_pos_cost_hessian(T *s_hess, const T *s_q, const T *s_p_des, const T *s_W, "
                            "T *s_end_effector_pose, T *s_end_effector_pose_gradient, T *s_end_effector_pose_hessian, "
-                           "T *s_scratch, const grid::robotModel<T> *d_robotModel) {", True)
+                           "T *s_scratch, const grid::robotModel<T> *d_robotModel, T psd_reg_eps = static_cast<T>(1e-6)) {", True)
     self.gen_add_code_line("using namespace grid;")
     if not with_d2ee:
         self.gen_add_code_line("static_assert(GAUSS_NEWTON, \"full-Newton ee_pos_cost_hessian requires 'end_effector_pose_hessian' in the algorithm set; pass GAUSS_NEWTON=true for the J_p^T W J_p approximation\");")
@@ -846,6 +850,30 @@ def gen_ee_pos_cost(self, with_d2ee = False):
     self.gen_add_code_line("    }")
     self.gen_add_code_line("}")
     self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
+    self.gen_add_end_control_flow()
+    # PSD projection (opt-in): floor the q-block eigenvalues at psd_reg_eps so a direct
+    # solver can factor the Newton hessian even where the residual-weighted curvature makes
+    # it indefinite. Applied in the pin output frame BEFORE the mjx congruence (G=blockdiag(R,I)
+    # is a congruence, which preserves PSD). The NV x NV q-block is column-major with stride NX
+    # inside s_hess, so gather it contiguous, eig_clamp in place, scatter back. The EE-inner
+    # arena (s_scratch) is dead here, so it doubles as the eig_clamp workspace
+    # (NV*NV gathered block + 2*NV*NV+2*NV+4 syev scratch); callers that set PSD_CLAMP=true must
+    # size s_scratch to at least that (>= END_EFFECTOR_POSE_HESSIAN inner need covers small robots).
+    self.gen_add_code_line("if constexpr (PSD_CLAMP) {", True)
+    self.gen_add_sync()
+    self.gen_add_code_line("T *s_psd_qb = s_scratch; T *s_psd_eig = &s_scratch[" + str(nv * nv) + "];")
+    self.gen_add_parallel_loop("ind", str(nv * nv))
+    self.gen_add_code_line("int r = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
+    self.gen_add_code_line("s_psd_qb[r + " + str(nv) + "*c] = s_hess[r + " + str(nx) + "*c];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_code_line("glass::eig_clamp<T, " + str(nv) + ">(s_psd_qb, psd_reg_eps, s_psd_eig);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", str(nv * nv))
+    self.gen_add_code_line("int r = ind % " + str(nv) + "; int c = ind / " + str(nv) + ";")
+    self.gen_add_code_line("s_hess[r + " + str(nx) + "*c] = s_psd_qb[r + " + str(nv) + "*c];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
     self.gen_add_end_control_flow()
     if self.robot.floating_base:
         # mjx output: the active q-block is at offset 0 of the NX x NX col-major
