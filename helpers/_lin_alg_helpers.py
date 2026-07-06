@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -49,6 +50,19 @@ def _glass_commit():
         return "unknown"
 
 
+# File-level `GLASS_*` preprocessor guards (e.g. gemm.cuh's
+# `GLASS_TILE4_HELPERS_DEFINED`, which dedups the tile4 helper block across the
+# gemm/gemm_strided/gemm_batched includes) are GLOBAL macros — the preprocessor
+# does not respect the `grid::glass` namespace we vendor into. If a consumer
+# includes BOTH its own global GLASS and this generated header, whichever defines
+# the guard first suppresses the OTHER copy's helper definitions, leaving e.g.
+# `tile4_has_vec`/`tile4_profitable` undefined in that namespace. Rename every
+# vendored `GLASS_*` macro token to a `GRID_VENDORED_`-prefixed name so the
+# vendored snapshot's guards can never collide with the consumer's GLASS — which
+# is the whole point of nesting the vendored copy (see gen_grid_linalg_backend_helpers).
+_GLASS_MACRO_TOKEN = re.compile(r"\bGLASS_[A-Z0-9_]+\b")
+
+
 def _emit_glass_source_file(self, relative_path):
     source_path = _glass_root() / relative_path
     if not source_path.exists():
@@ -60,6 +74,7 @@ def _emit_glass_source_file(self, relative_path):
             continue
         if stripped.startswith("#include"):
             continue
+        line = _GLASS_MACRO_TOKEN.sub(lambda m: "GRID_VENDORED_" + m.group(0), line)
         self.gen_add_code_line(line)
     self.gen_add_code_line("// END GLASS " + relative_path)
     self.gen_add_code_line("")
