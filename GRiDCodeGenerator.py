@@ -2196,24 +2196,40 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_Minv, NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_qdd, NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_M, NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #if GRID_HAS_INVERSE_DYNAMICS_GRADIENT", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dc_du, 2*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_FORWARD_DYNAMICS_GRADIENT", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df_du, 2*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #endif", \
                       "    // f_ext gradient column (section A): dtau/dfext, dqdd/dfext are each nv x (6*NB)", \
+                      "    #if GRID_HAS_F_EXT_GRADIENT", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dtau_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dfext, NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #endif", \
                       "    hd_data->h_dtau_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
                       "    hd_data->h_dqdd_dfext = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
-                      "    // f_ext A.3: -dJ^T/dq = d(inverse_dynamics_gradient)/dfext, nv*6NB*nv (both base modes)",
+                      "    // f_ext A.3: -dJ^T/dq = d(inverse_dynamics_gradient)/dfext, nv*6NB*nv (fixed base only; the largest per-timestep buffer)",
+                      "    #if GRID_HAS_F_EXT_GRADIENT_DQ",
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_f_ext_gradient_dq, NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T)));",
                       "    hd_data->h_f_ext_gradient_dq = (T *)malloc(NUM_VEL*6*NUM_BODIES*NUM_VEL*NUM_TIMESTEPS*sizeof(T));",
+                      "    #endif",
                       "    // R2: regressor Y and FD param-gradient dqdd/dpi (each nv x 10*NUM_BODIES)",
+                      "    #if GRID_HAS_INVERSE_DYNAMICS_REGRESSOR",
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_Y, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dpi, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
                       "    hd_data->h_Y = (T *)malloc(NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
-                      "    hd_data->h_dqdd_dpi = (T *)malloc(NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));"]
+                      "    #endif",
+                      "    #if GRID_HAS_FORWARD_DYNAMICS_PARAMETER_GRADIENT",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dqdd_dpi, NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T)));",
+                      "    hd_data->h_dqdd_dpi = (T *)malloc(NUM_VEL*10*NUM_BODIES*NUM_TIMESTEPS*sizeof(T));",
+                      "    #endif"]
                       + [
+                      "    #if GRID_HAS_IDSVA_SO", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_idsva_so, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_FDSVA_SO", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_df2, SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T)));", \
+                      "    #endif", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_workspace, GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()*GRID_WORKSPACE_SLOTS*NUM_TIMESTEPS));", \
                       "    // Phase 3a/b/c/e: L2-pin d_workspace for its lifetime. Spilled buffers", \
                       "    // (Minv-F, FD's Minv-F, ABA's inner scratch, FDSVA_SO's df_du/Minv) are", \
@@ -2223,14 +2239,26 @@ class GRiDCodeGenerator:
                       "    hd_data->h_Minv = (T *)malloc(NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_M = (T *)malloc(NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
                       "    hd_data->h_qdd = (T *)malloc(NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #if GRID_HAS_INVERSE_DYNAMICS_GRADIENT", \
                       "    hd_data->h_dc_du = (T *)malloc(2*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_FORWARD_DYNAMICS_GRADIENT", \
                       "    hd_data->h_df_du = (T *)malloc(2*NUM_VEL*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_IDSVA_SO", \
                       "    hd_data->h_idsva_so = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_FDSVA_SO", \
                       "    hd_data->h_df2 = (T *)malloc(SECOND_ORDER_TENSOR_SIZE*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_INTEGRATOR", \
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_x_kp1, 2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
-                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dAB, 2*NUM_JOINTS*3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_x_kp1 = (T *)malloc(2*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
+                      "    #if GRID_HAS_INTEGRATOR_GRADIENT", \
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_dAB, 2*NUM_JOINTS*3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T)));", \
                       "    hd_data->h_dAB = (T *)malloc(2*NUM_JOINTS*3*NUM_JOINTS*NUM_TIMESTEPS*sizeof(T));", \
+                      "    #endif", \
                       "}", \
                       "// kinematics outputs", \
                       "if (needs_kinematics) {", \
@@ -3232,6 +3260,12 @@ class GRiDCodeGenerator:
             "CRBA": "crba",
             "INVERSE_DYNAMICS_GRADIENT": "inverse_dynamics_gradient",
             "FORWARD_DYNAMICS_GRADIENT": "forward_dynamics_gradient",
+            # f_ext gradient family — big output buffers (dtau/dqdd_dfext each nv*6NB;
+            # f_ext_gradient_dq is nv*6NB*nv, the single largest per-timestep buffer).
+            # Gated so init_gridData (B2) skips their alloc when the algo wasn't generated
+            # (e.g. f_ext_gradient_dq is fixed-base-only -> absent on h2_plus floating).
+            "F_EXT_GRADIENT": "f_ext_gradient",
+            "F_EXT_GRADIENT_DQ": "f_ext_gradient_dq",
             "INVERSE_DYNAMICS_REGRESSOR": "inverse_dynamics_regressor",
             # FD parameter gradient (dqdd/dpi = -Minv . Y): its grid::kernel is
             # emitted only when 'forward_dynamics_parameter_gradient' is in the
