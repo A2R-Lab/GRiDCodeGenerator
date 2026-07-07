@@ -9,8 +9,11 @@ import numpy as np
 from .algorithms._idsva_so import _idsva_so_use_world_frame
 
 # Per-algo DESCRIPTOR table (item M) — single source of truth for the launch-config
-# enum/symbol metadata that used to live in the two module-level dicts below.
-from .algo_registry import ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol
+# enum/symbol metadata that used to live in the two module-level dicts below, and
+# (Step 2) for the KERNEL_ATTR_MANIFEST / mujoco_manifest per-entry HEAD fields
+# (algo_label, algo_short, gate_attr, bytes_macro) — only the irregular kernel
+# overload SIGNATURES stay as co-located payload data.
+from .algo_registry import ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol, descriptor_for
 
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
@@ -2336,9 +2339,15 @@ class GRiDCodeGenerator:
     # gen_f_ext_gradient actually emitted it (set True whenever f_ext_gradient runs).
     _f_ext_gradient_dq_emitted = False
 
-    KERNEL_ATTR_MANIFEST = [
-        # (algo_label, algo_short, gate_attr, bytes_macro, [(kernel_name<T>, signature), ...])
-        ("inverse_dynamics", "inverse_dynamics", None, "INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+    # ── Step 2: per-algo kernel-overload SIGNATURES (the irregular C++ payload).
+    # Keyed by algo_short, INSERTION ORDER == the historical KERNEL_ATTR_MANIFEST
+    # order (byte-identity: the emitted cudaFuncSetAttribute block + its alias
+    # counter follow this order). The per-entry HEAD (algo_label, gate_attr,
+    # bytes_macro) is NO LONGER restated here — it is derived from the descriptor
+    # table (algo_registry.ALGO_DESCRIPTORS) below, so gate/bytes live in exactly
+    # one place. algo_label == algo_short for every pin entry (registry invariant).
+    KERNEL_OVERLOADS = {
+        "inverse_dynamics": [
             ("inverse_dynamics_kernel<T>",
              "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel<T>",
@@ -2347,44 +2356,44 @@ class GRiDCodeGenerator:
              "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("minv", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "minv": [
             ("minv_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("minv_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("forward_dynamics", "forward_dynamics", None, "FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "forward_dynamics": [
             ("forward_dynamics_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("aba", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "aba": [
             ("aba_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("aba_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("crba", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "crba": [
             ("crba_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("crba_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("end_effector_pose", "end_effector_pose", None, "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "end_effector_pose": [
             ("end_effector_pose_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("end_effector_pose_gradient", "end_effector_pose_gradient", None, "END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "end_effector_pose_gradient": [
             ("end_effector_pose_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("inverse_dynamics_gradient", "inverse_dynamics_gradient", "generate_inverse_dynamics_gradient", "INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "inverse_dynamics_gradient": [
             ("inverse_dynamics_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel<T>",
@@ -2393,8 +2402,8 @@ class GRiDCodeGenerator:
              "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("forward_dynamics_gradient", "forward_dynamics_gradient", "generate_forward_dynamics_gradient", "FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "forward_dynamics_gradient": [
             ("forward_dynamics_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel<T>",
@@ -2403,212 +2412,264 @@ class GRiDCodeGenerator:
              "void (*)(T *, unsigned char *, const T *, const int, const T *, const T *, T *, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # g1-spill: f_ext_gradient_kernel gained `unsigned char *d_workspace` as its
         # 3rd arg (after the two outputs) so s_dqdd_dfext can spill there at LITE/MINIMAL.
-        ("f_ext_gradient", "f_ext_gradient", None, "F_EXT_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "f_ext_gradient": [
             ("f_ext_gradient_kernel<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_kernel_single_timing<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        # A.3 (-dJ^T/dq): own kernel + smem macro, fixed-base only. Gated on the
-        # instance attr _f_ext_gradient_dq_emitted (set True only when the kernel is
-        # actually emitted) so the floating-base header — which has neither the
-        # kernel nor the F_EXT_GRADIENT_DQ_* macro — never references them.
+        ],
+        # A.3 (-dJ^T/dq): own kernel + smem macro, fixed-base only. Gated (descriptor
+        # gate_attr=_f_ext_gradient_dq_emitted) so the floating-base header — which has
+        # neither the kernel nor the F_EXT_GRADIENT_DQ_* macro — never references them.
         # h2_plus-spill: f_ext_gradient_dq_kernel gained `unsigned char *d_workspace` as
         # its 2nd arg (after the output) so the s_JTp/s_JTm pair can spill there at rung 1.
-        ("f_ext_gradient_dq", "f_ext_gradient_dq", "_f_ext_gradient_dq_emitted", "F_EXT_GRADIENT_DQ_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "f_ext_gradient_dq": [
             ("f_ext_gradient_dq_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("f_ext_gradient_dq_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
+        ],
         # E1 joint-torque regressor: Y is nv x 10*NUM_BODIES, can exceed the 48 KB
         # default dynamic-smem cap on big robots (g1: ~55 KB), so it MUST opt in.
-        ("inverse_dynamics_regressor", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "inverse_dynamics_regressor": [
             ("inverse_dynamics_regressor_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("inverse_dynamics_regressor_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # PS5 energy regressors (each output 10*NUM_BODIES; opt-in like the joint-torque
         # regressor so big-robot launches set the dynamic-smem attr).
-        ("kinetic_energy_regressor", "kinetic_energy_regressor", None, "KINETIC_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "kinetic_energy_regressor": [
             ("kinetic_energy_regressor_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("kinetic_energy_regressor_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("potential_energy_regressor", "potential_energy_regressor", None, "POTENTIAL_ENERGY_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "potential_energy_regressor": [
             ("potential_energy_regressor_kernel<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("potential_energy_regressor_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # FD param gradient dqdd/dpi = -Minv . Y: output is nv x 10*NUM_BODIES (same
         # size class as the regressor), can exceed the 48 KB default cap; opt in.
         # g1-spill: forward_dynamics_parameter_gradient_kernel gained `unsigned char *d_workspace`
         # as its 2nd arg (after d_dqdd_dpi) so s_Y can spill there at LITE/MINIMAL.
-        ("forward_dynamics_parameter_gradient", "forward_dynamics_parameter_gradient", None, "FORWARD_DYNAMICS_PARAMETER_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "forward_dynamics_parameter_gradient": [
             ("forward_dynamics_parameter_gradient_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("forward_dynamics_parameter_gradient_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("idsva_so_body_frame", "idsva_so_body_frame", "generate_idsva_so_body_frame", "IDSVA_SO_BODY_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "idsva_so_body_frame": [
             ("idsva_so_body_frame_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("idsva_so_body_frame_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # world-frame single-pass alternative (opt-in via enable_idsva_so_world_frame).
         # Now takes d_workspace (unified signature; cold buffers spill there at LITE/MINIMAL).
         # Uses its own shared-mem macro (~25 KB for g1 vs shim's ~162 KB).
-        ("idsva_so_world_frame", "idsva_so_world_frame", "generate_idsva_so_world_frame",
-         "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "idsva_so_world_frame": [
             ("idsva_so_world_frame_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("idsva_so_world_frame_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("fdsva_so", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "fdsva_so": [
             ("fdsva_so_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
             ("fdsva_so_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # Integrator kernels are templated on IntegratorType IT (a non-type param
         # that does not change the function signature). Each IT is a distinct
         # __global__ instantiation, so cudaFuncSetAttribute must run for ALL of
         # them — otherwise a non-Euler IT whose floating-base arena exceeds the
         # 48 KB device default launches with cudaErrorInvalidValue while Euler
         # (the only one historically registered) succeeds.
-        ("integrator", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "integrator": [
             (f"integrator_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
-        ]),
-        ("integrator_gradient", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "integrator_gradient": [
             (f"integrator_gradient_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
-        ]),
-        ("integrator_with_gradient", "integrator_with_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "integrator_with_gradient": [
             (f"integrator_with_gradient_kernel{suffix}<T, IntegratorType::{it}>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
             for suffix in ("", "_single_timing")
             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4", "TRAPEZOIDAL")
-        ]),
+        ],
         # ee_pose_hessian is special: only emitted when its shared-mem fits the
         # GRID_CUDA_TARGET_SHARED_MEM_BYTES budget at compile time. The runtime
         # guard wraps the cudaFuncSetAttribute call.
-        ("end_effector_pose_hessian", "end_effector_pose_hessian", "generate_end_effector_pose_hessian",
-         "END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "end_effector_pose_hessian": [
             ("end_effector_pose_hessian_kernel<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("end_effector_pose_hessian_kernel_single_timing<T>",
              "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
+        ],
         # G2 centroidal quick-wins. R6: each registers on its OWN key (matching
         # gen_centroidal_quickwins' per-key emit) — algo_short keys an entry that
         # is in generated_algorithms exactly when THAT centroidal fn was emitted.
-        ("generalized_gravity", "generalized_gravity", None, "INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "generalized_gravity": [
             ("generalized_gravity_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("generalized_gravity_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
-        ("nonlinear_effects", "nonlinear_effects", None, "INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "nonlinear_effects": [
             ("nonlinear_effects_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("nonlinear_effects_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # PS5 Coriolis matrix C(q,qd): nv x nv output can exceed the 48 KB default
         # dynamic-smem cap on big robots, so it MUST opt in. Kernel takes d_workspace
         # as its 2nd arg (reserved for a future big-robot spill; unused at FULL).
-        ("coriolis_matrix", "coriolis_matrix", None, "CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "coriolis_matrix": [
             ("coriolis_matrix_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("coriolis_matrix_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
         # PS5 dCCRBA: cmm_time_variation (Adot 6*nv; no spill, no d_workspace arg) and
         # dccrba (6*nv*nv tensor; spill -> d_workspace as the 2nd arg). REQUIRED so
         # init_grid runs cudaFuncSetAttribute (the 6*nv*nv output blows the 48 KB cap).
-        ("cmm_time_variation", "cmm_time_variation", None, "CMM_TIME_VARIATION_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "cmm_time_variation": [
             ("cmm_time_variation_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("cmm_time_variation_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("dccrba", "dccrba", None, "DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "dccrba": [
             ("dccrba_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("dccrba_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
+        ],
         # E2/S1 general-frame Jacobian family (opt-in; gated on membership in
         # generated_algorithms via algo_short). The kernels take the target frame
         # at RUNTIME: (T *out, const T *q, const int stride_q, const int target_jid,
         # const int reference_frame, robotModel, int N).
-        ("frame_jacobian", "frame_jacobian", None, "FRAME_JACOBIAN_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "frame_jacobian": [
             ("frame_jacobian_kernel<T>",
              "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
             ("frame_jacobian_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("frame_jacobian_dot", "frame_jacobian_dot", None, "FRAME_JACOBIAN_DOT_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "frame_jacobian_dot": [
             ("frame_jacobian_dot_kernel<T>",
              "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
             ("frame_jacobian_dot_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const int, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("osc_inertia", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "osc_inertia": [
             ("osc_inertia_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("osc_inertia_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
+        ],
         # Runtime-target pose / pose-gradient (opt-in). Kernels take target_jid +
         # the runtime offset pointer: (T *out, const T *q, const int stride_q,
         # const int target_jid, const T *offset, robotModel, int N).
-        ("end_effector_pose_runtime", "end_effector_pose_runtime", None,
-         "END_EFFECTOR_POSE_RUNTIME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        "end_effector_pose_runtime": [
             ("end_effector_pose_runtime_kernel<T>",
              "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
             ("end_effector_pose_runtime_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
-        ]),
-        ("end_effector_pose_gradient_runtime", "end_effector_pose_gradient_runtime", None,
-         "END_EFFECTOR_POSE_GRADIENT_RUNTIME_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "end_effector_pose_gradient_runtime": [
             ("end_effector_pose_gradient_runtime_kernel<T>",
              "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
             ("end_effector_pose_gradient_runtime_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
-        ]),
-        ("com", "com", None, "COM_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "com": [
             ("com_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("com_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("ccrba", "ccrba", None, "CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "ccrba": [
             ("ccrba_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
             ("ccrba_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
-        ]),
-        ("energy", "energy", None, "ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>()", [
+        ],
+        "energy": [
             ("energy_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
             ("energy_kernel_single_timing<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)"),
-        ]),
+        ],
+    }
+
+    # KERNEL_ATTR_MANIFEST head (algo_label, algo_short, gate_attr, bytes_macro)
+    # DERIVED from the descriptor rows — single source of truth for gate/bytes. The
+    # `kernels` payload comes from KERNEL_OVERLOADS. Order follows KERNEL_OVERLOADS
+    # (== the historical manifest order) so the emitted attr block is byte-identical.
+    KERNEL_ATTR_MANIFEST = [
+        (short, short, descriptor_for(short).gate_attr, descriptor_for(short).bytes_macro, kernels)
+        for short, kernels in KERNEL_OVERLOADS.items()
     ]
+
+    # ── Step 2: floating mjx-twin (MUJOCO_OUTPUT=true) kernel-overload SIGNATURES.
+    # The mjx twin is a SUBSET of the pin kernels with the trailing `, GRID_DEFAULT_
+    # RESOURCE_TIER, true` template flag; it has NO single_timing twin. Payload only;
+    # the mujoco_manifest head (label=short+"(mjx)", gate_attr, bytes_macro) is derived
+    # from the descriptor rows in gen_init_close_grid. Insertion order == historical
+    # mujoco_manifest order (byte-identity of the mjx portion of the attr block). Some
+    # sigs differ from the pin base: id / id-grad use the qdd overload; fd-grad uses the
+    # single-output overload; integrator families fan out over their mjx IntegratorType set.
+    MJX_KERNEL_OVERLOADS = {
+        "inverse_dynamics": [("inverse_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")],
+        "minv": [("minv_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")],
+        "forward_dynamics": [("forward_dynamics_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")],
+        "aba": [("aba_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")],
+        "crba": [("crba_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")],
+        "end_effector_pose": [("end_effector_pose_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")],
+        # osc_inertia(mjx): Lambda is frame-invariant; quat reorder on input. Needs its
+        # >48KB dynamic-smem opt-in (passes on go2 where arena<48KB; fails on big floating).
+        "osc_inertia": [("osc_inertia_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")],
+        "end_effector_pose_gradient": [("end_effector_pose_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")],
+        "end_effector_pose_hessian": [("end_effector_pose_hessian_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")],
+        "inverse_dynamics_gradient": [("inverse_dynamics_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")],
+        "forward_dynamics_gradient": [("forward_dynamics_gradient_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")],
+        "inverse_dynamics_regressor": [("inverse_dynamics_regressor_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")],
+        "idsva_so_world_frame": [("idsva_so_world_frame_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")],
+        "fdsva_so": [("fdsva_so_kernel<T, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")],
+        "integrator": [(f"integrator_kernel<T, IntegratorType::{it}, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
+             for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")],
+        # integrator_gradient mjx is single-stage (EULER / SI-Euler) only.
+        "integrator_gradient": [(f"integrator_gradient_kernel<T, IntegratorType::{it}, GRID_DEFAULT_RESOURCE_TIER, true>",
+             "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
+             for it in ("EULER", "SEMI_IMPLICIT_EULER")],
+    }
 
     def gen_init_close_grid(self):
         # set the max shared mem to account for large robots and allocate streams
@@ -2655,64 +2716,16 @@ class GRiDCodeGenerator:
         # #ifdef GRID_FLOATING_BASE), independent of the MUJOCO_OUTPUT constructor arg
         # (which the .so build does not set). So the MUJOCO_OUTPUT=true instantiations
         # exist for any floating .so and need their dynamic-smem attribute registered.
+        # mujoco_manifest head derived from the descriptor rows (label=short+"(mjx)",
+        # gate_attr/bytes_macro from the descriptor — single source of truth); the mjx
+        # kernel-overload signatures come from MJX_KERNEL_OVERLOADS. Order follows that
+        # dict (== the historical mujoco_manifest order) for a byte-identical attr block.
         mujoco_manifest = []
         if self.robot.floating_base:
-            _GT = "GRID_DEFAULT_RESOURCE_TIER"
             mujoco_manifest = [
-                ("inverse_dynamics(mjx)", "inverse_dynamics", None, "INVERSE_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"inverse_dynamics_kernel<T, {_GT}, true>",
-                   "void (*)(T *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")]),
-                ("minv(mjx)", "minv", None, "MINV_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"minv_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
-                ("forward_dynamics(mjx)", "forward_dynamics", None, "FORWARD_DYNAMICS_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"forward_dynamics_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
-                ("aba(mjx)", "aba", None, "ABA_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"aba_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
-                ("crba(mjx)", "crba", None, "CRBA_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"crba_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
-                ("end_effector_pose(mjx)", "end_effector_pose", None, "END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"end_effector_pose_kernel<T, {_GT}, true>",
-                   "void (*)(T *, const T *, const int, const robotModel<T> *, const int)")]),
-                # osc_inertia(mjx): the mjx kernel (Lambda is frame-invariant; quat reorder
-                # on input) was missing its >48KB dynamic-smem opt-in (passes on go2 where
-                # the arena < 48KB, would fail cudaErrorInvalidValue on a big floating robot).
-                ("osc_inertia(mjx)", "osc_inertia", None, "OSC_INERTIA_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"osc_inertia_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
-                ("end_effector_pose_gradient(mjx)", "end_effector_pose_gradient", None, "END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"end_effector_pose_gradient_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
-                ("end_effector_pose_hessian(mjx)", "end_effector_pose_hessian", "generate_end_effector_pose_hessian", "END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"end_effector_pose_hessian_kernel<T, {_GT}, true>",
-                   "void (*)(T *, T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)")]),
-                ("inverse_dynamics_gradient(mjx)", "inverse_dynamics_gradient", "generate_inverse_dynamics_gradient", "INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"inverse_dynamics_gradient_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const T *, T *, const robotModel<T> *, const T, const int)")]),
-                ("forward_dynamics_gradient(mjx)", "forward_dynamics_gradient", "generate_forward_dynamics_gradient", "FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"forward_dynamics_gradient_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
-                ("inverse_dynamics_regressor(mjx)", "inverse_dynamics_regressor", None, "INVERSE_DYNAMICS_REGRESSOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"inverse_dynamics_regressor_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
-                ("idsva_so_world_frame(mjx)", "idsva_so_world_frame", "generate_idsva_so_world_frame", "IDSVA_SO_WORLD_FRAME_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"idsva_so_world_frame_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const T, const int)")]),
-                ("fdsva_so(mjx)", "fdsva_so", "generate_fdsva_so", "FDSVA_SO_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"fdsva_so_kernel<T, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, T *, const robotModel<T> *, const T, const int)")]),
-                ("integrator(mjx)", "integrator", None, "INTEGRATOR_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"integrator_kernel<T, IntegratorType::{it}, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
-                  for it in ("EULER", "SEMI_IMPLICIT_EULER", "MIDPOINT", "RK3", "RK4")]),
-                # integrator_gradient mjx is single-stage (EULER / SI-Euler) only.
-                ("integrator_gradient(mjx)", "integrator_gradient", None, "INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T>()",
-                 [(f"integrator_gradient_kernel<T, IntegratorType::{it}, {_GT}, true>",
-                   "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, T *, const T, const T, const int)")
-                  for it in ("EULER", "SEMI_IMPLICIT_EULER")]),
+                (short + "(mjx)", short, descriptor_for(short).gate_attr,
+                 descriptor_for(short).bytes_macro, kernels)
+                for short, kernels in self.MJX_KERNEL_OVERLOADS.items()
             ]
         for entry in self.KERNEL_ATTR_MANIFEST + mujoco_manifest:
             algo_label, algo_short, gate_attr, bytes_macro, kernels = entry
