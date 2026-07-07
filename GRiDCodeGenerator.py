@@ -8,6 +8,10 @@ import numpy as np
 # (else high-DOF fixed-base robots route to an undefined idsva_so_world_frame_inner).
 from .algorithms._idsva_so import _idsva_so_use_world_frame
 
+# Per-algo DESCRIPTOR table (item M) — single source of truth for the launch-config
+# enum/symbol metadata that used to live in the two module-level dicts below.
+from .algo_registry import ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol
+
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
 # launch_configs/<robot>/<DEFAULT_GPU>.json. At codegen time we read the
@@ -19,7 +23,7 @@ from .algorithms._idsva_so import _idsva_so_use_world_frame
 # DEFAULT GPU whose autotuned config ships baked-in.
 LAUNCH_CONFIG_DEFAULT_GPU = "rtx5090_sm120"
 
-# JSON tier name -> emitted TIER_* enum symbol.
+# JSON tier name -> emitted TIER_* enum symbol. Global (not per-algo), kept inline.
 LAUNCH_CONFIG_TIER_SYMBOL = {
     "shared":  "TIER_SHARED",
     "lite":    "TIER_LITE",
@@ -27,29 +31,13 @@ LAUNCH_CONFIG_TIER_SYMBOL = {
 }
 
 # JSON (bench-abbreviated) algo key -> canonical grid:: host-launcher symbol.
-# The launch_configs JSON inherits the autotune-sweep's short keys; map them to
+# DERIVED from the per-algo descriptor table (algo_registry.ALGO_DESCRIPTORS):
+# {autotune_key: descriptor.key} for every descriptor carrying a launch_cfg. The
+# launch_configs JSON inherits the autotune-sweep's short keys; this maps them to
 # the host-launcher / kernel base names so the baked enum is unambiguous. Algos
-# present in the registry but absent from the autotune sweep simply get no
-# baked override (they fall back to the conservative default).
-LAUNCH_CONFIG_ALGO_TO_SYMBOL = {
-    "id":                    "inverse_dynamics",
-    "minv":                  "minv",
-    "fd":                    "forward_dynamics",
-    "aba":                   "aba",
-    "crba":                  "crba",
-    "id_du":                 "inverse_dynamics_gradient",
-    "fd_du":                 "forward_dynamics_gradient",
-    "ee_pose":               "end_effector_pose",
-    "ee_pose_gradient":      "end_effector_pose_gradient",
-    "ee_pose_hessian":       "end_effector_pose_hessian",
-    "idsva_so":              "idsva_so",
-    "idsva_so_body_frame":   "idsva_so_body_frame",
-    "idsva_so_world_frame":  "idsva_so_world_frame",
-    "fdsva_so":              "fdsva_so",
-    "integrator":            "integrator",
-    "integrator_gradient":   "integrator_gradient",
-    "integrator_with_gradient": "integrator_with_gradient",
-}
+# present in the registry but absent from the autotune sweep simply get no baked
+# override (they fall back to the conservative default). Built once at import.
+_ALGO_TO_SYMBOL = build_launch_config_algo_to_symbol()
 
 
 def _launch_configs_dir():
@@ -98,7 +86,7 @@ def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU,
         base_block = host_block
     out = {}
     for algo_key, cfg in base_block.items():
-        symbol = LAUNCH_CONFIG_ALGO_TO_SYMBOL.get(algo_key)
+        symbol = _ALGO_TO_SYMBOL.get(algo_key)
         if symbol is None:
             continue
         tier_sym = LAUNCH_CONFIG_TIER_SYMBOL.get(str(cfg.get("tier", "")).lower())
@@ -606,8 +594,11 @@ class GRiDCodeGenerator:
         # Stable, declaration-ordered list of every algo that COULD carry a config
         # (the canonical grid:: symbols). Emit one enumerator per algo so the
         # table is complete regardless of which algos this robot tuned.
-        algo_symbols = list(dict.fromkeys(LAUNCH_CONFIG_ALGO_TO_SYMBOL.values()))
-        enum_names = {sym: "GRID_ALGO_" + sym.upper() for sym in algo_symbols}
+        # Driven from the descriptor table: every algo carrying a baked launch_cfg,
+        # in descriptor order (which is aligned to the launch-config enum order).
+        launch_descriptors = [d for d in ALGO_DESCRIPTORS if d.carries_launch_cfg]
+        algo_symbols = [d.key for d in launch_descriptors]
+        enum_names = {d.key: d.enum_name for d in launch_descriptors}
         base_name = "floating" if self.robot.floating_base else "fixed"
         if cfg:
             src = "launch_configs/" + str(robot_id) + "/" + LAUNCH_CONFIG_DEFAULT_GPU + ".json (" + base_name + ", profile=" + profile + ")"

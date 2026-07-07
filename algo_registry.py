@@ -192,14 +192,6 @@ ALGO_DESCRIPTORS: tuple[AlgoDescriptor, ...] = (
     AlgoDescriptor("kinetic_energy_regressor"),
     AlgoDescriptor("potential_energy_regressor"),
 
-    # Integrators
-    AlgoDescriptor("integrator", autotune_keys=("integrator",)),
-    AlgoDescriptor("integrator_gradient", autotune_keys=("integrator_gradient",),
-                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
-    AlgoDescriptor("integrator_with_gradient", autotune_keys=("integrator_with_gradient",),
-                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
-    AlgoDescriptor("integrator_hessian", has_kernel_attr=False),
-
     # Kinematics
     AlgoDescriptor("end_effector_pose", autotune_keys=("ee_pose",)),
     AlgoDescriptor("end_effector_pose_gradient", autotune_keys=("ee_pose_gradient",)),
@@ -218,6 +210,18 @@ ALGO_DESCRIPTORS: tuple[AlgoDescriptor, ...] = (
     AlgoDescriptor("idsva_so_world_frame", autotune_keys=("idsva_so_world_frame",),
                    gate_attr="generate_idsva_so_world_frame"),
     AlgoDescriptor("fdsva_so", autotune_keys=("fdsva_so",), gate_attr="generate_fdsva_so"),
+
+    # Integrators — kept AFTER Second-Order so `[d for d in ALGO_DESCRIPTORS if
+    # d.carries_launch_cfg]` reproduces the launch-config enum order (integrator
+    # group LAST), which Step 1 relies on for a byte-identical grid.cuh. (The
+    # ALGO_REGISTRY order above is the report/section order and is unaffected;
+    # the descriptor test asserts key-equality as a set/dict, order-independent.)
+    AlgoDescriptor("integrator", autotune_keys=("integrator",)),
+    AlgoDescriptor("integrator_gradient", autotune_keys=("integrator_gradient",),
+                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("integrator_with_gradient", autotune_keys=("integrator_with_gradient",),
+                   bytes_macro_stem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES"),
+    AlgoDescriptor("integrator_hessian", has_kernel_attr=False),
 
     # Centroidal / Energy / CoM
     AlgoDescriptor("generalized_gravity",
