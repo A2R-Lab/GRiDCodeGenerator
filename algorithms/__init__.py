@@ -23,3 +23,4 @@ from ._centroidal import *
 from ._coriolis import *
 from ._frame_jacobian import *
 from ._eepose_runtime import *
+from ._multitarget import *

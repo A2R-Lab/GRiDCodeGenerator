@@ -213,7 +213,10 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_gradient_runtime, _gen_runtime_host, \
                             gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
                             gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
-                            gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix
+                            gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix, \
+                            build_target_batch, gen_multi_target_position_inner_temp_mem_size, \
+                            gen_multi_target_position_inner_function_call, gen_multi_target_position_inner, \
+                            gen_multi_target_position_device, gen_multi_target_position
     from .algorithms._dccrba import _dccrba_inner_temp_mem_size, _dccrba_sweep_J_count, gen_cmm_time_variation, gen_dccrba
 
     # finally import the test code
@@ -3011,7 +3014,7 @@ class GRiDCodeGenerator:
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
                      enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False,
-                     runtime_joint_dynamics = None):
+                     runtime_joint_dynamics = None, multi_target_batch = None):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -3401,6 +3404,12 @@ class GRiDCodeGenerator:
                 "#define GRID_RBD_EE_POSE_GRADIENT_KERNEL end_effector_pose_gradient_kernel" + _ee_sfx,
                 "#define GRID_RBD_EE_POSE_HESSIAN_KERNEL end_effector_pose_hessian_kernel" + _ee_sfx,
                 ""])
+            # W1b: batched multi-target world positions. Opt-in via multi_target_batch
+            # (a list of {anchor_jid, offset[, group]}); default None -> NOT emitted so
+            # every existing robot's grid.cuh is byte-identical. Reuses the shared FK
+            # (emit_world_fk_chainup) + XmatsHom machinery set up above.
+            if multi_target_batch is not None:
+                self.gen_multi_target_position(self.build_target_batch(multi_target_batch))
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
