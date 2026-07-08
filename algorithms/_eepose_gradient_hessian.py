@@ -1692,7 +1692,8 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
     # differs per cell: rev/prism axis literals, variable-length alpha sums), but
     # they are a small minority, so the `if==k` ladder over THEM stays cheap.
     cross_table = []     # list of (prox_base, dist_base, si_base, sj_base, pee_base, out_base)
-    cell_emitters = []   # list of (comment_str, emit_callable) — one per NON-cross cell
+    same_table = []      # list of (shape, pa_base, si_base, sj_base, pee_base, out_base, axis6)
+    cell_emitters = []   # list of (comment_str, emit_callable) — mimic v-slot pairs only
     for ee_idx in range(num_ees):
         ee_jid = anchors[ee_idx]
         chain_dofs = per_ee_dof_info[ee_idx]
@@ -1765,12 +1766,11 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
                 # the column-3 expansion (S_prox @ S_dist @ X_ee)[:3, 3].
                 # Compute it for the proximal/distal ordering.
                 if a == b:
-                    # Same chain joint. For single-DOF joints, B_local = 0 (revolute or
-                    # prismatic intra-pair doesn't exist except for the diagonal where
-                    # B = A_x^2 for revolute, 0 for prismatic). For multi-DOF (floating
-                    # base) joints, use the closed form B_world below.
-                    # Diagonal vi == vj case (always present); off-diagonal same-joint
-                    # pairs only exist for multi-DOF (floating base) joints.
+                    # Same chain joint (intra-joint). Data-driven: classify the cell shape
+                    # (rev-rev / mixed lin-ang / pris-pris) + its world-axis source coeffs and
+                    # bake into the shared same-joint table (collapses the residual if==k
+                    # ladder, mirroring the cross collapse). Diagonal vi == vj exists for every
+                    # DOF; off-diagonal same-joint pairs only for multi-DOF (floating) joints.
                     if vi == vj:
                         sj_block = di  # same as dj on the diagonal
                     elif (vi, vj) in intra_pair_lookup:
@@ -1779,11 +1779,13 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
                         # Shouldn't happen (a == b but DOFs not in same joint).
                         # Out-of-chain cell stays at its Step-5a zero -> emit nothing.
                         continue
-                    emit = (lambda di=di, dj=sj_block, ee_idx=ee_idx, ee_jid=ee_jid, vi=vi, vj=vj,
-                                   jid=chain_jids[a], sib=si_base, sjb=sj_base:
-                                _emit_d2M_same_joint_block(self, di, dj,
-                                                           ee_idx, ee_jid, vi, vj, nv, num_ees,
-                                                           jid, sib, sjb))
+                    shape, axis6 = _same_joint_shape_axis(
+                        di["revolute"], di["ang"], di["lin"],
+                        sj_block["revolute"], sj_block["ang"], sj_block["lin"])
+                    out_base = ee_idx * 6 * nv * nv + (vi * nv + vj)
+                    same_table.append((shape, 16 * chain_jids[a], si_base, sj_base,
+                                       16 * ee_jid, out_base, axis6))
+                    continue
                 else:
                     # Different chain joints: proximal = smaller chain_pos.
                     # This is the data-driven cross-joint path: bake the six
@@ -1795,13 +1797,6 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
                     cross_table.append((prox_base, dist_base, si_base, sj_base,
                                         16 * ee_jid, out_base))
                     continue
-                def _emit_nonmimic_cell(ee_jid=ee_jid, _emit=emit):
-                    # Read X_ee column 3 (p_ee); helpers consume pex/pey/pez.
-                    self.gen_add_code_line("T pex = s_Xworld[" + str(16*ee_jid + 12) + "];")
-                    self.gen_add_code_line("T pey = s_Xworld[" + str(16*ee_jid + 13) + "];")
-                    self.gen_add_code_line("T pez = s_Xworld[" + str(16*ee_jid + 14) + "];")
-                    _emit()
-                cell_emitters.append((comment, _emit_nonmimic_cell))
 
     # Dispatch all cells one-thread-per-cell via a single block-parallel loop.
     # Flat cell index layout: [0, n_cross) cross-joint cells (one shared
@@ -1809,8 +1804,9 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
     # (same-joint + mimic) behind the residual `if==k` ladder. Same total cell
     # count and launch geometry as before; the cross bulk is now a single body.
     n_cross = len(cross_table)
-    n_noncross = len(cell_emitters)
-    n_cells = n_cross + n_noncross
+    n_same = len(same_table)
+    n_mimic = len(cell_emitters)
+    n_cells = n_cross + n_same + n_mimic
     self.gen_add_parallel_loop("d2m_cell", str(n_cells))
     if n_cross > 0:
         # Baked offset table for the cross-joint cells. Row layout (6 ints):
@@ -1828,9 +1824,28 @@ def gen_end_effector_pose_hessian_inner(self, fixed_target_name = ""):
         self.gen_add_code_line("if (d2m_cell < " + str(n_cross) + ") {", True)
         _emit_d2M_cross_joint_table_body(self, nv)
         self.gen_add_end_control_flow()
+    if n_same > 0:
+        # Same-joint (intra-joint) cells: one shared shape-switched body driven by baked
+        # per-cell shape/offset (int) + world-axis (T) tables. Collapses the residual
+        # if==k ladder over these cells; mirrors the cross table + the gradient eeg_job_ax.
+        int_flat = []
+        ax_flat = []
+        for (shape, pa_base, si_base, sj_base, pee_base, out_base, axis6) in same_table:
+            int_flat.extend([shape, pa_base, si_base, sj_base, pee_base, out_base])
+            ax_flat.extend(axis6)
+        int_literal = ", ".join(str(x) for x in int_flat)
+        ax_literal = ", ".join("static_cast<T>({:.17g})".format(v) for v in ax_flat)
+        self.gen_add_code_line("// Same-joint (intra-joint) cells: one shared shape-switched body")
+        self.gen_add_code_line("// driven by baked per-cell shape/offset + world-axis tables.")
+        self.gen_add_code_line("static const int s_d2ee_same_tab[" + str(len(int_flat)) + "] = {" + int_literal + "};")
+        self.gen_add_code_line("const T s_d2ee_same_axis[" + str(len(ax_flat)) + "] = {" + ax_literal + "};")
+        self.gen_add_code_line("if (d2m_cell >= " + str(n_cross) + " && d2m_cell < " + str(n_cross + n_same) + ") {", True)
+        self.gen_add_code_line("int same_cell = d2m_cell - " + str(n_cross) + ";")
+        _emit_d2M_same_joint_table_body(self, nv)
+        self.gen_add_end_control_flow()
     for k, (comment, emit) in enumerate(cell_emitters):
         self.gen_add_code_line(comment)
-        self.gen_add_code_line("if (d2m_cell == " + str(n_cross + k) + ") {", True)
+        self.gen_add_code_line("if (d2m_cell == " + str(n_cross + n_same + k) + ") {", True)
         emit()
         self.gen_add_end_control_flow()
     self.gen_add_end_control_flow()
@@ -2103,169 +2118,123 @@ def _emit_d2M_cross_joint_table_body(self, nv):
     self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 5 * " + str(nn) + "] = HW_z;")
 
 
-def _emit_d2M_same_joint_block(self, di, dj, ee_idx, ee_jid, vi, vj, nv, num_ees,
-                                joint_jid, si_base, sj_base):
-    """Emit per-pair code for the SAME-JOINT (a == b) case: d2M = L_a * B_local * L_a^-1 * X_ee
-    where the joint at chain position a contributes its intrinsic
-    second-order Lie-group term B_local (a 4x4).
+def _same_joint_shape_axis(rev_a, ang_a, lin_a, rev_b, ang_b, lin_b):
+    """Build-time: classify a same-joint (intra-joint) Hessian cell into a shape code
+    (0=rev-rev, 1=mixed lin-ang, 2=pris-pris) plus the six world-axis source
+    coefficients (two 3-vectors) the shared table body needs.
 
-    For 1-DOF revolute joints with axis a_local and vi == vj:
-       B_local = [[ [a]_x^2, 0 ], [ 0, 0 ]]
-    For 1-DOF prismatic: B_local = 0.
-    For multi-DOF (floating base, jid=0) intra-joint pairs (c_a, c_b):
-       - lin-lin: B_local = 0
-       - lin-ang or ang-lin: B_local[:3, 3] = 0.5 * (ang_local x lin_local) (third col only)
-       - ang-ang: B_local[:3, :3] = 0.5 * ([a]_x [b]_x + [b]_x [a]_x); col 3 = 0.
-
-    We resolve to (c_a = di['S_col'], c_b = dj['S_col']), grab the body-frame
-    ang/lin axes from the metadata, and inline emit the world-frame B (after
-    L_a conjugation) -> d2M = B_world * X_ee.
-
-    Closed-form world-frame B_world (= L_a B_local L_a^{-1}):
-      Let L_a = [[Ra, pa], [0, 1]]; L_a^-1 = [[Ra^T, -Ra^T pa], [0, 1]].
-      Let B_local = [[Br, Bt], [0, 0]] (top-left rotation 3x3 Br, top-right col Bt).
-      Then L_a B_local = [[Ra Br, Ra Bt], [0, 0]]
-           L_a B_local L_a^-1 = [[(Ra Br) Ra^T, -(Ra Br)(Ra^T pa) + (Ra Bt)], [0, 0]]
-                              = [[ Ra Br Ra^T, Ra Bt - (Ra Br Ra^T) pa ], [ 0, 0 ]]
-      So B_world[:3, :3] = Ra @ Br @ Ra^T
-         B_world[:3, 3]  = Ra @ Bt - B_world[:3, :3] @ pa
-
-    Then d2M = B_world * X_ee, exactly the same final step as the cross-joint
-    case (apart from the B_world matrix sourcing).
-
-    Writes:
-      - rows 0..2 of s_end_effector_pose_hessian[(ee, vi, vj)] = (d2M)[:3, 3]
-      - rows 3..5                                = H_w[:, vi, vj] =
-        skew_inv(B_world[:3, :3] - [Jwi]_x @ [Jwj]_x)
+    Mirrors the (rev_a, rev_b) branch logic of the former inline same-joint block (git history):
+      - rev-rev:   axis = (ang_a, ang_b)          -> Br = 0.5([aw]x[bw]x + [bw]x[aw]x)
+      - mixed:     axis = (ang_rev, lin_pris)      -> Bt = 0.5 (ang_w x lin_w); canonicalize
+                   so the FIRST 3 coeffs are the revolute DOF's angular axis and the next 3
+                   are the prismatic DOF's linear axis, matching the inline `if rev_a` select.
+      - pris-pris: axis = zeros                    -> B = 0.
+    Near-zero coeffs are clamped to exact 0.0 so the table body's emit-all-3-terms
+    world-axis is bit-identical to the old drop-near-zero emission (adding exact 0.0
+    never perturbs a finite float) -- same clamp the gradient inner's eeg_job_ax uses.
     """
-    c_a = di["S_col"]
-    c_b = dj["S_col"]
-    ang_a = di["ang"]; lin_a = di["lin"]; rev_a = di["revolute"]
-    ang_b = dj["ang"]; lin_b = dj["lin"]; rev_b = dj["revolute"]
-
-    # We need Ra, pa for chain joint a. Since a == b == di['chain_pos'] (and the
-    # joint is joint_jid), L_a is s_Xworld[16*joint_jid].
-    self.gen_add_code_line("// same-joint pair (intra-joint), joint_jid=" + str(joint_jid) +
-                           " c_a=" + str(c_a) + " c_b=" + str(c_b))
-    # Compute B_world[:3, :3] (Br_w) and B_world[:3, 3] (Bt_w) symbolically.
-    # We branch on (rev_a, rev_b) configurations:
-    #   rev-rev:   Br_local = 0.5 * ([a]_x [b]_x + [b]_x [a]_x); Bt_local = 0
-    #     Br_world = Ra @ Br_local @ Ra^T;  Bt_world = -Br_world @ pa
-    #     But Ra @ [a]_x @ Ra^T = [Ra a]_x = [a_w]_x (the world axis). So:
-    #     Br_world = 0.5 * ([a_w]_x [b_w]_x + [b_w]_x [a_w]_x)  -- can be expressed
-    #     using S_world top-left for both DOFs (already stored).
-    #   rev-pris (a rev, b pris): Br_local = 0; Bt_local = 0.5 * (a × b_lin)
-    #     Br_world = 0; Bt_world = 0.5 * Ra @ (a × b_lin) = 0.5 * (a_w × b_lin_w)
-    #     where a_w = Ra @ a (rotational axis), b_lin_w = Ra @ b_lin (lin axis).
-    #     Both a_w and b_lin_w can be read from the corresponding S_world entries.
-    #   pris-rev: symmetric to rev-pris (we treat B as symmetric in c_a, c_b).
-    #   pris-pris: B_local = 0 → d2M = 0 (no contribution).
-    a_w = "Ra @ ang_a"  # placeholder; we emit via S_world entries
-    # Get world axes from stored S entries:
-    # If revolute: skew block in S_world has axis (wx, wy, wz) = (S[2,1], S[0,2], S[1,0]).
-    # If prismatic: S_world[:3, 3] = R_a @ ax_local = axis_world.
-    # For the "ang_a" axis we need it whether a is revolute or whether it
-    # contributes only via the cross-product term. We'll compute axis_world
-    # FROM s_Xworld[16*joint_jid] @ ax_local for each axis we need.
-    # That keeps the code uniform and doesn't depend on extra interim variables.
-    def _emit_world_axis(name, ax_local):
-        # ax_world = Ra @ ax_local where Ra = top-left 3x3 of s_Xworld[16*joint_jid] (column-major)
-        for r in range(3):
-            terms = []
-            for c in range(3):
-                if abs(ax_local[c]) < 1e-15:
-                    continue
-                coef = "static_cast<T>(" + "{:.17g}".format(ax_local[c]) + ")"
-                terms.append("s_Xworld[" + str(16*joint_jid + r + 4*c) + "] * " + coef)
-            expr = " + ".join(terms) if terms else "static_cast<T>(0)"
-            self.gen_add_code_line("T " + name + "_" + str(r) + " = " + expr + ";")
-    self.gen_add_code_line("// Compute joint-a world frame axes of c_a and c_b body axes")
-    # For Br computation we need rotational world axes for revolute DOFs.
-    # For Bt (lin-ang) we need lin world axis and ang world axis. Compute both
-    # always (cheap) so the branching logic below is straightforward.
-    _emit_world_axis("aw", ang_a)  # ang_a in world
-    _emit_world_axis("bw", ang_b)
-    _emit_world_axis("alw", lin_a)  # lin_a in world
-    _emit_world_axis("blw", lin_b)
-    # pa = column 3 of s_Xworld[16*joint_jid]
-    self.gen_add_code_line("T pax = s_Xworld[" + str(16*joint_jid + 12) + "];")
-    self.gen_add_code_line("T pay = s_Xworld[" + str(16*joint_jid + 13) + "];")
-    self.gen_add_code_line("T paz = s_Xworld[" + str(16*joint_jid + 14) + "];")
-
+    def _clamp(v):
+        return [float(x) if abs(x) >= 1e-15 else 0.0 for x in v]
     if rev_a and rev_b:
-        # Br_world = 0.5 * ([a_w]_x @ [b_w]_x + [b_w]_x @ [a_w]_x)
-        # Using axw cross product identity:  [a]_x @ [b]_x = b @ a^T - (a . b) I
-        # So 0.5 * ([a]_x [b]_x + [b]_x [a]_x) = 0.5 * (a b^T + b a^T) - (a . b) I
-        # (the symmetric symmetric product of skews equals the symmetrized outer minus dot*I)
-        self.gen_add_code_line("// Br_world = 0.5 * ([aw]_x [bw]_x + [bw]_x [aw]_x)")
-        self.gen_add_code_line("//   = 0.5 * (aw bw^T + bw aw^T) - (aw . bw) I")
-        self.gen_add_code_line("T adotb = aw_0*bw_0 + aw_1*bw_1 + aw_2*bw_2;")
-        for r in range(3):
-            for c in range(3):
-                # Br[r, c] = 0.5 * (aw[r]*bw[c] + bw[r]*aw[c]) - adotb * (r == c)
-                diag = " - adotb" if r == c else ""
-                self.gen_add_code_line("T Br_" + str(r) + str(c) +
-                                       " = static_cast<T>(0.5) * (aw_" + str(r) + "*bw_" + str(c) +
-                                       " + bw_" + str(r) + "*aw_" + str(c) + ")" + diag + ";")
-        # Bt_world = -Br_world @ pa
-        for r in range(3):
-            self.gen_add_code_line(
-                "T Bt_" + str(r) + " = -(Br_" + str(r) + "0*pax + Br_" + str(r) + "1*pay + Br_" + str(r) + "2*paz);")
-    elif (rev_a and not rev_b) or ((not rev_a) and rev_b):
-        # Mixed lin-ang. Choose: a is rot if rev_a else b is rot.
-        if rev_a:
-            ang_var_x, ang_var_y, ang_var_z = "aw_0", "aw_1", "aw_2"
-            lin_var_x, lin_var_y, lin_var_z = "blw_0", "blw_1", "blw_2"
-        else:
-            ang_var_x, ang_var_y, ang_var_z = "bw_0", "bw_1", "bw_2"
-            lin_var_x, lin_var_y, lin_var_z = "alw_0", "alw_1", "alw_2"
-        # Br_world = 0; Bt_world = 0.5 * (ang_world x lin_world)
-        for r in range(3):
-            for c in range(3):
-                self.gen_add_code_line("T Br_" + str(r) + str(c) + " = static_cast<T>(0);")
-        self.gen_add_code_line(
-            "T Bt_0 = static_cast<T>(0.5) * (" + ang_var_y + "*" + lin_var_z + " - " + ang_var_z + "*" + lin_var_y + ");")
-        self.gen_add_code_line(
-            "T Bt_1 = static_cast<T>(0.5) * (" + ang_var_z + "*" + lin_var_x + " - " + ang_var_x + "*" + lin_var_z + ");")
-        self.gen_add_code_line(
-            "T Bt_2 = static_cast<T>(0.5) * (" + ang_var_x + "*" + lin_var_y + " - " + ang_var_y + "*" + lin_var_x + ");")
-    else:
-        # pris-pris: B_local = 0
-        for r in range(3):
-            for c in range(3):
-                self.gen_add_code_line("T Br_" + str(r) + str(c) + " = static_cast<T>(0);")
-        for r in range(3):
-            self.gen_add_code_line("T Bt_" + str(r) + " = static_cast<T>(0);")
-    # Now d2M = B_world * X_ee. We need d2M[:3, 3] (for H_xyz) and (d2R @ R_chain^T) = B_world[:3,:3].
-    # d2M[:3, 3] = B_world[:3, :3] @ p_ee + B_world[:3, 3] (since X_ee[3, 3] = 1).
+        return 0, _clamp(ang_a) + _clamp(ang_b)
+    if rev_a != rev_b:
+        return 1, (_clamp(ang_a) + _clamp(lin_b)) if rev_a else (_clamp(ang_b) + _clamp(lin_a))
+    return 2, [0.0] * 6
+
+
+def _emit_d2M_same_joint_table_body(self, nv):
+    """Data-driven SAME-JOINT (intra-joint) d2M body shared by every same-joint cell.
+
+    Numerically identical to the former inline same-joint block (same scalar ops, same float
+    association) with the per-cell shape + offsets + axis coefficients read at runtime
+    from `s_d2ee_same_tab` (6 ints) / `s_d2ee_same_axis` (6 T) indexed by `same_cell`,
+    collapsing the residual `if==k` ladder into ONE body -> the nvcc compile-time +
+    code-size win at identical Hessian values. Mirrors `_emit_d2M_cross_joint_table_body`
+    and the gradient inner's `eeg_job_ax` table.
+
+    Int row (6): [0]=shape (0=rev-rev,1=mixed,2=pris-pris) [1]=pa_base(=16*joint_jid)
+                 [2]=si_base [3]=sj_base [4]=pee_base [5]=out_base
+    Axis row (6 T): two world-axis source 3-vectors (see `_same_joint_shape_axis`).
+    """
+    nn = nv * nv
+    self.gen_add_code_line("const int *srow = &s_d2ee_same_tab[6 * same_cell];")
+    self.gen_add_code_line("int sshape = srow[0]; int pa_base = srow[1];")
+    self.gen_add_code_line("int si_base = srow[2]; int sj_base = srow[3];")
+    self.gen_add_code_line("int pee_base = srow[4]; int out_base = srow[5];")
+    self.gen_add_code_line("const T *ax = &s_d2ee_same_axis[6 * same_cell];")
+    # p_ee from the ee world transform (column 3).
+    self.gen_add_code_line("T pex = s_Xworld[pee_base + 12];")
+    self.gen_add_code_line("T pey = s_Xworld[pee_base + 13];")
+    self.gen_add_code_line("T pez = s_Xworld[pee_base + 14];")
+    # World axes u_w = R_a @ ax[0:3], v_w = R_a @ ax[3:6]. R_a = top-left 3x3 of
+    # s_Xworld[pa_base] (column-major, S[r + 4*c]). Emit all 3 terms (zero coeffs are
+    # exact -> bit-identical to the old drop-near-zero _emit_world_axis).
+    self.gen_add_code_line("// world axes u_w = R_a @ ax0, v_w = R_a @ ax1")
+    for r in range(3):
+        self.gen_add_code_line("T uw_" + str(r) + " = s_Xworld[pa_base + " + str(r) +
+                               "] * ax[0] + s_Xworld[pa_base + " + str(r + 4) +
+                               "] * ax[1] + s_Xworld[pa_base + " + str(r + 8) + "] * ax[2];")
+    for r in range(3):
+        self.gen_add_code_line("T vw_" + str(r) + " = s_Xworld[pa_base + " + str(r) +
+                               "] * ax[3] + s_Xworld[pa_base + " + str(r + 4) +
+                               "] * ax[4] + s_Xworld[pa_base + " + str(r + 8) + "] * ax[5];")
+    # pa = column 3 of s_Xworld[pa_base].
+    self.gen_add_code_line("T pax = s_Xworld[pa_base + 12];")
+    self.gen_add_code_line("T pay = s_Xworld[pa_base + 13];")
+    self.gen_add_code_line("T paz = s_Xworld[pa_base + 14];")
+    # B_world[:3,:3] (Br) and B_world[:3,3] (Bt); default 0 (pris-pris), set per shape.
+    for r in range(3):
+        for c in range(3):
+            self.gen_add_code_line("T Br_" + str(r) + str(c) + " = static_cast<T>(0);")
+    for r in range(3):
+        self.gen_add_code_line("T Bt_" + str(r) + " = static_cast<T>(0);")
+    # shape 0 = rev-rev: Br = 0.5*(uw vw^T + vw uw^T) - (uw.vw) I; Bt = -Br @ pa.
+    self.gen_add_code_line("if (sshape == 0) {", True)
+    self.gen_add_code_line("T adotb = uw_0*vw_0 + uw_1*vw_1 + uw_2*vw_2;")
+    for r in range(3):
+        for c in range(3):
+            diag = " - adotb" if r == c else ""
+            self.gen_add_code_line("Br_" + str(r) + str(c) +
+                                   " = static_cast<T>(0.5) * (uw_" + str(r) + "*vw_" + str(c) +
+                                   " + vw_" + str(r) + "*uw_" + str(c) + ")" + diag + ";")
+    for r in range(3):
+        self.gen_add_code_line("Bt_" + str(r) + " = -(Br_" + str(r) + "0*pax + Br_" +
+                               str(r) + "1*pay + Br_" + str(r) + "2*paz);")
+    self.gen_add_end_control_flow()
+    # shape 1 = mixed (lin-ang): Br = 0; Bt = 0.5 * (uw x vw) with uw=ang_w, vw=lin_w.
+    self.gen_add_code_line("else if (sshape == 1) {", True)
+    self.gen_add_code_line("Bt_0 = static_cast<T>(0.5) * (uw_1*vw_2 - uw_2*vw_1);")
+    self.gen_add_code_line("Bt_1 = static_cast<T>(0.5) * (uw_2*vw_0 - uw_0*vw_2);")
+    self.gen_add_code_line("Bt_2 = static_cast<T>(0.5) * (uw_0*vw_1 - uw_1*vw_0);")
+    self.gen_add_end_control_flow()
+    # shape 2 = pris-pris: Br = 0, Bt = 0 (defaults).
+    # Tail (identical to the inline same-joint tail): d2M[:,3] = Br @ p_ee + Bt.
     self.gen_add_code_line("T Hxyz_x = Br_00*pex + Br_01*pey + Br_02*pez + Bt_0;")
     self.gen_add_code_line("T Hxyz_y = Br_10*pex + Br_11*pey + Br_12*pez + Bt_1;")
     self.gen_add_code_line("T Hxyz_z = Br_20*pex + Br_21*pey + Br_22*pez + Bt_2;")
-    # [Jwi]_x and [Jwj]_x from S_i_world / S_j_world top-left
     self.gen_add_code_line("// Read [Jw_i]_x and [Jw_j]_x for the H_w correction")
     for c in range(3):
         for r in range(3):
-            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[" + str(si_base + r + 4*c) + "];")
+            self.gen_add_code_line("T Si" + str(r) + str(c) + " = s_Sworld[si_base + " + str(r + 4*c) + "];")
     for c in range(3):
         for r in range(3):
-            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[" + str(sj_base + r + 4*c) + "];")
+            self.gen_add_code_line("T Sj" + str(r) + str(c) + " = s_Sworld[sj_base + " + str(r + 4*c) + "];")
     for r in range(3):
         for c in range(3):
             self.gen_add_code_line(
                 "T SiSj" + str(r) + str(c) + " = Si" + str(r) + "0*Sj0" + str(c) +
                 " + Si" + str(r) + "1*Sj1" + str(c) +
                 " + Si" + str(r) + "2*Sj2" + str(c) + ";")
-    # H_w = skew_inv(Br_world - SiSj)
     self.gen_add_code_line("T HW_x = static_cast<T>(0.5) * ((Br_21 - SiSj21) - (Br_12 - SiSj12));")
     self.gen_add_code_line("T HW_y = static_cast<T>(0.5) * ((Br_02 - SiSj02) - (Br_20 - SiSj20));")
     self.gen_add_code_line("T HW_z = static_cast<T>(0.5) * ((Br_10 - SiSj10) - (Br_01 - SiSj01));")
-    base = "(" + str(ee_idx * 6 * nv * nv) + " + " + str(vi * nv + vj) + ")"
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 0 * " + str(nv*nv) + "] = Hxyz_x;")
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 1 * " + str(nv*nv) + "] = Hxyz_y;")
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 2 * " + str(nv*nv) + "] = Hxyz_z;")
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 3 * " + str(nv*nv) + "] = HW_x;")
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 4 * " + str(nv*nv) + "] = HW_y;")
-    self.gen_add_code_line("s_end_effector_pose_hessian[" + base + " + 5 * " + str(nv*nv) + "] = HW_z;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 0 * " + str(nn) + "] = Hxyz_x;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 1 * " + str(nn) + "] = Hxyz_y;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 2 * " + str(nn) + "] = Hxyz_z;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 3 * " + str(nn) + "] = HW_x;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 4 * " + str(nn) + "] = HW_y;")
+    self.gen_add_code_line("s_end_effector_pose_hessian[out_base + 5 * " + str(nn) + "] = HW_z;")
+
 
 def _emit_d2M_mimic_vslot_pair_block(self, ee_idx, ee_jid, vi, vj, nv, num_ees,
                                      blocks_i, blocks_j, si_base, sj_base):
