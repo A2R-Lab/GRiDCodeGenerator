@@ -507,6 +507,62 @@ def _eepose_grad_chain_metadata(self, all_ees, fixed_target_name, anchor_overrid
         jobs_all.append(jobs)
     return chains, anchors, jobs_all
 
+def emit_world_fk_chainup(self, header_lines, fixed_anchors=None, fixed_header_lines=None):
+    """Emit the BFS-level world-transform chain-up into s_Xworld, plus optional
+    fixed-target anchor composes. This is the SHARED forward-kinematics prefix used
+    by the ee-pose gradient/hessian inners AND the batched multi-target emitters
+    (W1b) -- factored out so there is ONE chain-up, not a copy per consumer.
+
+    Assumes `s_Xworld` (16 per joint, + fixed-target slots) and `s_Xhom` (per-joint
+    LOCAL homogeneous transforms) are in scope. The caller passes the EXACT comment
+    lines it used to emit inline so grid.cuh stays byte-identical across the refactor:
+      header_lines        : lines emitted before the BFS chain-up (Step 1).
+      fixed_anchors       : list of per-target None | (anchor_jid, parent_jid); the
+                            non-None entries get Xworld[anchor] = Xworld[parent] @
+                            Xhom_local[anchor] (Step 1b).
+      fixed_header_lines  : lines emitted before the fixed-anchor compose (Step 1b).
+    """
+    n_bfs_levels = self.robot.get_max_bfs_level() + 1
+    for line in header_lines:
+        self.gen_add_code_line(line)
+    for level in range(n_bfs_levels):
+        ids_at_level = self.robot.get_ids_by_bfs_level(level)
+        if not ids_at_level:
+            continue
+        njs = len(ids_at_level)
+        self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
+        self.gen_add_parallel_loop("ind", str(16 * njs))
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        jid_list = [str(j) for j in ids_at_level]
+        par_list = [str(self.robot.get_parent_id(j)) for j in ids_at_level]
+        select_var_vals = [("int", "jid", jid_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(njs)], select_var_vals)
+        self.gen_add_code_line("if (par == -1) {", True)
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = s_Xhom[16*jid + ele];")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("else {", True)
+        self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+    _fixed = [fa for fa in (fixed_anchors or []) if fa is not None]
+    if _fixed:
+        for line in (fixed_header_lines or []):
+            self.gen_add_code_line(line)
+        nfa = len(_fixed)
+        self.gen_add_parallel_loop("ind", str(16 * nfa))
+        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
+        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
+        anc_list = [str(a) for (a, _p) in _fixed]
+        par_list = [str(p) for (_a, p) in _fixed]
+        select_var_vals = [("int", "anc", anc_list), ("int", "par", par_list)]
+        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(nfa)], select_var_vals)
+        self.gen_add_code_line("s_Xworld[16*anc + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*anc + 4*col]);")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+
+
 def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     """Shared-chain geometric (spatial) Jacobian for d(pose)/dv (tangent).
 
@@ -531,7 +587,6 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     n = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
     n_xworld = _eepose_xworld_slot_count(self)
-    n_bfs_levels = self.robot.get_max_bfs_level() + 1
 
     # Resolve targets: leaf default => ee is its own anchor; fixed target => the
     # chain DOFs come from the fixed joint's parent movable joint, the world-frame
@@ -577,57 +632,21 @@ def gen_end_effector_pose_gradient_inner(self, fixed_target_name = ""):
     self.gen_add_code_line("T *s_Jw     = &s_temp[" + str(off_Jw)     + "];")
     self.gen_add_code_line("T *s_E_sc   = &s_temp[" + str(off_E)      + "];   // cy,sy,cp,sp per ee")
 
-    # ============ Step 1: world transforms by BFS level ============
-    self.gen_add_code_line("//")
-    self.gen_add_code_line("// Step 1: build world transforms for every joint via BFS-level chain-up")
-    self.gen_add_code_line("//")
-    for level in range(n_bfs_levels):
-        ids_at_level = self.robot.get_ids_by_bfs_level(level)
-        if not ids_at_level:
-            continue
-        njs = len(ids_at_level)
-        self.gen_add_code_line("// BFS level " + str(level) + " -> joints " + str(ids_at_level))
-        self.gen_add_parallel_loop("ind", str(16 * njs))
-        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
-        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
-        # bake the joint id and parent id per slot
-        jid_list = [str(j) for j in ids_at_level]
-        par_list = [str(self.robot.get_parent_id(j)) for j in ids_at_level]
-        select_var_vals = [("int", "jid", jid_list), ("int", "par", par_list)]
-        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(njs)], select_var_vals)
-        # If par == -1 (root), world := local; else world[jid] = world[par] @ local[jid].
-        # local[jid] is s_Xhom[16*jid]; world[jid] is s_Xworld[16*jid].
-        self.gen_add_code_line("if (par == -1) {", True)
-        self.gen_add_code_line("s_Xworld[16*jid + ele] = s_Xhom[16*jid + ele];")
-        self.gen_add_end_control_flow()
-        self.gen_add_code_line("else {", True)
-        # dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col])
-        self.gen_add_code_line("s_Xworld[16*jid + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*jid + 4*col]);")
-        self.gen_add_end_control_flow()
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
-
-    # ============ Step 1b: compose fixed-target anchor world transforms ============
-    # A fixed (welded) EE target lives off the end of the BFS-covered movable
-    # joints. Its LOCAL parent->fixed transform sits in s_Xhom[16*anchor]; compose
-    # it onto the parent's world transform so s_Xworld[16*anchor] is the fixed
-    # frame's world transform that the geometric Jacobian reads (p_ee / R_ee).
-    _fixed_anchors = [fa for fa in fixed_anchor if fa is not None]
-    if _fixed_anchors:
-        self.gen_add_code_line("//")
-        self.gen_add_code_line("// Step 1b: world transform of the fixed kinematic target(s): Xworld[anchor] = Xworld[parent] @ Xhom_local[anchor]")
-        self.gen_add_code_line("//")
-        nfa = len(_fixed_anchors)
-        self.gen_add_parallel_loop("ind", str(16 * nfa))
-        self.gen_add_code_line("int slot = ind / 16; int ele = ind % 16;")
-        self.gen_add_code_line("int row = ele & 3; int col = ele >> 2;")
-        anc_list = [str(a) for (a, _p) in _fixed_anchors]
-        par_list = [str(p) for (_a, p) in _fixed_anchors]
-        select_var_vals = [("int", "anc", anc_list), ("int", "par", par_list)]
-        self.gen_add_multi_threaded_select("slot", "<", [str(i+1) for i in range(nfa)], select_var_vals)
-        self.gen_add_code_line("s_Xworld[16*anc + ele] = dot_prod<T,4,4,1>(&s_Xworld[16*par + row], &s_Xhom[16*anc + 4*col]);")
-        self.gen_add_end_control_flow()
-        self.gen_add_sync()
+    # ============ Steps 1 + 1b: world transforms by BFS level (shared FK) ============
+    # The BFS-level chain-up (Step 1) and the fixed-target anchor compose (Step 1b,
+    # Xworld[anchor] = Xworld[parent] @ Xhom_local[anchor] for each welded EE target)
+    # are the shared forward-kinematics prefix reused by the batched multi-target
+    # emitters (W1b). Factored into emit_world_fk_chainup; the exact comment lines
+    # are passed through so grid.cuh is byte-identical to the former inline emission.
+    emit_world_fk_chainup(
+        self,
+        header_lines=["//",
+                      "// Step 1: build world transforms for every joint via BFS-level chain-up",
+                      "//"],
+        fixed_anchors=fixed_anchor,
+        fixed_header_lines=["//",
+                            "// Step 1b: world transform of the fixed kinematic target(s): Xworld[anchor] = Xworld[parent] @ Xhom_local[anchor]",
+                            "//"])
 
     # ============ Step 2: zero Jv, Jw ============
     self.gen_add_code_line("//")
