@@ -216,7 +216,10 @@ class GRiDCodeGenerator:
                             gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix, \
                             build_target_batch, gen_multi_target_position_inner_temp_mem_size, \
                             gen_multi_target_position_inner_function_call, gen_multi_target_position_inner, \
-                            gen_multi_target_position_device, gen_multi_target_position
+                            gen_multi_target_position_device, gen_multi_target_position, \
+                            gen_multi_target_position_gradient_inner_temp_mem_size, gen_multi_target_position_gradient_inner, \
+                            gen_multi_target_position_gradient_inner_function_call, gen_multi_target_position_gradient_device, \
+                            gen_multi_target_position_gradient
     from .algorithms._dccrba import _dccrba_inner_temp_mem_size, _dccrba_sweep_J_count, gen_cmm_time_variation, gen_dccrba
 
     # finally import the test code
@@ -3409,7 +3412,9 @@ class GRiDCodeGenerator:
             # every existing robot's grid.cuh is byte-identical. Reuses the shared FK
             # (emit_world_fk_chainup) + XmatsHom machinery set up above.
             if multi_target_batch is not None:
-                self.gen_multi_target_position(self.build_target_batch(multi_target_batch))
+                _mt_batch = self.build_target_batch(multi_target_batch)
+                self.gen_multi_target_position(_mt_batch)
+                self.gen_multi_target_position_gradient(_mt_batch)
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms

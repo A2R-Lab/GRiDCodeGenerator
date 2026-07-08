@@ -222,38 +222,99 @@ def gen_multi_target_position(self, batch):
 
 
 # ---------------------------------------------------------------------------
-# Batched multi-target GRADIENT — Phase B (the novel offset epilogue).
+# Batched multi-target position GRADIENT (W2a): anchor-deduped geometric Jacobian
+# (Phase A, shared helper) + per-target offset epilogue (Phase B, no FK re-walk).
 # Design: docs/open-tasks/design_W2a_batched_multitarget_gradient_2026-07-07.md
-#
-# Phase A (NOT prototyped here) = build s_Jv, s_Jw (3 x nv per DISTINCT anchor) by
-# reusing gen_end_effector_pose_gradient_inner Steps 1-3 with all_ees := distinct
-# anchors (ee-index -> anchor_idx). That already bakes the per-(anchor, S-col) job
-# table (eeg_job_*) and fills Jv = axw x (p_anchor - p_j), Jw = axw (revolute) etc.,
-# incl. the mimic alpha-fold. A __syncthreads follows (Jv/Jw complete).
-#
-# Phase B (below) = per-(target, vi, row) offset-corrected writeback, driven by the
-# baked batch tables + a target->anchor_idx map. NO FK re-walk:
-#   dpos[t][:,j] = Jv[anchor,:,j] + Jw[anchor,:,j] x (R_world[anchor] . r_local)
+#   dpos[t][:,vi] = Jv[anchor,:,vi] + Jw[anchor,:,vi] x (R_world[anchor] . r_local)
 # ---------------------------------------------------------------------------
-def gen_multi_target_gradient_phaseB(self, batch, anchor_index_of_target):
-    """Emit the offset epilogue. Assumes s_Jv/s_Jw (3 x nv per distinct anchor) are built
-    (Phase A) and s_Xworld holds anchor world transforms. `anchor_index_of_target[t]` maps
-    a target to its slot in the deduped anchor set; `batch` from build_target_batch.
-    Output s_out_grad is 3 * nv * N_targets (position gradient rows only)."""
-    n = batch["n"]
+def _multi_target_anchor_dedup(batch):
+    """Order-preserving distinct anchors + per-target index into that set. The
+    geometric Jacobian is built ONCE per distinct anchor (bounded by #links); only the
+    OUTPUT scales with target count (the anchor-dedup collapse -- same win as W1a)."""
+    distinct, idx_of, pos = [], [], {}
+    for a in batch["anchor"]:
+        if a not in pos:
+            pos[a] = len(distinct)
+            distinct.append(a)
+        idx_of.append(pos[a])
+    return distinct, idx_of
+
+
+def gen_multi_target_position_gradient_inner_temp_mem_size(self, batch):
+    """Scratch = s_Xworld (16 * n_xworld) | s_Jv (3*nv*N_anchors) | s_Jw (3*nv*N_anchors)
+    | s_ro (3*N_targets). Jv/Jw are deduped over DISTINCT anchors; s_ro holds each
+    target's world-rotated offset (Phase-B pre-pass, vi-independent)."""
+    from ._eepose_gradient_hessian import _eepose_xworld_slot_count
     nv = self.robot.get_num_vel()
+    distinct, _ = _multi_target_anchor_dedup(batch)
+    return 16 * _eepose_xworld_slot_count(self) + 2 * 3 * nv * len(distinct) + 3 * batch["n"]
 
-    # baked: target -> anchor slot (into s_Jv/s_Jw) and target -> local offset.
-    self.gen_add_code_line("static const int mt_anchor_idx[" + str(n) + "] = {" +
-                           ", ".join(str(a) for a in anchor_index_of_target) + "};")
-    self.gen_add_code_line("static const int mt_anchor[" + str(n) + "] = {" +
-                           ", ".join(str(a) for a in batch["anchor"]) + "};")
-    self.gen_add_code_line("const T mt_offset[" + str(3 * n) + "] = {" +
-                           ", ".join("static_cast<T>({:.17g})".format(v) for v in batch["offset"]) + "};")
 
-    # Pre-pass: rotate each target's LOCAL offset into world once (vi-independent).
-    # s_ro is 3*N scratch. ro = R_world[anchor] @ r_local.
-    self.gen_add_code_line("// ro[t] = R_world[anchor(t)] @ offset(t)  (once per target, vi-independent)")
+def gen_multi_target_position_gradient_inner(self, batch):
+    """Emit multi_target_position_gradient_inner<T>: d(world pos)/dv for every target
+    (3 x nv per target, row-fastest layout ob = 3*(nv*t+vi)+row). Phase A builds s_Jv/s_Jw
+    per DISTINCT anchor via the shared emit_geometric_jacobian_jvjw; Phase B applies the
+    offset epilogue. Position gradient only (world-frame LOCAL_WORLD_ALIGNED; no rpy)."""
+    from ._eepose_gradient_hessian import (
+        emit_world_fk_chainup, _eepose_xworld_slot_count,
+        _eepose_grad_chain_metadata, group_jacobian_jobs, emit_geometric_jacobian_jvjw)
+    nv = self.robot.get_num_vel()
+    n = batch["n"]
+    n_xworld = _eepose_xworld_slot_count(self)
+    distinct_anchors, anchor_idx_of_target = _multi_target_anchor_dedup(batch)
+    n_anchor = len(distinct_anchors)
+
+    func_params = [
+        "s_out_grad is shared memory of size 3*NUM_VEL*N_TARGETS (3 x nv per target), N_TARGETS = " + str(n) + ", NUM_VEL = " + str(nv),
+        "s_q is the vector of joint positions (unused; kept for signature parity)",
+        "s_Xhom is the per-joint LOCAL homogeneous transforms (already updated for q)",
+        "s_temp is helper shared memory (Xworld | Jv | Jw | ro)",
+        "d_workspace is the global-memory scratch used when !TEMP_IN_SMEM",
+    ]
+    func_notes = [
+        "Position gradient d(world pos)/dv of a baked batch of fixed-offset targets (grasp points / spheres).",
+        "Anchor-deduped geometric Jacobian (built once per distinct anchor) + offset epilogue; NO FK re-walk.",
+    ]
+    func_def_start = "void multi_target_position_gradient_inner("
+    func_def_middle = "T *s_out_grad, const T *s_q, const T *s_Xhom, "
+    func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(
+        func_def_middle, func_params, -1, NO_XI_FLAG=True)
+    self.gen_add_func_doc("Batched multi-target world-position gradient", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def_start + func_def_middle + func_def_end, True)
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_add_code_line("(void)s_q; (void)s_linalg_smem;")
+
+    off_Jv = 16 * n_xworld
+    off_Jw = off_Jv + 3 * nv * n_anchor
+    off_ro = off_Jw + 3 * nv * n_anchor
+    self.gen_add_code_line("// scratch layout: Xworld | Jv (3 x nv x anchor) | Jw (3 x nv x anchor) | ro (3 x target)")
+    self.gen_add_code_line("T *s_Xworld = &s_temp[0];")
+    self.gen_add_code_line("T *s_Jv     = &s_temp[" + str(off_Jv) + "];")
+    self.gen_add_code_line("T *s_Jw     = &s_temp[" + str(off_Jw) + "];")
+    self.gen_add_code_line("T *s_ro     = &s_temp[" + str(off_ro) + "];")
+
+    # Phase A step 1: shared FK
+    emit_world_fk_chainup(
+        self,
+        header_lines=["//", "// Step 1: build world transforms for every joint via BFS-level chain-up", "//"],
+        fixed_anchors=None)
+    # Phase A steps 2+3+3b: geometric Jacobian per DISTINCT anchor (shared with ee-pose gradient)
+    _chains, anchors, fill_jobs = _eepose_grad_chain_metadata(self, distinct_anchors, "", anchor_override=None)
+    single_jobs, multi_groups, has_mimic = group_jacobian_jobs(self, fill_jobs, anchors)
+    emit_geometric_jacobian_jvjw(self, nv, n_anchor, single_jobs, multi_groups, has_mimic)
+
+    # Phase B: baked batch tables
+    self.gen_add_code_line("// baked batch: target -> anchor world-frame jid, target -> deduped anchor slot, LOCAL offset")
+    self.gen_add_code_line("static const int mt_anchor[" + str(n) + "] = {" + ", ".join(str(a) for a in batch["anchor"]) + "};")
+    self.gen_add_code_line("static const int mt_anchor_idx[" + str(n) + "] = {" + ", ".join(str(a) for a in anchor_idx_of_target) + "};")
+    self.gen_add_code_line("const T mt_offset[" + str(3 * n) + "] = {" + ", ".join("static_cast<T>({:.17g})".format(v) for v in batch["offset"]) + "};")
+    # Phase B pre-pass: rotate each target's LOCAL offset into world (vi-independent).
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Phase B pre-pass: ro[t] = R_world[anchor(t)] @ offset(t)  (once per target)")
+    self.gen_add_code_line("//")
     self.gen_add_parallel_loop("t", str(n))
     self.gen_add_code_line("const T *X = &s_Xworld[16 * mt_anchor[t]];")
     self.gen_add_code_line("const T *o = &mt_offset[3 * t];")
@@ -262,9 +323,10 @@ def gen_multi_target_gradient_phaseB(self, batch, anchor_index_of_target):
     self.gen_add_code_line("s_ro[3*t + 2] = X[2]*o[0] + X[6]*o[1] + X[10]*o[2];")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
-
-    # Main: per (target, vi) -> corrected 3-vector. dpos = Jv + Jw x ro.
-    self.gen_add_code_line("// dpos[t][:,vi] = Jv[anchor,:,vi] + Jw[anchor,:,vi] x ro[t]")
+    # Phase B main: per (target, vi) offset-corrected column: dpos = Jv + Jw x ro.
+    self.gen_add_code_line("//")
+    self.gen_add_code_line("// Phase B: dpos[t][:,vi] = Jv[anchor,:,vi] + Jw[anchor,:,vi] x ro[t]  (Jw=0 for prismatic -> no cross)")
+    self.gen_add_code_line("//")
     self.gen_add_parallel_loop("ind", str(n * nv))
     self.gen_add_code_line("int vi = ind % " + str(nv) + "; int t = ind / " + str(nv) + ";")
     self.gen_add_code_line("int jb = 3 * (" + str(nv) + " * mt_anchor_idx[t] + vi);")
@@ -277,7 +339,63 @@ def gen_multi_target_gradient_phaseB(self, batch, anchor_index_of_target):
     self.gen_add_code_line("s_out_grad[ob + 2] = Jv2 + (Jw0*r1 - Jw1*r0);")
     self.gen_add_end_control_flow()
     self.gen_add_sync()
+    self.gen_add_end_function()
 
+
+def gen_multi_target_position_gradient_inner_function_call(self, updated_var_names=None, temp_in_smem_expr="true"):
+    var_names = dict(
+        s_Xhom_name="s_XmatsHom",
+        s_out_grad_name="s_out_grad",
+        s_q_name="s_q",
+        s_topology_helpers_name="s_topology_helpers",
+        s_temp_name="s_temp",
+        d_workspace_name="nullptr",
+        s_linalg_smem_name="s_linalg_smem",
+    )
+    if updated_var_names is not None:
+        for key, value in updated_var_names.items():
+            var_names[key] = value
+    code_start = ("multi_target_position_gradient_inner<T, " + temp_in_smem_expr + ">(" +
+                  var_names["s_out_grad_name"] + ", " + var_names["s_q_name"] + ", ")
+    code_middle = var_names["s_Xhom_name"] + ", "
+    code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
+    code_middle += self.gen_insert_helpers_function_call(updated_var_names=var_names, NO_XI_FLAG=True)
+    self.gen_add_code_line(code_start + code_middle + code_end)
+
+
+def gen_multi_target_position_gradient_device(self, batch):
+    n = batch["n"]
+    func_params = [
+        "s_out_grad is a pointer to shared memory of size 3*NUM_VEL*N_TARGETS where N_TARGETS = " + str(n),
+        "s_q is the vector of joint positions",
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
+    func_notes = ["Position gradient d(world pos)/dv of a baked batch of fixed-offset targets."]
+    func_def_start = "void multi_target_position_gradient_device("
+    func_def_middle = "T *s_out_grad, const T *s_q, "
+    func_def_end = "const robotModel<T> *d_robotModel) {"
+    func_def = func_def_start + func_def_middle + func_def_end
+    self.gen_add_func_doc("Computes batched multi-target world-position gradient", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def, True)
+    shared_mem_size = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True,
+                                                      linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+    self.gen_load_update_XmatsHom_helpers_function_call()
+    self.gen_multi_target_position_gradient_inner_function_call()
+    self.gen_add_end_function()
+
+
+def gen_multi_target_position_gradient(self, batch):
+    XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
+    total_t = XHom_size + self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
+    self.gen_add_code_lines([
+        "// W2a batched multi-target world-position GRADIENT (opt-in via multi_target_batch)",
+        "template <typename T> __host__ __device__ inline size_t MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() "
+        "{ return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+    ])
+    self.gen_multi_target_position_gradient_inner(batch)
+    self.gen_multi_target_position_gradient_device(batch)
 
 # ---------------------------------------------------------------------------
 # INTEGRATION STATUS
@@ -290,8 +408,12 @@ def gen_multi_target_gradient_phaseB(self, batch, anchor_index_of_target):
 #     emitter imports and calls it.
 # [x] wired into GRiDCodeGenerator.gen_all_code behind the opt-in multi_target_batch kwarg
 #     (default None -> not emitted; existing robots byte-identical).
-# [x] test: baxter (multi-anchor) + iiwa14 (offset==0==ee_pose) positions vs NumPy FK oracle;
-#     thread-invariance 1/32/256 (bit-identical); synccheck/racecheck/memcheck clean.
-# W1b.3 (remaining): _kernel/_host wrappers + gridData d_/h_ buffer + algo_registry
+# [x] test W1b: baxter (multi-anchor) + iiwa14 (offset==0==ee_pose) positions vs NumPy FK
+#     oracle; thread-invariance 1/32/256 (bit-identical); synccheck/racecheck/memcheck clean.
+# [x] W2a GRADIENT: anchor-deduped geometric Jacobian (Phase A, shared emit_geometric_jacobian_jvjw,
+#     byte-identical refactor GCG 44a7014) + offset epilogue (Phase B). Validated: baxter+iiwa14
+#     vs central-diff FD oracle; offset==0 == ee_pose_gradient rows 0..2 BIT-IDENTICAL;
+#     thread-invariant; sanitizers clean.
+# W1b.3 / W2a.3 (remaining): _kernel/_host wrappers + gridData d_/h_ buffers + algo_registry
 #     AlgoEntry/AlgoDescriptor rows + KERNEL_OVERLOADS + bench GRID_HAS_* wrappers.
-# W2a (remaining): wire gen_multi_target_gradient_phaseB (offset epilogue, no FK re-walk).
+# W2b (remaining): spill-tier the batched outputs + <T,TIER> reconciliation (fold registration).
