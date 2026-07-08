@@ -181,22 +181,34 @@ def gen_multi_target_position_inner_function_call(self, updated_var_names=None, 
 # ---------------------------------------------------------------------------
 def gen_multi_target_position_device(self, batch):
     n = batch["n"]
+    shared_mem_size = self.gen_multi_target_position_inner_temp_mem_size(batch)
     func_params = [
-        "s_out_pos is a pointer to shared memory of size 3*N_TARGETS where N_TARGETS = " + str(n),
+        "s_out_pos is a pointer to memory of size 3*N_TARGETS where N_TARGETS = " + str(n) +
+        " (caller chooses smem for small batches or a global buffer for many spheres)",
         "s_q is the vector of joint positions",
-        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
-    func_notes = ["Computes world positions of a baked batch of fixed-offset targets (grasp points / spheres)."]
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
+        "(= 0 at TIER_SHARED, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
+    func_notes = [
+        "Computes world positions of a baked batch of fixed-offset targets (grasp points / spheres).",
+        "Inline-CUDA / grid_collision users: at TIER_LITE/TIER_MINIMAL the shared FK scratch (s_Xworld, ~" +
+        str(shared_mem_size) + "*sizeof(T) bytes) moves from smem to d_workspace, freeing smem for the caller's outer kernel.",
+        "Output placement is the CALLER's choice (the s_out_pos pointer): smem for small batches, a global buffer when 3*N is large."]
     func_def_start = "void multi_target_position_device("
     func_def_middle = "T *s_out_pos, const T *s_q, "
-    func_def_end = "const robotModel<T> *d_robotModel) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes batched multi-target world positions", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    shared_mem_size = self.gen_multi_target_position_inner_temp_mem_size(batch)
+    # Tier-aware arena: at TIER_SHARED s_temp (the s_Xworld FK scratch) lives in the smem
+    # arena; at TIER_LITE/MINIMAL the whole s_temp slot is sourced from d_workspace and the
+    # arena skips it, mirroring forward_dynamics_device. The inner is called with the default
+    # TEMP_IN_SMEM=true because the s_temp pointer already routes per tier.
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True,
-                                                      linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+                                                      linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      tier_workspace_expr="d_workspace")
     self.gen_load_update_XmatsHom_helpers_function_call()
     self.gen_multi_target_position_inner_function_call()
     self.gen_add_end_function()
@@ -210,12 +222,20 @@ def gen_multi_target_position_device(self, batch):
 def gen_multi_target_position(self, batch):
     n = batch["n"]
     XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
-    total_t = XHom_size + self.gen_multi_target_position_inner_temp_mem_size(batch)
+    scratch = self.gen_multi_target_position_inner_temp_mem_size(batch)  # s_Xworld FK scratch
+    total_t = XHom_size + scratch
     self.gen_add_code_lines([
         "// W1b batched multi-target world positions (opt-in via multi_target_batch); NUM_MULTI_TARGETS = " + str(n),
         "const int NUM_MULTI_TARGETS = " + str(n) + ";",
-        "template <typename T> __host__ __device__ inline size_t MULTI_TARGET_POSITION_DYNAMIC_SHARED_MEM_BYTES() "
-        "{ return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+        # Tier-aware smem arena: at TIER_SHARED the FK scratch (s_Xworld) is in smem; at
+        # TIER_LITE/MINIMAL it spills to the device fn's d_workspace, shrinking the arena to
+        # s_XmatsHom + linalg only. Default TIER keeps every single-arg call site working.
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MULTI_TARGET_POSITION_DYNAMIC_SHARED_MEM_BYTES() { "
+        "if constexpr (TIER == TIER_SHARED) return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+        "else return grid_shared_arena_bytes<T>(" + str(XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+        # Companion d_workspace sizing for multi_target_position_device at TIER_LITE+.
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t MULTI_TARGET_POSITION_DEVICE_INLINE_WORKSPACE_BYTES() "
+        "{ return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(scratch) + "); }",
     ])
     self.gen_multi_target_position_inner(batch)
     self.gen_multi_target_position_device(batch)
@@ -365,22 +385,33 @@ def gen_multi_target_position_gradient_inner_function_call(self, updated_var_nam
 
 def gen_multi_target_position_gradient_device(self, batch):
     n = batch["n"]
+    shared_mem_size = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
     func_params = [
-        "s_out_grad is a pointer to shared memory of size 3*NUM_VEL*N_TARGETS where N_TARGETS = " + str(n),
+        "s_out_grad is a pointer to memory of size 3*NUM_VEL*N_TARGETS where N_TARGETS = " + str(n) +
+        " (caller chooses smem for small batches or a global buffer for many spheres)",
         "s_q is the vector of joint positions",
-        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)"]
-    func_notes = ["Position gradient d(world pos)/dv of a baked batch of fixed-offset targets."]
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION_GRADIENT_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
+        "(= 0 at TIER_SHARED, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
+    func_notes = [
+        "Position gradient d(world pos)/dv of a baked batch of fixed-offset targets.",
+        "Inline-CUDA / grid_collision users: at TIER_LITE/TIER_MINIMAL the anchor-deduped Jacobian scratch "
+        "(s_Xworld|Jv|Jw|ro, ~" + str(shared_mem_size) + "*sizeof(T) bytes; Jv/Jw dominate on big robots) moves from smem to d_workspace.",
+        "Output placement is the CALLER's choice (the s_out_grad pointer): smem for small batches, a global buffer when 3*nv*N is large."]
     func_def_start = "void multi_target_position_gradient_device("
     func_def_middle = "T *s_out_grad, const T *s_q, "
-    func_def_end = "const robotModel<T> *d_robotModel) {"
+    func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
     self.gen_add_func_doc("Computes batched multi-target world-position gradient", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    shared_mem_size = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
+    # Tier-aware arena: at TIER_SHARED s_temp (Xworld|Jv|Jw|ro) lives in smem; at TIER_LITE/MINIMAL
+    # the whole s_temp slot is sourced from d_workspace and the arena skips it (the load-bearing
+    # spill for many-sphere collision, where 3*nv*n_anchor Jacobian scratch dominates).
     self.gen_XmatsHom_helpers_temp_shared_memory_code(shared_mem_size, include_linalg_scratch=True,
-                                                      linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()")
+                                                      linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
+                                                      tier_workspace_expr="d_workspace")
     self.gen_load_update_XmatsHom_helpers_function_call()
     self.gen_multi_target_position_gradient_inner_function_call()
     self.gen_add_end_function()
@@ -388,11 +419,17 @@ def gen_multi_target_position_gradient_device(self, batch):
 
 def gen_multi_target_position_gradient(self, batch):
     XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
-    total_t = XHom_size + self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
+    scratch = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)  # Xworld|Jv|Jw|ro
+    total_t = XHom_size + scratch
     self.gen_add_code_lines([
         "// W2a batched multi-target world-position GRADIENT (opt-in via multi_target_batch)",
-        "template <typename T> __host__ __device__ inline size_t MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() "
-        "{ return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+        # Tier-aware smem arena: TIER_SHARED keeps the Jacobian scratch in smem; TIER_LITE/MINIMAL
+        # spills it to the device fn's d_workspace, shrinking the arena to s_XmatsHom + linalg.
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { "
+        "if constexpr (TIER == TIER_SHARED) return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
+        "else return grid_shared_arena_bytes<T>(" + str(XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t MULTI_TARGET_POSITION_GRADIENT_DEVICE_INLINE_WORKSPACE_BYTES() "
+        "{ return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(scratch) + "); }",
     ])
     self.gen_multi_target_position_gradient_inner(batch)
     self.gen_multi_target_position_gradient_device(batch)
