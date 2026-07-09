@@ -22,6 +22,17 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
+def _c_float_literal(v):
+    """Format a float as a valid C++ `float` literal. `"{:.9g}".format(1000.0)` yields "1000"
+    (no decimal point), so a bare "f" suffix parses as a user-defined literal and the compile
+    fails -- ensure a '.'/'e' is present before appending the suffix (integer-valued radii are
+    legal spherizer inputs)."""
+    s = "{:.9g}".format(float(v))
+    if not any(c in s for c in ".eEnN"):   # integer-valued (also guards inf/nan spelled out)
+        s += ".0"
+    return s + "f"
+
+
 # --------------------------------------------------------------------------- foam parse
 def parse_spherized_urdf(path):
     """foam output: per link, one `<collision><geometry><sphere radius/></geometry>
@@ -214,7 +225,7 @@ def gen_collision_namespace(self, batch, radius, self_cc_ranges):
         "\"collision sphere batch must be the multi_target batch\");",
         # fp32 radii (default collision precision, USER-CONFIRMED); ranges as {i, start_j, end_j} rows.
         "__device__ const float g_collision_sphere_r[" + str(max(n, 1)) + "] = {" +
-        ", ".join("{:.9g}f".format(rad) for rad in (radius or [0.0])) + "};",
+        ", ".join(_c_float_literal(rad) for rad in (radius or [0.0])) + "};",
         "__device__ const int g_collision_self_cc_ranges[" + str(max(3 * r, 1)) + "] = {" + flat_ranges + "};",
     ])
 
