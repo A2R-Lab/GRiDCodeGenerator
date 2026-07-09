@@ -157,6 +157,18 @@ def build_self_cc_ranges(robot, anchor):
     return ranges
 
 
+def collision_spec_from_urdf(robot, urdf_path, resolution, mesh_resolution=None, out_path=None):
+    """One-call URDF -> single-tier collision_spec (for gen_all_code). Spherizes `urdf_path`
+    (custom trimesh/analytic spherizer, foam-compatible output) then binds the spheres to GRiD
+    frames via build_sphere_tiers. Returns {anchor, offset, radius, self_cc_ranges} -- the dict
+    gen_all_code's collision_spec kwarg expects. `resolution` = sphere spacing (m)."""
+    from ._spherize import spherize_urdf
+    sph_path = spherize_urdf(urdf_path, resolution, out_path=out_path, mesh_resolution=mesh_resolution)
+    tier = build_sphere_tiers(robot, {"all": sph_path})["all"]
+    return {"anchor": tier["anchor"], "offset": tier["offset"],
+            "radius": tier["radius"], "self_cc_ranges": tier["self_cc_ranges"]}
+
+
 def build_sphere_tiers(robot, foam_outputs):
     """`foam_outputs = {tier_name: spherized_urdf_path}` (e.g. broad + fine, two foam runs).
     Returns `{tier: {"n", "anchor"[N], "offset"[3N], "radius"[N], "self_cc_ranges"[R][3]}}`.

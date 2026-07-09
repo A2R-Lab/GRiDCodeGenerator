@@ -121,6 +121,12 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     # so future per-primitive bench wrappers can reference it.
     AlgoEntry("plant",                "Plant (cost/constraint/step primitives)",
               "Plant"),
+    # Collision (W3): baked sphere data + config_free emitted in the sibling
+    # `grid_collision` namespace (composed over grid::multi_target_position + the
+    # static SDF geometry header). No standalone benchmarked kernel — registry key
+    # only, like `plant`.
+    AlgoEntry("collision",            "Collision (config_free / spherized-URDF)",
+              "Collision"),
 )
 
 
@@ -237,6 +243,8 @@ ALGO_DESCRIPTORS: tuple[AlgoDescriptor, ...] = (
 
     # Plant (no standalone kernel)
     AlgoDescriptor("plant", has_kernel_attr=False),
+    # Collision (no standalone benchmarked kernel; config_free lives in grid_collision)
+    AlgoDescriptor("collision", has_kernel_attr=False),
 )
 
 

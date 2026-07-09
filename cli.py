@@ -47,6 +47,12 @@ def parseInputs(NO_ARG_OPTION=False):
                         help="Enable debug mode")
     parser.add_argument("-f", "--floating-base", default=False, action="store_true",
                         help="Add a floating base")
+    parser.add_argument("-c", "--collision", default=False, action="store_true",
+                        help="Spherize the URDF collision geometry and emit the grid_collision "
+                             "namespace (config_free)")
+    parser.add_argument("--collision-res", default=0.05, type=float,
+                        help="Collision sphere spacing in meters (smaller = finer/more spheres). "
+                             "Default 0.05")
     args = parser.parse_args()
 
     if args.urdf_path is None:
@@ -65,6 +71,8 @@ def parseInputs(NO_ARG_OPTION=False):
     FLOATING_BASE = args.floating_base
     FILE_NAMESPACE_NAME = args.namespace
     FIXED_TARGET_NAMES = args.fixed_target_names
+    COLLISION = args.collision
+    COLLISION_RES = args.collision_res
     if FLOATING_BASE:
         DEBUG_MODE = False
 
@@ -73,8 +81,10 @@ def parseInputs(NO_ARG_OPTION=False):
     print("                    URDF = " + URDF_PATH)
     print("      FIXED_TARGET_NAMES = " + FIXED_TARGET_NAMES)
     print("               FILE_NAME = " + FILE_NAMESPACE_NAME)
+    print("               COLLISION = " + str(COLLISION) + (" (res=%g)" % COLLISION_RES if COLLISION else ""))
 
-    return (URDF_PATH, DEBUG_MODE, FILE_NAMESPACE_NAME, FLOATING_BASE, FIXED_TARGET_NAMES)
+    return (URDF_PATH, DEBUG_MODE, FILE_NAMESPACE_NAME, FLOATING_BASE, FIXED_TARGET_NAMES,
+            COLLISION, COLLISION_RES)
 
 
 def validateRobot(robot, NO_ARG_OPTION=False):
@@ -93,17 +103,25 @@ def main():
     from URDFParser import URDFParser
     from GRiDCodeGenerator import GRiDCodeGenerator
 
-    URDF_PATH, DEBUG_MODE, FILE_NAMESPACE_NAME, FLOATING_BASE, FIXED_TARGET_NAMES = parseInputs()
+    (URDF_PATH, DEBUG_MODE, FILE_NAMESPACE_NAME, FLOATING_BASE, FIXED_TARGET_NAMES,
+     COLLISION, COLLISION_RES) = parseInputs()
     parser = URDFParser()
     robot = parser.parse(URDF_PATH, floating_base=FLOATING_BASE)
 
     validateRobot(robot)
+
+    collision_spec = None
+    if COLLISION:
+        from GRiDCodeGenerator.algorithms._collision import collision_spec_from_urdf
+        collision_spec = collision_spec_from_urdf(robot, URDF_PATH, COLLISION_RES)
+        print("      collision spheres = " + str(len(collision_spec["anchor"])))
 
     codegen = GRiDCodeGenerator(robot, DEBUG_MODE, True, FILE_NAMESPACE=FILE_NAMESPACE_NAME)
     include_homogenous_transforms = not FLOATING_BASE
     codegen.gen_all_code(
         include_homogenous_transforms=include_homogenous_transforms,
         fixed_target_name=FIXED_TARGET_NAMES,
+        collision_spec=collision_spec,
     )
     print("New code generated and saved to grid.cuh!")
 
