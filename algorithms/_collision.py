@@ -170,3 +170,90 @@ def build_sphere_tiers(robot, foam_outputs):
             "self_cc_ranges": build_self_cc_ranges(robot, anchor),
         }
     return tiers
+
+
+# --------------------------------------------------------------------------- namespace emitter
+def gen_collision_namespace(self, batch, radius, self_cc_ranges):
+    """Emit the sibling `namespace grid_collision { ... }` block (model = gen_grid_plant).
+
+    Called AFTER the `grid` namespace closes, and ONLY when a collision batch is configured
+    (the sphere set IS the multi_target batch, so this requires gen_multi_target_position to
+    have been emitted -- NUM_COLLISION_SPHERES == grid::NUM_MULTI_TARGETS). Reopens the
+    grid_collision namespace already opened by the static geometry header
+    (collision/grid_collision_geometry.cuh, W3 Component E) and adds the per-robot BAKED data
+    (fp32 radii + self_cc_ranges) plus a thin `config_free` entry point that binds the W1b
+    batched extractor (grid::multi_target_position_device) to the header's SDF checks.
+
+    `batch`          = build_target_batch(...) output for the spheres (n == len(radius)).
+    `radius`         = per-sphere radii (len n), baked fp32 (collision change-of-record).
+    `self_cc_ranges` = build_self_cc_ranges(...) output: list of (sphere_i, start_j, end_j).
+    """
+    n = batch["n"]
+    r = len(self_cc_ranges)
+    assert len(radius) == n, "collision: radius count (%d) != sphere count (%d)" % (len(radius), n)
+
+    # The geometry header must precede the reopened namespace (it defines the SDFs + opens
+    # grid_collision). Emitted at file scope after the grid namespace closes.
+    self.gen_add_code_line("")
+    self.gen_add_code_line('#include "grid_collision_geometry.cuh"  // W3 Component E: SDF primitives (grid_collision::)')
+    self.gen_add_func_doc("Collision namespace: baked sphere data + config_free composed over "
+                          "grid::multi_target_position + the static SDF geometry header")
+    self.gen_add_code_line("namespace " + self.file_namespace + "_collision {", True)
+    # Bring the tier enum into scope so GRID_DEFAULT_RESOURCE_TIER (a macro expanding to a
+    # bare TIER_* name defined in namespace grid) resolves inside this sibling namespace,
+    # incl. a -DGRID_DEFAULT_RESOURCE_TIER=TIER_LITE/MINIMAL override.
+    self.gen_add_code_line("using " + self.file_namespace + "::TIER_SHARED; using " +
+                           self.file_namespace + "::TIER_LITE; using " + self.file_namespace + "::TIER_MINIMAL;")
+
+    # --- baked per-robot data ---
+    flat_ranges = ", ".join(str(v) for row in self_cc_ranges for v in row) if r else "0"
+    self.gen_add_code_lines([
+        "constexpr int NUM_COLLISION_SPHERES = " + str(n) + ";",
+        "constexpr int NUM_COLLISION_SELF_CC_RANGES = " + str(r) + ";",
+        "static_assert(NUM_COLLISION_SPHERES == grid::NUM_MULTI_TARGETS, "
+        "\"collision sphere batch must be the multi_target batch\");",
+        # fp32 radii (default collision precision, USER-CONFIRMED); ranges as {i, start_j, end_j} rows.
+        "__device__ const float g_collision_sphere_r[" + str(max(n, 1)) + "] = {" +
+        ", ".join("{:.9g}f".format(rad) for rad in (radius or [0.0])) + "};",
+        "__device__ const int g_collision_self_cc_ranges[" + str(max(3 * r, 1)) + "] = {" + flat_ranges + "};",
+    ])
+
+    # --- fill a caller T-scratch with the baked fp32 radii (cast to T) ---
+    self.gen_add_func_doc("Fill s_r[NUM_COLLISION_SPHERES] with the baked fp32 radii cast to T",
+                          [], ["s_r is caller shared memory of size NUM_COLLISION_SPHERES"], None)
+    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("__device__ __forceinline__")
+    self.gen_add_code_line("void load_collision_radii(T *s_r) {", True)
+    self.gen_add_parallel_loop("i", "NUM_COLLISION_SPHERES")
+    self.gen_add_code_line("s_r[i] = static_cast<T>(g_collision_sphere_r[i]);")
+    self.gen_add_end_control_flow()
+    self.gen_add_end_function()
+
+    # --- config_free entry point ---
+    func_params = [
+        "s_q is the vector of joint positions",
+        "d_robotModel is the initialized model-specific helpers on the GPU",
+        "env is the runtime obstacle set (grid_collision::Environment<T>)",
+        "s_sphere_pos is caller scratch of size 3*NUM_COLLISION_SPHERES (smem for small N, global for many)",
+        "s_sphere_r is caller scratch of size NUM_COLLISION_SPHERES (filled here from the baked radii)",
+        "d_workspace is the multi_target FK scratch at TIER_LITE+ (nullptr at TIER_SHARED)"]
+    func_notes = [
+        "Returns true iff the current configuration q is COLLISION-FREE (self + environment).",
+        "Sphere world positions via the W1b batched extractor; SDF self/env checks via the static header.",
+        "Every thread computes the same verdict; the self/env range loops are serial (parallelize = W3 perf TODO)."]
+    self.gen_add_func_doc("Collision-free test for configuration q (self + environment)", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("bool config_free(const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
+    self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
+    self.gen_add_sync()
+    self.gen_add_code_line("if (grid_cc_self_collision<T>(s_sphere_pos, s_sphere_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES)) return false;")
+    self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
+    self.gen_add_code_line("if (grid_cc_sphere_in_environment<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i])) return false;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("return true;")
+    self.gen_add_end_function()
+
+    self.gen_add_end_control_flow()  # close namespace grid_collision

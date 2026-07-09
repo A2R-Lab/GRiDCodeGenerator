@@ -220,6 +220,7 @@ class GRiDCodeGenerator:
                             gen_multi_target_position_gradient_inner_temp_mem_size, gen_multi_target_position_gradient_inner, \
                             gen_multi_target_position_gradient_inner_function_call, gen_multi_target_position_gradient_device, \
                             gen_multi_target_position_gradient
+    from .algorithms._collision import gen_collision_namespace
     from .algorithms._dccrba import _dccrba_inner_temp_mem_size, _dccrba_sweep_J_count, gen_cmm_time_variation, gen_dccrba
 
     # finally import the test code
@@ -3017,7 +3018,7 @@ class GRiDCodeGenerator:
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
                      enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False,
-                     runtime_joint_dynamics = None, multi_target_batch = None):
+                     runtime_joint_dynamics = None, multi_target_batch = None, collision_spec = None):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -3412,9 +3413,20 @@ class GRiDCodeGenerator:
             # every existing robot's grid.cuh is byte-identical. Reuses the shared FK
             # (emit_world_fk_chainup) + XmatsHom machinery set up above.
             if multi_target_batch is not None:
+                assert collision_spec is None, "multi_target_batch and collision_spec are exclusive (each defines the single multi_target batch / NUM_MULTI_TARGETS)"
                 _mt_batch = self.build_target_batch(multi_target_batch)
                 self.gen_multi_target_position(_mt_batch)
                 self.gen_multi_target_position_gradient(_mt_batch)
+            # W3: collision. The sphere set IS the multi_target batch — build it in the tier's
+            # own order (NO group re-sort) so the baked radii/self_cc_ranges stay index-aligned,
+            # then emit position + gradient (differentiable collision). The grid_collision
+            # namespace itself is emitted AFTER grid closes (below), like grid_plant.
+            if collision_spec is not None:
+                _n_cc = len(collision_spec["anchor"])
+                _cc_batch = {"n": _n_cc, "anchor": list(collision_spec["anchor"]),
+                             "offset": list(collision_spec["offset"]), "groups": {"all": (0, _n_cc)}}
+                self.gen_multi_target_position(_cc_batch)
+                self.gen_multi_target_position_gradient(_cc_batch)
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
@@ -3617,6 +3629,14 @@ class GRiDCodeGenerator:
         # primitives composed over the grid:: surface). Additive: this runs AFTER
         # the grid namespace closes and makes ZERO edits to any grid:: emit path.
         self.gen_grid_plant(algorithms)
+        # W3: sibling `grid_collision` namespace (baked sphere radii + self_cc_ranges + config_free
+        # over grid::multi_target_position + the static SDF header). Emitted like grid_plant, after
+        # the grid namespace closes; gated on collision_spec (the sphere batch was emitted above).
+        if collision_spec is not None:
+            _n_cc = len(collision_spec["anchor"])
+            _cc_batch = {"n": _n_cc, "anchor": list(collision_spec["anchor"]),
+                         "offset": list(collision_spec["offset"]), "groups": {"all": (0, _n_cc)}}
+            self.gen_collision_namespace(_cc_batch, collision_spec["radius"], collision_spec["self_cc_ranges"])
         # then output to a file
         if output_path is None:
             output_path = self.file_namespace + ".cuh"
