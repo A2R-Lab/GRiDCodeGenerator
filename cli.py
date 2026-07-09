@@ -50,8 +50,10 @@ def parseInputs(NO_ARG_OPTION=False):
     parser.add_argument("-c", "--collision", default=False, action="store_true",
                         help="Spherize the URDF collision geometry and emit the grid_collision "
                              "namespace (config_free)")
-    parser.add_argument("--collision-res", default=0.05, type=float,
+    parser.add_argument("--collision-res", default="0.05", type=str,
                         help="Collision sphere spacing in meters (smaller = finer/more spheres). "
+                             "Comma-separate multiple densities for a broad->fine cascade, e.g. "
+                             "'0.10,0.05' (config_free uses coarsest to reject + finest to confirm). "
                              "Default 0.05")
     args = parser.parse_args()
 
@@ -72,7 +74,7 @@ def parseInputs(NO_ARG_OPTION=False):
     FILE_NAMESPACE_NAME = args.namespace
     FIXED_TARGET_NAMES = args.fixed_target_names
     COLLISION = args.collision
-    COLLISION_RES = args.collision_res
+    COLLISION_RES = [float(x) for x in str(args.collision_res).split(",") if x.strip()]
     if FLOATING_BASE:
         DEBUG_MODE = False
 
@@ -81,7 +83,7 @@ def parseInputs(NO_ARG_OPTION=False):
     print("                    URDF = " + URDF_PATH)
     print("      FIXED_TARGET_NAMES = " + FIXED_TARGET_NAMES)
     print("               FILE_NAME = " + FILE_NAMESPACE_NAME)
-    print("               COLLISION = " + str(COLLISION) + (" (res=%g)" % COLLISION_RES if COLLISION else ""))
+    print("               COLLISION = " + str(COLLISION) + ((" (res=%s)" % ",".join("%g" % r for r in COLLISION_RES)) if COLLISION else ""))
 
     return (URDF_PATH, DEBUG_MODE, FILE_NAMESPACE_NAME, FLOATING_BASE, FIXED_TARGET_NAMES,
             COLLISION, COLLISION_RES)
@@ -112,9 +114,13 @@ def main():
 
     collision_spec = None
     if COLLISION:
-        from GRiDCodeGenerator.algorithms._collision import collision_spec_from_urdf
-        collision_spec = collision_spec_from_urdf(robot, URDF_PATH, COLLISION_RES)
-        print("      collision spheres = " + str(len(collision_spec["anchor"])))
+        from GRiDCodeGenerator.algorithms._collision import multi_tier_collision_spec_from_urdf
+        collision_spec = multi_tier_collision_spec_from_urdf(robot, URDF_PATH, COLLISION_RES)
+        if "tiers" in collision_spec:
+            print("      collision spheres = " + ", ".join(
+                "%s:%d" % (t["name"], len(t["anchor"])) for t in collision_spec["tiers"]))
+        else:
+            print("      collision spheres = " + str(len(collision_spec["anchor"])))
 
     codegen = GRiDCodeGenerator(robot, DEBUG_MODE, True, FILE_NAMESPACE=FILE_NAMESPACE_NAME)
     include_homogenous_transforms = not FLOATING_BASE

@@ -3417,16 +3417,21 @@ class GRiDCodeGenerator:
                 _mt_batch = self.build_target_batch(multi_target_batch)
                 self.gen_multi_target_position(_mt_batch)
                 self.gen_multi_target_position_gradient(_mt_batch)
-            # W3: collision. The sphere set IS the multi_target batch — build it in the tier's
-            # own order (NO group re-sort) so the baked radii/self_cc_ranges stay index-aligned,
-            # then emit position + gradient (differentiable collision). The grid_collision
-            # namespace itself is emitted AFTER grid closes (below), like grid_plant.
+            # W3: collision. Each sphere-density tier IS a multi_target batch — build it in the
+            # tier's own order (NO group re-sort) so the baked radii/self_cc_ranges stay
+            # index-aligned. Emit a POSITION extractor per tier (config_free's broad-phase needs
+            # the coarse positions); the expensive GRADIENT only for the FINEST tier (the sole
+            # consumer is the differentiable cost, which binds the finest/public batch). The
+            # grid_collision namespace itself is emitted AFTER grid closes (below), like grid_plant.
             if collision_spec is not None:
-                _n_cc = len(collision_spec["anchor"])
-                _cc_batch = {"n": _n_cc, "anchor": list(collision_spec["anchor"]),
-                             "offset": list(collision_spec["offset"]), "groups": {"all": (0, _n_cc)}}
-                self.gen_multi_target_position(_cc_batch)
-                self.gen_multi_target_position_gradient(_cc_batch)
+                from .algorithms._collision import normalize_collision_tiers
+                _cc_tiers = normalize_collision_tiers(collision_spec)
+                for _t in _cc_tiers:
+                    _cc_batch = {"n": _t["n"], "anchor": _t["anchor"],
+                                 "offset": _t["offset"], "groups": {"all": (0, _t["n"])}}
+                    self.gen_multi_target_position(_cc_batch, suffix=_t["suffix"])
+                    if _t["suffix"] == "":  # finest / public tier -> the differentiable path
+                        self.gen_multi_target_position_gradient(_cc_batch, suffix="")
         if self.robot.floating_base and not enable_floating_second_order:
             print('floating-base second order dynamics are still under development')
         # then generate the dynamics algorithms
@@ -3633,10 +3638,8 @@ class GRiDCodeGenerator:
         # over grid::multi_target_position + the static SDF header). Emitted like grid_plant, after
         # the grid namespace closes; gated on collision_spec (the sphere batch was emitted above).
         if collision_spec is not None:
-            _n_cc = len(collision_spec["anchor"])
-            _cc_batch = {"n": _n_cc, "anchor": list(collision_spec["anchor"]),
-                         "offset": list(collision_spec["offset"]), "groups": {"all": (0, _n_cc)}}
-            self.gen_collision_namespace(_cc_batch, collision_spec["radius"], collision_spec["self_cc_ranges"])
+            from .algorithms._collision import normalize_collision_tiers
+            self.gen_collision_namespace(normalize_collision_tiers(collision_spec))
         # then output to a file
         if output_path is None:
             output_path = self.file_namespace + ".cuh"

@@ -82,10 +82,14 @@ def gen_multi_target_position_inner_temp_mem_size(self, batch=None):
 # ---------------------------------------------------------------------------
 # Batched multi-target POSITION inner.
 # ---------------------------------------------------------------------------
-def gen_multi_target_position_inner(self, batch):
-    """Emit `multi_target_position_inner<T>`: compute ALL targets' world positions in one
+def gen_multi_target_position_inner(self, batch, suffix=""):
+    """Emit `multi_target_position<suffix>_inner<T>`: compute ALL targets' world positions in one
     call. s_out_pos is 3*N (xyz per target). One shared FK (s_Xworld) + a parallel
     extraction over the baked (anchor, offset) table. `batch` = build_target_batch(...) output.
+
+    `suffix` (e.g. "_broad") makes the function + macro + NUM_MULTI_TARGETS names unique per
+    collision tier so multiple sphere-density batches can coexist in one header; default "" is
+    byte-identical to the single-batch emission.
 
     pos[t][row] = R_world[anchor]·offset + p_world
                 = X[row]*o0 + X[row+4]*o1 + X[row+8]*o2 + X[row+12]   (X col-major 4x4)
@@ -105,7 +109,7 @@ def gen_multi_target_position_inner(self, batch):
         "Computes world positions of a baked batch of fixed-offset targets (grasp points / spheres).",
         "One shared FK (world transforms) + parallel-over-targets offset extraction.",
     ]
-    func_def_start = "void multi_target_position_inner("
+    func_def_start = "void multi_target_position" + suffix + "_inner("
     func_def_middle = "T *s_out_pos, const T *s_q, const T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(
@@ -151,7 +155,7 @@ def gen_multi_target_position_inner(self, batch):
 # ---------------------------------------------------------------------------
 # Inner function-call helper (mirrors gen_end_effector_pose_inner_function_call).
 # ---------------------------------------------------------------------------
-def gen_multi_target_position_inner_function_call(self, updated_var_names=None, temp_in_smem_expr="true"):
+def gen_multi_target_position_inner_function_call(self, updated_var_names=None, temp_in_smem_expr="true", suffix=""):
     var_names = dict(
         s_Xhom_name="s_XmatsHom",
         s_out_pos_name="s_out_pos",
@@ -164,7 +168,7 @@ def gen_multi_target_position_inner_function_call(self, updated_var_names=None, 
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
             var_names[key] = value
-    code_start = ("multi_target_position_inner<T, " + temp_in_smem_expr + ">(" +
+    code_start = ("multi_target_position" + suffix + "_inner<T, " + temp_in_smem_expr + ">(" +
                   var_names["s_out_pos_name"] + ", " + var_names["s_q_name"] + ", ")
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
@@ -179,7 +183,7 @@ def gen_multi_target_position_inner_function_call(self, updated_var_names=None, 
 # the batched inner. Caller supplies the s_out_pos output buffer (3*N shared),
 # exactly like end_effector_pose_device(s_pose, d_q, m). No gridData dependency.
 # ---------------------------------------------------------------------------
-def gen_multi_target_position_device(self, batch):
+def gen_multi_target_position_device(self, batch, suffix=""):
     n = batch["n"]
     shared_mem_size = self.gen_multi_target_position_inner_temp_mem_size(batch)
     func_params = [
@@ -187,14 +191,14 @@ def gen_multi_target_position_device(self, batch):
         " (caller chooses smem for small batches or a global buffer for many spheres)",
         "s_q is the vector of joint positions",
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
-        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
+        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION" + suffix.upper() + "_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
         "(= 0 at TIER_SHARED, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_notes = [
         "Computes world positions of a baked batch of fixed-offset targets (grasp points / spheres).",
         "Inline-CUDA / grid_collision users: at TIER_LITE/TIER_MINIMAL the shared FK scratch (s_Xworld, ~" +
         str(shared_mem_size) + "*sizeof(T) bytes) moves from smem to d_workspace, freeing smem for the caller's outer kernel.",
         "Output placement is the CALLER's choice (the s_out_pos pointer): smem for small batches, a global buffer when 3*N is large."]
-    func_def_start = "void multi_target_position_device("
+    func_def_start = "void multi_target_position" + suffix + "_device("
     func_def_middle = "T *s_out_pos, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
@@ -210,7 +214,7 @@ def gen_multi_target_position_device(self, batch):
                                                       linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       tier_workspace_expr="d_workspace")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    self.gen_multi_target_position_inner_function_call()
+    self.gen_multi_target_position_inner_function_call(suffix=suffix)
     self.gen_add_end_function()
 
 
@@ -219,26 +223,28 @@ def gen_multi_target_position_device(self, batch):
 # calls multi_target_position_device directly). Kernel + host + gridData buffer
 # registration = W1b.3.
 # ---------------------------------------------------------------------------
-def gen_multi_target_position(self, batch):
+def gen_multi_target_position(self, batch, suffix=""):
     n = batch["n"]
+    NUM = "NUM_MULTI_TARGETS" + suffix.upper()
+    POS = "MULTI_TARGET_POSITION" + suffix.upper()
     XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
     scratch = self.gen_multi_target_position_inner_temp_mem_size(batch)  # s_Xworld FK scratch
     total_t = XHom_size + scratch
     self.gen_add_code_lines([
-        "// W1b batched multi-target world positions (opt-in via multi_target_batch); NUM_MULTI_TARGETS = " + str(n),
-        "const int NUM_MULTI_TARGETS = " + str(n) + ";",
+        "// W1b batched multi-target world positions (opt-in via multi_target_batch); " + NUM + " = " + str(n),
+        "const int " + NUM + " = " + str(n) + ";",
         # Tier-aware smem arena: at TIER_SHARED the FK scratch (s_Xworld) is in smem; at
         # TIER_LITE/MINIMAL it spills to the device fn's d_workspace, shrinking the arena to
         # s_XmatsHom + linalg only. Default TIER keeps every single-arg call site working.
-        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MULTI_TARGET_POSITION_DYNAMIC_SHARED_MEM_BYTES() { "
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t " + POS + "_DYNAMIC_SHARED_MEM_BYTES() { "
         "if constexpr (TIER == TIER_SHARED) return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
         "else return grid_shared_arena_bytes<T>(" + str(XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-        # Companion d_workspace sizing for multi_target_position_device at TIER_LITE+.
-        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t MULTI_TARGET_POSITION_DEVICE_INLINE_WORKSPACE_BYTES() "
+        # Companion d_workspace sizing for multi_target_position<suffix>_device at TIER_LITE+.
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t " + POS + "_DEVICE_INLINE_WORKSPACE_BYTES() "
         "{ return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(scratch) + "); }",
     ])
-    self.gen_multi_target_position_inner(batch)
-    self.gen_multi_target_position_device(batch)
+    self.gen_multi_target_position_inner(batch, suffix=suffix)
+    self.gen_multi_target_position_device(batch, suffix=suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +276,8 @@ def gen_multi_target_position_gradient_inner_temp_mem_size(self, batch):
     return 16 * _eepose_xworld_slot_count(self) + 2 * 3 * nv * len(distinct) + 3 * batch["n"]
 
 
-def gen_multi_target_position_gradient_inner(self, batch):
-    """Emit multi_target_position_gradient_inner<T>: d(world pos)/dv for every target
+def gen_multi_target_position_gradient_inner(self, batch, suffix=""):
+    """Emit multi_target_position_gradient<suffix>_inner<T>: d(world pos)/dv for every target
     (3 x nv per target, row-fastest layout ob = 3*(nv*t+vi)+row). Phase A builds s_Jv/s_Jw
     per DISTINCT anchor via the shared emit_geometric_jacobian_jvjw; Phase B applies the
     offset epilogue. Position gradient only (world-frame LOCAL_WORLD_ALIGNED; no rpy)."""
@@ -295,7 +301,7 @@ def gen_multi_target_position_gradient_inner(self, batch):
         "Position gradient d(world pos)/dv of a baked batch of fixed-offset targets (grasp points / spheres).",
         "Anchor-deduped geometric Jacobian (built once per distinct anchor) + offset epilogue; NO FK re-walk.",
     ]
-    func_def_start = "void multi_target_position_gradient_inner("
+    func_def_start = "void multi_target_position_gradient" + suffix + "_inner("
     func_def_middle = "T *s_out_grad, const T *s_q, const T *s_Xhom, "
     func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
     func_def_middle, func_params = self.gen_insert_helpers_func_def_params(
@@ -362,7 +368,7 @@ def gen_multi_target_position_gradient_inner(self, batch):
     self.gen_add_end_function()
 
 
-def gen_multi_target_position_gradient_inner_function_call(self, updated_var_names=None, temp_in_smem_expr="true"):
+def gen_multi_target_position_gradient_inner_function_call(self, updated_var_names=None, temp_in_smem_expr="true", suffix=""):
     var_names = dict(
         s_Xhom_name="s_XmatsHom",
         s_out_grad_name="s_out_grad",
@@ -375,7 +381,7 @@ def gen_multi_target_position_gradient_inner_function_call(self, updated_var_nam
     if updated_var_names is not None:
         for key, value in updated_var_names.items():
             var_names[key] = value
-    code_start = ("multi_target_position_gradient_inner<T, " + temp_in_smem_expr + ">(" +
+    code_start = ("multi_target_position_gradient" + suffix + "_inner<T, " + temp_in_smem_expr + ">(" +
                   var_names["s_out_grad_name"] + ", " + var_names["s_q_name"] + ", ")
     code_middle = var_names["s_Xhom_name"] + ", "
     code_end = var_names["s_temp_name"] + ", " + var_names["d_workspace_name"] + ", " + var_names["s_linalg_smem_name"] + ");"
@@ -383,7 +389,7 @@ def gen_multi_target_position_gradient_inner_function_call(self, updated_var_nam
     self.gen_add_code_line(code_start + code_middle + code_end)
 
 
-def gen_multi_target_position_gradient_device(self, batch):
+def gen_multi_target_position_gradient_device(self, batch, suffix=""):
     n = batch["n"]
     shared_mem_size = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)
     func_params = [
@@ -391,14 +397,14 @@ def gen_multi_target_position_gradient_device(self, batch):
         " (caller chooses smem for small batches or a global buffer for many spheres)",
         "s_q is the vector of joint positions",
         "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
-        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION_GRADIENT_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
+        "d_workspace is the global scratch buffer; size MULTI_TARGET_POSITION_GRADIENT" + suffix.upper() + "_DEVICE_INLINE_WORKSPACE_BYTES<T, RESOURCE_TIER>() bytes "
         "(= 0 at TIER_SHARED, " + str(shared_mem_size) + "*sizeof(T) at TIER_LITE+). Pass nullptr at TIER_SHARED"]
     func_notes = [
         "Position gradient d(world pos)/dv of a baked batch of fixed-offset targets.",
         "Inline-CUDA / grid_collision users: at TIER_LITE/TIER_MINIMAL the anchor-deduped Jacobian scratch "
         "(s_Xworld|Jv|Jw|ro, ~" + str(shared_mem_size) + "*sizeof(T) bytes; Jv/Jw dominate on big robots) moves from smem to d_workspace.",
         "Output placement is the CALLER's choice (the s_out_grad pointer): smem for small batches, a global buffer when 3*nv*N is large."]
-    func_def_start = "void multi_target_position_gradient_device("
+    func_def_start = "void multi_target_position_gradient" + suffix + "_device("
     func_def_middle = "T *s_out_grad, const T *s_q, "
     func_def_end = "const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     func_def = func_def_start + func_def_middle + func_def_end
@@ -413,11 +419,12 @@ def gen_multi_target_position_gradient_device(self, batch):
                                                       linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       tier_workspace_expr="d_workspace")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    self.gen_multi_target_position_gradient_inner_function_call()
+    self.gen_multi_target_position_gradient_inner_function_call(suffix=suffix)
     self.gen_add_end_function()
 
 
-def gen_multi_target_position_gradient(self, batch):
+def gen_multi_target_position_gradient(self, batch, suffix=""):
+    POSG = "MULTI_TARGET_POSITION_GRADIENT" + suffix.upper()
     XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
     scratch = self.gen_multi_target_position_gradient_inner_temp_mem_size(batch)  # Xworld|Jv|Jw|ro
     total_t = XHom_size + scratch
@@ -425,14 +432,14 @@ def gen_multi_target_position_gradient(self, batch):
         "// W2a batched multi-target world-position GRADIENT (opt-in via multi_target_batch)",
         # Tier-aware smem arena: TIER_SHARED keeps the Jacobian scratch in smem; TIER_LITE/MINIMAL
         # spills it to the device fn's d_workspace, shrinking the arena to s_XmatsHom + linalg.
-        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES() { "
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ inline size_t " + POSG + "_DYNAMIC_SHARED_MEM_BYTES() { "
         "if constexpr (TIER == TIER_SHARED) return grid_shared_arena_bytes<T>(" + str(total_t) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); "
         "else return grid_shared_arena_bytes<T>(" + str(XHom_size) + ", TOPOLOGY_HELPERS_COUNT, GRID_EE_LINALG_SHARED_BYTES<T>()); }",
-        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t MULTI_TARGET_POSITION_GRADIENT_DEVICE_INLINE_WORKSPACE_BYTES() "
+        "template <typename T, int TIER = GRID_DEFAULT_RESOURCE_TIER> __host__ __device__ constexpr size_t " + POSG + "_DEVICE_INLINE_WORKSPACE_BYTES() "
         "{ return (TIER == TIER_SHARED) ? static_cast<size_t>(0) : sizeof(T) * static_cast<size_t>(" + str(scratch) + "); }",
     ])
-    self.gen_multi_target_position_gradient_inner(batch)
-    self.gen_multi_target_position_gradient_device(batch)
+    self.gen_multi_target_position_gradient_inner(batch, suffix=suffix)
+    self.gen_multi_target_position_gradient_device(batch, suffix=suffix)
 
 # ---------------------------------------------------------------------------
 # INTEGRATION STATUS

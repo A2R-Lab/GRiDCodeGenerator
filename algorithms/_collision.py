@@ -169,6 +169,29 @@ def collision_spec_from_urdf(robot, urdf_path, resolution, mesh_resolution=None,
             "radius": tier["radius"], "self_cc_ranges": tier["self_cc_ranges"]}
 
 
+def multi_tier_collision_spec_from_urdf(robot, urdf_path, resolutions, mesh_resolution=None):
+    """One-call URDF -> MULTI-tier collision_spec (`{"tiers": [...]}` for gen_all_code). Spherizes
+    `urdf_path` once per resolution and binds each to GRiD frames. `resolutions` = iterable of
+    sphere spacings (m); sorted DESCENDING so the returned tiers run COARSEST->FINEST (config_free
+    uses coarsest for the broad reject + finest for the confirm). Two tiers are named broad/fine;
+    more are named tier0..tierK (tier0 = coarsest). A single resolution returns the flat single-tier
+    spec (byte-identical to collision_spec_from_urdf)."""
+    res = sorted({float(r) for r in resolutions}, reverse=True)  # coarsest (largest spacing) first
+    if len(res) == 1:
+        return collision_spec_from_urdf(robot, urdf_path, res[0], mesh_resolution=mesh_resolution)
+    names = ["broad", "fine"] if len(res) == 2 else ["tier%d" % i for i in range(len(res))]
+    from ._spherize import spherize_urdf
+    outputs = {names[i]: spherize_urdf(urdf_path, res[i], mesh_resolution=mesh_resolution)
+               for i in range(len(res))}
+    built = build_sphere_tiers(robot, outputs)
+    tiers = []
+    for i in range(len(res)):
+        b = built[names[i]]
+        tiers.append({"name": names[i], "anchor": b["anchor"], "offset": b["offset"],
+                      "radius": b["radius"], "self_cc_ranges": b["self_cc_ranges"]})
+    return {"tiers": tiers}
+
+
 def build_sphere_tiers(robot, foam_outputs):
     """`foam_outputs = {tier_name: spherized_urdf_path}` (e.g. broad + fine, two foam runs).
     Returns `{tier: {"n", "anchor"[N], "offset"[3N], "radius"[N], "self_cc_ranges"[R][3]}}`.
@@ -195,26 +218,67 @@ def build_sphere_tiers(robot, foam_outputs):
     return tiers
 
 
+# --------------------------------------------------------------------------- tier normalization
+def normalize_collision_tiers(collision_spec):
+    """Normalize gen_all_code's `collision_spec` kwarg into an ORDERED (coarsest->finest) list of
+    tier dicts `{"name", "suffix", "anchor", "offset", "radius", "self_cc_ranges", "n"}`.
+
+    Accepts either:
+      * a FLAT single-tier dict `{"anchor","offset","radius","self_cc_ranges"}` (the pre-tier
+        shape; -> one finest tier, suffix ""), or
+      * a multi-tier dict `{"tiers": [ {"name","anchor","offset","radius","self_cc_ranges"}, ... ]}`
+        listed COARSEST FIRST.
+
+    Suffix assignment: the FINEST (last) tier is the public batch -> suffix "" (so the
+    differentiable API + single-tier config_free keep stable names); every coarser tier is
+    suffixed "_<name>". A single tier is therefore byte-identical to the pre-tier emission."""
+    if "tiers" in collision_spec:
+        raw = list(collision_spec["tiers"])
+        assert len(raw) >= 1, "collision_spec['tiers'] must be non-empty"
+    else:
+        raw = [{"name": "", **collision_spec}]
+    out = []
+    last = len(raw) - 1
+    for i, t in enumerate(raw):
+        name = t.get("name", "") if i != last else t.get("name", "")
+        suffix = "" if i == last else "_" + t["name"]
+        out.append({
+            "name": name, "suffix": suffix,
+            "anchor": list(t["anchor"]), "offset": list(t["offset"]),
+            "radius": list(t["radius"]), "self_cc_ranges": list(t["self_cc_ranges"]),
+            "n": len(t["anchor"]),
+        })
+    return out
+
+
 # --------------------------------------------------------------------------- namespace emitter
-def gen_collision_namespace(self, batch, radius, self_cc_ranges):
+def gen_collision_namespace(self, tiers):
     """Emit the sibling `namespace grid_collision { ... }` block (model = gen_grid_plant).
 
-    Called AFTER the `grid` namespace closes, and ONLY when a collision batch is configured
-    (the sphere set IS the multi_target batch, so this requires gen_multi_target_position to
-    have been emitted -- NUM_COLLISION_SPHERES == grid::NUM_MULTI_TARGETS). Reopens the
-    grid_collision namespace already opened by the static geometry header
+    Called AFTER the `grid` namespace closes, and ONLY when a collision batch is configured.
+    The sphere set(s) ARE the multi_target batch(es), so this requires gen_multi_target_position
+    to have been emitted per tier (NUM_COLLISION_SPHERES<CAP> == grid::NUM_MULTI_TARGETS<CAP>).
+    Reopens the grid_collision namespace already opened by the static geometry header
     (collision/grid_collision_geometry.cuh, W3 Component E) and adds the per-robot BAKED data
-    (fp32 radii + self_cc_ranges) plus a thin `config_free` entry point that binds the W1b
-    batched extractor (grid::multi_target_position_device) to the header's SDF checks.
+    (fp32 radii + self_cc_ranges) plus `config_free` composed over the W1b batched extractor
+    and the header's SDF checks.
 
-    `batch`          = build_target_batch(...) output for the spheres (n == len(radius)).
-    `radius`         = per-sphere radii (len n), baked fp32 (collision change-of-record).
-    `self_cc_ranges` = build_self_cc_ranges(...) output: list of (sphere_i, start_j, end_j).
+    `tiers` = ORDERED list (COARSEST -> FINEST) of sphere-density tiers, each a dict:
+        {"name": str, "suffix": str, "n": int, "radius": [float]*n,
+         "self_cc_ranges": [(sphere_i, start_j, end_j)]}
+    The FINEST (last) tier is the PUBLIC one: its suffix is "" so the differentiable
+    collision API (collision_distance/cost/..., NUM_COLLISION_SPHERES) and the single-tier
+    config_free keep stable, tier-count-invariant names. Coarser tiers are suffixed by name
+    (e.g. "_broad") and used ONLY as the broad-phase reject inside the multi-tier config_free.
+    A single tier (len==1) is the finest -> suffix "" -> byte-identical to the pre-tier emission.
     """
-    n = batch["n"]
-    r = len(self_cc_ranges)
+    assert len(tiers) >= 1, "collision: at least one sphere tier required"
     nv = self.robot.get_num_vel()
-    assert len(radius) == n, "collision: radius count (%d) != sphere count (%d)" % (len(radius), n)
+    fine = tiers[-1]  # finest tier = the public / differentiable batch (suffix "")
+    for t in tiers:
+        assert len(t["radius"]) == t["n"], "collision: radius count (%d) != sphere count (%d) [tier %s]" % (
+            len(t["radius"]), t["n"], t["name"])
+    assert fine["suffix"] == "", "collision: finest tier must be unsuffixed (the public batch)"
 
     # The geometry header must precede the reopened namespace (it defines the SDFs + opens
     # grid_collision). Emitted at file scope after the grid namespace closes.
@@ -229,56 +293,106 @@ def gen_collision_namespace(self, batch, radius, self_cc_ranges):
     self.gen_add_code_line("using " + self.file_namespace + "::TIER_SHARED; using " +
                            self.file_namespace + "::TIER_LITE; using " + self.file_namespace + "::TIER_MINIMAL;")
 
-    # --- baked per-robot data ---
-    flat_ranges = ", ".join(str(v) for row in self_cc_ranges for v in row) if r else "0"
-    self.gen_add_code_lines([
-        "constexpr int NUM_COLLISION_SPHERES = " + str(n) + ";",
-        "constexpr int NUM_COLLISION_SELF_CC_RANGES = " + str(r) + ";",
-        "static_assert(NUM_COLLISION_SPHERES == grid::NUM_MULTI_TARGETS, "
-        "\"collision sphere batch must be the multi_target batch\");",
-        # fp32 radii (default collision precision, USER-CONFIRMED); ranges as {i, start_j, end_j} rows.
-        "__device__ const float g_collision_sphere_r[" + str(max(n, 1)) + "] = {" +
-        ", ".join(_c_float_literal(rad) for rad in (radius or [0.0])) + "};",
-        "__device__ const int g_collision_self_cc_ranges[" + str(max(3 * r, 1)) + "] = {" + flat_ranges + "};",
-    ])
-
-    # --- fill a caller T-scratch with the baked fp32 radii (cast to T) ---
-    self.gen_add_func_doc("Fill s_r[NUM_COLLISION_SPHERES] with the baked fp32 radii cast to T",
-                          [], ["s_r is caller shared memory of size NUM_COLLISION_SPHERES"], None)
-    self.gen_add_code_line("template <typename T>")
-    self.gen_add_code_line("__device__ __forceinline__")
-    self.gen_add_code_line("void load_collision_radii(T *s_r) {", True)
-    self.gen_add_parallel_loop("i", "NUM_COLLISION_SPHERES")
-    self.gen_add_code_line("s_r[i] = static_cast<T>(g_collision_sphere_r[i]);")
-    self.gen_add_end_control_flow()
-    self.gen_add_end_function()
+    # --- baked per-robot data, PER TIER (finest is unsuffixed = the public batch) ---
+    for t in tiers:
+        sfx = t["suffix"]            # "" for finest, e.g. "_broad" for a coarse tier
+        cap = sfx.upper()
+        n = t["n"]
+        rr = t["self_cc_ranges"]
+        r = len(rr)
+        flat_ranges = ", ".join(str(v) for row in rr for v in row) if r else "0"
+        if len(tiers) > 1:
+            self.gen_add_code_line("// collision tier '" + t["name"] + "' (" + str(n) + " spheres" +
+                                   (", FINEST/public" if sfx == "" else ", broad-phase") + ")")
+        self.gen_add_code_lines([
+            "constexpr int NUM_COLLISION_SPHERES" + cap + " = " + str(n) + ";",
+            "constexpr int NUM_COLLISION_SELF_CC_RANGES" + cap + " = " + str(r) + ";",
+            "static_assert(NUM_COLLISION_SPHERES" + cap + " == grid::NUM_MULTI_TARGETS" + cap + ", "
+            "\"collision sphere batch must be the multi_target batch\");",
+            # fp32 radii (default collision precision, USER-CONFIRMED); ranges as {i, start_j, end_j} rows.
+            "__device__ const float g_collision_sphere_r" + sfx + "[" + str(max(n, 1)) + "] = {" +
+            ", ".join(_c_float_literal(rad) for rad in (t["radius"] or [0.0])) + "};",
+            "__device__ const int g_collision_self_cc_ranges" + sfx + "[" + str(max(3 * r, 1)) + "] = {" + flat_ranges + "};",
+        ])
+        # --- fill a caller T-scratch with this tier's baked fp32 radii (cast to T) ---
+        self.gen_add_func_doc("Fill s_r[NUM_COLLISION_SPHERES" + cap + "] with the baked fp32 radii cast to T",
+                              [], ["s_r is caller shared memory of size NUM_COLLISION_SPHERES" + cap], None)
+        self.gen_add_code_line("template <typename T>")
+        self.gen_add_code_line("__device__ __forceinline__")
+        self.gen_add_code_line("void load_collision_radii" + sfx + "(T *s_r) {", True)
+        self.gen_add_parallel_loop("i", "NUM_COLLISION_SPHERES" + cap)
+        self.gen_add_code_line("s_r[i] = static_cast<T>(g_collision_sphere_r" + sfx + "[i]);")
+        self.gen_add_end_control_flow()
+        self.gen_add_end_function()
 
     # --- config_free entry point ---
-    func_params = [
-        "s_q is the vector of joint positions",
-        "d_robotModel is the initialized model-specific helpers on the GPU",
-        "env is the runtime obstacle set (grid_collision::Environment<T>)",
-        "s_sphere_pos is caller scratch of size 3*NUM_COLLISION_SPHERES (smem for small N, global for many)",
-        "s_sphere_r is caller scratch of size NUM_COLLISION_SPHERES (filled here from the baked radii)",
-        "d_workspace is the multi_target FK scratch at TIER_LITE+ (nullptr at TIER_SHARED)"]
-    func_notes = [
-        "Returns true iff the current configuration q is COLLISION-FREE (self + environment).",
-        "Sphere world positions via the W1b batched extractor; SDF self/env checks via the static header.",
-        "Every thread computes the same verdict; the self/env range loops are serial (parallelize = W3 perf TODO)."]
-    self.gen_add_func_doc("Collision-free test for configuration q (self + environment)", func_notes, func_params, None)
-    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
-    self.gen_add_code_line("__device__")
-    self.gen_add_code_line("bool config_free(const T *s_q, const grid::robotModel<T> *d_robotModel, "
-                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
-    self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
-    self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
-    self.gen_add_sync()
-    self.gen_add_code_line("if (grid_cc_self_collision<T>(s_sphere_pos, s_sphere_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES)) return false;")
-    self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
-    self.gen_add_code_line("if (grid_cc_sphere_in_environment<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i])) return false;")
-    self.gen_add_end_control_flow()
-    self.gen_add_code_line("return true;")
-    self.gen_add_end_function()
+    if len(tiers) == 1:
+        # Single tier: inline self + env check on the (finest, unsuffixed) batch. Byte-identical
+        # to the pre-tier emission.
+        func_params = [
+            "s_q is the vector of joint positions",
+            "d_robotModel is the initialized model-specific helpers on the GPU",
+            "env is the runtime obstacle set (grid_collision::Environment<T>)",
+            "s_sphere_pos is caller scratch of size 3*NUM_COLLISION_SPHERES (smem for small N, global for many)",
+            "s_sphere_r is caller scratch of size NUM_COLLISION_SPHERES (filled here from the baked radii)",
+            "d_workspace is the multi_target FK scratch at TIER_LITE+ (nullptr at TIER_SHARED)"]
+        func_notes = [
+            "Returns true iff the current configuration q is COLLISION-FREE (self + environment).",
+            "Sphere world positions via the W1b batched extractor; SDF self/env checks via the static header.",
+            "Every thread computes the same verdict; the self/env range loops are serial (parallelize = W3 perf TODO)."]
+        self.gen_add_func_doc("Collision-free test for configuration q (self + environment)", func_notes, func_params, None)
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+        self.gen_add_code_line("__device__")
+        self.gen_add_code_line("bool config_free(const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                               "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
+        self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
+        self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
+        self.gen_add_sync()
+        self.gen_add_code_line("if (grid_cc_self_collision<T>(s_sphere_pos, s_sphere_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES)) return false;")
+        self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
+        self.gen_add_code_line("if (grid_cc_sphere_in_environment<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i])) return false;")
+        self.gen_add_end_control_flow()
+        self.gen_add_code_line("return true;")
+        self.gen_add_end_function()
+    else:
+        # Multi-tier: broad-phase reject (COARSEST tier) -> fine confirm (FINEST tier) via the
+        # header's grid_cc_config_free driver. The covering-sphere property (coarser => larger
+        # spheres enclosing the fine geometry) makes "broad clear => definitely free" exact, so
+        # the verdict is IDENTICAL to a fine-only check but skips the fine pass on clear configs.
+        # Middle tiers (if any) are emitted + callable but not used by config_free (the driver is
+        # coarsest+finest; a k-level cascade is a labeled header extension).
+        broad = tiers[0]
+        bsfx, bcap = broad["suffix"], broad["suffix"].upper()
+        func_params = [
+            "s_q is the vector of joint positions",
+            "d_robotModel is the initialized model-specific helpers on the GPU",
+            "env is the runtime obstacle set (grid_collision::Environment<T>)",
+            "s_broad_pos is caller scratch of size 3*NUM_COLLISION_SPHERES" + bcap + " (broad-phase sphere positions)",
+            "s_broad_r is caller scratch of size NUM_COLLISION_SPHERES" + bcap + " (filled here from broad baked radii)",
+            "s_fine_pos is caller scratch of size 3*NUM_COLLISION_SPHERES (fine sphere positions)",
+            "s_fine_r is caller scratch of size NUM_COLLISION_SPHERES (filled here from fine baked radii)",
+            "d_workspace is the multi_target FK scratch at TIER_LITE+ (nullptr at TIER_SHARED)"]
+        func_notes = [
+            "Returns true iff the current configuration q is COLLISION-FREE (self + environment).",
+            "Broad tier '" + broad["name"] + "' rejects clear configs; only possible collisions run the fine tier '" +
+            fine["name"] + "'. Verdict == fine-only (covering spheres make the broad reject conservative).",
+            "Every thread computes the same verdict; the self/env range loops are serial (parallelize = W3 perf TODO)."]
+        self.gen_add_func_doc("Collision-free test for configuration q (broad->fine, self + environment)", func_notes, func_params, None)
+        self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+        self.gen_add_code_line("__device__")
+        self.gen_add_code_line("bool config_free(const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                               "const Environment<T> &env, T *s_broad_pos, T *s_broad_r, "
+                               "T *s_fine_pos, T *s_fine_r, T *d_workspace = nullptr) {", True)
+        self.gen_add_code_line("grid::multi_target_position" + bsfx + "_device<T, RESOURCE_TIER>(s_broad_pos, s_q, d_robotModel, d_workspace);")
+        self.gen_add_code_line("load_collision_radii" + bsfx + "<T>(s_broad_r);")
+        self.gen_add_sync()
+        self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_fine_pos, s_q, d_robotModel, d_workspace);")
+        self.gen_add_code_line("load_collision_radii<T>(s_fine_r);")
+        self.gen_add_sync()
+        self.gen_add_code_line("return grid_cc_config_free<T>(env,")
+        self.gen_add_code_line("    s_broad_pos, s_broad_r, g_collision_self_cc_ranges" + bsfx + ", NUM_COLLISION_SELF_CC_RANGES" + bcap + ", NUM_COLLISION_SPHERES" + bcap + ",")
+        self.gen_add_code_line("    s_fine_pos, s_fine_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES, NUM_COLLISION_SPHERES);")
+        self.gen_add_end_function()
 
     # ---- differentiable collision PRIMITIVES + cost (value / gradient / Gauss-Newton hessian) ----
     # The raw building blocks are exposed SEPARATELY from the cost so consumers can assemble any
