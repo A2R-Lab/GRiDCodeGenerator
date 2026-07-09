@@ -213,6 +213,7 @@ def gen_collision_namespace(self, batch, radius, self_cc_ranges):
     """
     n = batch["n"]
     r = len(self_cc_ranges)
+    nv = self.robot.get_num_vel()
     assert len(radius) == n, "collision: radius count (%d) != sphere count (%d)" % (len(radius), n)
 
     # The geometry header must precede the reopened namespace (it defines the SDFs + opens
@@ -277,6 +278,161 @@ def gen_collision_namespace(self, batch, radius, self_cc_ranges):
     self.gen_add_code_line("if (grid_cc_sphere_in_environment<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i])) return false;")
     self.gen_add_end_control_flow()
     self.gen_add_code_line("return true;")
+    self.gen_add_end_function()
+
+    # ---- differentiable collision PRIMITIVES + cost (value / gradient / Gauss-Newton hessian) ----
+    # The raw building blocks are exposed SEPARATELY from the cost so consumers can assemble any
+    # collision objective (hinge, log-barrier, hard constraint) on the underlying derivatives:
+    #   collision_distance          -> per-sphere signed clearance d_i(q) (min over env) + surface normal
+    #   collision_distance_gradient -> per-sphere clearance Jacobian  d(d_i)/dq[vi] = n_i^T (dp_i/dq_vi)
+    # d(d_i)/dq composes the SDF surface normal n_i (grid_cc_nearest_obstacle) with the W2a batched
+    # position gradient (grid::multi_target_position_gradient_device, layout s_pos_grad[3*(NV*i+vi)+row]).
+    # The cost fns below are thin reductions over these primitives (a hinge on a safety margin):
+    #   viol_i = max(0, margin - d_i);  cost = 1/2 weight sum_i viol_i^2;  d(viol_i)/dq = -d(d_i)/dq.
+    # Environment-only (self-collision stays the boolean config_free feasibility test). The hard argmin
+    # over obstacles is non-smooth where the nearest obstacle switches; a consumer wanting a smooth MPC
+    # Hessian can freeze the per-sphere active obstacle across a step (the normal pre-pass is the seam).
+    _cc_state_params = [
+        "s_q is the vector of joint positions",
+        "d_robotModel is the initialized model-specific helpers on the GPU",
+        "env is the runtime obstacle set (grid_collision::Environment<T>)",
+        "s_sphere_pos is caller scratch of size 3*NUM_COLLISION_SPHERES (sphere world positions)",
+        "s_sphere_r is caller scratch of size NUM_COLLISION_SPHERES (filled here from the baked radii)",
+        "d_workspace is the multi_target FK scratch at TIER_LITE+ (nullptr at TIER_SHARED)"]
+
+    # PRIMITIVE: per-sphere signed clearance + normal
+    self.gen_add_func_doc("collision_distance: per-sphere nearest signed clearance d_i(q) + surface normal (env only)",
+                          ["d_i = min over environment obstacles of the signed distance (>0 clear, <0 penetrating).",
+                           "s_dist[i] = +1e30 sentinel when the environment is empty. Raw building block for any "
+                           "collision objective; the cost fns below reduce over it."],
+                          ["s_dist is the per-sphere clearance output (size NUM_COLLISION_SPHERES)",
+                           "s_normal is the per-sphere nearest-obstacle unit normal (size 3*NUM_COLLISION_SPHERES)"] + _cc_state_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_distance(T *s_dist, T *s_normal, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
+    self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("i", "NUM_COLLISION_SPHERES")
+    self.gen_add_code_line("T nx, ny, nz;")
+    self.gen_add_code_line("s_dist[i] = grid_cc_nearest_obstacle<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i], &nx, &ny, &nz);")
+    self.gen_add_code_line("s_normal[3*i+0] = nx; s_normal[3*i+1] = ny; s_normal[3*i+2] = nz;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+    # PRIMITIVE: per-sphere clearance Jacobian d(d_i)/dq
+    self.gen_add_func_doc("collision_distance_gradient: per-sphere clearance Jacobian s_ddist[i*NV+vi] = d(d_i)/dq_vi = n_i^T dp_i/dq_vi",
+                          ["Also returns s_dist (the clearances) so a consumer has value + Jacobian in one call.",
+                           "n_i^T (dp_i/dq) composes the SDF normal with grid::multi_target_position_gradient_device.",
+                           "s_ddist layout is per-sphere-major: sphere i's NV-gradient is s_ddist[i*NV .. i*NV+NV-1]."],
+                          ["s_dist is the per-sphere clearance output (size NUM_COLLISION_SPHERES)",
+                           "s_ddist is the per-sphere clearance Jacobian output (size NUM_COLLISION_SPHERES*NUM_VEL, sphere-major)"] +
+                          _cc_state_params +
+                          ["s_normal is caller scratch of size 3*NUM_COLLISION_SPHERES (nearest-obstacle normals)",
+                           "s_pos_grad is caller scratch of size 3*NUM_VEL*NUM_COLLISION_SPHERES (batched dp/dq)"], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_distance_gradient(T *s_dist, T *s_ddist, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *s_normal, T *s_pos_grad, "
+                           "T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("collision_distance<T, RESOURCE_TIER>(s_dist, s_normal, s_q, d_robotModel, env, s_sphere_pos, s_sphere_r, d_workspace);")
+    self.gen_add_code_line("grid::multi_target_position_gradient_device<T, RESOURCE_TIER>(s_pos_grad, s_q, d_robotModel, d_workspace);")
+    self.gen_add_sync()
+    self.gen_add_parallel_loop("ind", "NUM_COLLISION_SPHERES * " + str(nv))
+    self.gen_add_code_line("int vi = ind % " + str(nv) + "; int i = ind / " + str(nv) + ";")
+    self.gen_add_code_line("int jb = 3 * (" + str(nv) + " * i + vi);")
+    self.gen_add_code_line("s_ddist[i*" + str(nv) + " + vi] = s_normal[3*i+0]*s_pos_grad[jb+0] + s_normal[3*i+1]*s_pos_grad[jb+1] + s_normal[3*i+2]*s_pos_grad[jb+2];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+    _cc_cost_scalar_params = [
+        "margin is the safety distance (cost is a hinge on clearance < margin)",
+        "weight is the scalar quadratic penalty weight"]
+
+    # COST value
+    self.gen_add_func_doc("collision_cost: value = 1/2 * weight * sum_i max(0, margin - d_i)^2 (environment hinge)",
+                          ["Self-contained (no gradient scratch); every thread returns after the serial reduction.",
+                           "ACCUMULATE=false overwrites s_out[0]; true adds (fuse with other costs)."],
+                          ["s_out is the scalar cost output (s_out[0])"] + _cc_state_params[0:3] + _cc_cost_scalar_params + _cc_state_params[3:], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_cost(T *s_out, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T margin, T weight, "
+                           "T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
+    self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
+    self.gen_add_sync()
+    self.gen_add_serial_ops()
+    self.gen_add_code_line("T acc = static_cast<T>(0);")
+    self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
+    self.gen_add_code_line("T nx, ny, nz;")
+    self.gen_add_code_line("T d = grid_cc_nearest_obstacle<T>(env, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i], &nx, &ny, &nz);")
+    self.gen_add_code_line("T viol = margin - d;")
+    self.gen_add_code_line("if (viol > static_cast<T>(0)) acc += static_cast<T>(0.5) * weight * viol * viol;")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ACCUMULATE) { s_out[0] += acc; } else { s_out[0] = acc; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+    # COST gradient (over q; cost is q-only) -- reduction over the clearance Jacobian primitive
+    self.gen_add_func_doc("collision_cost_gradient: grad_q[vi] = -sum_i (weight*viol_i) d(d_i)/dq_vi  (viol_i = max(0,margin-d_i))",
+                          ["Gradient over q only (size NUM_VEL = " + str(nv) + "); built on collision_distance_gradient.",
+                           "ACCUMULATE=false overwrites s_grad_q; true adds."],
+                          ["s_grad_q is the q-gradient output (size NUM_VEL)"] + _cc_state_params[0:3] + _cc_cost_scalar_params + _cc_state_params[3:] +
+                          ["s_normal is caller scratch of size 3*NUM_COLLISION_SPHERES",
+                           "s_dist is caller scratch of size NUM_COLLISION_SPHERES",
+                           "s_ddist is caller scratch of size NUM_COLLISION_SPHERES*NUM_VEL (sphere-major clearance Jacobian)",
+                           "s_pos_grad is caller scratch of size 3*NUM_VEL*NUM_COLLISION_SPHERES (batched dp/dq)"], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_cost_gradient(T *s_grad_q, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T margin, T weight, "
+                           "T *s_sphere_pos, T *s_sphere_r, T *s_normal, T *s_dist, T *s_ddist, T *s_pos_grad, "
+                           "T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("collision_distance_gradient<T, RESOURCE_TIER>(s_dist, s_ddist, s_q, d_robotModel, env, s_sphere_pos, s_sphere_r, s_normal, s_pos_grad, d_workspace);")
+    self.gen_add_code_line("// grad_q[vi] = sum_i (weight*viol_i) * d(viol_i)/dq_vi, with d(viol)/dq = -d(clearance)/dq = -s_ddist")
+    self.gen_add_parallel_loop("vi", str(nv))
+    self.gen_add_code_line("T g = static_cast<T>(0);")
+    self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
+    self.gen_add_code_line("T viol = margin - s_dist[i];")
+    self.gen_add_code_line("if (viol > static_cast<T>(0)) g += (weight * viol) * s_ddist[i*" + str(nv) + " + vi];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ACCUMULATE) { s_grad_q[vi] += -g; } else { s_grad_q[vi] = -g; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+    # COST Gauss-Newton hessian (over q; PSD) -- outer product of the clearance Jacobian over active spheres
+    self.gen_add_func_doc("collision_cost_hessian: GN hessian H[vi,vj] = sum_{active i} weight d(d_i)/dq_vi d(d_i)/dq_vj",
+                          ["NUM_VEL x NUM_VEL (= " + str(nv) + "x" + str(nv) + ") column-major; PSD by construction; built on "
+                           "collision_distance_gradient. GN term only (residual-weighted SDF curvature dropped -- the "
+                           "ratified PSD choice; full-Newton collision hessian = labeled TODO).",
+                           "ACCUMULATE=false overwrites; true adds."],
+                          ["s_hess is the NUM_VEL x NUM_VEL column-major hessian output"] + _cc_state_params[0:3] + _cc_cost_scalar_params + _cc_state_params[3:] +
+                          ["s_normal is caller scratch of size 3*NUM_COLLISION_SPHERES",
+                           "s_dist is caller scratch of size NUM_COLLISION_SPHERES",
+                           "s_ddist is caller scratch of size NUM_COLLISION_SPHERES*NUM_VEL (sphere-major clearance Jacobian)",
+                           "s_pos_grad is caller scratch of size 3*NUM_VEL*NUM_COLLISION_SPHERES (batched dp/dq)"], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER, bool ACCUMULATE = false>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_cost_hessian(T *s_hess, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T margin, T weight, "
+                           "T *s_sphere_pos, T *s_sphere_r, T *s_normal, T *s_dist, T *s_ddist, T *s_pos_grad, "
+                           "T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("collision_distance_gradient<T, RESOURCE_TIER>(s_dist, s_ddist, s_q, d_robotModel, env, s_sphere_pos, s_sphere_r, s_normal, s_pos_grad, d_workspace);")
+    self.gen_add_parallel_loop("ind", str(nv * nv))
+    self.gen_add_code_line("int row = ind % " + str(nv) + "; int col = ind / " + str(nv) + ";")
+    self.gen_add_code_line("T h = static_cast<T>(0);")
+    self.gen_add_code_line("for (int i = 0; i < NUM_COLLISION_SPHERES; ++i) {", True)
+    self.gen_add_code_line("if ((margin - s_dist[i]) > static_cast<T>(0)) h += weight * s_ddist[i*" + str(nv) + " + row] * s_ddist[i*" + str(nv) + " + col];")
+    self.gen_add_end_control_flow()
+    self.gen_add_code_line("if (ACCUMULATE) { s_hess[ind] += h; } else { s_hess[ind] = h; }")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
     self.gen_add_end_function()
 
     self.gen_add_end_control_flow()  # close namespace grid_collision
