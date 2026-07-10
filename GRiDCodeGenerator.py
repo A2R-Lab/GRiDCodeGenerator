@@ -14,7 +14,7 @@ from .algorithms._idsva_so import _idsva_so_use_world_frame
 # (algo_label, algo_short, gate_attr, bytes_macro) — only the irregular kernel
 # overload SIGNATURES stay as co-located payload data.
 from .algo_registry import (ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol, descriptor_for,
-                            arena_ctx_from_codegen, compose_arena_full)
+                            arena_ctx_from_codegen, compose_arena_full, compose_arena_rungs)
 
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
@@ -903,8 +903,11 @@ class GRiDCodeGenerator:
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_minv_inner_F_size()
         _minv_no_F_count = self.gen_minv_inner_no_F_size()
-        _minv_t_count_full     = n + n*n + _minv_F_count + _minv_no_F_count + XI_size + rt_xfixed_reserve
-        _minv_t_count_surgical = n + n*n                 + _minv_no_F_count + XI_size + rt_xfixed_reserve
+        _minv_rungs_legacy = (n + n*n + _minv_F_count + _minv_no_F_count + XI_size + rt_xfixed_reserve,
+                              n + n*n                 + _minv_no_F_count + XI_size + rt_xfixed_reserve)
+        (_minv_t_count_full, _minv_t_count_surgical) = compose_arena_rungs("minv", self._arena_ctx)   # Step 3.2 fold
+        assert (_minv_t_count_full, _minv_t_count_surgical) == _minv_rungs_legacy, \
+            f"arena parity minv rungs: {(_minv_t_count_full, _minv_t_count_surgical)} != {_minv_rungs_legacy}"
         self.minv_spill_tier_3way = select_shared_tier_3way(_minv_t_count_full, _minv_t_count_surgical)
         self.minv_use_workspace_F = self.minv_spill_tier_3way[0] == 1
         minv_t_count = _minv_t_count_full if not self.minv_use_workspace_F else _minv_t_count_surgical
@@ -922,8 +925,11 @@ class GRiDCodeGenerator:
         # n>nv so the arena must reserve the wider 3*n slot the kernel slices (the
         # old 3*nv+fb under-reserved by 3*(n-nv)-fb floats -> smem overrun).
         _fd_base = 3*n + nv + XI_size + rt_xfixed_reserve
-        _fd_t_count_full      = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
-        _fd_t_count_surgical  = _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
+        _fd_rungs_legacy = (_fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
+                            _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
+        (_fd_t_count_full, _fd_t_count_surgical) = compose_arena_rungs("forward_dynamics", self._arena_ctx)   # Step 3.2 fold
+        assert (_fd_t_count_full, _fd_t_count_surgical) == _fd_rungs_legacy, \
+            f"arena parity forward_dynamics rungs: {(_fd_t_count_full, _fd_t_count_surgical)} != {_fd_rungs_legacy}"
         self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
         self.fd_use_workspace_F = self.fd_spill_tier_3way[0] == 1
         fd_t_count = _fd_t_count_full if not self.fd_use_workspace_F else _fd_t_count_surgical
@@ -1182,9 +1188,13 @@ class GRiDCodeGenerator:
         # raising occupancy on big floating robots (h2_plus crba LITE ~47.6KB -> ~34KB).
         _crba_inner   = self.gen_crba_inner_temp_mem_size()
         _crba_no_M    = crba_input_t_count + XI_size + rt_xfixed_reserve   # input + XI, no s_M
-        _crba_t_count_full         = nv*nv + _crba_no_M + _crba_inner      # s_M + inner band + input/XI
-        _crba_t_count_output_spill = _crba_no_M + _crba_inner              # s_M -> d_workspace; hot band stays smem
-        _crba_t_count_workspace    = _crba_no_M                            # both s_M and inner band spilled
+        _crba_rungs_legacy = (nv*nv + _crba_no_M + _crba_inner,   # full: s_M + inner + input/XI
+                              _crba_no_M + _crba_inner,           # output_spill: s_M -> d_workspace
+                              _crba_no_M)                         # workspace: s_M + inner -> d_workspace
+        (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace) = \
+            compose_arena_rungs("crba", self._arena_ctx)   # Step 3.2 fold
+        assert (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace) == _crba_rungs_legacy, \
+            f"arena parity crba rungs: {(_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)} != {_crba_rungs_legacy}"
         self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)
         # whole-band spill (inner band -> d_workspace) fires only at the deepest rung (index 2).
         self.crba_use_workspace_temp = self.crba_spill_tier_3way[0] == 2
@@ -1545,6 +1555,14 @@ class GRiDCodeGenerator:
             "idsva_so_world_frame":                idsva_so_world_frame_full_t_count,
             "fdsva_so":                            _fdsva_so_tiers[0][1],
             "integrator_hessian":                  _psh_t_full,
+        }
+        # Spill-ladder rung arenas (least-spill first), for the composer parity net on
+        # the LADDERED folds (Step 3.2+). Keyed by ALGO_DESCRIPTORS key; each tuple is
+        # the hand-written legacy rungs the descriptor `compose_arena_rungs` reproduces.
+        self._arena_rung_t_counts = {
+            "crba":              _crba_rungs_legacy,
+            "minv":              _minv_rungs_legacy,
+            "forward_dynamics":  _fd_rungs_legacy,
         }
 
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK

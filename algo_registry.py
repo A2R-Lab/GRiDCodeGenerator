@@ -400,6 +400,7 @@ class ArenaCtx:
     minv_noF: int
     ximats_helper_temp: int
     fd_inner_Fsmem: int
+    fd_inner_noFsmem: int
     fdgrad_inner: int
     idgrad_inner: int
     aba_inner: int
@@ -464,6 +465,7 @@ def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
         minv_noF=gen.gen_minv_inner_no_F_size(),
         ximats_helper_temp=gen.gen_load_update_XImats_helpers_temp_mem_size(),
         fd_inner_Fsmem=gen.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
+        fd_inner_noFsmem=gen.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False),
         fdgrad_inner=gen.gen_forward_dynamics_gradient_inner_temp_mem_size(),
         idgrad_inner=gen.gen_inverse_dynamics_gradient_inner_temp_mem_size(),
         aba_inner=gen.gen_aba_inner_temp_mem_size(),
@@ -570,3 +572,36 @@ def compose_arena_full(key: str, ctx: ArenaCtx) -> int:
     Parity-checked against GRiDCodeGenerator._arena_full_t_counts[key]. Raises KeyError
     for SO-dispatch algos not yet composed (see ARENA_COMPOSED_KEYS)."""
     return _ARENA_FULL_FNS[key](ctx)
+
+
+# Per-algo SPILL-LADDER rung arenas (least-spill first), composed from the ArenaCtx.
+# The generator still runs `select_shared_tier_3way(*rungs)` (the picker needs the
+# robot's smem budget, not pure ctx) and builds the per-tier tuple that drives the
+# TIER-templated `*_DYNAMIC_SHARED_MEM_BYTES` macro. This folds the RUNG SIZING (the
+# §2-relevant buffer lists) into the table; rung[0] MUST equal `arena_full_fn`. Most
+# rungs are subtractive (full − buffer) but FD/MINV re-call the inner helper with
+# minv_f_in_smem=False, so they read the dedicated ctx.fd_inner_noFsmem / minv_noF.
+_ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
+    "crba": (
+        lambda c: c.nv*c.nv + (c.n + c.nv) + c.XI + c.rt + c.crba_inner,   # full: s_M + inner + input/XI
+        lambda c: (c.n + c.nv) + c.XI + c.rt + c.crba_inner,               # output_spill: s_M -> ws
+        lambda c: (c.n + c.nv) + c.XI + c.rt,                              # workspace: s_M + inner -> ws
+    ),
+    "minv": (
+        lambda c: c.n + c.n*c.n + c.minv_F + c.minv_noF + c.XI + c.rt,     # full: F in smem
+        lambda c: c.n + c.n*c.n + c.minv_noF + c.XI + c.rt,                # surgical: F -> ws
+    ),
+    "forward_dynamics": (
+        lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_Fsmem,           # full: minv-F in smem
+        lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_noFsmem,         # surgical: minv-F -> ws
+    ),
+}
+
+ARENA_RUNG_KEYS: frozenset[str] = frozenset(_ARENA_RUNG_FNS)
+
+
+def compose_arena_rungs(key: str, ctx: ArenaCtx) -> tuple[int, ...]:
+    """Spill-ladder rung arenas (least-spill first) for `key`, composed from the
+    ArenaCtx. Fed to the generator's `select_shared_tier_3way`. rung[0] == the FULL
+    arena (asserted consistent with `compose_arena_full` by the parity test)."""
+    return tuple(fn(ctx) for fn in _ARENA_RUNG_FNS[key])
