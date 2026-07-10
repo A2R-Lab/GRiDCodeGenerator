@@ -595,6 +595,41 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_Fsmem,           # full: minv-F in smem
         lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_noFsmem,         # surgical: minv-F -> ws
     ),
+    # ── 3.3 clean ladders ──
+    "coriolis_matrix": (
+        lambda c: c.nv*c.nv + (c.n + c.nv) + c.XI + c.rt + c.coriolis_inner,  # full: s_coriolis + inner + input/XI
+        lambda c: (c.n + c.nv) + c.XI + c.rt + c.coriolis_inner,              # output_spill: s_coriolis -> SO band
+        lambda c: (c.n + c.nv) + c.XI + c.rt,                                 # workspace: output + inner -> ws
+    ),
+    "integrator": (
+        lambda c: (3*c.n + c.nv + 3*c.nv + 3*(c.n + c.nv) + (c.n + c.nv)
+                   + c.XI + c.rt + c.fd_inner_Fsmem),                         # full: minv-F in smem
+        lambda c: (3*c.n + c.nv + 3*c.nv + 3*(c.n + c.nv) + (c.n + c.nv)
+                   + c.XI + c.rt + c.fd_inner_noFsmem),                       # Fspill: minv-F -> ws
+    ),
+    # dccrba family (XmatsHom domain, s_J band tier-routed). rung[0] == full closure.
+    "dccrba": (
+        lambda c: (c.n + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom) + 6*c.nv*c.nv + c.dccrba_sJ,  # L0: out + s_J in smem
+        lambda c: (c.n + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom) + c.dccrba_sJ,                 # L1: out -> ws, s_J smem
+        lambda c: (c.n + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom),                                # L2: out + s_J -> ws
+    ),
+    "cmm_time_variation": (
+        lambda c: (2*c.n + 6*c.nv + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom) + c.dccrba_sJ,  # L0: s_J in smem
+        lambda c: (2*c.n + 6*c.nv + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom),                # L1: s_J -> ws
+    ),
+    # com/ccrba/energy (centroidal, s_J band tier-routed). Differ only in the input+output band.
+    "com": (
+        lambda c: (c.n + (3 + 3*c.nv) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom) + 6*c.nv*c.NB,  # L0: s_J smem
+        lambda c: (c.n + (3 + 3*c.nv) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom),                # L1: s_J -> ws
+    ),
+    "ccrba": (
+        lambda c: (2*c.n + (6*c.nv + 6) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom) + 6*c.nv*c.NB,
+        lambda c: (2*c.n + (6*c.nv + 6) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom),
+    ),
+    "energy": (
+        lambda c: (2*c.n + 3 + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom) + 6*c.nv*c.NB,
+        lambda c: (2*c.n + 3 + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom),
+    ),
 }
 
 ARENA_RUNG_KEYS: frozenset[str] = frozenset(_ARENA_RUNG_FNS)

@@ -775,9 +775,13 @@ class GRiDCodeGenerator:
         # whole-band rung ~22KB (LITE/MINIMAL).
         _coriolis_inner   = self.gen_coriolis_matrix_inner_temp_mem_size()
         _coriolis_no_out  = (n + nv) + XI_size + rt_xfixed_reserve            # input + XI, no s_coriolis
-        _coriolis_t_full          = nv*nv + _coriolis_no_out + _coriolis_inner   # output + inner band + input/XI
-        _coriolis_t_output_spill  = _coriolis_no_out + _coriolis_inner          # s_coriolis -> SO band; inner stays smem
-        _coriolis_t_workspace     = _coriolis_no_out                            # both output and inner band spilled
+        _coriolis_rungs_legacy = (nv*nv + _coriolis_no_out + _coriolis_inner,   # output + inner band + input/XI
+                                  _coriolis_no_out + _coriolis_inner,          # s_coriolis -> SO band; inner stays smem
+                                  _coriolis_no_out)                            # both output and inner band spilled
+        (_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace) = \
+            compose_arena_rungs("coriolis_matrix", self._arena_ctx)   # Step 3.3 fold
+        assert (_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace) == _coriolis_rungs_legacy, \
+            f"arena parity coriolis rungs: {(_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)} != {_coriolis_rungs_legacy}"
         self.coriolis_matrix_spill_tier_3way = select_shared_tier_3way(_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)
         # whole-band spill (inner scratch -> d_workspace) fires only at the deepest rung (index 2).
         self.coriolis_matrix_use_workspace_temp = self.coriolis_matrix_spill_tier_3way[0] == 2
@@ -797,8 +801,11 @@ class GRiDCodeGenerator:
         # it to the d_workspace SO band.
         #   base = s_q_qd(2n) + s_out(6nv) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
         _cmm_base = 2*n + 6*nv + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        _cmm_t_count_full = _cmm_base + _dccrba_sJ   # L0: s_J in smem
-        _cmm_t_count_Jspill = _cmm_base              # L1: s_J -> d_workspace
+        _cmm_rungs_legacy = (_cmm_base + _dccrba_sJ,   # L0: s_J in smem
+                             _cmm_base)                # L1: s_J -> d_workspace
+        (_cmm_t_count_full, _cmm_t_count_Jspill) = compose_arena_rungs("cmm_time_variation", self._arena_ctx)   # Step 3.3 fold
+        assert (_cmm_t_count_full, _cmm_t_count_Jspill) == _cmm_rungs_legacy, \
+            f"arena parity cmm rungs: {(_cmm_t_count_full, _cmm_t_count_Jspill)} != {_cmm_rungs_legacy}"
         self.cmm_time_variation_spill_tier_3way = select_shared_tier_3way(_cmm_t_count_full, _cmm_t_count_Jspill)
         self.cmm_time_variation_t_count_per_tier = tuple(
             (_cmm_t_count_full, _cmm_t_count_Jspill)[i] for i in self.cmm_time_variation_spill_tier_3way
@@ -811,9 +818,12 @@ class GRiDCodeGenerator:
         #   base = s_q(n) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom (no out, no s_J).
         _dccrba_out = 6 * nv * nv
         _dccrba_base = n + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        _dccrba_L0 = _dccrba_base + _dccrba_out + _dccrba_sJ   # nothing spilled
-        _dccrba_L1 = _dccrba_base + _dccrba_sJ                 # output -> ws, s_J in smem
-        _dccrba_L2 = _dccrba_base                              # output + s_J -> ws
+        _dccrba_rungs_legacy = (_dccrba_base + _dccrba_out + _dccrba_sJ,   # L0: nothing spilled
+                                _dccrba_base + _dccrba_sJ,                 # L1: output -> ws, s_J in smem
+                                _dccrba_base)                              # L2: output + s_J -> ws
+        (_dccrba_L0, _dccrba_L1, _dccrba_L2) = compose_arena_rungs("dccrba", self._arena_ctx)   # Step 3.3 fold
+        assert (_dccrba_L0, _dccrba_L1, _dccrba_L2) == _dccrba_rungs_legacy, \
+            f"arena parity dccrba rungs: {(_dccrba_L0, _dccrba_L1, _dccrba_L2)} != {_dccrba_rungs_legacy}"
         self.dccrba_spill_tier_3way = select_shared_tier_3way(_dccrba_L0, _dccrba_L1, _dccrba_L2)
         self.dccrba_t_count_per_tier = tuple(
             (_dccrba_L0, _dccrba_L1, _dccrba_L2)[i] for i in self.dccrba_spill_tier_3way
@@ -959,8 +969,11 @@ class GRiDCodeGenerator:
         # the standalone forward_dynamics kernel's MINV_F_IN_SMEM lever. For
         # h1_2 the value arena overflows by only a few KB, so the surgical F
         # spill is enough — no whole-arena dump.
-        _integrator_t_count_full   = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True)
-        _integrator_t_count_Fspill = _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False)
+        _integrator_rungs_legacy = (_integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
+                                    _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
+        (_integrator_t_count_full, _integrator_t_count_Fspill) = compose_arena_rungs("integrator", self._arena_ctx)   # Step 3.3 fold
+        assert (_integrator_t_count_full, _integrator_t_count_Fspill) == _integrator_rungs_legacy, \
+            f"arena parity integrator rungs: {(_integrator_t_count_full, _integrator_t_count_Fspill)} != {_integrator_rungs_legacy}"
         self.integrator_spill_tier_3way = select_shared_tier_3way(_integrator_t_count_full, _integrator_t_count_Fspill)
         self.integrator_t_count_per_tier = tuple(
             (_integrator_t_count_full, _integrator_t_count_Fspill)[i] for i in self.integrator_spill_tier_3way)
@@ -1293,12 +1306,22 @@ class GRiDCodeGenerator:
         _com_base    = n     + (3 + 3*nv) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
         _ccrba_base  = 2*n   + (6*nv + 6) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
         _energy_base = 2*n   + 3          + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
-        self.com_spill_tier_3way    = select_shared_tier_3way(_com_base + _centroidal_sJ, _com_base)
-        self.ccrba_spill_tier_3way  = select_shared_tier_3way(_ccrba_base + _centroidal_sJ, _ccrba_base)
-        self.energy_spill_tier_3way = select_shared_tier_3way(_energy_base + _centroidal_sJ, _energy_base)
-        self.com_t_count_per_tier    = tuple((_com_base + _centroidal_sJ, _com_base)[i] for i in self.com_spill_tier_3way)
-        self.ccrba_t_count_per_tier  = tuple((_ccrba_base + _centroidal_sJ, _ccrba_base)[i] for i in self.ccrba_spill_tier_3way)
-        self.energy_t_count_per_tier = tuple((_energy_base + _centroidal_sJ, _energy_base)[i] for i in self.energy_spill_tier_3way)
+        _com_rungs_legacy    = (_com_base + _centroidal_sJ, _com_base)
+        _ccrba_rungs_legacy  = (_ccrba_base + _centroidal_sJ, _ccrba_base)
+        _energy_rungs_legacy = (_energy_base + _centroidal_sJ, _energy_base)
+        _com_rungs    = compose_arena_rungs("com", self._arena_ctx)      # Step 3.3 fold
+        _ccrba_rungs  = compose_arena_rungs("ccrba", self._arena_ctx)    # Step 3.3 fold
+        _energy_rungs = compose_arena_rungs("energy", self._arena_ctx)   # Step 3.3 fold
+        assert _com_rungs == _com_rungs_legacy and _ccrba_rungs == _ccrba_rungs_legacy \
+            and _energy_rungs == _energy_rungs_legacy, \
+            f"arena parity centroidal rungs: {(_com_rungs, _ccrba_rungs, _energy_rungs)} != " \
+            f"{(_com_rungs_legacy, _ccrba_rungs_legacy, _energy_rungs_legacy)}"
+        self.com_spill_tier_3way    = select_shared_tier_3way(*_com_rungs)
+        self.ccrba_spill_tier_3way  = select_shared_tier_3way(*_ccrba_rungs)
+        self.energy_spill_tier_3way = select_shared_tier_3way(*_energy_rungs)
+        self.com_t_count_per_tier    = tuple(_com_rungs[i] for i in self.com_spill_tier_3way)
+        self.ccrba_t_count_per_tier  = tuple(_ccrba_rungs[i] for i in self.ccrba_spill_tier_3way)
+        self.energy_t_count_per_tier = tuple(_energy_rungs[i] for i in self.energy_spill_tier_3way)
         self.centroidal_spill_J_ws_count = _centroidal_sJ
         # Size-triggered gravity-shim full-spill. Default OFF; if shim total shared
         # would exceed the target, set self.idsva_so_body_frame_grav_full_spill and
@@ -1560,9 +1583,16 @@ class GRiDCodeGenerator:
         # the LADDERED folds (Step 3.2+). Keyed by ALGO_DESCRIPTORS key; each tuple is
         # the hand-written legacy rungs the descriptor `compose_arena_rungs` reproduces.
         self._arena_rung_t_counts = {
-            "crba":              _crba_rungs_legacy,
-            "minv":              _minv_rungs_legacy,
-            "forward_dynamics":  _fd_rungs_legacy,
+            "crba":               _crba_rungs_legacy,
+            "minv":               _minv_rungs_legacy,
+            "forward_dynamics":   _fd_rungs_legacy,
+            "coriolis_matrix":    _coriolis_rungs_legacy,
+            "integrator":         _integrator_rungs_legacy,
+            "dccrba":             _dccrba_rungs_legacy,
+            "cmm_time_variation": _cmm_rungs_legacy,
+            "com":                _com_rungs_legacy,
+            "ccrba":              _ccrba_rungs_legacy,
+            "energy":             _energy_rungs_legacy,
         }
 
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
