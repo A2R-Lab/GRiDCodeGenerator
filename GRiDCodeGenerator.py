@@ -1376,13 +1376,19 @@ class GRiDCodeGenerator:
             ("output_temp",   _idsva_bf_base_smem,           True,  True,  False, False),
         ]
         self._idsva_so_body_tier_table = _idsva_so_body_tiers
+        _idsva_so_body_arenas_legacy = tuple(t[1] for t in _idsva_so_body_tiers)
         if self.robot.floating_base:
             # Diagnostic path: keep legacy single-body emit + grav shim (no ladder).
+            # The body ladder is NOT composed here: floating body inner is grav_full_spill-
+            # dependent (picker-driven), so it is not ctx-pure — the single-value override
+            # stays in-gen and the body rungs are asserted/captured only on fixed base.
             self.idsva_so_body_frame_spill_tier_3way = (0, 0, 0)
             self.idsva_so_body_frame_t_count_per_tier = (idsva_so_body_frame_t_count,) * 3
             self.idsva_so_body_frame_use_ladder = False
         else:
-            _idsva_so_body_arenas = tuple(t[1] for t in _idsva_so_body_tiers)
+            _idsva_so_body_arenas = compose_arena_rungs("idsva_so_body_frame", self._arena_ctx)   # Step 3.5 fold (fixed-base ladder)
+            assert _idsva_so_body_arenas == _idsva_so_body_arenas_legacy, \
+                f"arena parity idsva_so_body rungs: {_idsva_so_body_arenas} != {_idsva_so_body_arenas_legacy}"
             self.idsva_so_body_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_body_arenas)
             self.idsva_so_body_frame_t_count_per_tier = tuple(_idsva_so_body_arenas[i] for i in self.idsva_so_body_frame_spill_tier_3way)
             self.idsva_so_body_frame_use_ladder = True
@@ -1414,7 +1420,10 @@ class GRiDCodeGenerator:
             ("output_temp",   _idsva_wf_base_smem,                                True,  True,  False),
         ]
         self._idsva_so_world_tier_table = _idsva_so_world_tiers
-        _idsva_so_world_arenas = tuple(t[1] for t in _idsva_so_world_tiers)
+        _idsva_so_world_arenas_legacy = tuple(t[1] for t in _idsva_so_world_tiers)
+        _idsva_so_world_arenas = compose_arena_rungs("idsva_so_world_frame", self._arena_ctx)   # Step 3.5 fold
+        assert _idsva_so_world_arenas == _idsva_so_world_arenas_legacy, \
+            f"arena parity idsva_so_world rungs: {_idsva_so_world_arenas} != {_idsva_so_world_arenas_legacy}"
         self.idsva_so_world_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_world_arenas)
         self.idsva_so_world_frame_t_count_per_tier = tuple(_idsva_so_world_arenas[i] for i in self.idsva_so_world_frame_spill_tier_3way)
         self.idsva_so_world_frame_use_global_output = _idsva_so_world_tiers[self.idsva_so_world_frame_spill_tier_3way[0]][2]
@@ -1580,7 +1589,7 @@ class GRiDCodeGenerator:
             # captured here for the 3.4/3.5 fold commits, NOT composed in Step 3.0.
             "idsva_so_body_frame":                 (_idsva_bf_full if not self.robot.floating_base
                                                     else idsva_so_body_frame_t_count),
-            "idsva_so_world_frame":                idsva_so_world_frame_full_t_count,
+            "idsva_so_world_frame":                _idsva_so_world_arenas[0],
             "fdsva_so":                            _fdsva_so_arenas[0],
             "integrator_hessian":                  _psh_t_full,
         }
@@ -1599,7 +1608,12 @@ class GRiDCodeGenerator:
             "ccrba":              _ccrba_rungs_legacy,
             "energy":             _energy_rungs_legacy,
             "fdsva_so":           _fdsva_so_arenas_legacy,
+            "idsva_so_world_frame": _idsva_so_world_arenas_legacy,
         }
+        # Body ladder is fixed-base only (floating body uses the picker-driven override,
+        # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.
+        if not self.robot.floating_base:
+            self._arena_rung_t_counts["idsva_so_body_frame"] = _idsva_so_body_arenas_legacy
 
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before inverse_dynamics_gradient / forward_dynamics_gradient in any kernel that

@@ -415,6 +415,7 @@ class ArenaCtx:
     fdsva_fdg_inline: int      # gen_fdsva_so_fd_gradient_inline_temp_mem_size()
     fdsva_fdg_inline_spilled: int  # ..._spilled()
     idsva_world_cold: int      # gen_idsva_so_world_cold_floats()
+    idsva_bf_jids_a: int       # len(get_jid_ancestor_ids(include_joint=True)[0]) — body t/p scratch span
     has_spherical: bool
 
     # ── derived buffer counts (thin helpers so the closures read like the source) ──
@@ -512,6 +513,7 @@ def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
         fdsva_fdg_inline=gen.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
         fdsva_fdg_inline_spilled=gen.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled(),
         idsva_world_cold=gen.gen_idsva_so_world_cold_floats(),
+        idsva_bf_jids_a=len(robot.get_jid_ancestor_ids(include_joint=True)[0]),
         has_spherical=bool(gen.robot.robot_has_spherical()),
     )
 
@@ -589,9 +591,14 @@ _ARENA_FULL_FNS: dict[str, Callable[[ArenaCtx], int]] = {
     "energy":
         lambda c: (2*c.n + 3 + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom)
                   + 6*c.nv*c.NB,
-    # ── Second-order (s_temp domain, 8-rung ladder — full == rung-0) ──
+    # ── Second-order (s_temp domain — full == rung-0) ──
     "fdsva_so":
         lambda c: c.fdsva_base + 8*c.nv**3 + c.fdsva_temp_full,
+    # idsva_so world frame: full arena is ctx-pure (no picker). Body-frame full is
+    # NOT composed — its floating path is a picker-dependent single-value override
+    # (grav_full_spill) inseparable from the smem budget, so it stays in-gen (see 3.5).
+    "idsva_so_world_frame":
+        lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt + 4*c.nv**3,
 }
 
 
@@ -648,6 +655,23 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: (c.fdsva_base - 2*c.nv*c.nv) + c.fdsva_temp_spilled,      # spill_df_du
         lambda c: (c.fdsva_base - 2*c.nv*c.nv - c.nv*c.nv) + c.fdsva_temp_spilled,  # spill_Minv
         lambda c: c.fdsva_base,                                             # pool_global
+    ),
+    # ── 3.5 idsva_so dispatch ladders. Body ladder (5-rung) is FIXED-BASE only —
+    # the generator composes/asserts it just on fixed base (floating body uses a
+    # picker-dependent single-value override kept in-gen). World ladder (4-rung) is
+    # composed on all bases. rung[0] == the respective full arena. ──
+    "idsva_so_body_frame": (
+        lambda c: (3*c.n) + c.idsva_body_inner + c.XI + 4*c.nv**3 + c.rt,   # full: output + s_temp + BC in smem
+        lambda c: (3*c.n) + c.idsva_body_inner + c.XI + c.rt,               # global_output: 4nv³ output -> ws
+        lambda c: (3*c.n) + c.idsva_body_inner + c.XI + c.rt - 36*c.NB,     # output_bc: + BC(36NB) -> ws
+        lambda c: (3*c.n) + c.idsva_body_inner + c.XI + c.rt - 36*c.idsva_bf_jids_a,  # output_tp: + t/p scratch -> ws
+        lambda c: (3*c.n) + c.XI,                                           # output_temp: whole s_temp -> ws (no rt)
+    ),
+    "idsva_so_world_frame": (
+        lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt + 4*c.nv**3,  # full: output + s_temp in smem
+        lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt,              # global_output: 4nv³ output -> ws
+        lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt - c.idsva_world_cold,  # output_cold: + cold quad -> ws
+        lambda c: (3*c.n) + c.XI,                                           # output_temp: whole s_temp -> ws (no rt)
     ),
     # ── 3.3 clean ladders ──
     "coriolis_matrix": (
