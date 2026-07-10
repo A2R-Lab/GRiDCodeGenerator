@@ -472,6 +472,18 @@ class ArenaCtx:
         # SPARSE inner shrinks to max(minv inner, the da_df selective_shared_count).
         return self.fdgrad_inner if self.has_mimic else max(self.minv_inner, self.idgrad_selective_shared)
 
+    @property
+    def idgrad_selective(self) -> int:   # id_gradient selective inner (mimic dense can't shrink)
+        return self.idgrad_inner if self.has_mimic else self.idgrad_selective_shared
+
+    @property
+    def fdgrad_selective(self) -> int:   # fd_gradient selective inner = max(minv, id_grad selective)
+        return max(self.minv_inner, self.idgrad_selective)
+
+    @property
+    def aba_surgical_inner(self) -> int:   # aba surgical rung hot-band inner (cold sub-band -> d_cold)
+        return (self.aba_inner - 138) if self.floating else (98 * self.NJ)
+
 
 def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
     """Build an ArenaCtx from a GRiDCodeGenerator. Reads the same sizing primitives +
@@ -681,6 +693,24 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt,              # global_output: 4nv³ output -> ws
         lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt - c.idsva_world_cold,  # output_cold: + cold quad -> ws
         lambda c: (3*c.n) + c.XI,                                           # output_temp: whole s_temp -> ws (no rt)
+    ),
+    # ── 3.5c core-gradient + aba ladders ──
+    "inverse_dynamics_gradient": (
+        lambda c: (c.nv + c.n) + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.idgrad_inner + c.XI + c.rt,      # full
+        lambda c: (c.nv + c.n) + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.idgrad_selective + c.XI + c.rt,  # selective inner
+        lambda c: (c.nv + c.n) + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.XI + c.rt,                       # emergency: inner -> ws
+    ),
+    "forward_dynamics_gradient": (
+        lambda c: 3*c.n + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.nv*c.nv + c.fdgrad_inner + c.XI + c.rt,      # full
+        lambda c: 3*c.n + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.nv*c.nv + c.fdgrad_selective + c.XI + c.rt,  # selective inner
+        lambda c: 3*c.n + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.nv*c.nv + c.XI + c.rt,                       # emergency: inner -> ws
+        lambda c: (3*c.n + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.nv*c.nv + c.XI + c.rt
+                   - (2*c.nv*c.nv + c.nv*c.nv)),                                                           # output_spill: + s_dc_du/s_Minv -> SO band
+    ),
+    "aba": (
+        lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt + c.aba_inner,           # full: whole inner in smem
+        lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt + c.aba_surgical_inner,  # surgical: cold sub-band -> d_cold
+        lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt,                         # workspace: whole inner -> ws
     ),
     # integrator_gradient 4-rung ladder. rung[0] == _integrator_gradient_full. Dqdd =
     # max_stages(4)*nv*3nv, dAB = 2*nv*3nv. rung-2 selective-inner shrink is mimic-conditional.

@@ -1136,8 +1136,14 @@ class GRiDCodeGenerator:
         # (inverse_dynamics_gradient_spill_tier etc.) are kept = perf pick so today's emit paths
         # are byte-for-byte unchanged; the lite/minimal indices are exposed
         # only as metadata until the per-tier emit work lands.
-        _inverse_dynamics_gradient_arenas = (inverse_dynamics_gradient_t_count_full, inverse_dynamics_gradient_t_count_selective, inverse_dynamics_gradient_t_count_emergency)
-        _forward_dynamics_gradient_arenas = (forward_dynamics_gradient_t_count_full, forward_dynamics_gradient_t_count_selective, forward_dynamics_gradient_t_count_emergency, forward_dynamics_gradient_t_count_output_spill)
+        _inverse_dynamics_gradient_arenas_legacy = (inverse_dynamics_gradient_t_count_full, inverse_dynamics_gradient_t_count_selective, inverse_dynamics_gradient_t_count_emergency)
+        _forward_dynamics_gradient_arenas_legacy = (forward_dynamics_gradient_t_count_full, forward_dynamics_gradient_t_count_selective, forward_dynamics_gradient_t_count_emergency, forward_dynamics_gradient_t_count_output_spill)
+        _inverse_dynamics_gradient_arenas = compose_arena_rungs("inverse_dynamics_gradient", self._arena_ctx)   # Step 3.5c fold
+        _forward_dynamics_gradient_arenas = compose_arena_rungs("forward_dynamics_gradient", self._arena_ctx)   # Step 3.5c fold
+        assert _inverse_dynamics_gradient_arenas == _inverse_dynamics_gradient_arenas_legacy, \
+            f"arena parity id_gradient rungs: {_inverse_dynamics_gradient_arenas} != {_inverse_dynamics_gradient_arenas_legacy}"
+        assert _forward_dynamics_gradient_arenas == _forward_dynamics_gradient_arenas_legacy, \
+            f"arena parity fd_gradient rungs: {_forward_dynamics_gradient_arenas} != {_forward_dynamics_gradient_arenas_legacy}"
         self.inverse_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_inverse_dynamics_gradient_arenas)
         self.forward_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_forward_dynamics_gradient_arenas)
         self.inverse_dynamics_gradient_spill_tier = self.inverse_dynamics_gradient_spill_tier_3way[0]
@@ -1179,12 +1185,14 @@ class GRiDCodeGenerator:
         # cannot be byte-identically compacted out of smem).
         _aba_surgical_inner_count = (_aba_inner_temp_count - 138) if self.robot.floating_base else (98 * NJ)
         _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size + rt_xfixed_reserve
-        _aba_t_count_full      = _aba_base_count + _aba_inner_temp_count
-        _aba_t_count_surgical  = _aba_base_count + _aba_surgical_inner_count
-        _aba_t_count_workspace = _aba_base_count
-        self.aba_spill_tier_3way = select_shared_tier_3way(_aba_t_count_full, _aba_t_count_surgical, _aba_t_count_workspace)
+        _aba_arenas_legacy = (_aba_base_count + _aba_inner_temp_count,
+                              _aba_base_count + _aba_surgical_inner_count,
+                              _aba_base_count)
+        _aba_arenas = compose_arena_rungs("aba", self._arena_ctx)   # Step 3.5c fold
+        assert _aba_arenas == _aba_arenas_legacy, \
+            f"arena parity aba rungs: {_aba_arenas} != {_aba_arenas_legacy}"
+        self.aba_spill_tier_3way = select_shared_tier_3way(*_aba_arenas)
         self.aba_use_workspace_temp = self.aba_spill_tier_3way[0] == 2
-        _aba_arenas = (_aba_t_count_full, _aba_t_count_surgical, _aba_t_count_workspace)
         aba_t_count = _aba_arenas[self.aba_spill_tier_3way[0]]
         self.aba_t_count_per_tier = tuple(_aba_arenas[i] for i in self.aba_spill_tier_3way)
         self._aba_inner_cold_count = _aba_inner_cold_count
@@ -1577,7 +1585,7 @@ class GRiDCodeGenerator:
             "integrator_with_gradient":            _integrator_gradient_full,
             "inverse_dynamics_gradient":           inverse_dynamics_gradient_t_count_full,
             "forward_dynamics_gradient":           forward_dynamics_gradient_t_count_full,
-            "aba":                                 _aba_t_count_full,
+            "aba":                                 _aba_arenas[0],
             "crba":                                _crba_t_count_full,
             "osc_inertia":                         _osc_t_full,
             "end_effector_pose":                   ee_t_count,
@@ -1613,6 +1621,9 @@ class GRiDCodeGenerator:
             "fdsva_so":           _fdsva_so_arenas_legacy,
             "idsva_so_world_frame": _idsva_so_world_arenas_legacy,
             "integrator_gradient": _integrator_gradient_arenas_legacy,
+            "inverse_dynamics_gradient": _inverse_dynamics_gradient_arenas_legacy,
+            "forward_dynamics_gradient": _forward_dynamics_gradient_arenas_legacy,
+            "aba":                _aba_arenas_legacy,
         }
         # Body ladder is fixed-base only (floating body uses the picker-driven override,
         # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.
