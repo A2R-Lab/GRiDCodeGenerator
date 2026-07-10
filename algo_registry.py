@@ -620,7 +620,15 @@ _ARENA_FULL_FNS: dict[str, Callable[[ArenaCtx], int]] = {
     # (grav_full_spill) inseparable from the smem budget, so it stays in-gen (see 3.5).
     "idsva_so_world_frame":
         lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt + 4*c.nv**3,
+    # plant_step_hessian (integrator_hessian) s_d2AB surface. Pool == fdsva_temp_full.
+    "integrator_hessian":
+        lambda c: (_psh_base(c) + 2*c.nv*(3*c.nv)*(3*c.nv) + 8*c.nv**3 + c.fdsva_temp_full),
 }
+
+
+def _psh_base(c: ArenaCtx) -> int:
+    # plant_step_hessian smem base: s_x(2nv) + s_u(nv) + s_qdd(nv) + s_Minv(nv²) + s_df_du(2nv²) + XI.
+    return (c.nv + c.nv) + c.nv + c.nv*c.nv + 2*c.nv*c.nv + c.nv + c.XI
 
 
 def _integrator_gradient_full(c: ArenaCtx) -> int:
@@ -733,6 +741,25 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
                          + c.feg_inner + c.ximats_helper_temp) + c.XI,        # full: both JT bufs in smem
         lambda c: c.n + (c.n + (c.nv if c.floating else 0)
                          + c.feg_inner + c.ximats_helper_temp) + c.XI,        # spill: JT pair -> ws
+    ),
+    # ── 3.5e kinematics ladders (XmatsHom domain; degenerate 3rd rung == 2nd) ──
+    "osc_inertia": (
+        lambda c: c.osc_XI + c.XHom + c.nv*c.nv + c.minv_F + 6*c.nv + c.nv*6 + 72 + c.osc_temp,  # full: s_F in smem
+        lambda c: c.osc_XI + c.XHom + c.nv*c.nv + 6*c.nv + c.nv*6 + 72 + c.osc_temp,             # spill_F: s_F -> ws
+    ),
+    "end_effector_pose_gradient": (
+        lambda c: c.n + 6*c.n*c.n_leaf + c.eeg_inner + c.XHom,   # full: inner + output in smem
+        lambda c: c.n + c.XHom,                                 # spill_temp: inner + output -> ws
+        lambda c: c.n + c.XHom,                                 # MINIMAL (== spill_temp)
+    ),
+    "end_effector_pose_hessian": (
+        lambda c: c.n + 6*c.nv*c.n_leaf + c.d2ee_out + c.d2ee_inner + c.XHom,  # full: grad + output + inner
+        lambda c: c.n + 6*c.nv*c.n_leaf + c.d2ee_inner + c.XHom,               # spill: output -> ws
+        lambda c: c.n + 6*c.nv*c.n_leaf + c.d2ee_inner + c.XHom,               # MINIMAL (== spill)
+    ),
+    "integrator_hessian": (
+        lambda c: _psh_base(c) + 2*c.nv*(3*c.nv)*(3*c.nv) + 8*c.nv**3 + c.fdsva_temp_full,  # full: d2AB + fdsva tensors + pool
+        lambda c: _psh_base(c),                                                             # deep spill: base only in smem
     ),
     # integrator_gradient 4-rung ladder. rung[0] == _integrator_gradient_full. Dqdd =
     # max_stages(4)*nv*3nv, dAB = 2*nv*3nv. rung-2 selective-inner shrink is mimic-conditional.

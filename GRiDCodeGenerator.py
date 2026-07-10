@@ -1246,8 +1246,11 @@ class GRiDCodeGenerator:
         _osc_Xhom, _, _ = self.gen_get_Xhom_size()
         _osc_F = self.gen_minv_inner_F_size()                          # 6*nv*nv minv F-region
         _osc_temp = max(self.gen_minv_inner_no_F_size(), 16 * self.robot.get_num_joints())
-        _osc_t_full     = _osc_XI + _osc_Xhom + nv*nv + _osc_F + 6*nv + nv*6 + 72 + _osc_temp
-        _osc_t_spill_F  = _osc_t_full - _osc_F                         # s_F -> d_workspace
+        _osc_rungs_legacy = (_osc_XI + _osc_Xhom + nv*nv + _osc_F + 6*nv + nv*6 + 72 + _osc_temp,
+                             _osc_XI + _osc_Xhom + nv*nv + 6*nv + nv*6 + 72 + _osc_temp)  # s_F -> d_workspace
+        (_osc_t_full, _osc_t_spill_F) = compose_arena_rungs("osc_inertia", self._arena_ctx)   # Step 3.5e fold
+        assert (_osc_t_full, _osc_t_spill_F) == _osc_rungs_legacy, \
+            f"arena parity osc_inertia rungs: {(_osc_t_full, _osc_t_spill_F)} != {_osc_rungs_legacy}"
         self.osc_inertia_spill_tier_3way = select_shared_tier_3way(_osc_t_full, _osc_t_spill_F)
         self.osc_inertia_t_count_per_tier = tuple(
             (_osc_t_full, _osc_t_spill_F)[i] for i in self.osc_inertia_spill_tier_3way)
@@ -1267,7 +1270,10 @@ class GRiDCodeGenerator:
         _end_effector_pose_gradient_full_t_count        = n + 6*n*_end_effector_pose_gradient_num_ees + _end_effector_pose_gradient_inner_temp_count + XHom_size
         _end_effector_pose_gradient_spill_temp_t_count  = n                                                    + XHom_size
         # Degenerate 3rd arena == 2nd (MINIMAL = last index always; collapses to spill).
-        _end_effector_pose_gradient_arenas = (_end_effector_pose_gradient_full_t_count, _end_effector_pose_gradient_spill_temp_t_count, _end_effector_pose_gradient_spill_temp_t_count)
+        _end_effector_pose_gradient_arenas_legacy = (_end_effector_pose_gradient_full_t_count, _end_effector_pose_gradient_spill_temp_t_count, _end_effector_pose_gradient_spill_temp_t_count)
+        _end_effector_pose_gradient_arenas = compose_arena_rungs("end_effector_pose_gradient", self._arena_ctx)   # Step 3.5e fold
+        assert _end_effector_pose_gradient_arenas == _end_effector_pose_gradient_arenas_legacy, \
+            f"arena parity ee_gradient rungs: {_end_effector_pose_gradient_arenas} != {_end_effector_pose_gradient_arenas_legacy}"
         self.end_effector_pose_gradient_spill_tier_3way = select_shared_tier_3way(*_end_effector_pose_gradient_arenas)
         self.end_effector_pose_gradient_spill_tier = self.end_effector_pose_gradient_spill_tier_3way[0]
         self.end_effector_pose_gradient_use_workspace_temp = self.end_effector_pose_gradient_spill_tier >= 1
@@ -1285,7 +1291,10 @@ class GRiDCodeGenerator:
         d2ee_full_t_count   = n + d2ee_grad_count + d2ee_output_count + d2ee_inner_temp_count + XHom_size
         # output spilled: drop d2ee_output from smem (still need q + grad + inner_temp + Xhom)
         d2ee_spill_t_count  = n + d2ee_grad_count                     + d2ee_inner_temp_count + XHom_size
-        _d2ee_arenas = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_t_count)
+        _d2ee_arenas_legacy = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_t_count)
+        _d2ee_arenas = compose_arena_rungs("end_effector_pose_hessian", self._arena_ctx)   # Step 3.5e fold
+        assert _d2ee_arenas == _d2ee_arenas_legacy, \
+            f"arena parity ee_hessian rungs: {_d2ee_arenas} != {_d2ee_arenas_legacy}"
         if "end_effector_pose_hessian" in getattr(self, "generated_algorithms", set()):
             self.d2ee_spill_tier_3way = select_shared_tier_3way(*_d2ee_arenas)
         else:
@@ -1566,8 +1575,10 @@ class GRiDCodeGenerator:
         _psh_d2ab = 2 * nv * (3 * nv) * (3 * nv)
         _psh_base = (nv + nv) + nv + nv*nv + 2*nv*nv + nv + XI_size  # s_x(nx==2nv fixed) + s_u + s_qdd + Minv + df_du
         _psh_pool = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
-        _psh_t_full  = _psh_base + _psh_d2ab + 8*nv**3 + _psh_pool
-        _psh_t_spill = _psh_base
+        _psh_rungs_legacy = (_psh_base + _psh_d2ab + 8*nv**3 + _psh_pool, _psh_base)
+        (_psh_t_full, _psh_t_spill) = compose_arena_rungs("integrator_hessian", self._arena_ctx)   # Step 3.5e fold
+        assert (_psh_t_full, _psh_t_spill) == _psh_rungs_legacy, \
+            f"arena parity integrator_hessian rungs: {(_psh_t_full, _psh_t_spill)} != {_psh_rungs_legacy}"
         self.plant_step_hessian_spill_tier_3way = select_shared_tier_3way(_psh_t_full, _psh_t_spill)
 
         # ── Descriptor-table Step 3 parity net (item M) ──────────────────────
@@ -1638,6 +1649,10 @@ class GRiDCodeGenerator:
             "forward_dynamics_parameter_gradient": _fpg_rungs_legacy,
             "f_ext_gradient":     _feg_rungs_legacy,
             "f_ext_gradient_dq":  _feg_dq_rungs_legacy,
+            "osc_inertia":        _osc_rungs_legacy,
+            "end_effector_pose_gradient": _end_effector_pose_gradient_arenas_legacy,
+            "end_effector_pose_hessian":  _d2ee_arenas_legacy,
+            "integrator_hessian": _psh_rungs_legacy,
         }
         # Body ladder is fixed-base only (floating body uses the picker-driven override,
         # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.
