@@ -712,6 +712,28 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt + c.aba_surgical_inner,  # surgical: cold sub-band -> d_cold
         lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt,                         # workspace: whole inner -> ws
     ),
+    # ── 3.5d parameter/regressor + f_ext ladders ──
+    "inverse_dynamics_regressor": (
+        lambda c: (c.n + 2*c.nv) + c.nv*10*c.NB + 18*c.n + c.idr_inner + c.XI + c.rt,   # full: s_Y in smem
+        lambda c: (c.n + 2*c.nv) + 18*c.n + c.idr_inner + c.XI + c.rt,                  # surgical: s_Y -> ws
+    ),
+    "forward_dynamics_parameter_gradient": (
+        lambda c: ((c.n + 2*c.nv) + c.nv*10*c.NB + c.nv*c.nv + c.nv*10*c.NB + c.nv + 18*c.n + c.nv
+                   + c.fpg_inner + c.XI + c.rt),                                        # full: s_Y in smem
+        lambda c: ((c.n + 2*c.nv) + c.nv*c.nv + c.nv*10*c.NB + c.nv + 18*c.n + c.nv
+                   + c.fpg_inner + c.XI + c.rt),                                        # surgical: first s_Y -> ws
+    ),
+    "f_ext_gradient": (
+        lambda c: c.n + 2*(c.nv*6*c.NB) + c.nv*c.nv + max(c.feg_inner, c.minv_inner) + c.XI + c.rt,  # full: both outs + minv-F
+        lambda c: c.n + (c.nv*6*c.NB) + c.nv*c.nv + max(c.feg_inner, c.minv_inner) + c.XI + c.rt,     # out_spill: 2nd out -> ws
+        lambda c: c.n + c.nv*c.nv + max(c.feg_inner, c.minv_noF) + c.XI + c.rt,                        # deep: both outs -> ws, minv no-F
+    ),
+    "f_ext_gradient_dq": (
+        lambda c: c.n + (c.n + (c.nv if c.floating else 0) + 2*c.nv*6*c.NB
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI,        # full: both JT bufs in smem
+        lambda c: c.n + (c.n + (c.nv if c.floating else 0)
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI,        # spill: JT pair -> ws
+    ),
     # integrator_gradient 4-rung ladder. rung[0] == _integrator_gradient_full. Dqdd =
     # max_stages(4)*nv*3nv, dAB = 2*nv*3nv. rung-2 selective-inner shrink is mimic-conditional.
     "integrator_gradient": (

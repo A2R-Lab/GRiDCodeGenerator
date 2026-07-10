@@ -745,8 +745,10 @@ class GRiDCodeGenerator:
         # SO section at any tier whose full arena overflows the target, keeping s_vaf +
         # inputs + XImats + RNEA scratch in smem. Small robots stay rung 0 (s_Y in smem).
         _idr_Y_count          = nv*10*self.robot.get_num_bodies()
-        _idr_t_count_full     = regressor_t_count
-        _idr_t_count_surgical = regressor_t_count - _idr_Y_count
+        _idr_rungs_legacy     = (regressor_t_count, regressor_t_count - _idr_Y_count)
+        (_idr_t_count_full, _idr_t_count_surgical) = compose_arena_rungs("inverse_dynamics_regressor", self._arena_ctx)   # Step 3.5d fold
+        assert (_idr_t_count_full, _idr_t_count_surgical) == _idr_rungs_legacy, \
+            f"arena parity id_regressor rungs: {(_idr_t_count_full, _idr_t_count_surgical)} != {_idr_rungs_legacy}"
         self.inverse_dynamics_regressor_spill_tier_3way = select_shared_tier_3way(_idr_t_count_full, _idr_t_count_surgical)
         self.inverse_dynamics_regressor_t_count_per_tier = tuple(
             (_idr_t_count_full, _idr_t_count_surgical)[i] for i in self.inverse_dynamics_regressor_spill_tier_3way)
@@ -845,8 +847,11 @@ class GRiDCodeGenerator:
         # from ~135 KB to ~94 KB, under the sm_120 ~99 KB cap. The picker selects
         # level 1 for any tier whose level-0 arena overflows the smem target.
         _fpg_Y_count = nv * 10 * self.robot.get_num_bodies()
-        _fpg_t_count_full     = forward_dynamics_parameter_gradient_t_count
-        _fpg_t_count_surgical = forward_dynamics_parameter_gradient_t_count - _fpg_Y_count
+        _fpg_rungs_legacy = (forward_dynamics_parameter_gradient_t_count,
+                             forward_dynamics_parameter_gradient_t_count - _fpg_Y_count)
+        (_fpg_t_count_full, _fpg_t_count_surgical) = compose_arena_rungs("forward_dynamics_parameter_gradient", self._arena_ctx)   # Step 3.5d fold
+        assert (_fpg_t_count_full, _fpg_t_count_surgical) == _fpg_rungs_legacy, \
+            f"arena parity fd_param_gradient rungs: {(_fpg_t_count_full, _fpg_t_count_surgical)} != {_fpg_rungs_legacy}"
         self.forward_dynamics_parameter_gradient_spill_tier_3way = select_shared_tier_3way(_fpg_t_count_full, _fpg_t_count_surgical)
         self.forward_dynamics_parameter_gradient_t_count_per_tier = tuple(
             (_fpg_t_count_full, _fpg_t_count_surgical)[i] for i in self.forward_dynamics_parameter_gradient_spill_tier_3way
@@ -874,9 +879,12 @@ class GRiDCodeGenerator:
         #     in smem. select picks the least-spill rung that fits, so small robots keep 0.
         _feg_temp_deep = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                      self.gen_minv_inner_no_F_size())
-        _feg_t_count_full      = f_ext_gradient_t_count
-        _feg_t_count_out_spill = f_ext_gradient_t_count - _feg_out
-        _feg_t_count_deep      = _n_pos + _feg_temp_deep + XI_size + rt_xfixed_reserve
+        _feg_rungs_legacy = (f_ext_gradient_t_count,
+                             f_ext_gradient_t_count - _feg_out,
+                             _n_pos + _feg_temp_deep + XI_size + rt_xfixed_reserve)
+        (_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep) = compose_arena_rungs("f_ext_gradient", self._arena_ctx)   # Step 3.5d fold
+        assert (_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep) == _feg_rungs_legacy, \
+            f"arena parity f_ext_gradient rungs: {(_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep)} != {_feg_rungs_legacy}"
         self.f_ext_gradient_spill_tier_3way = select_shared_tier_3way(
             _feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep)
         self.f_ext_gradient_t_count_per_tier = tuple(
@@ -902,8 +910,10 @@ class GRiDCodeGenerator:
         # L2-pinned d_workspace SO section (s_JTp at SO base, s_JTm at SO base + nv*6NB);
         # s_qpert/s_dv/the J^T-inner scratch/XImats reload stay hot in smem. On h2_plus
         # the pair is ~288 KB (full arena ~311 KB, UNLAUNCHABLE); spilling it lands ~22 KB.
-        _feg_dq_t_count_full  = f_ext_gradient_dq_t_count
-        _feg_dq_t_count_spill = f_ext_gradient_dq_t_count - _feg_dq_jt
+        _feg_dq_rungs_legacy = (f_ext_gradient_dq_t_count, f_ext_gradient_dq_t_count - _feg_dq_jt)
+        (_feg_dq_t_count_full, _feg_dq_t_count_spill) = compose_arena_rungs("f_ext_gradient_dq", self._arena_ctx)   # Step 3.5d fold
+        assert (_feg_dq_t_count_full, _feg_dq_t_count_spill) == _feg_dq_rungs_legacy, \
+            f"arena parity f_ext_gradient_dq rungs: {(_feg_dq_t_count_full, _feg_dq_t_count_spill)} != {_feg_dq_rungs_legacy}"
         self.f_ext_gradient_dq_spill_tier_3way = select_shared_tier_3way(_feg_dq_t_count_full, _feg_dq_t_count_spill)
         self.f_ext_gradient_dq_t_count_per_tier = tuple(
             (_feg_dq_t_count_full, _feg_dq_t_count_spill)[i] for i in self.f_ext_gradient_dq_spill_tier_3way
@@ -1624,6 +1634,10 @@ class GRiDCodeGenerator:
             "inverse_dynamics_gradient": _inverse_dynamics_gradient_arenas_legacy,
             "forward_dynamics_gradient": _forward_dynamics_gradient_arenas_legacy,
             "aba":                _aba_arenas_legacy,
+            "inverse_dynamics_regressor": _idr_rungs_legacy,
+            "forward_dynamics_parameter_gradient": _fpg_rungs_legacy,
+            "f_ext_gradient":     _feg_rungs_legacy,
+            "f_ext_gradient_dq":  _feg_dq_rungs_legacy,
         }
         # Body ladder is fixed-base only (floating body uses the picker-driven override,
         # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.
