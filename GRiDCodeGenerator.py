@@ -1510,13 +1510,18 @@ class GRiDCodeGenerator:
             # pool->global: smem = base (inputs + qdd + Minv + df_du + XI), no pool/outputs/contraction.
             ("pool_global",          fdsva_so_base_t_count,                         True,  True,  False, False, False, True,  False),
         ]
-        _fdsva_so_arenas = tuple(t[1] for t in _fdsva_so_tiers)
+        _fdsva_so_arenas_legacy = tuple(t[1] for t in _fdsva_so_tiers)
+        _fdsva_so_arenas = compose_arena_rungs("fdsva_so", self._arena_ctx)   # Step 3.4 fold
+        assert _fdsva_so_arenas == _fdsva_so_arenas_legacy, \
+            f"arena parity fdsva_so rungs: {_fdsva_so_arenas} != {_fdsva_so_arenas_legacy}"
         self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
+        # arena counts now come from the composer; the 9-tuple STATE FLAGS stay in-gen.
         _chosen = _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]]
-        (_, fdsva_so_t_count, self.fdsva_so_use_global_tensors,
+        (_, _, self.fdsva_so_use_global_tensors,
          self.fdsva_so_use_workspace_temp, self.fdsva_so_fd_grad_use_spill,
          self.fdsva_so_use_workspace_df_du, self.fdsva_so_use_workspace_Minv,
          self.fdsva_so_use_workspace_idsva_temp, self.fdsva_so_idsva_cold_in_global) = _chosen
+        fdsva_so_t_count = _fdsva_so_arenas[self.fdsva_so_spill_tier_3way[0]]
         self.fdsva_so_t_count_per_tier = tuple(_fdsva_so_arenas[i] for i in self.fdsva_so_spill_tier_3way)
 
         # ----- F1: plant_step_hessian shared-mem tier selection (fixed-base only) -----
@@ -1576,7 +1581,7 @@ class GRiDCodeGenerator:
             "idsva_so_body_frame":                 (_idsva_bf_full if not self.robot.floating_base
                                                     else idsva_so_body_frame_t_count),
             "idsva_so_world_frame":                idsva_so_world_frame_full_t_count,
-            "fdsva_so":                            _fdsva_so_tiers[0][1],
+            "fdsva_so":                            _fdsva_so_arenas[0],
             "integrator_hessian":                  _psh_t_full,
         }
         # Spill-ladder rung arenas (least-spill first), for the composer parity net on
@@ -1593,6 +1598,7 @@ class GRiDCodeGenerator:
             "com":                _com_rungs_legacy,
             "ccrba":              _ccrba_rungs_legacy,
             "energy":             _energy_rungs_legacy,
+            "fdsva_so":           _fdsva_so_arenas_legacy,
         }
 
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK

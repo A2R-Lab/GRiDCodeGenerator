@@ -409,6 +409,13 @@ class ArenaCtx:
     eeg_inner: int
     d2ee_inner: int
     d2ee_out: int
+    # second-order (fdsva_so) inner-temp helpers
+    idsva_body_inner: int      # gen_idsva_so_body_frame_inner_temp_mem_size()
+    idsva_world_inner: int     # world (floating) else body — matches gen dispatch
+    fdsva_fdg_inline: int      # gen_fdsva_so_fd_gradient_inline_temp_mem_size()
+    fdsva_fdg_inline_spilled: int  # ..._spilled()
+    idsva_world_cold: int      # gen_idsva_so_world_cold_floats()
+    has_spherical: bool
 
     # ── derived buffer counts (thin helpers so the closures read like the source) ──
     @property
@@ -430,6 +437,31 @@ class ArenaCtx:
     @property
     def osc_temp(self) -> int:
         return max(self.minv_noF, 16 * self.NJ)
+
+    # ── fdsva_so ladder primitives (mirror _fdsva_so_tiers in the generator) ──
+    @property
+    def fdsva_base(self) -> int:      # inputs + s_qdd + s_Minv + s_df_du + XI
+        return 4*self.nv + self.nv*self.nv + self.nv + 2*self.nv*self.nv + self.XI
+
+    @property
+    def fdsva_inner_idsva(self) -> int:   # world (floating) else body — the dispatched idsva inner
+        return self.idsva_world_inner
+
+    @property
+    def fdsva_cold_floats(self) -> int:   # world cold-quad spill, only when the composed inner is world
+        return self.idsva_world_cold if (self.floating or self.has_spherical) else 0
+
+    @property
+    def fdsva_temp_full(self) -> int:     # inner | contraction(4nv³) | fd_grad_inline, + rt
+        return max(self.fdsva_inner_idsva, 4*self.nv**3, self.fdsva_fdg_inline) + self.rt
+
+    @property
+    def fdsva_temp_no_contract(self) -> int:
+        return max(self.fdsva_inner_idsva, self.fdsva_fdg_inline) + self.rt
+
+    @property
+    def fdsva_temp_spilled(self) -> int:
+        return max(self.fdsva_inner_idsva, self.fdsva_fdg_inline_spilled) + self.rt
 
 
 def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
@@ -474,6 +506,13 @@ def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
         eeg_inner=gen.gen_end_effector_pose_gradient_inner_temp_mem_size(),
         d2ee_inner=gen.gen_end_effector_pose_hessian_inner_temp_mem_size(),
         d2ee_out=gen.gen_end_effector_pose_hessian_output_count(),
+        idsva_body_inner=gen.gen_idsva_so_body_frame_inner_temp_mem_size(),
+        idsva_world_inner=(gen.gen_idsva_so_world_frame_temp_mem_size() if robot.floating_base
+                           else gen.gen_idsva_so_body_frame_inner_temp_mem_size()),
+        fdsva_fdg_inline=gen.gen_fdsva_so_fd_gradient_inline_temp_mem_size(),
+        fdsva_fdg_inline_spilled=gen.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled(),
+        idsva_world_cold=gen.gen_idsva_so_world_cold_floats(),
+        has_spherical=bool(gen.robot.robot_has_spherical()),
     )
 
 
@@ -550,6 +589,9 @@ _ARENA_FULL_FNS: dict[str, Callable[[ArenaCtx], int]] = {
     "energy":
         lambda c: (2*c.n + 3 + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom)
                   + 6*c.nv*c.NB,
+    # ── Second-order (s_temp domain, 8-rung ladder — full == rung-0) ──
+    "fdsva_so":
+        lambda c: c.fdsva_base + 8*c.nv**3 + c.fdsva_temp_full,
 }
 
 
@@ -594,6 +636,18 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
     "forward_dynamics": (
         lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_Fsmem,           # full: minv-F in smem
         lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_noFsmem,         # surgical: minv-F -> ws
+    ),
+    # ── 3.4 fdsva_so 8-rung ladder (least-spill first). Only t_count here; the 9-tuple
+    # STATE FLAGS (use_global_tensors, use_workspace_temp, ...) stay in the generator. ──
+    "fdsva_so": (
+        lambda c: c.fdsva_base + 8*c.nv**3 + c.fdsva_temp_full,             # full
+        lambda c: c.fdsva_base + c.fdsva_temp_full,                         # global_tensors
+        lambda c: c.fdsva_base + c.fdsva_temp_full - c.fdsva_cold_floats,   # idsva_cold
+        lambda c: c.fdsva_base + c.fdsva_temp_no_contract,                  # workspace_temp
+        lambda c: c.fdsva_base + c.fdsva_temp_spilled,                      # workspace_temp_spill
+        lambda c: (c.fdsva_base - 2*c.nv*c.nv) + c.fdsva_temp_spilled,      # spill_df_du
+        lambda c: (c.fdsva_base - 2*c.nv*c.nv - c.nv*c.nv) + c.fdsva_temp_spilled,  # spill_Minv
+        lambda c: c.fdsva_base,                                             # pool_global
     ),
     # ── 3.3 clean ladders ──
     "coriolis_matrix": (
