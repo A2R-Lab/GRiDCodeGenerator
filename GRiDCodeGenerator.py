@@ -14,7 +14,8 @@ from .algorithms._idsva_so import _idsva_so_use_world_frame
 # (algo_label, algo_short, gate_attr, bytes_macro) — only the irregular kernel
 # overload SIGNATURES stay as co-located payload data.
 from .algo_registry import (ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol, descriptor_for,
-                            arena_ctx_from_codegen, compose_arena_full, compose_arena_rungs)
+                            arena_ctx_from_codegen, compose_arena_full, compose_arena_rungs,
+                            ARENA_COMPOSED_KEYS, ARENA_RUNG_KEYS)
 
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
@@ -731,9 +732,7 @@ class GRiDCodeGenerator:
         # (NJ > n) size it 18*NJ so the inner's body f-writes don't overflow into
         # the XImats region. Non-mimic keeps the legacy 18*n byte-identical.
         _id_vaf = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-        _id_t_count_legacy = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         id_t_count = compose_arena_full("inverse_dynamics", self._arena_ctx)   # Step 3.1 fold
-        assert id_t_count == _id_t_count_legacy, f"arena parity inverse_dynamics: {id_t_count} != {_id_t_count_legacy}"
         # joint-torque regressor (E1): kernel smem = XI + s_q_qd_qdd(NUM_POS+2nv)
         # + s_Y (nv x 10*NUM_BODIES) + s_vaf(18*NUM_POS) + RNEA forward scratch.
         # n == get_num_pos() here. Additive.
@@ -745,10 +744,7 @@ class GRiDCodeGenerator:
         # SO section at any tier whose full arena overflows the target, keeping s_vaf +
         # inputs + XImats + RNEA scratch in smem. Small robots stay rung 0 (s_Y in smem).
         _idr_Y_count          = nv*10*self.robot.get_num_bodies()
-        _idr_rungs_legacy     = (regressor_t_count, regressor_t_count - _idr_Y_count)
         (_idr_t_count_full, _idr_t_count_surgical) = compose_arena_rungs("inverse_dynamics_regressor", self._arena_ctx)   # Step 3.5d fold
-        assert (_idr_t_count_full, _idr_t_count_surgical) == _idr_rungs_legacy, \
-            f"arena parity id_regressor rungs: {(_idr_t_count_full, _idr_t_count_surgical)} != {_idr_rungs_legacy}"
         self.inverse_dynamics_regressor_spill_tier_3way = select_shared_tier_3way(_idr_t_count_full, _idr_t_count_surgical)
         self.inverse_dynamics_regressor_t_count_per_tier = tuple(
             (_idr_t_count_full, _idr_t_count_surgical)[i] for i in self.inverse_dynamics_regressor_spill_tier_3way)
@@ -756,18 +752,10 @@ class GRiDCodeGenerator:
         # PS5 energy regressors. Both outputs are 10*NUM_BODIES (no DoF sweep).
         # KE (spatial / XImats domain): s_q_qd(n+nv) + s_y_ke(10NB) + s_vaf(18n)
         #   + RNEA forward scratch + XI_size.
-        _ker_t_count_legacy = (n + nv) + 10*self.robot.get_num_bodies() + 18*n \
-            + self.gen_kinetic_energy_regressor_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
         self.kinetic_energy_regressor_t_count = compose_arena_full("kinetic_energy_regressor", self._arena_ctx)   # Step 3.1 fold
-        assert self.kinetic_energy_regressor_t_count == _ker_t_count_legacy, \
-            f"arena parity kinetic_energy_regressor: {self.kinetic_energy_regressor_t_count} != {_ker_t_count_legacy}"
         # PE (kinematics / XmatsHom domain): s_q(n) + s_y_pe(10NB)
         #   + world-transform BFS scratch (16*NUM_JOINTS) + XHom_size.
-        _per_t_count_legacy = n + 10*self.robot.get_num_bodies() \
-            + 16*self.robot.get_num_joints() + XHom_size
         self.potential_energy_regressor_t_count = compose_arena_full("potential_energy_regressor", self._arena_ctx)   # Step 3.1 fold
-        assert self.potential_energy_regressor_t_count == _per_t_count_legacy, \
-            f"arena parity potential_energy_regressor: {self.potential_energy_regressor_t_count} != {_per_t_count_legacy}"
         # PS5 Coriolis matrix C(q,qd): kernel smem = XI + s_q_qd(NUM_POS+nv) + s_coriolis(nv*nv)
         #   + the inner spatial-recursion scratch (per-body NB bands + per-column n_int bands).
         # 3-rung surgical ladder (mirror crba): full | s_coriolis(nv*nv output) -> L2-pinned SO
@@ -777,13 +765,8 @@ class GRiDCodeGenerator:
         # whole-band rung ~22KB (LITE/MINIMAL).
         _coriolis_inner   = self.gen_coriolis_matrix_inner_temp_mem_size()
         _coriolis_no_out  = (n + nv) + XI_size + rt_xfixed_reserve            # input + XI, no s_coriolis
-        _coriolis_rungs_legacy = (nv*nv + _coriolis_no_out + _coriolis_inner,   # output + inner band + input/XI
-                                  _coriolis_no_out + _coriolis_inner,          # s_coriolis -> SO band; inner stays smem
-                                  _coriolis_no_out)                            # both output and inner band spilled
         (_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace) = \
             compose_arena_rungs("coriolis_matrix", self._arena_ctx)   # Step 3.3 fold
-        assert (_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace) == _coriolis_rungs_legacy, \
-            f"arena parity coriolis rungs: {(_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)} != {_coriolis_rungs_legacy}"
         self.coriolis_matrix_spill_tier_3way = select_shared_tier_3way(_coriolis_t_full, _coriolis_t_output_spill, _coriolis_t_workspace)
         # whole-band spill (inner scratch -> d_workspace) fires only at the deepest rung (index 2).
         self.coriolis_matrix_use_workspace_temp = self.coriolis_matrix_spill_tier_3way[0] == 2
@@ -803,11 +786,7 @@ class GRiDCodeGenerator:
         # it to the d_workspace SO band.
         #   base = s_q_qd(2n) + s_out(6nv) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom.
         _cmm_base = 2*n + 6*nv + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        _cmm_rungs_legacy = (_cmm_base + _dccrba_sJ,   # L0: s_J in smem
-                             _cmm_base)                # L1: s_J -> d_workspace
         (_cmm_t_count_full, _cmm_t_count_Jspill) = compose_arena_rungs("cmm_time_variation", self._arena_ctx)   # Step 3.3 fold
-        assert (_cmm_t_count_full, _cmm_t_count_Jspill) == _cmm_rungs_legacy, \
-            f"arena parity cmm rungs: {(_cmm_t_count_full, _cmm_t_count_Jspill)} != {_cmm_rungs_legacy}"
         self.cmm_time_variation_spill_tier_3way = select_shared_tier_3way(_cmm_t_count_full, _cmm_t_count_Jspill)
         self.cmm_time_variation_t_count_per_tier = tuple(
             (_cmm_t_count_full, _cmm_t_count_Jspill)[i] for i in self.cmm_time_variation_spill_tier_3way
@@ -820,12 +799,7 @@ class GRiDCodeGenerator:
         #   base = s_q(n) + s_A(6nv) + s_com(3) + s_extra(4) + inner + XHom (no out, no s_J).
         _dccrba_out = 6 * nv * nv
         _dccrba_base = n + 6*nv + 3 + 4 + _dccrba_inner_temp + XHom_size
-        _dccrba_rungs_legacy = (_dccrba_base + _dccrba_out + _dccrba_sJ,   # L0: nothing spilled
-                                _dccrba_base + _dccrba_sJ,                 # L1: output -> ws, s_J in smem
-                                _dccrba_base)                              # L2: output + s_J -> ws
         (_dccrba_L0, _dccrba_L1, _dccrba_L2) = compose_arena_rungs("dccrba", self._arena_ctx)   # Step 3.3 fold
-        assert (_dccrba_L0, _dccrba_L1, _dccrba_L2) == _dccrba_rungs_legacy, \
-            f"arena parity dccrba rungs: {(_dccrba_L0, _dccrba_L1, _dccrba_L2)} != {_dccrba_rungs_legacy}"
         self.dccrba_spill_tier_3way = select_shared_tier_3way(_dccrba_L0, _dccrba_L1, _dccrba_L2)
         self.dccrba_t_count_per_tier = tuple(
             (_dccrba_L0, _dccrba_L1, _dccrba_L2)[i] for i in self.dccrba_spill_tier_3way
@@ -847,11 +821,7 @@ class GRiDCodeGenerator:
         # from ~135 KB to ~94 KB, under the sm_120 ~99 KB cap. The picker selects
         # level 1 for any tier whose level-0 arena overflows the smem target.
         _fpg_Y_count = nv * 10 * self.robot.get_num_bodies()
-        _fpg_rungs_legacy = (forward_dynamics_parameter_gradient_t_count,
-                             forward_dynamics_parameter_gradient_t_count - _fpg_Y_count)
         (_fpg_t_count_full, _fpg_t_count_surgical) = compose_arena_rungs("forward_dynamics_parameter_gradient", self._arena_ctx)   # Step 3.5d fold
-        assert (_fpg_t_count_full, _fpg_t_count_surgical) == _fpg_rungs_legacy, \
-            f"arena parity fd_param_gradient rungs: {(_fpg_t_count_full, _fpg_t_count_surgical)} != {_fpg_rungs_legacy}"
         self.forward_dynamics_parameter_gradient_spill_tier_3way = select_shared_tier_3way(_fpg_t_count_full, _fpg_t_count_surgical)
         self.forward_dynamics_parameter_gradient_t_count_per_tier = tuple(
             (_fpg_t_count_full, _fpg_t_count_surgical)[i] for i in self.forward_dynamics_parameter_gradient_spill_tier_3way
@@ -879,12 +849,7 @@ class GRiDCodeGenerator:
         #     in smem. select picks the least-spill rung that fits, so small robots keep 0.
         _feg_temp_deep = nv*nv + max(self.gen_f_ext_gradient_inner_temp_mem_size(),
                                      self.gen_minv_inner_no_F_size())
-        _feg_rungs_legacy = (f_ext_gradient_t_count,
-                             f_ext_gradient_t_count - _feg_out,
-                             _n_pos + _feg_temp_deep + XI_size + rt_xfixed_reserve)
         (_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep) = compose_arena_rungs("f_ext_gradient", self._arena_ctx)   # Step 3.5d fold
-        assert (_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep) == _feg_rungs_legacy, \
-            f"arena parity f_ext_gradient rungs: {(_feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep)} != {_feg_rungs_legacy}"
         self.f_ext_gradient_spill_tier_3way = select_shared_tier_3way(
             _feg_t_count_full, _feg_t_count_out_spill, _feg_t_count_deep)
         self.f_ext_gradient_t_count_per_tier = tuple(
@@ -910,10 +875,7 @@ class GRiDCodeGenerator:
         # L2-pinned d_workspace SO section (s_JTp at SO base, s_JTm at SO base + nv*6NB);
         # s_qpert/s_dv/the J^T-inner scratch/XImats reload stay hot in smem. On h2_plus
         # the pair is ~288 KB (full arena ~311 KB, UNLAUNCHABLE); spilling it lands ~22 KB.
-        _feg_dq_rungs_legacy = (f_ext_gradient_dq_t_count, f_ext_gradient_dq_t_count - _feg_dq_jt)
         (_feg_dq_t_count_full, _feg_dq_t_count_spill) = compose_arena_rungs("f_ext_gradient_dq", self._arena_ctx)   # Step 3.5d fold
-        assert (_feg_dq_t_count_full, _feg_dq_t_count_spill) == _feg_dq_rungs_legacy, \
-            f"arena parity f_ext_gradient_dq rungs: {(_feg_dq_t_count_full, _feg_dq_t_count_spill)} != {_feg_dq_rungs_legacy}"
         self.f_ext_gradient_dq_spill_tier_3way = select_shared_tier_3way(_feg_dq_t_count_full, _feg_dq_t_count_spill)
         self.f_ext_gradient_dq_t_count_per_tier = tuple(
             (_feg_dq_t_count_full, _feg_dq_t_count_spill)[i] for i in self.f_ext_gradient_dq_spill_tier_3way
@@ -923,11 +885,7 @@ class GRiDCodeGenerator:
         # bytes); Level 1 = surgical F to L2-pinned workspace.
         _minv_F_count = self.gen_minv_inner_F_size()
         _minv_no_F_count = self.gen_minv_inner_no_F_size()
-        _minv_rungs_legacy = (n + n*n + _minv_F_count + _minv_no_F_count + XI_size + rt_xfixed_reserve,
-                              n + n*n                 + _minv_no_F_count + XI_size + rt_xfixed_reserve)
         (_minv_t_count_full, _minv_t_count_surgical) = compose_arena_rungs("minv", self._arena_ctx)   # Step 3.2 fold
-        assert (_minv_t_count_full, _minv_t_count_surgical) == _minv_rungs_legacy, \
-            f"arena parity minv rungs: {(_minv_t_count_full, _minv_t_count_surgical)} != {_minv_rungs_legacy}"
         self.minv_spill_tier_3way = select_shared_tier_3way(_minv_t_count_full, _minv_t_count_surgical)
         self.minv_use_workspace_F = self.minv_spill_tier_3way[0] == 1
         minv_t_count = _minv_t_count_full if not self.minv_use_workspace_F else _minv_t_count_surgical
@@ -945,11 +903,7 @@ class GRiDCodeGenerator:
         # n>nv so the arena must reserve the wider 3*n slot the kernel slices (the
         # old 3*nv+fb under-reserved by 3*(n-nv)-fb floats -> smem overrun).
         _fd_base = 3*n + nv + XI_size + rt_xfixed_reserve
-        _fd_rungs_legacy = (_fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
-                            _fd_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
         (_fd_t_count_full, _fd_t_count_surgical) = compose_arena_rungs("forward_dynamics", self._arena_ctx)   # Step 3.2 fold
-        assert (_fd_t_count_full, _fd_t_count_surgical) == _fd_rungs_legacy, \
-            f"arena parity forward_dynamics rungs: {(_fd_t_count_full, _fd_t_count_surgical)} != {_fd_rungs_legacy}"
         self.fd_spill_tier_3way = select_shared_tier_3way(_fd_t_count_full, _fd_t_count_surgical)
         self.fd_use_workspace_F = self.fd_spill_tier_3way[0] == 1
         fd_t_count = _fd_t_count_full if not self.fd_use_workspace_F else _fd_t_count_surgical
@@ -979,11 +933,7 @@ class GRiDCodeGenerator:
         # the standalone forward_dynamics kernel's MINV_F_IN_SMEM lever. For
         # h1_2 the value arena overflows by only a few KB, so the surgical F
         # spill is enough — no whole-arena dump.
-        _integrator_rungs_legacy = (_integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
-                                    _integrator_base + self.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=False))
         (_integrator_t_count_full, _integrator_t_count_Fspill) = compose_arena_rungs("integrator", self._arena_ctx)   # Step 3.3 fold
-        assert (_integrator_t_count_full, _integrator_t_count_Fspill) == _integrator_rungs_legacy, \
-            f"arena parity integrator rungs: {(_integrator_t_count_full, _integrator_t_count_Fspill)} != {_integrator_rungs_legacy}"
         self.integrator_spill_tier_3way = select_shared_tier_3way(_integrator_t_count_full, _integrator_t_count_Fspill)
         self.integrator_t_count_per_tier = tuple(
             (_integrator_t_count_full, _integrator_t_count_Fspill)[i] for i in self.integrator_spill_tier_3way)
@@ -1057,16 +1007,7 @@ class GRiDCodeGenerator:
             else max(self.gen_minv_inner_temp_mem_size(),
                      self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]))
         _integrator_gradient_full = max(integrator_gradient_t_count, integrator_gradient_with_x_kp1_t_count)
-        _integrator_gradient_arenas_legacy = (
-            _integrator_gradient_full,                                                                                  # 0 full
-            _integrator_gradient_full - _integrator_gradient_D_qdd_count,                                                     # 1 +Dqdd
-            _integrator_gradient_full - _integrator_gradient_D_qdd_count - _integrator_gradient_dAB_count                           # 2 +dAB+selective
-                - (_integrator_gradient_inner_full - _integrator_gradient_inner_selective),
-            _integrator_gradient_full - _integrator_gradient_D_qdd_count - _integrator_gradient_dAB_count - _integrator_gradient_inner_full,  # 3 +whole inner
-        )
         _integrator_gradient_arenas = compose_arena_rungs("integrator_gradient", self._arena_ctx)   # Step 3.5b fold
-        assert _integrator_gradient_arenas == _integrator_gradient_arenas_legacy, \
-            f"arena parity integrator_gradient rungs: {_integrator_gradient_arenas} != {_integrator_gradient_arenas_legacy}"
         self.integrator_gradient_spill_tier_3way = select_shared_tier_3way(*_integrator_gradient_arenas)
         self.integrator_gradient_t_count_per_tier = tuple(_integrator_gradient_arenas[i] for i in self.integrator_gradient_spill_tier_3way)
         _picks = self.integrator_gradient_spill_tier_3way
@@ -1146,14 +1087,8 @@ class GRiDCodeGenerator:
         # (inverse_dynamics_gradient_spill_tier etc.) are kept = perf pick so today's emit paths
         # are byte-for-byte unchanged; the lite/minimal indices are exposed
         # only as metadata until the per-tier emit work lands.
-        _inverse_dynamics_gradient_arenas_legacy = (inverse_dynamics_gradient_t_count_full, inverse_dynamics_gradient_t_count_selective, inverse_dynamics_gradient_t_count_emergency)
-        _forward_dynamics_gradient_arenas_legacy = (forward_dynamics_gradient_t_count_full, forward_dynamics_gradient_t_count_selective, forward_dynamics_gradient_t_count_emergency, forward_dynamics_gradient_t_count_output_spill)
         _inverse_dynamics_gradient_arenas = compose_arena_rungs("inverse_dynamics_gradient", self._arena_ctx)   # Step 3.5c fold
         _forward_dynamics_gradient_arenas = compose_arena_rungs("forward_dynamics_gradient", self._arena_ctx)   # Step 3.5c fold
-        assert _inverse_dynamics_gradient_arenas == _inverse_dynamics_gradient_arenas_legacy, \
-            f"arena parity id_gradient rungs: {_inverse_dynamics_gradient_arenas} != {_inverse_dynamics_gradient_arenas_legacy}"
-        assert _forward_dynamics_gradient_arenas == _forward_dynamics_gradient_arenas_legacy, \
-            f"arena parity fd_gradient rungs: {_forward_dynamics_gradient_arenas} != {_forward_dynamics_gradient_arenas_legacy}"
         self.inverse_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_inverse_dynamics_gradient_arenas)
         self.forward_dynamics_gradient_spill_tier_3way = select_shared_tier_3way(*_forward_dynamics_gradient_arenas)
         self.inverse_dynamics_gradient_spill_tier = self.inverse_dynamics_gradient_spill_tier_3way[0]
@@ -1195,12 +1130,7 @@ class GRiDCodeGenerator:
         # cannot be byte-identically compacted out of smem).
         _aba_surgical_inner_count = (_aba_inner_temp_count - 138) if self.robot.floating_base else (98 * NJ)
         _aba_base_count = nv + aba_input_t_count + 12*NJ + XI_size + rt_xfixed_reserve
-        _aba_arenas_legacy = (_aba_base_count + _aba_inner_temp_count,
-                              _aba_base_count + _aba_surgical_inner_count,
-                              _aba_base_count)
         _aba_arenas = compose_arena_rungs("aba", self._arena_ctx)   # Step 3.5c fold
-        assert _aba_arenas == _aba_arenas_legacy, \
-            f"arena parity aba rungs: {_aba_arenas} != {_aba_arenas_legacy}"
         self.aba_spill_tier_3way = select_shared_tier_3way(*_aba_arenas)
         self.aba_use_workspace_temp = self.aba_spill_tier_3way[0] == 2
         aba_t_count = _aba_arenas[self.aba_spill_tier_3way[0]]
@@ -1222,13 +1152,8 @@ class GRiDCodeGenerator:
         # raising occupancy on big floating robots (h2_plus crba LITE ~47.6KB -> ~34KB).
         _crba_inner   = self.gen_crba_inner_temp_mem_size()
         _crba_no_M    = crba_input_t_count + XI_size + rt_xfixed_reserve   # input + XI, no s_M
-        _crba_rungs_legacy = (nv*nv + _crba_no_M + _crba_inner,   # full: s_M + inner + input/XI
-                              _crba_no_M + _crba_inner,           # output_spill: s_M -> d_workspace
-                              _crba_no_M)                         # workspace: s_M + inner -> d_workspace
         (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace) = \
             compose_arena_rungs("crba", self._arena_ctx)   # Step 3.2 fold
-        assert (_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace) == _crba_rungs_legacy, \
-            f"arena parity crba rungs: {(_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)} != {_crba_rungs_legacy}"
         self.crba_spill_tier_3way = select_shared_tier_3way(_crba_t_count_full, _crba_t_count_output_spill, _crba_t_count_workspace)
         # whole-band spill (inner band -> d_workspace) fires only at the deepest rung (index 2).
         self.crba_use_workspace_temp = self.crba_spill_tier_3way[0] == 2
@@ -1246,17 +1171,11 @@ class GRiDCodeGenerator:
         _osc_Xhom, _, _ = self.gen_get_Xhom_size()
         _osc_F = self.gen_minv_inner_F_size()                          # 6*nv*nv minv F-region
         _osc_temp = max(self.gen_minv_inner_no_F_size(), 16 * self.robot.get_num_joints())
-        _osc_rungs_legacy = (_osc_XI + _osc_Xhom + nv*nv + _osc_F + 6*nv + nv*6 + 72 + _osc_temp,
-                             _osc_XI + _osc_Xhom + nv*nv + 6*nv + nv*6 + 72 + _osc_temp)  # s_F -> d_workspace
         (_osc_t_full, _osc_t_spill_F) = compose_arena_rungs("osc_inertia", self._arena_ctx)   # Step 3.5e fold
-        assert (_osc_t_full, _osc_t_spill_F) == _osc_rungs_legacy, \
-            f"arena parity osc_inertia rungs: {(_osc_t_full, _osc_t_spill_F)} != {_osc_rungs_legacy}"
         self.osc_inertia_spill_tier_3way = select_shared_tier_3way(_osc_t_full, _osc_t_spill_F)
         self.osc_inertia_t_count_per_tier = tuple(
             (_osc_t_full, _osc_t_spill_F)[i] for i in self.osc_inertia_spill_tier_3way)
-        _ee_t_count_legacy = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
         ee_t_count = compose_arena_full("end_effector_pose", self._arena_ctx)   # Step 3.1 fold
-        assert ee_t_count == _ee_t_count_legacy, f"arena parity end_effector_pose: {ee_t_count} != {_ee_t_count_legacy}"
         # Phase 3d (EE_POSE_GRAD): two-tier spill, mirrors D2EE's (full, spill, spill).
         # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient). Level 1 =
         # inner_temp + s_end_effector_pose_gradient -> workspace/global. The old dXmatsHom
@@ -1270,10 +1189,7 @@ class GRiDCodeGenerator:
         _end_effector_pose_gradient_full_t_count        = n + 6*n*_end_effector_pose_gradient_num_ees + _end_effector_pose_gradient_inner_temp_count + XHom_size
         _end_effector_pose_gradient_spill_temp_t_count  = n                                                    + XHom_size
         # Degenerate 3rd arena == 2nd (MINIMAL = last index always; collapses to spill).
-        _end_effector_pose_gradient_arenas_legacy = (_end_effector_pose_gradient_full_t_count, _end_effector_pose_gradient_spill_temp_t_count, _end_effector_pose_gradient_spill_temp_t_count)
         _end_effector_pose_gradient_arenas = compose_arena_rungs("end_effector_pose_gradient", self._arena_ctx)   # Step 3.5e fold
-        assert _end_effector_pose_gradient_arenas == _end_effector_pose_gradient_arenas_legacy, \
-            f"arena parity ee_gradient rungs: {_end_effector_pose_gradient_arenas} != {_end_effector_pose_gradient_arenas_legacy}"
         self.end_effector_pose_gradient_spill_tier_3way = select_shared_tier_3way(*_end_effector_pose_gradient_arenas)
         self.end_effector_pose_gradient_spill_tier = self.end_effector_pose_gradient_spill_tier_3way[0]
         self.end_effector_pose_gradient_use_workspace_temp = self.end_effector_pose_gradient_spill_tier >= 1
@@ -1291,10 +1207,7 @@ class GRiDCodeGenerator:
         d2ee_full_t_count   = n + d2ee_grad_count + d2ee_output_count + d2ee_inner_temp_count + XHom_size
         # output spilled: drop d2ee_output from smem (still need q + grad + inner_temp + Xhom)
         d2ee_spill_t_count  = n + d2ee_grad_count                     + d2ee_inner_temp_count + XHom_size
-        _d2ee_arenas_legacy = (d2ee_full_t_count, d2ee_spill_t_count, d2ee_spill_t_count)
         _d2ee_arenas = compose_arena_rungs("end_effector_pose_hessian", self._arena_ctx)   # Step 3.5e fold
-        assert _d2ee_arenas == _d2ee_arenas_legacy, \
-            f"arena parity ee_hessian rungs: {_d2ee_arenas} != {_d2ee_arenas_legacy}"
         if "end_effector_pose_hessian" in getattr(self, "generated_algorithms", set()):
             self.d2ee_spill_tier_3way = select_shared_tier_3way(*_d2ee_arenas)
         else:
@@ -1319,11 +1232,8 @@ class GRiDCodeGenerator:
         # macro under-budgets and the high-body f-writes overflow shared mem (h1_2:fixed
         # NB=51>NV=39 crashed). Non-mimic (nb_vaf==n) is byte-identical to the old 18*n.
         nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
-        _id_bias_t_count_legacy = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size + rt_xfixed_reserve
         # generalized_gravity / nonlinear_effects share the INVERSE_DYNAMICS_BIAS arena.
         self.id_bias_t_count = compose_arena_full("generalized_gravity", self._arena_ctx)   # Step 3.1 fold
-        assert self.id_bias_t_count == _id_bias_t_count_legacy, \
-            f"arena parity id_bias: {self.id_bias_t_count} != {_id_bias_t_count_legacy}"
         # com/ccrba/energy (DE-GATE #2): the Jw band (6*nv*NB) is carved as a SEPARATE
         # tier-routed buffer s_J (in-smem tail at the J-in-smem tier, d_workspace at the
         # J-spilled tier), mirroring cmm/dccrba. Each family gets a 2-rung ladder:
@@ -1336,16 +1246,9 @@ class GRiDCodeGenerator:
         _com_base    = n     + (3 + 3*nv) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
         _ccrba_base  = 2*n   + (6*nv + 6) + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
         _energy_base = 2*n   + 3          + 6*nv + 3 + 4 + _centroidal_inner_noJ + XHom_size
-        _com_rungs_legacy    = (_com_base + _centroidal_sJ, _com_base)
-        _ccrba_rungs_legacy  = (_ccrba_base + _centroidal_sJ, _ccrba_base)
-        _energy_rungs_legacy = (_energy_base + _centroidal_sJ, _energy_base)
         _com_rungs    = compose_arena_rungs("com", self._arena_ctx)      # Step 3.3 fold
         _ccrba_rungs  = compose_arena_rungs("ccrba", self._arena_ctx)    # Step 3.3 fold
         _energy_rungs = compose_arena_rungs("energy", self._arena_ctx)   # Step 3.3 fold
-        assert _com_rungs == _com_rungs_legacy and _ccrba_rungs == _ccrba_rungs_legacy \
-            and _energy_rungs == _energy_rungs_legacy, \
-            f"arena parity centroidal rungs: {(_com_rungs, _ccrba_rungs, _energy_rungs)} != " \
-            f"{(_com_rungs_legacy, _ccrba_rungs_legacy, _energy_rungs_legacy)}"
         self.com_spill_tier_3way    = select_shared_tier_3way(*_com_rungs)
         self.ccrba_spill_tier_3way  = select_shared_tier_3way(*_ccrba_rungs)
         self.energy_spill_tier_3way = select_shared_tier_3way(*_energy_rungs)
@@ -1406,7 +1309,6 @@ class GRiDCodeGenerator:
             ("output_temp",   _idsva_bf_base_smem,           True,  True,  False, False),
         ]
         self._idsva_so_body_tier_table = _idsva_so_body_tiers
-        _idsva_so_body_arenas_legacy = tuple(t[1] for t in _idsva_so_body_tiers)
         if self.robot.floating_base:
             # Diagnostic path: keep legacy single-body emit + grav shim (no ladder).
             # The body ladder is NOT composed here: floating body inner is grav_full_spill-
@@ -1417,8 +1319,6 @@ class GRiDCodeGenerator:
             self.idsva_so_body_frame_use_ladder = False
         else:
             _idsva_so_body_arenas = compose_arena_rungs("idsva_so_body_frame", self._arena_ctx)   # Step 3.5 fold (fixed-base ladder)
-            assert _idsva_so_body_arenas == _idsva_so_body_arenas_legacy, \
-                f"arena parity idsva_so_body rungs: {_idsva_so_body_arenas} != {_idsva_so_body_arenas_legacy}"
             self.idsva_so_body_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_body_arenas)
             self.idsva_so_body_frame_t_count_per_tier = tuple(_idsva_so_body_arenas[i] for i in self.idsva_so_body_frame_spill_tier_3way)
             self.idsva_so_body_frame_use_ladder = True
@@ -1450,10 +1350,7 @@ class GRiDCodeGenerator:
             ("output_temp",   _idsva_wf_base_smem,                                True,  True,  False),
         ]
         self._idsva_so_world_tier_table = _idsva_so_world_tiers
-        _idsva_so_world_arenas_legacy = tuple(t[1] for t in _idsva_so_world_tiers)
         _idsva_so_world_arenas = compose_arena_rungs("idsva_so_world_frame", self._arena_ctx)   # Step 3.5 fold
-        assert _idsva_so_world_arenas == _idsva_so_world_arenas_legacy, \
-            f"arena parity idsva_so_world rungs: {_idsva_so_world_arenas} != {_idsva_so_world_arenas_legacy}"
         self.idsva_so_world_frame_spill_tier_3way = select_shared_tier_3way(*_idsva_so_world_arenas)
         self.idsva_so_world_frame_t_count_per_tier = tuple(_idsva_so_world_arenas[i] for i in self.idsva_so_world_frame_spill_tier_3way)
         self.idsva_so_world_frame_use_global_output = _idsva_so_world_tiers[self.idsva_so_world_frame_spill_tier_3way[0]][2]
@@ -1549,10 +1446,7 @@ class GRiDCodeGenerator:
             # pool->global: smem = base (inputs + qdd + Minv + df_du + XI), no pool/outputs/contraction.
             ("pool_global",          fdsva_so_base_t_count,                         True,  True,  False, False, False, True,  False),
         ]
-        _fdsva_so_arenas_legacy = tuple(t[1] for t in _fdsva_so_tiers)
         _fdsva_so_arenas = compose_arena_rungs("fdsva_so", self._arena_ctx)   # Step 3.4 fold
-        assert _fdsva_so_arenas == _fdsva_so_arenas_legacy, \
-            f"arena parity fdsva_so rungs: {_fdsva_so_arenas} != {_fdsva_so_arenas_legacy}"
         self.fdsva_so_spill_tier_3way = select_shared_tier_3way(*_fdsva_so_arenas)
         # arena counts now come from the composer; the 9-tuple STATE FLAGS stay in-gen.
         _chosen = _fdsva_so_tiers[self.fdsva_so_spill_tier_3way[0]]
@@ -1575,10 +1469,7 @@ class GRiDCodeGenerator:
         _psh_d2ab = 2 * nv * (3 * nv) * (3 * nv)
         _psh_base = (nv + nv) + nv + nv*nv + 2*nv*nv + nv + XI_size  # s_x(nx==2nv fixed) + s_u + s_qdd + Minv + df_du
         _psh_pool = max(fdsva_so_inner_idsva_so_temp_count, fdsva_so_contract_temp_count, fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
-        _psh_rungs_legacy = (_psh_base + _psh_d2ab + 8*nv**3 + _psh_pool, _psh_base)
         (_psh_t_full, _psh_t_spill) = compose_arena_rungs("integrator_hessian", self._arena_ctx)   # Step 3.5e fold
-        assert (_psh_t_full, _psh_t_spill) == _psh_rungs_legacy, \
-            f"arena parity integrator_hessian rungs: {(_psh_t_full, _psh_t_spill)} != {_psh_rungs_legacy}"
         self.plant_step_hessian_spill_tier_3way = select_shared_tier_3way(_psh_t_full, _psh_t_spill)
 
         # ── Descriptor-table Step 3 parity net (item M) ──────────────────────
@@ -1625,39 +1516,27 @@ class GRiDCodeGenerator:
             "fdsva_so":                            _fdsva_so_arenas[0],
             "integrator_hessian":                  _psh_t_full,
         }
-        # Spill-ladder rung arenas (least-spill first), for the composer parity net on
-        # the LADDERED folds (Step 3.2+). Keyed by ALGO_DESCRIPTORS key; each tuple is
-        # the hand-written legacy rungs the descriptor `compose_arena_rungs` reproduces.
+        # Spill-ladder rung arenas (least-spill first). The generator DRIVES every
+        # `select_shared_tier_3way` call above from `compose_arena_rungs`; this snapshot
+        # is the descriptor table's canonical arena record + what the invariant parity
+        # test reads (test/test_algo_descriptor_arena_parity.py). The body ladder is
+        # fixed-base only (floating body uses the grav_full_spill picker override, which
+        # is NOT ctx-pure), so it is captured only there.
         self._arena_rung_t_counts = {
-            "crba":               _crba_rungs_legacy,
-            "minv":               _minv_rungs_legacy,
-            "forward_dynamics":   _fd_rungs_legacy,
-            "coriolis_matrix":    _coriolis_rungs_legacy,
-            "integrator":         _integrator_rungs_legacy,
-            "dccrba":             _dccrba_rungs_legacy,
-            "cmm_time_variation": _cmm_rungs_legacy,
-            "com":                _com_rungs_legacy,
-            "ccrba":              _ccrba_rungs_legacy,
-            "energy":             _energy_rungs_legacy,
-            "fdsva_so":           _fdsva_so_arenas_legacy,
-            "idsva_so_world_frame": _idsva_so_world_arenas_legacy,
-            "integrator_gradient": _integrator_gradient_arenas_legacy,
-            "inverse_dynamics_gradient": _inverse_dynamics_gradient_arenas_legacy,
-            "forward_dynamics_gradient": _forward_dynamics_gradient_arenas_legacy,
-            "aba":                _aba_arenas_legacy,
-            "inverse_dynamics_regressor": _idr_rungs_legacy,
-            "forward_dynamics_parameter_gradient": _fpg_rungs_legacy,
-            "f_ext_gradient":     _feg_rungs_legacy,
-            "f_ext_gradient_dq":  _feg_dq_rungs_legacy,
-            "osc_inertia":        _osc_rungs_legacy,
-            "end_effector_pose_gradient": _end_effector_pose_gradient_arenas_legacy,
-            "end_effector_pose_hessian":  _d2ee_arenas_legacy,
-            "integrator_hessian": _psh_rungs_legacy,
+            k: compose_arena_rungs(k, self._arena_ctx)
+            for k in sorted(ARENA_RUNG_KEYS)
+            if not (k == "idsva_so_body_frame" and self.robot.floating_base)
         }
-        # Body ladder is fixed-base only (floating body uses the picker-driven override,
-        # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.
-        if not self.robot.floating_base:
-            self._arena_rung_t_counts["idsva_so_body_frame"] = _idsva_so_body_arenas_legacy
+        # In-generation descriptor-arena invariants (runs on EVERY robot generated): every
+        # composed rung is positive, and — for keys whose FULL is composed — rung[0] equals
+        # the full arena. Cheap structural guard against a future closure edit producing a
+        # negative/absurd/inconsistent arena (the §2 under-size bug class). rt-reservation
+        # correctness is checked in the parity test (needs a no-rt ctx variant).
+        for _k, _rungs in self._arena_rung_t_counts.items():
+            assert all(r > 0 for r in _rungs), f"descriptor arena {_k}: non-positive rung {_rungs}"
+            if _k in ARENA_COMPOSED_KEYS:
+                _full = compose_arena_full(_k, self._arena_ctx)
+                assert _rungs[0] == _full, f"descriptor arena {_k}: rung[0] {_rungs[0]} != full {_full}"
 
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before inverse_dynamics_gradient / forward_dynamics_gradient in any kernel that
