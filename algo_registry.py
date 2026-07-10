@@ -431,10 +431,12 @@ class ArenaCtx:
         return max(self.minv_noF, 16 * self.NJ)
 
 
-def arena_ctx_from_codegen(gen) -> ArenaCtx:
-    """Build an ArenaCtx from a GRiDCodeGenerator whose gen_add_constants_helpers has
-    already run. Reads the same sizing primitives + inner-temp helpers the imperative
-    arena math uses. Kept in this module (not the generator) as the table's adapter."""
+def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
+    """Build an ArenaCtx from a GRiDCodeGenerator. Reads the same sizing primitives +
+    inner-temp helpers the imperative arena math uses. `xi`/`xhom`/`rt` override the
+    derived values so gen_add_constants_helpers can pass its EXACT locals (matters when
+    called with include_base_inertia=True, where the derived XI would differ). Kept in
+    this module (not the generator) as the table's adapter."""
     robot = gen.robot
     n = robot.get_num_pos()
     return ArenaCtx(
@@ -442,9 +444,9 @@ def arena_ctx_from_codegen(gen) -> ArenaCtx:
         nv=robot.get_num_vel(),
         NB=robot.get_num_bodies(),
         NJ=robot.get_num_joints(),
-        XI=gen.gen_get_XI_size(False, include_homogenous_transforms=False),
-        XHom=gen.gen_get_Xhom_size()[0],
-        rt=(36 * robot.get_num_joints()) if getattr(gen, "runtime_transform", False) else 0,
+        XI=gen.gen_get_XI_size(False, include_homogenous_transforms=False) if xi is None else xi,
+        XHom=gen.gen_get_Xhom_size()[0] if xhom is None else xhom,
+        rt=((36 * robot.get_num_joints()) if getattr(gen, "runtime_transform", False) else 0) if rt is None else rt,
         floating=bool(robot.floating_base),
         has_mimic=bool(gen.robot_has_mimic_joints()),
         n_leaf=robot.get_total_leaf_nodes(),

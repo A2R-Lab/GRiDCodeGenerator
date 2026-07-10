@@ -13,7 +13,8 @@ from .algorithms._idsva_so import _idsva_so_use_world_frame
 # (Step 2) for the KERNEL_ATTR_MANIFEST / mujoco_manifest per-entry HEAD fields
 # (algo_label, algo_short, gate_attr, bytes_macro) — only the irregular kernel
 # overload SIGNATURES stay as co-located payload data.
-from .algo_registry import ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol, descriptor_for
+from .algo_registry import (ALGO_DESCRIPTORS, build_launch_config_algo_to_symbol, descriptor_for,
+                            arena_ctx_from_codegen, compose_arena_full)
 
 # ─── A1b launch-config bake (single source of truth) ─────────────────────────
 # The autotuned per-(robot,base,algo) {tier,threads} live in
@@ -682,6 +683,14 @@ class GRiDCodeGenerator:
         # would corrupt the XImats layout) — it is appended to the temp region.
         rt_xfixed_reserve = (36 * NJ) if getattr(self, "runtime_transform", False) else 0
         XHom_size, dXhom_size, d2Xhom_size = self.gen_get_Xhom_size()
+        # Descriptor-table Step 3: build the ArenaCtx snapshot from the exact sizing
+        # locals so the per-algo `arena_full_fn` closures (algo_registry) can drive the
+        # FULL/rung-0 arena t_counts. Each fold keeps the hand-written legacy expression
+        # behind `assert composed == legacy` (the parity shim, deleted in 3.6). The
+        # inner-temp helpers ArenaCtx reads are pure robot-shape functions, so building
+        # the snapshot here (before the arena math) matches their mid-function values —
+        # proven by test/test_algo_descriptor_arena_parity.py.
+        self._arena_ctx = arena_ctx_from_codegen(self, xi=XI_size, xhom=XHom_size, rt=rt_xfixed_reserve)
         dva_cols_per_partial = self.robot.get_total_ancestor_count() + self.robot.get_num_joints()
         max_threads_in_comp_loop = 6*2*dva_cols_per_partial
         max_perf_level_threads = 32 * int(np.ceil(max_threads_in_comp_loop/32.0))
@@ -722,7 +731,9 @@ class GRiDCodeGenerator:
         # (NJ > n) size it 18*NJ so the inner's body f-writes don't overflow into
         # the XImats region. Non-mimic keeps the legacy 18*n byte-identical.
         _id_vaf = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-        id_t_count = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        _id_t_count_legacy = 2*n + n + _id_vaf + n + self.gen_inverse_dynamics_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        id_t_count = compose_arena_full("inverse_dynamics", self._arena_ctx)   # Step 3.1 fold
+        assert id_t_count == _id_t_count_legacy, f"arena parity inverse_dynamics: {id_t_count} != {_id_t_count_legacy}"
         # joint-torque regressor (E1): kernel smem = XI + s_q_qd_qdd(NUM_POS+2nv)
         # + s_Y (nv x 10*NUM_BODIES) + s_vaf(18*NUM_POS) + RNEA forward scratch.
         # n == get_num_pos() here. Additive.
@@ -743,12 +754,18 @@ class GRiDCodeGenerator:
         # PS5 energy regressors. Both outputs are 10*NUM_BODIES (no DoF sweep).
         # KE (spatial / XImats domain): s_q_qd(n+nv) + s_y_ke(10NB) + s_vaf(18n)
         #   + RNEA forward scratch + XI_size.
-        self.kinetic_energy_regressor_t_count = (n + nv) + 10*self.robot.get_num_bodies() + 18*n \
+        _ker_t_count_legacy = (n + nv) + 10*self.robot.get_num_bodies() + 18*n \
             + self.gen_kinetic_energy_regressor_inner_temp_mem_size() + XI_size + rt_xfixed_reserve
+        self.kinetic_energy_regressor_t_count = compose_arena_full("kinetic_energy_regressor", self._arena_ctx)   # Step 3.1 fold
+        assert self.kinetic_energy_regressor_t_count == _ker_t_count_legacy, \
+            f"arena parity kinetic_energy_regressor: {self.kinetic_energy_regressor_t_count} != {_ker_t_count_legacy}"
         # PE (kinematics / XmatsHom domain): s_q(n) + s_y_pe(10NB)
         #   + world-transform BFS scratch (16*NUM_JOINTS) + XHom_size.
-        self.potential_energy_regressor_t_count = n + 10*self.robot.get_num_bodies() \
+        _per_t_count_legacy = n + 10*self.robot.get_num_bodies() \
             + 16*self.robot.get_num_joints() + XHom_size
+        self.potential_energy_regressor_t_count = compose_arena_full("potential_energy_regressor", self._arena_ctx)   # Step 3.1 fold
+        assert self.potential_energy_regressor_t_count == _per_t_count_legacy, \
+            f"arena parity potential_energy_regressor: {self.potential_energy_regressor_t_count} != {_per_t_count_legacy}"
         # PS5 Coriolis matrix C(q,qd): kernel smem = XI + s_q_qd(NUM_POS+nv) + s_coriolis(nv*nv)
         #   + the inner spatial-recursion scratch (per-body NB bands + per-column n_int bands).
         # 3-rung surgical ladder (mirror crba): full | s_coriolis(nv*nv output) -> L2-pinned SO
@@ -1190,7 +1207,9 @@ class GRiDCodeGenerator:
         self.osc_inertia_spill_tier_3way = select_shared_tier_3way(_osc_t_full, _osc_t_spill_F)
         self.osc_inertia_t_count_per_tier = tuple(
             (_osc_t_full, _osc_t_spill_F)[i] for i in self.osc_inertia_spill_tier_3way)
-        ee_t_count = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
+        _ee_t_count_legacy = n + 6*self.robot.get_total_leaf_nodes() + self.gen_end_effector_pose_inner_temp_mem_size() + XHom_size
+        ee_t_count = compose_arena_full("end_effector_pose", self._arena_ctx)   # Step 3.1 fold
+        assert ee_t_count == _ee_t_count_legacy, f"arena parity end_effector_pose: {ee_t_count} != {_ee_t_count_legacy}"
         # Phase 3d (EE_POSE_GRAD): two-tier spill, mirrors D2EE's (full, spill, spill).
         # Level 0 = full smem (inner_temp + s_end_effector_pose_gradient). Level 1 =
         # inner_temp + s_end_effector_pose_gradient -> workspace/global. The old dXmatsHom
@@ -1247,7 +1266,11 @@ class GRiDCodeGenerator:
         # macro under-budgets and the high-body f-writes overflow shared mem (h1_2:fixed
         # NB=51>NV=39 crashed). Non-mimic (nb_vaf==n) is byte-identical to the old 18*n.
         nb_vaf = self.robot.get_num_joints() if self.robot_has_mimic_joints() else n
-        self.id_bias_t_count = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size + rt_xfixed_reserve
+        _id_bias_t_count_legacy = 2*n + nv + 18*nb_vaf + nv + 6*n + XI_size + rt_xfixed_reserve
+        # generalized_gravity / nonlinear_effects share the INVERSE_DYNAMICS_BIAS arena.
+        self.id_bias_t_count = compose_arena_full("generalized_gravity", self._arena_ctx)   # Step 3.1 fold
+        assert self.id_bias_t_count == _id_bias_t_count_legacy, \
+            f"arena parity id_bias: {self.id_bias_t_count} != {_id_bias_t_count_legacy}"
         # com/ccrba/energy (DE-GATE #2): the Jw band (6*nv*NB) is carved as a SEPARATE
         # tier-routed buffer s_J (in-smem tail at the J-in-smem tier, d_workspace at the
         # J-spilled tier), mirroring cmm/dccrba. Each family gets a 2-rung ladder:
