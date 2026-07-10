@@ -1047,13 +1047,16 @@ class GRiDCodeGenerator:
             else max(self.gen_minv_inner_temp_mem_size(),
                      self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]))
         _integrator_gradient_full = max(integrator_gradient_t_count, integrator_gradient_with_x_kp1_t_count)
-        _integrator_gradient_arenas = (
+        _integrator_gradient_arenas_legacy = (
             _integrator_gradient_full,                                                                                  # 0 full
             _integrator_gradient_full - _integrator_gradient_D_qdd_count,                                                     # 1 +Dqdd
             _integrator_gradient_full - _integrator_gradient_D_qdd_count - _integrator_gradient_dAB_count                           # 2 +dAB+selective
                 - (_integrator_gradient_inner_full - _integrator_gradient_inner_selective),
             _integrator_gradient_full - _integrator_gradient_D_qdd_count - _integrator_gradient_dAB_count - _integrator_gradient_inner_full,  # 3 +whole inner
         )
+        _integrator_gradient_arenas = compose_arena_rungs("integrator_gradient", self._arena_ctx)   # Step 3.5b fold
+        assert _integrator_gradient_arenas == _integrator_gradient_arenas_legacy, \
+            f"arena parity integrator_gradient rungs: {_integrator_gradient_arenas} != {_integrator_gradient_arenas_legacy}"
         self.integrator_gradient_spill_tier_3way = select_shared_tier_3way(*_integrator_gradient_arenas)
         self.integrator_gradient_t_count_per_tier = tuple(_integrator_gradient_arenas[i] for i in self.integrator_gradient_spill_tier_3way)
         _picks = self.integrator_gradient_spill_tier_3way
@@ -1609,6 +1612,7 @@ class GRiDCodeGenerator:
             "energy":             _energy_rungs_legacy,
             "fdsva_so":           _fdsva_so_arenas_legacy,
             "idsva_so_world_frame": _idsva_so_world_arenas_legacy,
+            "integrator_gradient": _integrator_gradient_arenas_legacy,
         }
         # Body ladder is fixed-base only (floating body uses the picker-driven override,
         # not ctx-pure) — capture its rungs for the parity net only when the ladder is live.

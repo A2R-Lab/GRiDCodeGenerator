@@ -416,6 +416,7 @@ class ArenaCtx:
     fdsva_fdg_inline_spilled: int  # ..._spilled()
     idsva_world_cold: int      # gen_idsva_so_world_cold_floats()
     idsva_bf_jids_a: int       # len(get_jid_ancestor_ids(include_joint=True)[0]) — body t/p scratch span
+    idgrad_selective_shared: int   # id_gradient_temp_layout()["selective_shared_count"] (sparse da_df band)
     has_spherical: bool
 
     # ── derived buffer counts (thin helpers so the closures read like the source) ──
@@ -463,6 +464,13 @@ class ArenaCtx:
     @property
     def fdsva_temp_spilled(self) -> int:
         return max(self.fdsva_inner_idsva, self.fdsva_fdg_inline_spilled) + self.rt
+
+    @property
+    def ig_inner_selective(self) -> int:
+        # integrator_gradient rung-2 selective FD-grad inner: the MIMIC dense inner
+        # can't shrink (ignores USE_DA_DF_SPILL) so it stays at the full inner; the
+        # SPARSE inner shrinks to max(minv inner, the da_df selective_shared_count).
+        return self.fdgrad_inner if self.has_mimic else max(self.minv_inner, self.idgrad_selective_shared)
 
 
 def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
@@ -514,6 +522,7 @@ def arena_ctx_from_codegen(gen, xi=None, xhom=None, rt=None) -> ArenaCtx:
         fdsva_fdg_inline_spilled=gen.gen_fdsva_so_fd_gradient_inline_temp_mem_size_spilled(),
         idsva_world_cold=gen.gen_idsva_so_world_cold_floats(),
         idsva_bf_jids_a=len(robot.get_jid_ancestor_ids(include_joint=True)[0]),
+        idgrad_selective_shared=gen.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"],
         has_spherical=bool(gen.robot.robot_has_spherical()),
     )
 
@@ -672,6 +681,15 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt,              # global_output: 4nv³ output -> ws
         lambda c: (3*c.n) + c.idsva_world_inner + c.XI + c.rt - c.idsva_world_cold,  # output_cold: + cold quad -> ws
         lambda c: (3*c.n) + c.XI,                                           # output_temp: whole s_temp -> ws (no rt)
+    ),
+    # integrator_gradient 4-rung ladder. rung[0] == _integrator_gradient_full. Dqdd =
+    # max_stages(4)*nv*3nv, dAB = 2*nv*3nv. rung-2 selective-inner shrink is mimic-conditional.
+    "integrator_gradient": (
+        lambda c: _integrator_gradient_full(c),                                          # 0 full
+        lambda c: _integrator_gradient_full(c) - 4*c.nv*3*c.nv,                           # 1 +Dqdd -> ws
+        lambda c: (_integrator_gradient_full(c) - 4*c.nv*3*c.nv - 2*c.nv*3*c.nv           # 2 +dAB + selective inner
+                   - (c.fdgrad_inner - c.ig_inner_selective)),
+        lambda c: _integrator_gradient_full(c) - 4*c.nv*3*c.nv - 2*c.nv*3*c.nv - c.fdgrad_inner,  # 3 +whole inner -> ws
     ),
     # ── 3.3 clean ladders ──
     "coriolis_matrix": (
