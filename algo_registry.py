@@ -24,6 +24,7 @@ emission of the kernel + the bench's `#if GRID_HAS_X` measure wrappers).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -316,3 +317,254 @@ def single_call_printf_line(key: str) -> str:
         f'printf("Single Call {printf_label_for(key)} %fus\\n",'
         'time_delta_us_timespec(start,end)/static_cast<double>(num_timesteps));'
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTOR TABLE STEP 3 — arena / spill schema + composer (item M).
+#
+# Step 3 folds the ~272 hand-written `*_t_count` arena expressions + spill ladders
+# in GRiDCodeGenerator.gen_add_constants_helpers into the descriptor table
+# (design: docs/open-tasks/design_descriptor_table_spec.md §3-4). This is the
+# RISKIEST step (a wrong arena silently under-sizes shared memory), so it lands
+# strictly one algo per commit behind a byte-diff + CUDA-equivalence gate.
+#
+# Step 3.0 (this landing) GENERATES NOTHING. It lands:
+#   - the `ArenaRegion` / `SpillRung` schema the per-algo folds will populate,
+#   - an `ArenaCtx` snapshot of the sizing primitives + inner-temp helper results,
+#   - a per-algo `arena_full_fn` closure that recomputes the FULL (least-spill /
+#     rung-0) arena t_count from the ArenaCtx, DECOUPLED from the imperative math,
+#   - `compose_arena_full(key, ctx)` + `ARENA_COMPOSED_KEYS`.
+# test/test_algo_descriptor_arena_parity.py asserts every closure reproduces the
+# imperative `GRiDCodeGenerator._arena_full_t_counts[key]` on the matrix robots —
+# the Step-0-style safety net that de-risks driving the arena sites from the table.
+#
+# The 3 SO-DISPATCH algos (idsva_so_body_frame / idsva_so_world_frame / fdsva_so)
+# have per_base_override + workspace_bytes_fn + dispatch aliases that are inseparable
+# from their multi-rung emission, so their closures land WITH their generation flip
+# in commits 3.4/3.5 — they are captured in `_arena_full_t_counts` but intentionally
+# excluded from `ARENA_COMPOSED_KEYS` here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ArenaRegion:
+    """One named buffer band in an algo's shared-memory arena. The per-algo folds
+    (3.1+) populate these; the full arena is `sum(count_fn(ctx))` + the auto-injected
+    cross-cutting rt_xfixed region for s_temp-domain arenas (the §2 bug class fix)."""
+    name: str
+    count_fn: Callable[[ArenaCtx], int]
+    domain: str = "s_temp"          # "s_temp" | "XmatsHom"
+    spillable: bool = False         # can move to d_workspace at a spilled rung
+    cross_cutting: bool = False     # contributed by a shared helper (rt_xfixed)
+
+
+@dataclass(frozen=True)
+class SpillRung:
+    """One rung of an algo's spill ladder, least-spill first. `in_smem` names the
+    regions KEPT in smem at this rung (the rest route to d_workspace)."""
+    label: str
+    in_smem: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ArenaCtx:
+    """Immutable snapshot of the arena-sizing primitives + inner-temp helper results
+    for ONE robot, as read by gen_add_constants_helpers. Built by
+    `arena_ctx_from_codegen(gen)` AFTER gen_add_constants_helpers has run (so all
+    spill flags are final). The `arena_full_fn` closures below read only these
+    fields, never the generator — so the composer is decoupled from the imperative
+    math and a drift in either is caught by the parity test."""
+    # sizing scalars
+    n: int            # num_pos
+    nv: int           # num_vel
+    NB: int           # num_bodies
+    NJ: int           # num_joints
+    XI: int           # DYNAMICS_XI_T_COUNT (gen_get_XI_size)
+    XHom: int         # XHOM_T_COUNT
+    rt: int           # rt_xfixed_reserve (36*NJ under runtime_transform, else 0)
+    floating: bool
+    has_mimic: bool
+    n_leaf: int       # total_leaf_nodes (num EEs)
+    osc_XI: int       # gen_get_XI_size(False, False) — usually == XI
+    # inner-temp helper results (pure size functions of the robot)
+    id_inner: int
+    idr_inner: int
+    ker_inner: int
+    coriolis_inner: int
+    dccrba_inner: int
+    dccrba_sJ: int
+    fpg_inner: int
+    feg_inner: int
+    minv_inner: int
+    minv_F: int
+    minv_noF: int
+    ximats_helper_temp: int
+    fd_inner_Fsmem: int
+    fdgrad_inner: int
+    idgrad_inner: int
+    aba_inner: int
+    crba_inner: int
+    ee_inner: int
+    eeg_inner: int
+    d2ee_inner: int
+    d2ee_out: int
+
+    # ── derived buffer counts (thin helpers so the closures read like the source) ──
+    @property
+    def id_vaf(self) -> int:          # s_vaf body-band, pos-flavour (18*NJ mimic else 18*n)
+        return 18 * (self.NJ if self.has_mimic else self.n)
+
+    @property
+    def grad_vaf(self) -> int:        # s_vaf body-band, vel-flavour (18*NJ mimic else 18*nv)
+        return 18 * (self.NJ if self.has_mimic else self.nv)
+
+    @property
+    def nb_vaf(self) -> int:          # id-bias s_vaf body-count (NJ mimic else n)
+        return self.NJ if self.has_mimic else self.n
+
+    @property
+    def centroidal_inner_noJ(self) -> int:
+        return 16 * self.NJ + 36 * self.NB + 6 * self.nv + 36
+
+    @property
+    def osc_temp(self) -> int:
+        return max(self.minv_noF, 16 * self.NJ)
+
+
+def arena_ctx_from_codegen(gen) -> ArenaCtx:
+    """Build an ArenaCtx from a GRiDCodeGenerator whose gen_add_constants_helpers has
+    already run. Reads the same sizing primitives + inner-temp helpers the imperative
+    arena math uses. Kept in this module (not the generator) as the table's adapter."""
+    robot = gen.robot
+    n = robot.get_num_pos()
+    return ArenaCtx(
+        n=n,
+        nv=robot.get_num_vel(),
+        NB=robot.get_num_bodies(),
+        NJ=robot.get_num_joints(),
+        XI=gen.gen_get_XI_size(False, include_homogenous_transforms=False),
+        XHom=gen.gen_get_Xhom_size()[0],
+        rt=(36 * robot.get_num_joints()) if getattr(gen, "runtime_transform", False) else 0,
+        floating=bool(robot.floating_base),
+        has_mimic=bool(gen.robot_has_mimic_joints()),
+        n_leaf=robot.get_total_leaf_nodes(),
+        osc_XI=gen.gen_get_XI_size(False, False),
+        id_inner=gen.gen_inverse_dynamics_inner_temp_mem_size(),
+        idr_inner=gen.gen_inverse_dynamics_regressor_inner_temp_mem_size(),
+        ker_inner=gen.gen_kinetic_energy_regressor_inner_temp_mem_size(),
+        coriolis_inner=gen.gen_coriolis_matrix_inner_temp_mem_size(),
+        dccrba_inner=gen._dccrba_inner_temp_mem_size(),
+        dccrba_sJ=gen._dccrba_sweep_J_count(),
+        fpg_inner=gen.gen_forward_dynamics_parameter_gradient_inner_temp_mem_size(),
+        feg_inner=gen.gen_f_ext_gradient_inner_temp_mem_size(),
+        minv_inner=gen.gen_minv_inner_temp_mem_size(),
+        minv_F=gen.gen_minv_inner_F_size(),
+        minv_noF=gen.gen_minv_inner_no_F_size(),
+        ximats_helper_temp=gen.gen_load_update_XImats_helpers_temp_mem_size(),
+        fd_inner_Fsmem=gen.gen_forward_dynamics_inner_temp_mem_size(minv_f_in_smem=True),
+        fdgrad_inner=gen.gen_forward_dynamics_gradient_inner_temp_mem_size(),
+        idgrad_inner=gen.gen_inverse_dynamics_gradient_inner_temp_mem_size(),
+        aba_inner=gen.gen_aba_inner_temp_mem_size(),
+        crba_inner=gen.gen_crba_inner_temp_mem_size(),
+        ee_inner=gen.gen_end_effector_pose_inner_temp_mem_size(),
+        eeg_inner=gen.gen_end_effector_pose_gradient_inner_temp_mem_size(),
+        d2ee_inner=gen.gen_end_effector_pose_hessian_inner_temp_mem_size(),
+        d2ee_out=gen.gen_end_effector_pose_hessian_output_count(),
+    )
+
+
+# Per-algo FULL (least-spill / rung-0) arena t_count closures, decoupled from the
+# imperative gen_add_constants_helpers math. Each mirrors the buffer list the kernel
+# slices; the parity test proves they agree on every matrix robot. The `+ c.rt`
+# terms encode the rt_xfixed reservation on the s_temp-domain arenas (§2); commit 3.1
+# refactors these into `ArenaRegion`s with domain-driven auto-injection.
+_ARENA_FULL_FNS: dict[str, Callable[[ArenaCtx], int]] = {
+    # ── Core dynamics (s_temp domain) ──
+    "inverse_dynamics":
+        lambda c: 2*c.n + c.n + c.id_vaf + c.n + c.id_inner + c.XI + c.rt,
+    "minv":
+        lambda c: c.n + c.n*c.n + c.minv_F + c.minv_noF + c.XI + c.rt,
+    "forward_dynamics":
+        lambda c: 3*c.n + c.nv + c.XI + c.rt + c.fd_inner_Fsmem,
+    "aba":
+        lambda c: c.nv + 3*c.n + 12*c.NJ + c.XI + c.rt + c.aba_inner,
+    "crba":
+        lambda c: c.nv*c.nv + (c.n + c.nv) + c.XI + c.rt + c.crba_inner,
+    # ── Gradients / regressors (s_temp domain) ──
+    "inverse_dynamics_gradient":
+        lambda c: (c.nv + c.n) + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.idgrad_inner + c.XI + c.rt,
+    "forward_dynamics_gradient":
+        lambda c: 3*c.n + 2*c.nv*c.nv + c.grad_vaf + c.nv + c.nv*c.nv + c.fdgrad_inner + c.XI + c.rt,
+    "f_ext_gradient":
+        lambda c: c.n + 2*(c.nv*6*c.NB) + c.nv*c.nv + max(c.feg_inner, c.minv_inner) + c.XI + c.rt,
+    "f_ext_gradient_dq":
+        lambda c: c.n + (c.n + (c.nv if c.floating else 0) + 2*c.nv*6*c.NB
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI,
+    "inverse_dynamics_regressor":
+        lambda c: (c.n + 2*c.nv) + c.nv*10*c.NB + 18*c.n + c.idr_inner + c.XI + c.rt,
+    "forward_dynamics_parameter_gradient":
+        lambda c: (c.n + 2*c.nv) + c.nv*10*c.NB + c.nv*c.nv + c.nv*10*c.NB + c.nv + 18*c.n + c.nv
+                  + c.fpg_inner + c.XI + c.rt,
+    "kinetic_energy_regressor":
+        lambda c: (c.n + c.nv) + 10*c.NB + 18*c.n + c.ker_inner + c.XI + c.rt,
+    # ── Kinematics (XmatsHom domain — no rt) ──
+    "potential_energy_regressor":
+        lambda c: c.n + 10*c.NB + 16*c.NJ + c.XHom,
+    "end_effector_pose":
+        lambda c: c.n + 6*c.n_leaf + c.ee_inner + c.XHom,
+    "end_effector_pose_gradient":
+        lambda c: c.n + 6*c.n*c.n_leaf + c.eeg_inner + c.XHom,
+    "end_effector_pose_hessian":
+        lambda c: c.n + 6*c.nv*c.n_leaf + c.d2ee_out + c.d2ee_inner + c.XHom,
+    "osc_inertia":
+        lambda c: c.osc_XI + c.XHom + c.nv*c.nv + c.minv_F + 6*c.nv + c.nv*6 + 72 + c.osc_temp,
+    # ── Integrators (s_temp domain) ──
+    "integrator":
+        lambda c: (3*c.n + c.nv + 3*c.nv + 3*(c.n + c.nv) + (c.n + c.nv) + c.XI + c.rt
+                   + c.fd_inner_Fsmem),
+    "integrator_gradient":
+        lambda c: _integrator_gradient_full(c),
+    "integrator_with_gradient":
+        lambda c: _integrator_gradient_full(c),
+    # ── Centroidal / energy (XmatsHom domain — no rt) ──
+    "generalized_gravity":
+        lambda c: 2*c.n + c.nv + 18*c.nb_vaf + c.nv + 6*c.n + c.XI + c.rt,
+    "nonlinear_effects":
+        lambda c: 2*c.n + c.nv + 18*c.nb_vaf + c.nv + 6*c.n + c.XI + c.rt,
+    "coriolis_matrix":
+        lambda c: c.nv*c.nv + (c.n + c.nv) + c.XI + c.rt + c.coriolis_inner,
+    "dccrba":
+        lambda c: (c.n + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom) + 6*c.nv*c.nv + c.dccrba_sJ,
+    "cmm_time_variation":
+        lambda c: (2*c.n + 6*c.nv + 6*c.nv + 3 + 4 + c.dccrba_inner + c.XHom) + c.dccrba_sJ,
+    "com":
+        lambda c: (c.n + (3 + 3*c.nv) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom)
+                  + 6*c.nv*c.NB,
+    "ccrba":
+        lambda c: (2*c.n + (6*c.nv + 6) + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom)
+                  + 6*c.nv*c.NB,
+    "energy":
+        lambda c: (2*c.n + 3 + 6*c.nv + 3 + 4 + c.centroidal_inner_noJ + c.XHom)
+                  + 6*c.nv*c.NB,
+}
+
+
+def _integrator_gradient_full(c: ArenaCtx) -> int:
+    # max(integrator_gradient_t_count, +s_x_kp1) == the with_x_kp1 arena (n+nv > 0).
+    _max_stages = 4
+    ig = (3*c.n + 2*c.nv*3*c.nv + 2*(c.nv*2*c.nv)
+          + c.grad_vaf + c.nv*c.nv + c.nv
+          + (c.n + c.nv) + _max_stages*c.nv + _max_stages*c.nv*3*c.nv
+          + 72
+          + c.fdgrad_inner + c.XI + c.rt)
+    return ig + (c.n + c.nv)
+
+
+ARENA_COMPOSED_KEYS: frozenset[str] = frozenset(_ARENA_FULL_FNS)
+
+
+def compose_arena_full(key: str, ctx: ArenaCtx) -> int:
+    """FULL (least-spill / rung-0) arena t_count for `key`, composed from the ArenaCtx.
+    Parity-checked against GRiDCodeGenerator._arena_full_t_counts[key]. Raises KeyError
+    for SO-dispatch algos not yet composed (see ARENA_COMPOSED_KEYS)."""
+    return _ARENA_FULL_FNS[key](ctx)

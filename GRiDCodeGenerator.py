@@ -1479,6 +1479,51 @@ class GRiDCodeGenerator:
         _psh_t_spill = _psh_base
         self.plant_step_hessian_spill_tier_3way = select_shared_tier_3way(_psh_t_full, _psh_t_spill)
 
+        # ── Descriptor-table Step 3 parity net (item M) ──────────────────────
+        # Ground-truth capture of each algo's FULL (least-spill / rung-0) arena
+        # t_count, keyed by ALGO_DESCRIPTORS key. This EMITS NOTHING — it snapshots
+        # the hand-written arena math above so test/test_algo_descriptor_arena_parity.py
+        # can assert the descriptor `arena_regions` composer reproduces it exactly on
+        # every matrix robot (the Step-0-style safety net that de-risks driving the
+        # arena sites from the table). See docs/open-tasks/design_descriptor_table_spec.md.
+        self._arena_full_t_counts = {
+            "inverse_dynamics":                    id_t_count,
+            "inverse_dynamics_regressor":          _idr_t_count_full,
+            "kinetic_energy_regressor":            self.kinetic_energy_regressor_t_count,
+            "potential_energy_regressor":          self.potential_energy_regressor_t_count,
+            "coriolis_matrix":                     _coriolis_t_full,
+            "cmm_time_variation":                  _cmm_t_count_full,
+            "dccrba":                              _dccrba_L0,
+            "forward_dynamics_parameter_gradient": _fpg_t_count_full,
+            "f_ext_gradient":                      _feg_t_count_full,
+            "f_ext_gradient_dq":                   _feg_dq_t_count_full,
+            "minv":                                _minv_t_count_full,
+            "forward_dynamics":                    _fd_t_count_full,
+            "integrator":                          _integrator_t_count_full,
+            "integrator_gradient":                 _integrator_gradient_full,
+            "integrator_with_gradient":            _integrator_gradient_full,
+            "inverse_dynamics_gradient":           inverse_dynamics_gradient_t_count_full,
+            "forward_dynamics_gradient":           forward_dynamics_gradient_t_count_full,
+            "aba":                                 _aba_t_count_full,
+            "crba":                                _crba_t_count_full,
+            "osc_inertia":                         _osc_t_full,
+            "end_effector_pose":                   ee_t_count,
+            "end_effector_pose_gradient":          _end_effector_pose_gradient_full_t_count,
+            "end_effector_pose_hessian":           d2ee_full_t_count,
+            "generalized_gravity":                 self.id_bias_t_count,
+            "nonlinear_effects":                   self.id_bias_t_count,
+            "com":                                 _com_base + _centroidal_sJ,
+            "ccrba":                               _ccrba_base + _centroidal_sJ,
+            "energy":                              _energy_base + _centroidal_sJ,
+            # SO-dispatch monsters (per_base_override / workspace / dispatch aliases):
+            # captured here for the 3.4/3.5 fold commits, NOT composed in Step 3.0.
+            "idsva_so_body_frame":                 (_idsva_bf_full if not self.robot.floating_base
+                                                    else idsva_so_body_frame_t_count),
+            "idsva_so_world_frame":                idsva_so_world_frame_full_t_count,
+            "fdsva_so":                            _fdsva_so_tiers[0][1],
+            "integrator_hessian":                  _psh_t_full,
+        }
+
         # Phase 3a: include Minv-F count if Minv is spilling (collisions are OK
         # because Minv runs before inverse_dynamics_gradient / forward_dynamics_gradient in any kernel that
         # composes both — they sequentially reuse the same workspace bytes).
