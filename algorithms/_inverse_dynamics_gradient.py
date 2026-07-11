@@ -932,6 +932,45 @@ def gen_inverse_dynamics_gradient_inner(self):
         if not sparsity_branch_corrector_needed:
             sparsity_branch_corrector = str(0)
         self.gen_add_code_line("// df_lambda/du += X^T * df/du + {Xmx(f), 0}")
+        if self.robot.floating_base and len(inds) > 1 and self.robot.has_repeated_parents(inds):
+            # Shared parents (quadruped legs → floating root): the per-child df
+            # updates COLLIDE on the parent's (dense, n-column) df cells. A
+            # slot-major atomicAdd would sum them in warp-scheduling order → the
+            # result varies in the last ULP run-to-run (single-block kernels must
+            # be bit-deterministic, Inc6). Iterate PARENT-column-major instead:
+            # each unique parent df cell is owned by exactly one thread that sums
+            # its child slots in FIXED ascending slot order (race-free,
+            # deterministic, no atomics). (Fixed-base branched robots keep the
+            # sparsity-compressed atomicAdd path below for now.)
+            unique_parents = sorted(set(self.robot.get_parent_id(j) for j in inds))
+            nup = len(unique_parents)
+            upar_csv = ", ".join(str(p) for p in unique_parents)
+            jids_csv = ", ".join(str(j) for j in inds)
+            pars_csv = ", ".join(str(self.robot.get_parent_id(j)) for j in inds)
+            # Per-level {} scope so the compile-time tables don't collide across
+            # BFS levels emitted into the same function body.
+            self.gen_add_code_line("{", True)
+            self.gen_add_code_line(f"const int s_jid_lvl[{len(inds)}] = {{{jids_csv}}};")
+            self.gen_add_code_line(f"const int s_par_lvl[{len(inds)}] = {{{pars_csv}}};")
+            self.gen_add_code_line(f"const int s_upar_lvl[{nup}] = {{{upar_csv}}};")
+            self.gen_add_parallel_loop("ind", str(6*2*n*nup))
+            self.gen_add_code_line(f"bool dq_flag = ind < {6*n*nup};")
+            self.gen_add_code_line(f"int loc = ind % {6*n*nup};")
+            self.gen_add_code_line(f"int up = loc / {6*n}; int rc = loc % {6*n};")
+            self.gen_add_code_line("int col = rc / 6; int row = rc % 6;")
+            self.gen_add_code_line("int par_l = s_upar_lvl[up];")
+            self.gen_add_code_line(f"int du_col_offset = dq_flag * {Offset_df_dq} + !dq_flag * {Offset_df_dqd} + 6*col;")
+            self.gen_add_code_line(f"T *dst = &s_temp[du_col_offset + par_l*{6*n} + row];")
+            self.gen_add_code_line("T acc = static_cast<T>(0);")
+            self.gen_add_code_line(f"for (int slot = 0; slot < {len(inds)}; slot++) {{ if (s_par_lvl[slot] != par_l) continue;")
+            self.gen_add_code_line("    int jid = s_jid_lvl[slot];")
+            self.gen_add_code_line(f"    acc += dot_prod<T,6,1,1>(&s_XImats[36*jid + 6*row],&s_temp[du_col_offset + jid*{6*n}])")
+            self.gen_add_code_line(f"          + dq_flag * (col == jid+5) * s_temp[{Offset_MxXv} + 6*jid + row]; }}")
+            self.gen_add_code_line("*dst += acc;")
+            self.gen_add_end_control_flow()
+            self.gen_add_sync()
+            self.gen_add_end_control_flow()  # close the per-level {} scope
+            continue
         if self.robot.floating_base:
             # dq_flag is deferred (emitted below after extra setup), so pass None.
             jid, _ = self._emit_fb_bfs_level_indexing(inds, n)

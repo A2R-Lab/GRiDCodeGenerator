@@ -1038,6 +1038,17 @@ def gen_aba_inner(self):
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
                 # update IA of the parent
+                # NOTE (Inc6): this fixed-base branched path folds shared-parent
+                # child IA into the parent via atomicAdd (order-dependent → last-ULP
+                # run-to-run nondeterminism, same class as the crba/minv/id_gradient
+                # floating folds fixed in Inc6). It is NOT exercised by the current
+                # equivalence matrix (go2-fixed's only repeated-parent level is 0,
+                # which the `bfs_level != 0` guard skips; fr3's mimic fingers collapse
+                # to a single codegen joint; iiwa14 is a chain), so it cannot be
+                # GPU-verified yet. Left on atomicAdd + tracked as a same-class
+                # follow-up (with idsva_so / dccrba / coriolis-mimic / id_gradient
+                # fixed-base sparsity) to convert to the deterministic parent-major
+                # fixed-order sum once a robot that exercises it is in the matrix.
                 self.gen_add_code_line("// IA[parent] += temp[k]*X[k]")
                 self.gen_add_parallel_loop("ind", str(36 * len(inds)))
                 self.gen_add_code_line("int row = ind % 6; int col = (ind / 6) %6;")

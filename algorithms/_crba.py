@@ -576,25 +576,36 @@ def gen_crba_inner_floating(self):
 
         # Backward: IC[parent] += alpha[slot] * X[jid].
         # When siblings share a parent (e.g. quadruped legs all feeding the
-        # floating-base body), the accumulation cells COLLIDE and we must
-        # atomicAdd into IC[parent]. When parents are disjoint (the common
-        # case below the root), each (slot, r, c) writes a unique cell.
+        # floating-base body), the per-child contributions COLLIDE on the parent's
+        # IC cells. A slot-major atomicAdd would sum them in warp-scheduling order,
+        # so the result varies in the last ULP run-to-run — single-block kernels
+        # must be bit-deterministic (Inc6). Instead iterate PARENT-cell-major: each
+        # unique parent cell is owned by exactly one thread, which sums its child
+        # slots' contributions in FIXED ascending slot order. Race-free (unique
+        # writer per cell), deterministic (fixed order), no atomics. When parents
+        # are disjoint (the common case below the root), each (slot, r, c) already
+        # writes a unique cell so the plain fused loop stays.
         if self.robot.has_repeated_parents(inds):
-            self.gen_add_code_line(f"// fused backward (shared parents → atomicAdd): IC[parent] += alpha[slot] * X[jid_slot]")
-            self.gen_add_parallel_loop("el", str(36 * k))
-            self.gen_add_code_line("int slot = el / 36;")
+            unique_parents = sorted(set(self.robot.get_parent_id(j) for j in inds))
+            nup = len(unique_parents)
+            upar_csv = ", ".join(str(p) for p in unique_parents)
+            self.gen_add_code_line("// fused backward (shared parents → deterministic parent-major fixed-order sum): IC[parent] += sum_slot alpha[slot] * X[jid_slot]")
+            self.gen_add_code_line(f"const int s_upar_lvl[{nup}] = {{{upar_csv}}};")
+            self.gen_add_parallel_loop("el", str(36 * nup))
+            self.gen_add_code_line("int up = el / 36;")
             self.gen_add_code_line("int rc = el % 36;")
             self.gen_add_code_line("int row = rc % 6;")
             self.gen_add_code_line("int col = rc / 6;")
-            self.gen_add_code_line("int jid_l = s_jid_lvl[slot];")
-            self.gen_add_code_line("int par_l = s_par_lvl[slot];")
-            self.gen_add_code_line(f"const T *alphaSlot = &s_temp[{alphaOffset} + 36*slot];")
-            self.gen_add_code_line("const T *Xj = &s_XImats[36*jid_l];")
-            # alpha is row-major effectively but stored col-major as a 6x6: alpha[r, p] at offset r + 6*p.
-            # X column-major: X[p, c] at p + 6*c. Result[r, c] = sum_p alpha[r,p] * X[p,c].
+            self.gen_add_code_line("int par_l = s_upar_lvl[up];")
+            # alpha is stored col-major as a 6x6: alpha[r, p] at offset r + 6*p.
+            # X column-major: X[p, c] at p + 6*c. contrib[r, c] = sum_p alpha[r,p] * X[p,c].
+            # Sum child slots in ascending slot order (fixed) for run-to-run determinism.
             self.gen_add_code_line("T acc = static_cast<T>(0);")
-            self.gen_add_code_line("for (int p = 0; p < 6; p++) { acc += alphaSlot[row + 6*p] * Xj[p + 6*col]; }")
-            self.gen_add_code_line(f"atomicAdd(&s_temp[{ICOffset} + 36*par_l + row + 6*col], acc);")
+            self.gen_add_code_line(f"for (int slot = 0; slot < {k}; slot++) {{ if (s_par_lvl[slot] != par_l) continue;")
+            self.gen_add_code_line(f"    const T *alphaSlot = &s_temp[{alphaOffset} + 36*slot]; const T *Xj = &s_XImats[36*s_jid_lvl[slot]];")
+            self.gen_add_code_line("    T contrib = static_cast<T>(0); for (int p = 0; p < 6; p++) { contrib += alphaSlot[row + 6*p] * Xj[p + 6*col]; }")
+            self.gen_add_code_line("    acc += contrib; }")
+            self.gen_add_code_line(f"s_temp[{ICOffset} + 36*par_l + row + 6*col] += acc;")
             self.gen_add_end_control_flow()
             self.gen_add_sync()
             self.gen_add_end_control_flow()  # close the per-level scope

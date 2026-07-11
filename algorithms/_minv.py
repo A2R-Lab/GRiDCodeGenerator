@@ -465,18 +465,37 @@ def gen_minv_inner(self):
             # Finally IA[parent_ind] += IA_Update_Temp * Xmat
             self.gen_add_code_line("// IA[parent_ind] += IA_Update_Temp * Xmat")
             if len(inds) > 1 and self.robot.has_repeated_parents(inds):
-                self.gen_add_parallel_loop("ind",str(6*6*len(inds)))
-                self.gen_add_code_line("int col = ind / 6; int row = ind % 6;")
-                self.gen_add_code_line("int col_max6 = col % 6; int jid_ind = col / 6;")
-                select_var_vals = [("int", "jid", [str(jid) for jid in inds])]
-                self.gen_add_multi_threaded_select("jid_ind", "==", [str(i) for i in range(len(inds))], select_var_vals)
-                self.gen_add_code_line("T * src = &s_temp[" + str(IaTempOffset) + " + 36*jid_ind + row]; " + \
-                                        "T * dst = &s_temp[" + str(IAOffset) + " + 36*" + parent_ind_cpp + " + 6*col_max6 + row];")
-                self.gen_add_code_line("// Atomics required for shared parent")
-                self.gen_add_code_line("T val = dot_prod<T,6,6,1>(src,&s_XImats[36*jid + 6*col_max6]);")
-                self.gen_add_code_line("atomicAdd(dst,val);")
+                # Shared parents (quadruped legs → floating root): the per-child IA
+                # updates COLLIDE on the parent's IA cells. A slot-major atomicAdd
+                # would sum them in warp-scheduling order → last-ULP run-to-run
+                # variation (single-block kernels must be bit-deterministic, Inc6).
+                # Iterate PARENT-cell-major instead: each unique parent cell is
+                # owned by one thread that sums its child slots in FIXED ascending
+                # slot order (race-free, deterministic, no atomics).
+                unique_parents = sorted(set(self.robot.get_parent_id(j) for j in inds))
+                nup = len(unique_parents)
+                upar_csv = ", ".join(str(p) for p in unique_parents)
+                jids_csv = ", ".join(str(j) for j in inds)
+                pars_csv = ", ".join(str(self.robot.get_parent_id(j)) for j in inds)
+                # Per-level {} scope so the compile-time tables don't collide
+                # across BFS levels emitted into the same function body.
+                self.gen_add_code_line("// deterministic parent-major fixed-order sum (shared parent): IA[parent] += sum_slot IA_Update_Temp[slot] * X[jid_slot]")
+                self.gen_add_code_line("{", True)
+                self.gen_add_code_line(f"const int s_jid_lvl[{len(inds)}] = {{{jids_csv}}};")
+                self.gen_add_code_line(f"const int s_par_lvl[{len(inds)}] = {{{pars_csv}}};")
+                self.gen_add_code_line(f"const int s_upar_lvl[{nup}] = {{{upar_csv}}};")
+                self.gen_add_parallel_loop("ind",str(6*6*nup))
+                self.gen_add_code_line("int up = ind / 36; int rc = ind % 36;")
+                self.gen_add_code_line("int col_max6 = rc / 6; int row = rc % 6;")
+                self.gen_add_code_line("int par_l = s_upar_lvl[up];")
+                self.gen_add_code_line("T acc = static_cast<T>(0);")
+                self.gen_add_code_line(f"for (int slot = 0; slot < {len(inds)}; slot++) {{ if (s_par_lvl[slot] != par_l) continue;")
+                self.gen_add_code_line(f"    T * src = &s_temp[{IaTempOffset} + 36*slot + row];")
+                self.gen_add_code_line("    acc += dot_prod<T,6,6,1>(src,&s_XImats[36*s_jid_lvl[slot] + 6*col_max6]); }")
+                self.gen_add_code_line(f"s_temp[{IAOffset} + 36*par_l + 6*col_max6 + row] += acc;")
                 self.gen_add_end_control_flow()
                 self.gen_add_sync()
+                self.gen_add_end_control_flow()  # close the per-level {} scope
             elif len(inds) > 1:
                 for i, jid_val in enumerate(inds):
                     parent_val = self.robot.get_parent_id(jid_val)
