@@ -292,6 +292,14 @@ def gen_collision_namespace(self, tiers):
     # incl. a -DGRID_DEFAULT_RESOURCE_TIER=TIER_LITE/MINIMAL override.
     self.gen_add_code_line("using " + self.file_namespace + "::TIER_SHARED; using " +
                            self.file_namespace + "::TIER_LITE; using " + self.file_namespace + "::TIER_MINIMAL;")
+    # The broad->fine link_CC narrowing (Inc4a) keys a uint64 hit-mask by anchor (frame/joint) id,
+    # so every collision-sphere anchor id must fit in 64 bits. A future >64-frame robot needs the
+    # documented bool[NUM_JOINTS] fallback in grid_cc_config_free instead. Only the multi-tier driver
+    # uses the mask, so this (and the per-tier sphere->link tables) are emitted only for 2+ tiers.
+    if len(tiers) > 1:
+        self.gen_add_code_line("static_assert(" + self.file_namespace + "::NUM_JOINTS <= 64, "
+                               "\"link_CC broad-phase mask is a uint64 keyed by frame id; \"")
+        self.gen_add_code_line("              \"robots with >64 frames need the bool[NUM_JOINTS] fallback\");")
 
     # --- baked per-robot data, PER TIER (finest is unsuffixed = the public batch) ---
     for t in tiers:
@@ -314,6 +322,14 @@ def gen_collision_namespace(self, tiers):
             ", ".join(_c_float_literal(rad) for rad in (t["radius"] or [0.0])) + "};",
             "__device__ const int g_collision_self_cc_ranges" + sfx + "[" + str(max(3 * r, 1)) + "] = {" + flat_ranges + "};",
         ])
+        if len(tiers) > 1:
+            # sphere -> anchor (GRiD frame/joint) id: the bit index into the broad-phase link_CC
+            # hit-mask (W3 Inc4a). The mask lets the fine pass skip spheres whose link the broad pass
+            # didn't flag. Multi-tier only (the single-tier config_free doesn't narrow); the
+            # NUM_JOINTS<=64 static_assert above (also multi-tier-gated) keeps every id in a uint64.
+            self.gen_add_code_line(
+                "__device__ const int g_collision_sphere_link" + sfx + "[" + str(max(n, 1)) + "] = {" +
+                ", ".join(str(a) for a in (t["anchor"] or [0])) + "};")
         # --- fill a caller T-scratch with this tier's baked fp32 radii (cast to T) ---
         self.gen_add_func_doc("Fill s_r[NUM_COLLISION_SPHERES" + cap + "] with the baked fp32 radii cast to T",
                               [], ["s_r is caller shared memory of size NUM_COLLISION_SPHERES" + cap], None)
@@ -382,7 +398,8 @@ def gen_collision_namespace(self, tiers):
         self.gen_add_code_line("__device__")
         self.gen_add_code_line("bool config_free(const T *s_q, const grid::robotModel<T> *d_robotModel, "
                                "const Environment<T> &env, T *s_broad_pos, T *s_broad_r, "
-                               "T *s_fine_pos, T *s_fine_r, T *d_workspace = nullptr) {", True)
+                               "T *s_fine_pos, T *s_fine_r, T *d_workspace = nullptr, "
+                               "int *dbg_fine_rechecked = nullptr) {", True)
         self.gen_add_code_line("grid::multi_target_position" + bsfx + "_device<T, RESOURCE_TIER>(s_broad_pos, s_q, d_robotModel, d_workspace);")
         self.gen_add_code_line("load_collision_radii" + bsfx + "<T>(s_broad_r);")
         self.gen_add_sync()
@@ -390,8 +407,8 @@ def gen_collision_namespace(self, tiers):
         self.gen_add_code_line("load_collision_radii<T>(s_fine_r);")
         self.gen_add_sync()
         self.gen_add_code_line("return grid_cc_config_free<T>(env,")
-        self.gen_add_code_line("    s_broad_pos, s_broad_r, g_collision_self_cc_ranges" + bsfx + ", NUM_COLLISION_SELF_CC_RANGES" + bcap + ", NUM_COLLISION_SPHERES" + bcap + ",")
-        self.gen_add_code_line("    s_fine_pos, s_fine_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES, NUM_COLLISION_SPHERES);")
+        self.gen_add_code_line("    s_broad_pos, s_broad_r, g_collision_self_cc_ranges" + bsfx + ", NUM_COLLISION_SELF_CC_RANGES" + bcap + ", NUM_COLLISION_SPHERES" + bcap + ", g_collision_sphere_link" + bsfx + ",")
+        self.gen_add_code_line("    s_fine_pos, s_fine_r, g_collision_self_cc_ranges, NUM_COLLISION_SELF_CC_RANGES, NUM_COLLISION_SPHERES, g_collision_sphere_link, dbg_fine_rechecked);")
         self.gen_add_end_function()
 
     # ---- differentiable collision PRIMITIVES + cost (value / gradient / Gauss-Newton hessian) ----
