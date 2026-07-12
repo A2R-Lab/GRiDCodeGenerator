@@ -223,16 +223,20 @@ def gen_multi_target_position_device(self, batch, suffix=""):
 # calls multi_target_position_device directly). Kernel + host + gridData buffer
 # registration = W1b.3.
 # ---------------------------------------------------------------------------
-def gen_multi_target_position(self, batch, suffix=""):
+def gen_multi_target_position(self, batch, suffix="", emit_num_const=True):
     n = batch["n"]
     NUM = "NUM_MULTI_TARGETS" + suffix.upper()
     POS = "MULTI_TARGET_POSITION" + suffix.upper()
     XHom_size, _dXhom, _d2Xhom = self.gen_get_Xhom_size()
     scratch = self.gen_multi_target_position_inner_temp_mem_size(batch)  # s_Xworld FK scratch
     total_t = XHom_size + scratch
+    # `emit_num_const=False` when the caller already emitted `const int NUM_MULTI_TARGETS`
+    # EARLY (before gen_init_gridData, so the guarded gridData mallocs can size on it) —
+    # the public multi_target_batch path. The collision path keeps emitting it here (its
+    # suffixed per-tier constants have no early emission and no gridData dependency).
     self.gen_add_code_lines([
-        "// W1b batched multi-target world positions (opt-in via multi_target_batch); " + NUM + " = " + str(n),
-        "const int " + NUM + " = " + str(n) + ";",
+        "// W1b batched multi-target world positions (opt-in via multi_target_batch); " + NUM + " = " + str(n)]
+        + (["const int " + NUM + " = " + str(n) + ";"] if emit_num_const else []) + [
         # Tier-aware smem arena: at TIER_SHARED the FK scratch (s_Xworld) is in smem; at
         # TIER_LITE/MINIMAL it spills to the device fn's d_workspace, shrinking the arena to
         # s_XmatsHom + linalg only. Default TIER keeps every single-arg call site working.
@@ -441,6 +445,235 @@ def gen_multi_target_position_gradient(self, batch, suffix=""):
     self.gen_multi_target_position_gradient_inner(batch, suffix=suffix)
     self.gen_multi_target_position_gradient_device(batch, suffix=suffix)
 
+
+# ===========================================================================
+# W1b.3 / W2a.3 — launchable KERNEL + 3-mode HOST wrappers (bench registration).
+# Emitted ONLY for the opt-in public multi_target_batch (suffix-free); the per-tier
+# collision batches stay device-composite (config_free drives them internally). The
+# *_device wrappers own the ENTIRE dynamic-smem arena (s_XmatsHom + FK/Jacobian
+# scratch), so the kernel keeps its q input + world-position output in STATIC
+# __shared__ (mirrors frame_jacobian_dot_kernel) and launches with the *_device
+# DYNAMIC_SHARED_MEM_BYTES macro. multi_target is a world-frame quantity computed by
+# manipulators (grasp points / spheres) -> no MUJOCO_OUTPUT convention flag.
+# ===========================================================================
+def gen_multi_target_position_kernel(self, batch, single_call_timing=False):
+    n_pos = self.robot.get_num_pos()
+    out_size = 3 * batch["n"]
+    func_params = [
+        "d_multi_target_position is the vector of 3*NUM_MULTI_TARGETS world positions per timestep",
+        "d_q is the vector of joint positions",
+        "stride_q is the stride between each q",
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+        "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_def_start = "void multi_target_position_kernel(T *d_multi_target_position, const T *d_q, const int stride_q, "
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute batched multi-target world positions", [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    # STATIC __shared__ I/O; the *_device wrapper owns the dynamic arena (see header note).
+    self.gen_add_code_line("__shared__ T s_q[" + str(n_pos) + "];")
+    self.gen_add_code_line("__shared__ T s_multi_target_position[" + str(out_size) + "];")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
+        self.gen_add_code_line("// compute")
+        self.gen_add_code_line("multi_target_position_device<T>(s_multi_target_position, s_q, d_robotModel);")
+        self.gen_add_sync()
+        self.gen_kernel_save_result("multi_target_position", str(out_size), stride=str(out_size))
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q", str(n_pos))
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="multi_target_position")
+        self.gen_add_code_line("multi_target_position_device<T>(s_multi_target_position, s_q, d_robotModel);")
+        self.gen_anti_licm_output_write("multi_target_position")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("multi_target_position", str(out_size))
+    self.gen_add_end_function()
+
+
+def gen_multi_target_position_host(self, batch, mode=0):
+    single_call_timing = True if mode == 1 else False
+    compute_only = True if mode == 2 else False
+    func_params = ["hd_data is the packaged input and output pointers",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+    func_def_start = "void multi_target_position(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute batched multi-target world positions", [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"multi_target_position requires all-data or kinematics gridData\");")
+    func_call_start = ("multi_target_position_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,MULTI_TARGET_POSITION_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+                       "(hd_data->d_multi_target_position,hd_data->d_q,stride_q,")
+    func_call_end = "d_robotModel,num_timesteps);"
+    if single_call_timing:
+        func_call_start = func_call_start.replace("multi_target_position_kernel<", "multi_target_position_kernel_single_timing<")
+    if not compute_only:
+        self.gen_add_code_lines(["// start code with memory transfer",
+                                 "int stride_q;",
+                                 "if (USE_COMPRESSED_MEM) {stride_q = NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "else {stride_q = 3*NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "gpuErrchkKernel();"])
+    else:
+        self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call = func_call_start + func_call_end
+    func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q", "hd_data->d_q_qd_u") + "}"
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"multi_target_position\", MULTI_TARGET_POSITION_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines(["// finally transfer the result back",
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_multi_target_position,hd_data->d_multi_target_position,3*NUM_MULTI_TARGETS*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("multi_target_position"))
+    self.gen_add_end_function()
+
+
+def gen_multi_target_position_gradient_kernel(self, batch, single_call_timing=False):
+    n_pos = self.robot.get_num_pos()
+    nv = self.robot.get_num_vel()
+    out_size = 3 * nv * batch["n"]
+    func_params = [
+        "d_multi_target_position_gradient is the vector of 3*NUM_VEL*NUM_MULTI_TARGETS position gradients per timestep",
+        "d_q is the vector of joint positions",
+        "stride_q is the stride between each q",
+        "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+        "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)"]
+    func_def_start = "void multi_target_position_gradient_kernel(T *d_multi_target_position_gradient, const T *d_q, const int stride_q, "
+    func_def_end = "const robotModel<T> *d_robotModel, const int NUM_TIMESTEPS) {"
+    func_def = func_def_start + func_def_end
+    if single_call_timing:
+        func_def = func_def.replace("(", "_single_timing(")
+    self.gen_add_func_doc("Compute batched multi-target world-position gradient", [], func_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__global__")
+    self.gen_add_code_line("__launch_bounds__(tier_max_threads<RESOURCE_TIER>())")
+    self.gen_add_code_line(func_def, True)
+    self.gen_add_code_line("__shared__ T s_q[" + str(n_pos) + "];")
+    self.gen_add_code_line("__shared__ T s_multi_target_position_gradient[" + str(out_size) + "];")
+    if not single_call_timing:
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_kernel_load_inputs("q", str(n_pos), stride="stride_q")
+        self.gen_add_code_line("// compute")
+        self.gen_add_code_line("multi_target_position_gradient_device<T>(s_multi_target_position_gradient, s_q, d_robotModel);")
+        self.gen_add_sync()
+        self.gen_kernel_save_result("multi_target_position_gradient", str(out_size), stride=str(out_size))
+        self.gen_add_end_control_flow()
+    else:
+        self.gen_kernel_load_inputs("q", str(n_pos))
+        self.gen_add_code_line("// compute with NUM_TIMESTEPS as NUM_REPS for timing")
+        self.gen_add_code_line("for (int rep = 0; rep < NUM_TIMESTEPS; rep++){", True)
+        self.gen_anti_licm_input_reload("q", str(n_pos), feedback_from="multi_target_position_gradient")
+        self.gen_add_code_line("multi_target_position_gradient_device<T>(s_multi_target_position_gradient, s_q, d_robotModel);")
+        self.gen_anti_licm_output_write("multi_target_position_gradient")
+        self.gen_add_end_control_flow()
+        self.gen_kernel_save_result("multi_target_position_gradient", str(out_size))
+    self.gen_add_end_function()
+
+
+def gen_multi_target_position_gradient_host(self, batch, mode=0):
+    single_call_timing = True if mode == 1 else False
+    compute_only = True if mode == 2 else False
+    func_params = ["hd_data is the packaged input and output pointers",
+                   "d_robotModel is the pointer to the initialized model specific helpers on the GPU (XImats, topology_helpers, etc.)",
+                   "num_timesteps is the length of the trajectory points we need to compute over (or overloaded as test_iters for timing)",
+                   "streams are pointers to CUDA streams for async memory transfers (if needed)"]
+    func_def_start = "void multi_target_position_gradient(gridData<T, KIND> *hd_data, const robotModel<T> *d_robotModel, const int num_timesteps,"
+    func_def_end = "                            const dim3 block_dimms, const dim3 thread_dimms, cudaStream_t *streams) {"
+    if single_call_timing:
+        func_def_start = func_def_start.replace("(", "_single_timing(")
+        func_def_end = "              " + func_def_end
+    if compute_only:
+        func_def_start = func_def_start.replace("(", "_compute_only(")
+        func_def_end = "             " + func_def_end.replace(", cudaStream_t *streams", "")
+    self.gen_add_func_doc("Compute batched multi-target world-position gradient", [], func_params, None)
+    self.gen_add_code_line("template <typename T, bool USE_COMPRESSED_MEM = false, gridDataKind KIND = GRID_DATA_ALL, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__host__")
+    self.gen_add_code_line(func_def_start)
+    self.gen_add_code_line(func_def_end, True)
+    self.gen_add_code_line("static_assert(KIND == GRID_DATA_ALL || KIND == GRID_DATA_KINEMATICS, \"multi_target_position_gradient requires all-data or kinematics gridData\");")
+    func_call_start = ("multi_target_position_gradient_kernel<T, RESOURCE_TIER><<<block_dimms,thread_dimms,MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>"
+                       "(hd_data->d_multi_target_position_gradient,hd_data->d_q,stride_q,")
+    func_call_end = "d_robotModel,num_timesteps);"
+    if single_call_timing:
+        func_call_start = func_call_start.replace("multi_target_position_gradient_kernel<", "multi_target_position_gradient_kernel_single_timing<")
+    if not compute_only:
+        self.gen_add_code_lines(["// start code with memory transfer",
+                                 "int stride_q;",
+                                 "if (USE_COMPRESSED_MEM) {stride_q = NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q,hd_data->h_q,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "else {stride_q = 3*NUM_JOINTS; " +
+                                    "gpuErrchk(cudaMemcpyAsync(hd_data->d_q_qd_u,hd_data->h_q_qd_u,stride_q*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyHostToDevice,streams[0]));}",
+                                 "gpuErrchkKernel();"])
+    else:
+        self.gen_add_code_line("int stride_q = USE_COMPRESSED_MEM ? NUM_JOINTS: 3*NUM_JOINTS;")
+    self.gen_add_code_line("// then call the kernel")
+    func_call = func_call_start + func_call_end
+    func_call_mem_adjust = "if (USE_COMPRESSED_MEM) {" + func_call + "}"
+    func_call_mem_adjust2 = "else                    {" + func_call.replace("hd_data->d_q", "hd_data->d_q_qd_u") + "}"
+    func_call_code = [func_call_mem_adjust, func_call_mem_adjust2, "gpuErrchkKernel();"]
+    if single_call_timing:
+        func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    self.gen_add_code_line("gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"multi_target_position_gradient\", MULTI_TARGET_POSITION_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()));")
+    self.gen_add_code_lines(func_call_code)
+    if not compute_only:
+        self.gen_add_code_lines(["// finally transfer the result back",
+                                 "gpuErrchk(cudaMemcpy(hd_data->h_multi_target_position_gradient,hd_data->d_multi_target_position_gradient,3*NUM_VEL*NUM_MULTI_TARGETS*" +
+                                    ("num_timesteps*" if not single_call_timing else "") + "sizeof(T),cudaMemcpyDeviceToHost));",
+                                 "gpuErrchkKernel();"])
+    if single_call_timing:
+        from ..algo_registry import single_call_printf_line
+        self.gen_add_code_line(single_call_printf_line("multi_target_position_gradient"))
+    self.gen_add_end_function()
+
+
+def gen_multi_target_position_bench(self, batch):
+    """Emit the launchable kernel + 3-mode host for the public multi_target batch
+    (position + gradient). Called ONLY from the opt-in multi_target_batch dispatch
+    (NOT the per-tier collision batches, which stay device-composite)."""
+    self.gen_multi_target_position_kernel(batch, single_call_timing=False)
+    self.gen_multi_target_position_kernel(batch, single_call_timing=True)
+    self.gen_multi_target_position_host(batch, mode=0)
+    self.gen_multi_target_position_host(batch, mode=1)
+    self.gen_multi_target_position_host(batch, mode=2)
+    self.gen_multi_target_position_gradient_kernel(batch, single_call_timing=False)
+    self.gen_multi_target_position_gradient_kernel(batch, single_call_timing=True)
+    self.gen_multi_target_position_gradient_host(batch, mode=0)
+    self.gen_multi_target_position_gradient_host(batch, mode=1)
+    self.gen_multi_target_position_gradient_host(batch, mode=2)
+
+
 # ---------------------------------------------------------------------------
 # INTEGRATION STATUS
 # ---------------------------------------------------------------------------
@@ -458,6 +691,11 @@ def gen_multi_target_position_gradient(self, batch, suffix=""):
 #     byte-identical refactor GCG 44a7014) + offset epilogue (Phase B). Validated: baxter+iiwa14
 #     vs central-diff FD oracle; offset==0 == ee_pose_gradient rows 0..2 BIT-IDENTICAL;
 #     thread-invariant; sanitizers clean.
-# W1b.3 / W2a.3 (remaining): _kernel/_host wrappers + gridData d_/h_ buffers + algo_registry
-#     AlgoEntry/AlgoDescriptor rows + KERNEL_OVERLOADS + bench GRID_HAS_* wrappers.
+# [x] W1b.3 / W2a.3 (Inc4b): gen_multi_target_position_bench() emits _kernel (+_single_timing)
+#     + 3-mode _host for BOTH position and gradient (public suffix-free batch only; collision
+#     tiers stay device-composite). gridData d_/h_ buffers (unconditional pointers; malloc/free
+#     #if GRID_HAS_MULTI_TARGET_POSITION-guarded), NUM_MULTI_TARGETS + GRID_HAS_MULTI_TARGET_POSITION
+#     emitted EARLY (before gen_init_gridData), KERNEL_OVERLOADS pins, algo_registry AlgoEntry +
+#     AlgoDescriptor(has_kernel_attr=True, gate_attr) rows. Kernel keeps q/out in STATIC __shared__;
+#     the *_device wrapper owns the dynamic arena -> launches with the *_device SHARED_MEM_BYTES macro.
 # W2b (remaining): spill-tier the batched outputs + <T,TIER> reconciliation (fold registration).

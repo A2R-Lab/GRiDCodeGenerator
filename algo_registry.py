@@ -87,6 +87,8 @@ ALGO_REGISTRY: tuple[AlgoEntry, ...] = (
     AlgoEntry("osc_inertia",          "OSC_INERTIA (operational-space inertia Lambda = (J Minv J^T)^-1)", "Kinematics"),
     AlgoEntry("end_effector_pose_runtime",          "END_EFFECTOR_POSE_RUNTIME (runtime target/offset pose [xyz;rpy])", "Kinematics"),
     AlgoEntry("end_effector_pose_gradient_runtime", "END_EFFECTOR_POSE_GRADIENT_RUNTIME (runtime target/offset pose Jacobian)", "Kinematics"),
+    AlgoEntry("multi_target_position",          "MULTI_TARGET_POSITION (batched world positions of baked fixed-offset targets)", "Kinematics"),
+    AlgoEntry("multi_target_position_gradient", "MULTI_TARGET_POSITION_GRADIENT (∂world pos/∂v of baked targets)", "Kinematics"),
 
     # Second-Order
     AlgoEntry("idsva_so",             "IDSVA_SO (dispatched: body for fixed, world for floating)",
@@ -209,6 +211,12 @@ ALGO_DESCRIPTORS: tuple[AlgoDescriptor, ...] = (
     AlgoDescriptor("osc_inertia"),
     AlgoDescriptor("end_effector_pose_runtime"),
     AlgoDescriptor("end_effector_pose_gradient_runtime"),
+    # W1b.3 batched multi-target (opt-in via multi_target_batch). Real benchmarked
+    # kernels (has_kernel_attr=True) gated on the generator's _has_multi_target_position
+    # flag. bytes_macro stems default from KEY.upper() (MULTI_TARGET_POSITION[_GRADIENT]
+    # _DYNAMIC_SHARED_MEM_BYTES) — no override needed. No autotune_keys (no baked launch_cfg).
+    AlgoDescriptor("multi_target_position", gate_attr="_has_multi_target_position"),
+    AlgoDescriptor("multi_target_position_gradient", gate_attr="_has_multi_target_position"),
 
     # Second-Order
     AlgoDescriptor("idsva_so", autotune_keys=("idsva_so",), has_kernel_attr=False),

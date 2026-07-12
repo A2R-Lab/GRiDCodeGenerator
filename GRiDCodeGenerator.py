@@ -221,7 +221,10 @@ class GRiDCodeGenerator:
                             gen_multi_target_position_device, gen_multi_target_position, \
                             gen_multi_target_position_gradient_inner_temp_mem_size, gen_multi_target_position_gradient_inner, \
                             gen_multi_target_position_gradient_inner_function_call, gen_multi_target_position_gradient_device, \
-                            gen_multi_target_position_gradient
+                            gen_multi_target_position_gradient, \
+                            gen_multi_target_position_kernel, gen_multi_target_position_host, \
+                            gen_multi_target_position_gradient_kernel, gen_multi_target_position_gradient_host, \
+                            gen_multi_target_position_bench
     from .algorithms._collision import gen_collision_namespace
     from .algorithms._dccrba import _dccrba_inner_temp_mem_size, _dccrba_sweep_J_count, gen_cmm_time_variation, gen_dccrba
 
@@ -2172,7 +2175,16 @@ class GRiDCodeGenerator:
                                  # runtime offset is a single device buffer, host-init to {0,0,0}.
                                  "    T *d_eePose;               // end_effector_pose_runtime (6 = [xyz;rpy])", \
                                  "    T *d_eePoseGrad;           // end_effector_pose_gradient_runtime (6 x NUM_VEL)", \
-                                 "    T *d_eepose_runtime_offset; // runtime 3-vector point offset (target frame)", \
+                                 "    T *d_eepose_runtime_offset; // runtime 3-vector point offset (target frame)"] \
+                                 # W1b.3 batched multi-target world positions / position-gradient (opt-in via
+                                 # multi_target_batch). Emitted ONLY for an MT robot -- a Python-side condition,
+                                 # not a #if, so a non-MT header stays BYTE-IDENTICAL (no inert preprocessor
+                                 # text). NUM_MULTI_TARGETS (the malloc size) is emitted before gen_init_gridData.
+                                 + ([
+                                 "    T *d_multi_target_position;          // multi_target_position (3 x NUM_MULTI_TARGETS)",
+                                 "    T *d_multi_target_position_gradient; // multi_target_position_gradient (3 x NUM_VEL x NUM_MULTI_TARGETS)",
+                                 ] if getattr(self, "_has_multi_target_position", False) else []) \
+                                 + [
                                  "    unsigned char *d_workspace;", \
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *d_idsva_so;", \
@@ -2215,7 +2227,13 @@ class GRiDCodeGenerator:
                                  "    T *h_frame_jacobian_dot;", \
                                  "    T *h_osc_inertia;", \
                                  "    T *h_eePose;", \
-                                 "    T *h_eePoseGrad;", \
+                                 "    T *h_eePoseGrad;"] \
+                                 # W1b.3 batched multi-target host buffers (opt-in; Python-conditional like d_ above)
+                                 + ([
+                                 "    T *h_multi_target_position;",
+                                 "    T *h_multi_target_position_gradient;",
+                                 ] if getattr(self, "_has_multi_target_position", False) else []) \
+                                 + [
                                  # idsva_so - d2tau_dq2, d2tau_dqd2, d2tau_dvdq, dM_dq
                                  "    T *h_idsva_so;", \
                                  # fdsva_so - d2a_dq2, d2a_dv2, d2a_dvdq, d2a_dtdq
@@ -2344,7 +2362,28 @@ class GRiDCodeGenerator:
                       "    gpuErrchk(cudaMalloc((void**)&hd_data->d_eepose_runtime_offset, 3*sizeof(T)));", \
                       "    gpuErrchk(cudaMemset(hd_data->d_eepose_runtime_offset, 0, 3*sizeof(T)));", \
                       "    hd_data->h_eePose = (T *)malloc(6*NUM_TIMESTEPS*sizeof(T));", \
-                      "    hd_data->h_eePoseGrad = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));", \
+                      "    hd_data->h_eePoseGrad = (T *)malloc(6*NUM_VEL*NUM_TIMESTEPS*sizeof(T));"] \
+                      # W1b.3 batched multi-target. Emitted ONLY for an MT robot (Python-conditional,
+                      # not a #if) so a non-MT header is byte-identical AND never references
+                      # NUM_MULTI_TARGETS, which only exists when the batch is emitted.
+                      #
+                      # The DEVICE buffers carry a 1024-element FLOOR. The single_timing kernels'
+                      # anti-LICM feedback indexes d_<out>[(rep + 0x3FF) & 0x3FF] -> up to slot 1023,
+                      # so gen_anti_licm_{input_reload,output_write} REQUIRE >= 1024 output slots.
+                      # Every other algo meets that naturally (ee_pose: 6*NUM_EES*256 = 1536), but
+                      # multi_target scales with the BATCH: a small batch under-allocates (a 1-target
+                      # batch is only 3*1*256 = 768 < 1024) and the timing kernel reads OOB (caught by
+                      # compute-sanitizer memcheck). The floor costs a few KB and makes it unbreakable;
+                      # the D2H copy still moves only the natural 3*NUM_MULTI_TARGETS*n elements.
+                      + ([
+                      "    const int MT_POS_SLOTS  = 3*NUM_MULTI_TARGETS*NUM_TIMESTEPS;",
+                      "    const int MT_GRAD_SLOTS = 3*NUM_VEL*NUM_MULTI_TARGETS*NUM_TIMESTEPS;",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_multi_target_position, (MT_POS_SLOTS > 1024 ? MT_POS_SLOTS : 1024)*sizeof(T)));",
+                      "    gpuErrchk(cudaMalloc((void**)&hd_data->d_multi_target_position_gradient, (MT_GRAD_SLOTS > 1024 ? MT_GRAD_SLOTS : 1024)*sizeof(T)));",
+                      "    hd_data->h_multi_target_position = (T *)malloc(MT_POS_SLOTS*sizeof(T));",
+                      "    hd_data->h_multi_target_position_gradient = (T *)malloc(MT_GRAD_SLOTS*sizeof(T));",
+                      ] if getattr(self, "_has_multi_target_position", False) else []) \
+                      + [
                       "}", \
                       "// G2 centroidal quick-wins outputs (com: 3+3*NV ; ccrba: 6*NV+6 ; energy: 3)", \
                       "if (needs_dynamics || needs_kinematics) {", \
@@ -2660,6 +2699,21 @@ class GRiDCodeGenerator:
             ("end_effector_pose_gradient_runtime_kernel_single_timing<T>",
              "void (*)(T *, const T *, const int, const int, const T *, const robotModel<T> *, const int)"),
         ],
+        # W1b.3 batched multi-target world positions / position-gradient (opt-in via
+        # multi_target_batch; gated on _has_multi_target_position). Same launch shape as
+        # end_effector_pose: (T *out, const T *q, const int stride_q, robotModel, int N).
+        "multi_target_position": [
+            ("multi_target_position_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("multi_target_position_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ],
+        "multi_target_position_gradient": [
+            ("multi_target_position_gradient_kernel<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+            ("multi_target_position_gradient_kernel_single_timing<T>",
+             "void (*)(T *, const T *, const int, const robotModel<T> *, const int)"),
+        ],
         "com": [
             ("com_kernel<T>",
              "void (*)(T *, unsigned char *, const T *, const int, const robotModel<T> *, const int)"),
@@ -2884,7 +2938,13 @@ class GRiDCodeGenerator:
                                  "gpuErrchk(cudaFree(hd_data->d_frame_jacobian)); gpuErrchk(cudaFree(hd_data->d_frame_jacobian_dot)); gpuErrchk(cudaFree(hd_data->d_osc_inertia));", \
                                  "free(hd_data->h_frame_jacobian); free(hd_data->h_frame_jacobian_dot); free(hd_data->h_osc_inertia);", \
                                  "gpuErrchk(cudaFree(hd_data->d_eePose)); gpuErrchk(cudaFree(hd_data->d_eePoseGrad)); gpuErrchk(cudaFree(hd_data->d_eepose_runtime_offset));", \
-                                 "free(hd_data->h_eePose); free(hd_data->h_eePoseGrad);", \
+                                 "free(hd_data->h_eePose); free(hd_data->h_eePoseGrad);"] \
+                                 # W1b.3 batched multi-target (opt-in; Python-conditional, mirrors the alloc)
+                                 + ([
+                                 "gpuErrchk(cudaFree(hd_data->d_multi_target_position)); gpuErrchk(cudaFree(hd_data->d_multi_target_position_gradient));",
+                                 "free(hd_data->h_multi_target_position); free(hd_data->h_multi_target_position_gradient);",
+                                 ] if getattr(self, "_has_multi_target_position", False) else []) \
+                                 + [
                                  "gpuErrchk(cudaFree(hd_data->d_x_kp1)); gpuErrchk(cudaFree(hd_data->d_dAB));", \
                                  "free(hd_data->h_x_kp1); free(hd_data->h_dAB);", \
                                  "for(int i=0; i<" + str(MAX_STREAMS) + "; i++){gpuErrchk(cudaStreamDestroy(streams[i]));} free(streams);"])
@@ -3377,6 +3437,17 @@ class GRiDCodeGenerator:
         self.gen_add_func_doc("All functions are kept in this namespace")
         self.gen_add_code_line("namespace " + self.file_namespace + " {", True)
         self.gen_add_shared_memory_helpers()
+        # W1b.3 (Inc4b): multi_target PRESENCE marker emitted here — BEFORE the gridData
+        # struct (in gen_add_constants_helpers just below) — so the struct's
+        # #if GRID_HAS_MULTI_TARGET_POSITION-guarded d_/h_multi_target_position fields
+        # resolve. Non-MT robots never see the #define -> #if reads 0 -> byte-identical
+        # struct. NUM_MULTI_TARGETS (the malloc size) is emitted later, just before
+        # gen_init_gridData. Collision is exclusive (each owns the single batch).
+        self._has_multi_target_position = multi_target_batch is not None
+        if multi_target_batch is not None:
+            assert collision_spec is None, "multi_target_batch and collision_spec are exclusive (each defines the single multi_target batch / NUM_MULTI_TARGETS)"
+            self._mt_batch = self.build_target_batch(multi_target_batch)
+            self.gen_add_code_line("#define GRID_HAS_MULTI_TARGET_POSITION 1")
         # then generate any constants and other helpers
         self.gen_add_constants_helpers(include_base_inertia, include_homogenous_transforms)
         # then the linear algebra related helpers
@@ -3420,6 +3491,18 @@ class GRiDCodeGenerator:
             self.gen_set_joint_dynamics_params()
         self.gen_init_robotModel()
         self.gen_free_robotModel()
+        # W1b.3 (Inc4b): emit the multi_target CONSTANTS *before* gen_init_gridData so its
+        # #if GRID_HAS_MULTI_TARGET_POSITION-guarded d_/h_multi_target_position mallocs can
+        # size on NUM_MULTI_TARGETS. The batch's functions (inner/device/kernel/host) are
+        # emitted later in the kinematics dispatch (they need the world-FK machinery); only
+        # the count + presence marker are hoisted here. Build the batch ONCE and cache it on
+        # self so the dispatch reuses the exact same descriptor. Collision is exclusive.
+        # NUM_MULTI_TARGETS (the malloc size) emitted here — before gen_init_gridData —
+        # so the #if GRID_HAS_MULTI_TARGET_POSITION-guarded d_/h_multi_target_position
+        # mallocs can size on it. The presence #define + cached batch were set right after
+        # the namespace opened (above the gridData struct); reuse the cached batch.
+        if multi_target_batch is not None:
+            self.gen_add_code_line("const int NUM_MULTI_TARGETS = " + str(self._mt_batch["n"]) + ";")
         self.gen_init_gridData()
         self.gen_joint_limits_size()
         self.gen_init_joint_limits()
@@ -3472,10 +3555,14 @@ class GRiDCodeGenerator:
             # every existing robot's grid.cuh is byte-identical. Reuses the shared FK
             # (emit_world_fk_chainup) + XmatsHom machinery set up above.
             if multi_target_batch is not None:
-                assert collision_spec is None, "multi_target_batch and collision_spec are exclusive (each defines the single multi_target batch / NUM_MULTI_TARGETS)"
-                _mt_batch = self.build_target_batch(multi_target_batch)
-                self.gen_multi_target_position(_mt_batch)
+                # NUM_MULTI_TARGETS + GRID_HAS_MULTI_TARGET_POSITION were emitted EARLY
+                # (before gen_init_gridData); reuse the cached batch and skip the duplicate
+                # const here. gen_multi_target_position_bench emits the launchable kernel +
+                # 3-mode host for BOTH position and gradient (public batch only).
+                _mt_batch = self._mt_batch
+                self.gen_multi_target_position(_mt_batch, emit_num_const=False)
                 self.gen_multi_target_position_gradient(_mt_batch)
+                self.gen_multi_target_position_bench(_mt_batch)
             # W3: collision. Each sphere-density tier IS a multi_target batch — build it in the
             # tier's own order (NO group re-sort) so the baked radii/self_cc_ranges stay
             # index-aligned. Emit a POSITION extractor per tier (config_free's broad-phase needs
