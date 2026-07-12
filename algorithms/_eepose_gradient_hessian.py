@@ -134,11 +134,26 @@ def gen_end_effector_pose_inner(self, fixed_target_name = ""):
                 # column to the -1 sentinel once it reaches/passes the root (jid == -1 OR
                 # its link no longer resolves) — the runtime `if(parent_jid==-1){continue;}`
                 # guard below then skips the compose for already-rooted columns, exactly as
-                # the all-leaf path already does. Byte-identical for every non-crashing case
-                # (a valid jid still returns link.get_parent_id()).
+                # the all-leaf path already does.
+                #
+                # GATO Ask-4 FIX (2026-07-11): a FIXED-target jid has NO link (the fixed
+                # joint table is separate), so get_link_by_id() returned None -> -1 for the
+                # target itself. On a BRANCHED tree that made the very first parent hop -1,
+                # so `if(parent_jid==-1){continue;}` skipped EVERY level: the chain-up never
+                # ran and the extract then read a NEVER-WRITTEN s_temp half (an uninitialized
+                # shared-memory read -- it merely LOOKED right whenever a prior EE call had
+                # left a stale world transform in the arena). Resolve a fixed-target jid
+                # through the fixed-joint table instead, exactly as the serial-chain path
+                # above already does (:98-99). Moving jids are unaffected
+                # (get_fixed_joint_by_id -> None), so the all-leaf/generic emission for every
+                # robot stays BYTE-IDENTICAL.
                 def _parent_or_root(jid):
                     if jid == -1:
                         return -1
+                    fixed = self.robot.get_fixed_joint_by_id(jid)
+                    if fixed is not None:
+                        parent_name = fixed.get_parent()
+                        return self.robot.get_joint_by_name(parent_name).get_id() if parent_name != "" else -1
                     link = self.robot.get_link_by_id(jid)
                     return -1 if link is None else link.get_parent_id()
                 for i in range(bfs_level):
@@ -3287,3 +3302,82 @@ def gen_eepose_and_derivatives(self, fixed_target_name = "",
             self.gen_ee_pose_inner_warp(fixed_target_name = fixed_target_name)
             self.gen_ee_pose_fk_batched_kernel()
             self.gen_ee_pose_fk_batched_host()
+
+
+def gen_ee_target_aliases(self, include_pose = True, include_gradient = True, include_hessian = True):
+    """GATO Ask-4: STABLE, robot-independent aliases for the true end-effector frame.
+
+    The problem they solve: when a robot is generated with a named fixed kinematic
+    target, GCG emits the correct-frame variant under a symbol whose name EMBEDS the
+    joint name (`end_effector_pose_inner_EE` on indy7, `..._panda_hand` on panda). A
+    consumer writing ONE code path across robots cannot reference that, so it falls back
+    to the generic `end_effector_pose_inner` -- which evaluates the last MOVING joint and
+    silently DROPS the terminal fixed joint's <origin> (indy7 "EE": 6cm z; iiwa14: 4cm).
+
+    These aliases give that consumer a fixed name. They are emitted UNCONDITIONALLY:
+    with a named target they forward to the `_<name>` family (the TRUE ee_frame, ==
+    pinocchio oMf[target]); with no target ("" or "all") they forward to the generic
+    family. Always-defined is the whole point -- if the alias only appeared when a target
+    was baked, consumers would need a feature test and we would have recreated the exact
+    problem we are fixing.
+
+    Variadic forwarders (not hand-copied signatures) so the alias CANNOT drift from the
+    callee: the *_inner defs take a variable set of injected topology-helper params, and
+    replicating that here would be a second source of truth. All params are pointers /
+    scalars, so by-value pass-through is free.
+    """
+    sfx = getattr(self, "_ee_target_sfx", "")
+    named = sfx != ""
+    num_ees = 1 if named else self.robot.get_total_leaf_nodes()
+
+    self.gen_add_code_lines([
+        "// ---- GATO Ask-4: stable end-effector TARGET aliases -------------------------",
+        "// Resolve to the named fixed kinematic target when one was generated, else to the",
+        "// generic (last-moving-joint) family. ALWAYS defined, so a consumer never has to",
+        "// name a robot-specific joint (indy7 '_EE' vs panda '_panda_hand') or feature-test.",
+        "// " + ("NAMED target" + sfx + " -> TRUE ee_frame (== pinocchio oMf[target]); NUM_EE = 1."
+                 if named else
+                 "NO named target baked -> generic last-MOVING-joint family; NUM_EE = NUM_EES."),
+        "// " + ("" if named else "NOTE: this frame DROPS any terminal fixed joint's <origin>. Regenerate with "
+                                  "fixed_target_names=<joint> to track the true TCP."),
+        "const int NUM_TARGET_EES = " + str(num_ees) + ";",
+        ""])
+
+    if include_pose:
+        self.gen_add_code_lines([
+            "template <typename T, bool TEMP_IN_SMEM = true, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_target_inner(Args... args) { "
+            "end_effector_pose_inner" + sfx + "<T, TEMP_IN_SMEM>(args...); }",
+            "",
+            "template <typename T, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_target_device(Args... args) { "
+            "end_effector_pose_device" + sfx + "<T>(args...); }",
+            ""])
+
+    if include_gradient:
+        self.gen_add_code_lines([
+            "template <typename T, bool TEMP_IN_SMEM = true, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_gradient_target_inner(Args... args) { "
+            "end_effector_pose_gradient_inner" + sfx + "<T, TEMP_IN_SMEM>(args...); }",
+            "",
+            "template <typename T, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_gradient_target_device(Args... args) { "
+            "end_effector_pose_gradient_device" + sfx + "<T>(args...); }",
+            ""])
+
+    if include_hessian:
+        self.gen_add_code_lines([
+            "template <typename T, bool OUT_IN_SMEM = true, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_hessian_target_inner(Args... args) { "
+            "end_effector_pose_hessian_inner" + sfx + "<T, OUT_IN_SMEM>(args...); }",
+            "",
+            "template <typename T, int RESOURCE_TIER = TIER_SHARED, typename... Args>",
+            "__device__ __forceinline__",
+            "void end_effector_pose_hessian_target_device(Args... args) { "
+            "end_effector_pose_hessian_device" + sfx + "<T, RESOURCE_TIER>(args...); }",
+            ""])

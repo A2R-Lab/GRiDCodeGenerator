@@ -169,7 +169,7 @@ class GRiDCodeGenerator:
                             gen_end_effector_pose_hessian_inner, gen_end_effector_pose_hessian_device, gen_end_effector_pose_hessian_kernel, gen_ee_pose_inner_thread, gen_ee_pose_inner_warp, \
                             gen_ee_pose_inner_xform_from_q_lines, gen_ee_pose_inner_parent_lookup, gen_update_XmatHom_joint, \
                             gen_ee_pose_fk_batched_kernel, gen_ee_pose_fk_batched_host, \
-                            gen_end_effector_pose_hessian_host, gen_eepose_and_derivatives, \
+                            gen_end_effector_pose_hessian_host, gen_eepose_and_derivatives, gen_ee_target_aliases, \
                             gen_aba, gen_aba_inner, gen_aba_host, \
                             gen_aba_inner_function_call, gen_aba_kernel, gen_aba_device, gen_aba_inner_temp_mem_size, gen_aba_inner_cold_mem_size, \
                             gen_crba, gen_crba_inner_temp_mem_size, gen_crba_inner_function_call, gen_crba_inner, gen_crba_device_temp_mem_size, \
@@ -3195,6 +3195,16 @@ class GRiDCodeGenerator:
         if "idsva_so_world_frame" in algorithms:
             enable_idsva_so_world_frame = True
         self.include_fixed_kinematic_targets = fixed_target_name != ""
+        # GATO Ask-4: the single named kinematic target, resolved ONCE here so every
+        # consumer agrees. The generic end_effector_pose* family evaluates the last
+        # MOVING joint -- it DROPS the terminal fixed joint's <origin> (indy7 "EE":
+        # 6cm z; iiwa14: 4cm z), so grid_plant's EE costs were tracking the wrong
+        # frame. "" and "all" have no single canonical target -> fall back to the
+        # generic family (same rule as the GRID_RBD_* macros below). Read by
+        # gen_ee_target_aliases (the stable end_effector_pose_target_* symbols) and
+        # by _plant.py's ee_pos_cost family, so neither hard-codes a joint name.
+        self._ee_target_name = fixed_target_name if fixed_target_name not in ("", "all") else ""
+        self._ee_target_sfx = ("_" + self._ee_target_name) if self._ee_target_name else ""
         # D.4 / Phase 5: runtime-mutable inertia table. When True, the per-link
         # spatial inertia is reconstructed on-device from a mutable d_inertia_params
         # table (set_inertia_params) instead of streamed from the baked d_XImats.
@@ -3530,6 +3540,12 @@ class GRiDCodeGenerator:
                                             include_pose = "end_effector_pose" in algorithms,
                                             include_gradient = "end_effector_pose_gradient" in algorithms,
                                             include_hessian = "end_effector_pose_hessian" in algorithms)
+            # GATO Ask-4: stable end_effector_pose_target_* aliases (forward to the named
+            # target's family when one is baked, else to the generic one). Emitted right
+            # after the family they alias, so both symbols are in scope.
+            self.gen_ee_target_aliases(include_pose = "end_effector_pose" in algorithms,
+                                       include_gradient = "end_effector_pose_gradient" in algorithms,
+                                       include_hessian = "end_effector_pose_hessian" in algorithms)
             # C4: grid_rbd EE binding entry-point aliases. The C-ABI wrappers
             # (grid_rbd_end_effector_pose[_gradient/_hessian]) and the A1 kernel-threads
             # introspection call THROUGH these macros rather than the bare unsuffixed

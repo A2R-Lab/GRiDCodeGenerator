@@ -648,7 +648,16 @@ def gen_ee_pos_cost(self, with_d2ee = False):
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    num_ees = self.robot.get_total_leaf_nodes()
+    # GATO Ask-4: track the TRUE ee_frame. The generic end_effector_pose* family evaluates
+    # the last MOVING joint and drops the terminal fixed joint's <origin> (indy7 "EE": 6cm z;
+    # iiwa14: 4cm), so every EE cost here was tracking a frame offset from the real TCP. When
+    # the robot is generated with a named fixed target we now bottom out at that target's
+    # `_<name>` inners. "" / "all" keep the generic family (resolved in gen_all_code).
+    # NOTE this changes num_ees to 1 -> it MUST also drive the *_temp_mem_size calls below,
+    # not just the call sites: a named target sizes its EE scratch for 1 EE while the generic
+    # sizes for one per LEAF NODE, and those differ on a multi-leaf robot (go2: 4 feet).
+    _tgt = getattr(self, "_ee_target_name", "")
+    num_ees = 1 if _tgt else self.robot.get_total_leaf_nodes()
     nx = nq + nv
 
     # ---- value ----
@@ -676,12 +685,12 @@ def gen_ee_pos_cost(self, with_d2ee = False):
     # extern __shared__ would alias an outer kernel's arena). using namespace grid lets the
     # shared XmatsHom/load/inner emit helpers resolve unqualified (same pattern as plant_step_gradient_kernel).
     self.gen_add_code_line("using namespace grid;")
-    _ee_scratch = self.gen_end_effector_pose_inner_temp_mem_size()
+    _ee_scratch = self.gen_end_effector_pose_inner_temp_mem_size(_tgt)
     self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       arena_base_expr = "s_scratch")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    self.gen_end_effector_pose_inner_function_call()
+    self.gen_end_effector_pose_inner_function_call(fixed_target_name = _tgt)
     self.gen_add_sync()
     self.gen_add_serial_ops()
     self.gen_add_code_line("T acc = static_cast<T>(0);")
@@ -718,15 +727,16 @@ def gen_ee_pos_cost(self, with_d2ee = False):
     # end_effector_pose_gradient_inner (J_p) -- both read the same const s_Xhom. using namespace grid
     # lets the unqualified XmatsHom/load/inner emit helpers resolve (same pattern as the value fn).
     self.gen_add_code_line("using namespace grid;")
-    _ee_scratch = max(self.gen_end_effector_pose_inner_temp_mem_size(),
-                      self.gen_end_effector_pose_gradient_inner_temp_mem_size())
+    _ee_scratch = max(self.gen_end_effector_pose_inner_temp_mem_size(_tgt),
+                      self.gen_end_effector_pose_gradient_inner_temp_mem_size(_tgt))
     self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       arena_base_expr = "s_scratch")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    self.gen_end_effector_pose_inner_function_call()
+    self.gen_end_effector_pose_inner_function_call(fixed_target_name = _tgt)
     self.gen_add_sync()
-    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
+    self.gen_end_effector_pose_gradient_inner_function_call(fixed_target_name = _tgt,
+                                                            updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     # grad_q[i] = sum_r J_p[r,i] * W[r] * (p_r - p_des_r)
     self.gen_add_parallel_loop("i", str(nv))
@@ -806,26 +816,28 @@ def gen_ee_pos_cost(self, with_d2ee = False):
         # (they run sequentially and share the temp). Branch-scoped so the GN instantiation
         # keeps its smaller gradient-only arena contract.
         self.gen_add_code_line("if constexpr (!GAUSS_NEWTON) {", True)
-        _ee_scratch_newton = max(self.gen_end_effector_pose_inner_temp_mem_size(),
-                                 self.gen_end_effector_pose_hessian_inner_temp_mem_size())
+        _ee_scratch_newton = max(self.gen_end_effector_pose_inner_temp_mem_size(_tgt),
+                                 self.gen_end_effector_pose_hessian_inner_temp_mem_size(_tgt))
         self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch_newton, include_linalg_scratch = True,
                                                           linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                           arena_base_expr = "s_scratch")
         self.gen_load_update_XmatsHom_helpers_function_call()
-        self.gen_end_effector_pose_inner_function_call()
+        self.gen_end_effector_pose_inner_function_call(fixed_target_name = _tgt)
         self.gen_add_sync()
-        self.gen_end_effector_pose_hessian_inner_function_call(out_in_smem_expr = "true")
+        self.gen_end_effector_pose_hessian_inner_function_call(fixed_target_name = _tgt,
+                                                               out_in_smem_expr = "true")
         self.gen_add_sync()
         self.gen_add_end_control_flow()
         self.gen_add_code_line("else {", True)
     # GN path (the ONLY path when with_d2ee is False): lay out the EE-pose-gradient arena
     # from s_scratch, load XmatsHom, call the geometric-Jacobian inner (s_dXhom = nullptr).
-    _ee_scratch = self.gen_end_effector_pose_gradient_inner_temp_mem_size()
+    _ee_scratch = self.gen_end_effector_pose_gradient_inner_temp_mem_size(_tgt)
     self.gen_XmatsHom_helpers_temp_shared_memory_code(_ee_scratch, include_linalg_scratch = True,
                                                       linalg_scratch_bytes = "GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       arena_base_expr = "s_scratch")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    self.gen_end_effector_pose_gradient_inner_function_call(updated_var_names = {"s_dXhom_name": "nullptr"})
+    self.gen_end_effector_pose_gradient_inner_function_call(fixed_target_name = _tgt,
+                                                            updated_var_names = {"s_dXhom_name": "nullptr"})
     self.gen_add_sync()
     if with_d2ee:
         self.gen_add_end_control_flow()
@@ -2007,7 +2019,12 @@ def gen_ee_pos_cost_kernel(self):
     """
     nq = self.robot.get_num_pos()
     nv = self.robot.get_num_vel()
-    num_ees = self.robot.get_total_leaf_nodes()
+    # GATO Ask-4: MUST mirror gen_ee_pos_cost's num_ees -- this kernel slices its global
+    # d_end_effector_pose[_gradient] buffers at 6*num_ees / 6*nv*num_ees per timestep, and the
+    # cost fns it calls now write 6*NUM_EE for the RESOLVED target (1 when a named target is
+    # baked). A stale all-leaf num_ees here would stride past what was written.
+    _tgt = getattr(self, "_ee_target_name", "")
+    num_ees = 1 if _tgt else self.robot.get_total_leaf_nodes()
     nx = nq + nv
     self.gen_add_func_doc("ee_pos_cost_kernel: value + grad_x + GN hess_x per timestep (EE=0)",
                           [], ["d_out scalar cost (1 per timestep)",
