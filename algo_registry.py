@@ -466,6 +466,26 @@ class ArenaCtx:
         return max(self.fdsva_inner_idsva, 4*self.nv**3, self.fdsva_fdg_inline) + self.rt
 
     @property
+    def fdsva_temp_idsva_cold(self) -> int:
+        """Pool for the `idsva_cold` rung: the idsva world inner spills its cold quad to
+        GLOBAL, so only the IDSVA term shrinks — by fdsva_cold_floats.
+
+        ⚠ The reduction MUST be applied INSIDE the max, not subtracted from the total.
+        The pool is a max over three INDEPENDENT consumers (idsva inner | contraction 4nv³
+        | fd_grad inline), and on a floating quadruped the CONTRACTION dominates
+        (go2-floating: idsva=3030, contraction=23328, fdg=10494). Shrinking the idsva term
+        3030 -> 1938 therefore changes the max by NOTHING, yet the old formula
+        `fdsva_base + fdsva_temp_full - fdsva_cold_floats` still cut 1092 elements off the
+        arena. The kernel kept carving the full pool, so the launch under-reserved by 1077
+        elements (4308 B) and fdsva_so_kernel wrote past the end of shared memory ->
+        "illegal memory access" on go2-floating @ TIER_SHARED, at EVERY thread count
+        (memcheck: invalid __shared__ write at 0x190fc, 252 B past the 100 KiB cap).
+        See docs/agent_debugging_guide.md §1t.
+        """
+        return max(self.fdsva_inner_idsva - self.fdsva_cold_floats,
+                   4*self.nv**3, self.fdsva_fdg_inline) + self.rt
+
+    @property
     def fdsva_temp_no_contract(self) -> int:
         return max(self.fdsva_inner_idsva, self.fdsva_fdg_inline) + self.rt
 
@@ -686,7 +706,7 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
     "fdsva_so": (
         lambda c: c.fdsva_base + 8*c.nv**3 + c.fdsva_temp_full,             # full
         lambda c: c.fdsva_base + c.fdsva_temp_full,                         # global_tensors
-        lambda c: c.fdsva_base + c.fdsva_temp_full - c.fdsva_cold_floats,   # idsva_cold
+        lambda c: c.fdsva_base + c.fdsva_temp_idsva_cold,                   # idsva_cold (see property: reduction goes INSIDE the max)
         lambda c: c.fdsva_base + c.fdsva_temp_no_contract,                  # workspace_temp
         lambda c: c.fdsva_base + c.fdsva_temp_spilled,                      # workspace_temp_spill
         lambda c: (c.fdsva_base - 2*c.nv*c.nv) + c.fdsva_temp_spilled,      # spill_df_du

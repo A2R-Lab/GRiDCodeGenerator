@@ -1437,11 +1437,24 @@ class GRiDCodeGenerator:
         # idsva_so world cold rung (_idsva_wf_cold).
         _fdsva_so_uses_world_idsva = self.robot.floating_base or self.robot.robot_has_spherical()
         _fdsva_so_cold_floats = self.gen_idsva_so_world_cold_floats() if _fdsva_so_uses_world_idsva else 0
+        # idsva_cold rung pool: the idsva world inner spills its cold quad to GLOBAL, so ONLY the
+        # idsva term shrinks -- the reduction goes INSIDE the max. The pool is a max over three
+        # INDEPENDENT consumers and the CONTRACTION (4nv^3) dominates on a floating quadruped
+        # (go2-floating: idsva=3030, contraction=23328, fdg=10494), so shrinking idsva changes the
+        # max by NOTHING. The old `_temp_full - _fdsva_so_cold_floats` cut the TOTAL instead,
+        # under-reserving the launch by 1077 elems (4308 B) while the kernel still carved the full
+        # pool -> fdsva_so_kernel wrote past shared memory ("illegal memory access", go2-floating @
+        # TIER_SHARED, every thread count). See docs/agent_debugging_guide.md §1t.
+        # NOTE the arena values in the 9-tuple below are DEAD (the composer has supplied arenas
+        # since Step 3.4) -- but they must stay CORRECT so they can't mislead a future reader.
+        _temp_idsva_cold = max(fdsva_so_inner_idsva_so_temp_count - _fdsva_so_cold_floats,
+                               fdsva_so_contract_temp_count,
+                               fdsva_so_fd_gradient_inline_temp_count) + rt_xfixed_reserve
         # 9-tuple: (..., use_workspace_idsva_temp == pool->global, idsva_cold_in_global). Levels keep pool in smem except pool_global.
         _fdsva_so_tiers = [
             ("full",                 fdsva_so_base_t_count + 8*nv**3 + _temp_full,  False, False, False, False, False, False, False),
             ("global_tensors",       fdsva_so_base_t_count + _temp_full,            True,  False, False, False, False, False, False),
-            ("idsva_cold",           fdsva_so_base_t_count + _temp_full - _fdsva_so_cold_floats, True, False, False, False, False, False, True),
+            ("idsva_cold",           fdsva_so_base_t_count + _temp_idsva_cold,      True,  False, False, False, False, False, True),
             ("workspace_temp",       fdsva_so_base_t_count + _temp_no_contract,        True,  True,  False, False, False, False, False),
             ("workspace_temp_spill", fdsva_so_base_t_count + _temp_spilled,         True,  True,  True,  False, False, False, False),
             ("spill_df_du",          fdsva_so_base_no_df_du + _temp_spilled,        True,  True,  True,  True,  False, False, False),
