@@ -479,6 +479,71 @@ def gen_collision_namespace(self, tiers):
     self.gen_add_sync()
     self.gen_add_end_function()
 
+    # PRIMITIVES: UN-REDUCED per-(sphere, obstacle) rows.
+    # collision_distance above min-reduces over the environment, and that argmin is exactly where the
+    # clearance stops being differentiable: as a sphere slides past two obstacles the winning obstacle
+    # switches and d(d_i)/dq jumps. A solver that wants one smooth CONSTRAINT ROW PER PAIR (GATO's
+    # obstacle rows) needs the reduction dropped, so these emit the full NUM_COLLISION_SPHERES x n_obs
+    # block. Each row IS smooth in q (a single fixed primitive), so the non-smoothness moves out of the
+    # dynamics and into the solver's own active-set/max, where it belongs.
+    # n_obs = grid_cc_num_obstacles(env) is a RUNTIME count (the obstacle set is not baked), so the
+    # output sizes are runtime too -- see the caller-contract notes on each param.
+    _cc_pair_note = ("Obstacle o indexes the FLATTENED env: spheres | capsules | cuboids | planes, "
+                     "o in [0, n_obs) with n_obs = grid_cc_num_obstacles(env). Pair index is "
+                     "pair = i*n_obs + o (sphere-major).")
+
+    self.gen_add_func_doc("collision_distance_pairs: UN-REDUCED signed clearance d_io(q) + normal, for every (sphere, obstacle) pair",
+                          ["Same SDFs as collision_distance but WITHOUT the min-over-obstacles reduction, which is "
+                           "non-smooth precisely where the nearest obstacle switches. Each pair row is smooth in q.",
+                           _cc_pair_note,
+                           "n_obs == 0 (empty environment) is well-defined: the loop bound is 0 and nothing is written."],
+                          ["s_dist is the per-PAIR clearance output (size NUM_COLLISION_SPHERES*n_obs, RUNTIME-sized)",
+                           "s_normal is the per-PAIR unit surface normal (size 3*NUM_COLLISION_SPHERES*n_obs, RUNTIME-sized)"] +
+                          _cc_state_params, None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_distance_pairs(T *s_dist, T *s_normal, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("grid::multi_target_position_device<T, RESOURCE_TIER>(s_sphere_pos, s_q, d_robotModel, d_workspace);")
+    self.gen_add_code_line("load_collision_radii<T>(s_sphere_r);")
+    self.gen_add_sync()
+    self.gen_add_code_line("const int n_obs = grid_cc_num_obstacles<T>(env);")
+    self.gen_add_parallel_loop("ind", "NUM_COLLISION_SPHERES * n_obs")
+    self.gen_add_code_line("int o = ind % n_obs; int i = ind / n_obs;")
+    self.gen_add_code_line("T nx, ny, nz;")
+    self.gen_add_code_line("s_dist[ind] = grid_cc_obstacle_signed<T>(env, o, s_sphere_pos[3*i], s_sphere_pos[3*i+1], s_sphere_pos[3*i+2], s_sphere_r[i], &nx, &ny, &nz);")
+    self.gen_add_code_line("s_normal[3*ind+0] = nx; s_normal[3*ind+1] = ny; s_normal[3*ind+2] = nz;")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
+    self.gen_add_func_doc("collision_distance_pairs_gradient: per-PAIR clearance Jacobian s_ddist[pair*NV + vi] = d(d_io)/dq_vi = n_io^T dp_i/dq_vi",
+                          ["The un-reduced twin of collision_distance_gradient: one NV-row per (sphere, obstacle) pair, "
+                           "each smooth in q. Also returns s_dist so a consumer has value + Jacobian in one call.",
+                           _cc_pair_note,
+                           "s_ddist layout is pair-major: pair (i,o)'s NV-gradient is s_ddist[pair*NV .. pair*NV+NV-1]."],
+                          ["s_dist is the per-PAIR clearance output (size NUM_COLLISION_SPHERES*n_obs, RUNTIME-sized)",
+                           "s_ddist is the per-PAIR clearance Jacobian output (size NUM_COLLISION_SPHERES*n_obs*NUM_VEL, pair-major, RUNTIME-sized)"] +
+                          _cc_state_params +
+                          ["s_normal is caller scratch of size 3*NUM_COLLISION_SPHERES*n_obs (per-pair normals, RUNTIME-sized)",
+                           "s_pos_grad is caller scratch of size 3*NUM_VEL*NUM_COLLISION_SPHERES (batched dp/dq)"], None)
+    self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line("void collision_distance_pairs_gradient(T *s_dist, T *s_ddist, const T *s_q, const grid::robotModel<T> *d_robotModel, "
+                           "const Environment<T> &env, T *s_sphere_pos, T *s_sphere_r, T *s_normal, T *s_pos_grad, "
+                           "T *d_workspace = nullptr) {", True)
+    self.gen_add_code_line("collision_distance_pairs<T, RESOURCE_TIER>(s_dist, s_normal, s_q, d_robotModel, env, s_sphere_pos, s_sphere_r, d_workspace);")
+    self.gen_add_code_line("grid::multi_target_position_gradient_device<T, RESOURCE_TIER>(s_pos_grad, s_q, d_robotModel, d_workspace);")
+    self.gen_add_sync()
+    self.gen_add_code_line("const int n_obs = grid_cc_num_obstacles<T>(env);")
+    self.gen_add_parallel_loop("ind", "NUM_COLLISION_SPHERES * n_obs * " + str(nv))
+    self.gen_add_code_line("int vi = ind % " + str(nv) + "; int pair = ind / " + str(nv) + "; int i = pair / n_obs;")
+    self.gen_add_code_line("int jb = 3 * (" + str(nv) + " * i + vi);")
+    self.gen_add_code_line("s_ddist[ind] = s_normal[3*pair+0]*s_pos_grad[jb+0] + s_normal[3*pair+1]*s_pos_grad[jb+1] + s_normal[3*pair+2]*s_pos_grad[jb+2];")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+    self.gen_add_end_function()
+
     _cc_cost_scalar_params = [
         "margin is the safety distance (cost is a hinge on clearance < margin)",
         "weight is the scalar quadratic penalty weight"]
