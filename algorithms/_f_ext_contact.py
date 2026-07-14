@@ -324,32 +324,41 @@ def gen_f_ext_body_jacobian_dq_inner(self, contacts):
 # NOT hand-rolled: this arena/tier surface is where both §1s and §1t lived.
 # ---------------------------------------------------------------------------
 def _emit_device(self, contacts, which):
+    """which in {"value", "dq", "dfc"}. Each owns the tier-aware smem arena + s_XmatsHom, then calls
+    its inner -- modeled verbatim on gen_multi_target_position_device (same FK, same arena shape)."""
     scratch = gen_f_ext_contact_inner_temp_mem_size(self)
     nv = self.robot.get_num_vel()
     NB = self.robot.get_num_bodies()
-    is_dq = (which == "dq")
-    name = "f_ext_body_jacobian_dq_device" if is_dq else "f_ext_body_device"
-    out = ("s_dfext_dq is the output d(f_ext)/dq, size " + str(6 * NB * nv) +
-           " (column-major [row + " + str(6 * NB) + "*v])") if is_dq else \
-          ("s_f_ext is the output joint-local wrench array, size " + str(6 * NB))
-    func_params = [out,
-                   "s_f_c is the contact wrench input, size " + str(6 * len(contacts)) +
-                   " ([n_w; f_w] per frame, WORLD-ALIGNED, moment about the contact origin)"]
-    if is_dq:
+    NC = len(contacts)
+    NAME = {"value": "f_ext_body_device",
+            "dq":    "f_ext_body_jacobian_dq_device",
+            "dfc":   "f_ext_body_jacobian_dfc_device"}[which]
+    OUT = {"value": ("T *s_f_ext, ",     "s_f_ext is the output joint-local wrench array, size " + str(6 * NB)),
+           "dq":    ("T *s_dfext_dq, ",  "s_dfext_dq is the output d(f_ext)/dq, size " + str(6 * NB * nv) +
+                                         " (column-major [row + " + str(6 * NB) + "*v])"),
+           "dfc":   ("T *s_dfext_dfc, ", "s_dfext_dfc is the output d(f_ext)/d(f_c), size " + str(6 * NB * 6 * NC) +
+                                         " (column-major [row + " + str(6 * NB) + "*(6*c+j)])")}[which]
+    func_params = [OUT[1]]
+    if which != "dfc":   # the dfc block is f_c-INDEPENDENT -> takes no wrench
+        func_params.append("s_f_c is the contact wrench input, size " + str(6 * NC) +
+                           " ([n_w; f_w] per frame, WORLD-ALIGNED, moment about the contact origin)")
+    if which == "dq":
         func_params.append("s_dtau_dfext is -J^T from grid::f_ext_gradient_device, size " + str(nv * 6 * NB))
     func_params += [
         "s_q is the vector of joint positions",
         "d_robotModel is the initialized model-specific helpers on the GPU",
         "d_workspace is the global scratch (= 0 bytes at TIER_SHARED, " + str(scratch) +
         "*sizeof(T) at TIER_LITE+); pass nullptr at TIER_SHARED"]
-    self.gen_add_func_doc(
-        ("d(f_ext)/dq at fixed contact wrench" if is_dq else
-         "Contact-frame wrenches -> the joint-local f_ext array plant_step consumes"),
-        [], func_params, None)
+    doc = {"value": "Contact-frame wrenches -> the joint-local f_ext array plant_step consumes",
+           "dq":    "d(f_ext)/dq at fixed contact wrench (the chain-rule term solvers drop)",
+           "dfc":   "d(f_ext)/d(contact wrench) -- compose with dqdd/dfext to get dqdd/df_c"}[which]
+    self.gen_add_func_doc(doc, [], func_params, None)
     self.gen_add_code_line("template <typename T, int RESOURCE_TIER = GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__device__")
-    sig = "void " + name + "(" + ("T *s_dfext_dq, " if is_dq else "T *s_f_ext, ") + "const T *s_f_c, "
-    if is_dq:
+    sig = "void " + NAME + "(" + OUT[0]
+    if which != "dfc":
+        sig += "const T *s_f_c, "
+    if which == "dq":
         sig += "const T *s_dtau_dfext, "
     sig += "const T *s_q, const robotModel<T> *d_robotModel, T *d_workspace = nullptr) {"
     self.gen_add_code_line(sig, True)
@@ -357,11 +366,106 @@ def _emit_device(self, contacts, which):
                                                       linalg_scratch_bytes="GRID_EE_LINALG_SHARED_BYTES<T>()",
                                                       tier_workspace_expr="d_workspace")
     self.gen_load_update_XmatsHom_helpers_function_call()
-    inner = ("f_ext_body_jacobian_dq_inner<T>(s_dfext_dq, s_f_c, s_dtau_dfext, s_q, s_XmatsHom, "
-             if is_dq else "f_ext_body_inner<T>(s_f_ext, s_f_c, s_q, s_XmatsHom, ")
+    inner = {"value": "f_ext_body_inner<T>(s_f_ext, s_f_c, s_q, s_XmatsHom, ",
+             "dq":    "f_ext_body_jacobian_dq_inner<T>(s_dfext_dq, s_f_c, s_dtau_dfext, s_q, s_XmatsHom, ",
+             "dfc":   "f_ext_body_jacobian_dfc_inner<T>(s_dfext_dfc, s_q, s_XmatsHom, "}[which]
     inner += self.gen_insert_helpers_function_call(NO_XI_FLAG=True)
     inner += "s_temp, nullptr, s_linalg_smem);"
     self.gen_add_code_line(inner)
+    self.gen_add_end_function()
+
+
+def gen_f_ext_body_jacobian_dfc_inner(self, contacts):
+    """Emit `f_ext_body_jacobian_dfc_inner`: d(f_ext)/d(f_c), size 6*NUM_BODIES x 6*NUM_CONTACT_FRAMES.
+
+    THE quantity a solver differentiates its decision variable through:
+        dqdd/df_c = (dqdd/dfext)[nv x 6NB] @ (dfext/df_c)[6NB x 6NC]
+    The map is LINEAR in f_c, so this block is f_c-INDEPENDENT -- a pure function of q. Per (body b,
+    contact c) pair it is the 6x6
+
+        [ R^T   skew(r_c) R^T ]
+        [  0          R^T     ]
+
+    and ZERO for every other body. Column-major [row + 6*NUM_BODIES*col], col = 6*c + j.
+    """
+    cs = build_contact_set(self, contacts)
+    NB = self.robot.get_num_bodies()
+    n = cs["n"]
+    n_joints = self.robot.get_num_joints()
+    NR = 6 * NB
+
+    func_params = [
+        "s_dfext_dfc is the output, size " + str(NR * 6 * n) + " (column-major [row + " + str(NR) + "*col], col = 6*c + j)",
+        "s_q is the vector of joint positions",
+        "s_Xhom is the per-joint local homogeneous transforms (already updated for q)",
+        "s_temp is helper shared memory (holds s_Xworld = 16*NUM_JOINTS)",
+        "d_workspace is the global-memory scratch used when !TEMP_IN_SMEM",
+    ]
+    func_notes = [
+        "f_c-INDEPENDENT by construction (the map is linear in f_c) -- takes no f_c argument.",
+        "Compose with grid::f_ext_gradient_device's dqdd/dfext to get dqdd/df_c.",
+    ]
+    func_def_start = "void f_ext_body_jacobian_dfc_inner("
+    func_def_middle = "T *s_dfext_dfc, const T *s_q, const T *s_Xhom, "
+    func_def_end = "T *s_temp, T *d_workspace, unsigned char *s_linalg_smem) {"
+    func_def_middle, func_params = self.gen_insert_helpers_func_def_params(
+        func_def_middle, func_params, -1, NO_XI_FLAG=True)
+    self.gen_add_func_doc("d(f_ext)/d(contact wrench) -- f_c-independent", func_notes, func_params, None)
+    self.gen_add_code_line("template <typename T, bool TEMP_IN_SMEM = true>")
+    self.gen_add_code_line("__device__")
+    self.gen_add_code_line(func_def_start + func_def_middle + func_def_end, True)
+    self.gen_add_code_line("if constexpr (!TEMP_IN_SMEM) { s_temp = d_workspace; } else { (void)d_workspace; }")
+    self.gen_add_code_line("(void)s_q; (void)s_linalg_smem;")
+    self.gen_add_code_line("T *s_Xworld = s_temp;   // 16 * " + str(n_joints))
+
+    from ._eepose_gradient_hessian import emit_world_fk_chainup
+    emit_world_fk_chainup(
+        self,
+        header_lines=["//", "// Build world transforms for every joint via BFS-level chain-up", "//"],
+        fixed_anchors=None)
+
+    _emit_contact_tables(self, cs)
+
+    self.gen_add_code_line("// zero: only the (body of contact c) rows are nonzero for column block c")
+    self.gen_add_parallel_loop("ind", str(NR * 6 * n))
+    self.gen_add_code_line("s_dfext_dfc[ind] = static_cast<T>(0);")
+    self.gen_add_end_control_flow()
+    self.gen_add_sync()
+
+    # one thread per (contact, output-row k, input-col j): every slot has a single writer.
+    self.gen_add_code_line("// one thread per (contact, out-component k, in-component j)")
+    self.gen_add_parallel_loop("ind", str(36 * n))
+    self.gen_add_code_lines([
+        "int j = ind % 6; int rest = ind / 6; int k = rest % 6; int c = rest / 6;",
+        "const int b = fc_body[c];",
+        "const T r0 = fc_offset[3*c+0], r1 = fc_offset[3*c+1], r2 = fc_offset[3*c+2];",
+        "// Rt(a, r) = R^T[a][r] = R[r][a] = s_Xworld[16*b + 4*a + r]",
+        "T val = static_cast<T>(0);",
+        "if (k >= 3) {", True,
+        "// linear rows: [ 0 | R^T ] -> only the linear half of f_c contributes",
+        "if (j >= 3) { val = s_Xworld[16*b + 4*(k-3) + (j-3)]; }",
+    ])
+    self.gen_add_end_control_flow()
+    self.gen_add_code_lines([
+        "else {", True,
+        "// angular rows: [ R^T | skew(r_c) R^T ]",
+        "if (j < 3) { val = s_Xworld[16*b + 4*k + j]; }",
+        "else {", True,
+        "// (skew(r) R^T)[k][j-3] = sum_a skew(r)[k][a] * R^T[a][j-3]",
+        "const int jj = j - 3;",
+        "const T Rt0 = s_Xworld[16*b + 4*0 + jj];",
+        "const T Rt1 = s_Xworld[16*b + 4*1 + jj];",
+        "const T Rt2 = s_Xworld[16*b + 4*2 + jj];",
+        "// skew(r) rows: [0,-r2,r1], [r2,0,-r0], [-r1,r0,0]",
+        "val = (k == 0) ? (-r2*Rt1 + r1*Rt2)",
+        "    : ((k == 1) ? ( r2*Rt0 - r0*Rt2)",
+        "                : (-r1*Rt0 + r0*Rt1));",
+    ])
+    self.gen_add_end_control_flow()   # else j>=3
+    self.gen_add_end_control_flow()   # else k<3
+    self.gen_add_code_line("s_dfext_dfc[(6*b + k) + " + str(NR) + "*(6*c + j)] = val;")
+    self.gen_add_end_control_flow()   # parallel loop
+    self.gen_add_sync()
     self.gen_add_end_function()
 
 
@@ -378,6 +482,8 @@ def gen_f_ext_contact(self, contacts):
     self.gen_add_code_line("#define GRID_HAS_CONTACT_FRAMES 1")
     self.gen_add_code_line("const int NUM_CONTACT_FRAMES = " + str(cs["n"]) + ";")
     gen_f_ext_body_inner(self, contacts)
+    gen_f_ext_body_jacobian_dfc_inner(self, contacts)
     gen_f_ext_body_jacobian_dq_inner(self, contacts)
     _emit_device(self, contacts, "value")
+    _emit_device(self, contacts, "dfc")
     _emit_device(self, contacts, "dq")
