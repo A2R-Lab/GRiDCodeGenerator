@@ -216,6 +216,7 @@ class GRiDCodeGenerator:
                             gen_coriolis_matrix_inner_temp_mem_size, gen_coriolis_matrix_inner_function_call, \
                             gen_coriolis_matrix_inner, gen_coriolis_matrix_device, \
                             gen_coriolis_matrix_kernel, gen_coriolis_matrix_host, gen_coriolis_matrix, \
+                            gen_f_ext_contact, gen_f_ext_contact_inner_temp_mem_size, \
                             build_target_batch, gen_multi_target_position_inner_temp_mem_size, \
                             gen_multi_target_position_inner_function_call, gen_multi_target_position_inner, \
                             gen_multi_target_position_device, gen_multi_target_position, \
@@ -3150,7 +3151,8 @@ class GRiDCodeGenerator:
     def gen_all_code(self, include_base_inertia = False, include_homogenous_transforms = False, fixed_target_name = "", output_path = None,
                      codegen_profile = "all", algorithm_list = None, enable_floating_second_order = True,
                      enable_idsva_so_world_frame = None, runtime_inertia = False, runtime_transform = False,
-                     runtime_joint_dynamics = None, multi_target_batch = None, collision_spec = None):
+                     runtime_joint_dynamics = None, multi_target_batch = None, collision_spec = None,
+                     contact_frames = None):
         # Default-pick the SO variant that wins per the 2026-05 perf sweep
         # (see test/benchmarks/benchmark_multi_version_sm120_5090_full.md
         # § IDSVA_SO_BODY_FRAME vs IDSVA_SO_WORLD_FRAME):
@@ -3592,6 +3594,11 @@ class GRiDCodeGenerator:
                 self.gen_multi_target_position(_mt_batch, emit_num_const=False)
                 self.gen_multi_target_position_gradient(_mt_batch)
                 self.gen_multi_target_position_bench(_mt_batch)
+            # C.2 (GATO ask 1): contact-frame wrench -> joint-local f_ext + d/dq. Opt-in: default None
+            # emits nothing, so every existing header is byte-identical. Reuses the SAME world-FK
+            # chain-up as multi_target (emit_world_fk_chainup) — no second copy.
+            if contact_frames:
+                self.gen_f_ext_contact(contact_frames)
             # W3: collision. Each sphere-density tier IS a multi_target batch — build it in the
             # tier's own order (NO group re-sort) so the baked radii/self_cc_ranges stay
             # index-aligned. Emit a POSITION extractor per tier (config_free's broad-phase needs

@@ -8,6 +8,7 @@ from ._inverse_dynamics_gradient import *
 from ._inverse_dynamics_gradient import _emit_fb_bfs_level_indexing
 from ._forward_dynamics_gradient import *
 from ._f_ext_gradient import *
+from ._f_ext_contact import *
 from ._eepose_gradient_hessian import *
 from ._aba import *
 from ._crba import *
