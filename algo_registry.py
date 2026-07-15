@@ -592,8 +592,10 @@ _ARENA_FULL_FNS: dict[str, Callable[[ArenaCtx], int]] = {
     "f_ext_gradient":
         lambda c: c.n + 2*(c.nv*6*c.NB) + c.nv*c.nv + max(c.feg_inner, c.minv_inner) + c.XI + c.rt,
     "f_ext_gradient_dq":
+        # + c.rt: FD loop recomputes XImats per perturbation -> rt_xfixed reserved under
+        # runtime_transform (matches the rt-aware kernel carve; §2 fix 2026-07-14). See the rung closure.
         lambda c: c.n + (c.n + (c.nv if c.floating else 0) + 2*c.nv*6*c.NB
-                         + c.feg_inner + c.ximats_helper_temp) + c.XI,
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI + c.rt,
     "inverse_dynamics_regressor":
         lambda c: (c.n + 2*c.nv) + c.nv*10*c.NB + 18*c.n + c.idr_inner + c.XI + c.rt,
     "forward_dynamics_parameter_gradient":
@@ -765,10 +767,16 @@ _ARENA_RUNG_FNS: dict[str, tuple[Callable[[ArenaCtx], int], ...]] = {
         lambda c: c.n + c.nv*c.nv + max(c.feg_inner, c.minv_noF) + c.XI + c.rt,                        # deep: both outs -> ws, minv no-F
     ),
     "f_ext_gradient_dq": (
+        # + c.rt: the FD loop RECOMPUTES XImats per perturbation, so under runtime_transform its
+        # load_update_XImats scratch reserves the rt_xfixed region (36*NJ) exactly like every other
+        # s_temp-domain arena. The imperative kernel carve (_f_ext_gradient_dq_smem_count -> the rt-aware
+        # gen_load_update_XImats_helpers_temp_mem_size) already includes it; this closure did NOT, so the
+        # launch macro under-counted by 36*NJ under rt (a §2 silent under-size, caught by
+        # test_shared_arena_covers_carve's rt cells 2026-07-14).
         lambda c: c.n + (c.n + (c.nv if c.floating else 0) + 2*c.nv*6*c.NB
-                         + c.feg_inner + c.ximats_helper_temp) + c.XI,        # full: both JT bufs in smem
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI + c.rt,  # full: both JT bufs in smem
         lambda c: c.n + (c.n + (c.nv if c.floating else 0)
-                         + c.feg_inner + c.ximats_helper_temp) + c.XI,        # spill: JT pair -> ws
+                         + c.feg_inner + c.ximats_helper_temp) + c.XI + c.rt,  # spill: JT pair -> ws
     ),
     # ── 3.5e kinematics ladders (XmatsHom domain; degenerate 3rd rung == 2nd) ──
     "osc_inertia": (
