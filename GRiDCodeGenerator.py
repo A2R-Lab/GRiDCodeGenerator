@@ -3417,10 +3417,14 @@ class GRiDCodeGenerator:
             "FORWARD_DYNAMICS_GRADIENT": "forward_dynamics_gradient",
             # f_ext gradient family — big output buffers (dtau/dqdd_dfext each nv*6NB;
             # f_ext_gradient_dq is nv*6NB*nv, the single largest per-timestep buffer).
-            # Gated so init_gridData (B2) skips their alloc when the algo wasn't generated
-            # (e.g. f_ext_gradient_dq is fixed-base-only -> absent on h2_plus floating).
+            # Gated so init_gridData (B2) skips their alloc when the algo wasn't generated.
+            # BOTH map to the parent key "f_ext_gradient": gen_f_ext_gradient emits the
+            # first-order kernels AND the A.3 (-dJ^T/dq) child UNCONDITIONALLY for both
+            # base modes (C.2), so d_f_ext_gradient_dq must be allocated whenever
+            # f_ext_gradient is requested. Keying the DQ macro to the (never-present)
+            # child key "f_ext_gradient_dq" left the buffer unallocated -> null-write crash.
             "F_EXT_GRADIENT": "f_ext_gradient",
-            "F_EXT_GRADIENT_DQ": "f_ext_gradient_dq",
+            "F_EXT_GRADIENT_DQ": "f_ext_gradient",
             "INVERSE_DYNAMICS_REGRESSOR": "inverse_dynamics_regressor",
             # FD parameter gradient (dqdd/dpi = -Minv . Y): its grid::kernel is
             # emitted only when 'forward_dynamics_parameter_gradient' is in the
