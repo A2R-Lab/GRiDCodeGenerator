@@ -1,5 +1,10 @@
 # GRiDCodeGenerator
 
+> **⚠️ DEPRECATED as a standalone repo.** As of 2026-07-17 this has been folded
+> into [A2R-Lab/GRiD](https://github.com/A2R-Lab/GRiD) under `GRiDCodeGenerator/`
+> (history-preserving subtree merge). Develop there, not here. This repo is a
+> frozen mirror — see [DEPRECATED.md](DEPRECATED.md).
+
 A optimized CUDA C++ code generation engine for rigid body dynamics algorithms and their analytical gradients.
 
 This package is written in Python and outputs CUDA C++ code. Helper functions have been written to speed up the algorithm implementation process and are detailed below. If your favorite rigid body dynamics algorithm is not yet implemented please either submit a PR to this repo with the code generation implementation or simply submit a PR to our [rbdReference](https://github.com/robot-acceleration/rbdReference) package with the Python implementation and we'll then try to get a GPU implementation designed as soon as possible.
